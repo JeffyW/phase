@@ -28077,6 +28077,9 @@ pub struct BoardWideCostModifier<'a> {
     /// (CR 601.2f "as long as" / "during your turn" clauses). `None` is
     /// unconditional.
     pub condition: Option<&'a StaticCondition>,
+    /// CR 118.7b/c/d: whether an unmatched colored/colorless reduction unit
+    /// spills into generic mana. Only meaningful when `mode` is `Reduce`.
+    pub reach: crate::types::statics::CostReductionReach,
 }
 
 impl StaticDefinition {
@@ -28091,6 +28094,7 @@ impl StaticDefinition {
             amount,
             spell_filter,
             dynamic_count,
+            reach,
         } = &self.mode
         else {
             return None;
@@ -28108,6 +28112,7 @@ impl StaticDefinition {
             dynamic_count: dynamic_count.as_ref(),
             caster_scope: cost_modifier_caster_scope(self.affected.as_ref()),
             condition: self.condition.as_ref(),
+            reach: *reach,
         })
     }
 
