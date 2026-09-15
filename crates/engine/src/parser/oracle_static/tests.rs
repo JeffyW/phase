@@ -6646,6 +6646,22 @@ fn colored_only_rider_sets_the_cost_reduction_reach() {
             "a reduction with no rider keeps the CR 118.7b default: {line}"
         );
     }
+
+    // Sentence-boundary guard: a longer sentence that merely OPENS with the
+    // rider wording says something the engine has not been taught, so it must
+    // NOT be read as the rider. Without the boundary check these fall through
+    // to `ColoredManaOnly` and silently narrow the reduction.
+    for line in [
+        "Creature spells you cast cost {B} less to cast. This effect reduces only the amount of colored mana you pay for that spell's kicker.",
+        "Creature spells you cast cost {B} less to cast. This effect reduces only the amount of colored mana you pay during your turn.",
+    ] {
+        assert_eq!(
+            reach(line),
+            CostReductionReach::SpillsToGeneric,
+            "an unsupported continuation of the rider wording must not be \
+             classified as the rider: {line}"
+        );
+    }
 }
 
 // CR 205.4a: Kethis, the Hidden Hand — "Legendary spells you cast cost {1} less

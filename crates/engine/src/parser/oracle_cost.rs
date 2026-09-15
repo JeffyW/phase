@@ -1505,9 +1505,12 @@ pub(crate) fn parse_colored_mana_only_clause(
     let (rest, _) = tag(" mana you pay").parse(rest)?;
     // Require a sentence boundary so a longer sentence that merely OPENS with
     // this wording ("... mana you pay for that spell's kicker", say) cannot
-    // false-positive. `peek` leaves the terminator for the caller — the Defiler
-    // parser consumes the trailing '.' itself.
-    let (rest, _) = peek(alt((eof, tag("."), tag(" ")))).parse(rest)?;
+    // false-positive. Accepting a bare space here would admit exactly that
+    // continuation, so only a period or end-of-input terminates the rider.
+    // `peek` leaves the terminator for the caller — the Defiler parser consumes
+    // the trailing '.' itself. All 12 printed riders end with '.'; `eof` covers
+    // a line whose trailing period was already stripped upstream.
+    let (rest, _) = peek(alt((eof, tag(".")))).parse(rest)?;
     Ok((rest, scope))
 }
 
