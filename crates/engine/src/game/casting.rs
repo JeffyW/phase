@@ -9596,8 +9596,7 @@ pub(super) fn collect_imposed_additional_cast_costs(
 fn apply_cost_modifications_in_order(mana_cost: &mut ManaCost, collected: &[CostModification]) {
     // CR 601.2f: apply all cost increases first, then all reductions, so the
     // single {0} floor (the `saturating_sub` in `apply_cost_mod_to_mana`) acts on
-    // base + increases. Reductions among themselves commute (each floors at 0), so
-    // their relative order is irrelevant.
+    // base + increases.
     for modification in collected.iter().filter(|m| m.is_raise) {
         apply_cost_mod_to_mana(
             mana_cost,
@@ -9607,7 +9606,32 @@ fn apply_cost_modifications_in_order(mana_cost: &mut ManaCost, collected: &[Cost
             modification.reach,
         );
     }
-    for modification in collected.iter().filter(|m| !m.is_raise) {
+
+    // CR 601.2f: "If multiple cost reductions apply, the player may apply them
+    // in any order." Reductions do NOT commute once reaches are mixed: on
+    // {1}{W}, a {W} ColoredManaOnly reducer followed by a {W} SpillsToGeneric
+    // reducer gives {0} (the colored-only unit takes the pip, the spillover unit
+    // falls through to generic), while the reverse gives {1} (the spillover unit
+    // takes the pip, and the colored-only unit has nothing left to match and is
+    // discarded). Leaving that to collection order would silently make a choice
+    // the rules hand the caster, so apply every ColoredManaOnly reduction first.
+    //
+    // That ordering is caster-OPTIMAL, not merely deterministic: a
+    // ColoredManaOnly unit can only ever cancel a matching pip, whereas a
+    // SpillsToGeneric unit can cancel a matching pip OR fall back to generic.
+    // The colored-only units are strictly the more constrained, so spending them
+    // first can never strand a unit that the flexible ones could not have
+    // absorbed — the standard exchange argument. Because CR 601.2f permits any
+    // order, always handing the caster the cheapest one is rules-legal and needs
+    // no prompt. A player-facing ordering round-trip would only matter to a
+    // caster who wants a deliberately HIGHER cost; that is tracked separately.
+    let mut reductions: Vec<&CostModification> = collected.iter().filter(|m| !m.is_raise).collect();
+    // Stable, so collection order is still respected within one reach class.
+    reductions.sort_by_key(|m| match m.reach {
+        CostReductionReach::ColoredManaOnly => 0u8,
+        CostReductionReach::SpillsToGeneric => 1,
+    });
+    for modification in reductions {
         apply_cost_mod_to_mana(
             mana_cost,
             &modification.amount,

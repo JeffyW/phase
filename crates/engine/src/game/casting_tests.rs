@@ -12294,6 +12294,68 @@ fn morophon_reduces_colored_mana_for_chosen_creature_type() {
     );
 }
 
+/// CR 601.2f: "If multiple cost reductions apply, the player may apply them in
+/// any order." Once reaches are mixed those reductions stop commuting, so the
+/// order the engine happens to collect them in must not be what decides the
+/// cost.
+///
+/// On {1}{W} with a {W} `ColoredManaOnly` reducer and a {W} `SpillsToGeneric`
+/// reducer, the colored-only-first order gives {0} (the colored-only unit takes
+/// the pip; the spillover unit falls through to generic), while the reverse
+/// gives {1} (the spillover unit takes the pip; the colored-only unit has
+/// nothing to match and is discarded). The caster is entitled to the {0}, so
+/// BOTH collection orders must produce it.
+///
+/// Reach guard: the second permutation is the one that was wrong before this
+/// fix — it returned {1} when the reductions were applied in collection order.
+#[test]
+fn mixed_reach_reductions_do_not_let_collection_order_decide_the_cost() {
+    fn reducer(reach: CostReductionReach) -> CostModification {
+        CostModification {
+            is_raise: false,
+            amount: ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::White],
+            },
+            multiplier: 1,
+            reach,
+        }
+    }
+
+    for (label, collected) in [
+        (
+            "colored-only collected first",
+            vec![
+                reducer(CostReductionReach::ColoredManaOnly),
+                reducer(CostReductionReach::SpillsToGeneric),
+            ],
+        ),
+        (
+            "spillover collected first",
+            vec![
+                reducer(CostReductionReach::SpillsToGeneric),
+                reducer(CostReductionReach::ColoredManaOnly),
+            ],
+        ),
+    ] {
+        let mut mana_cost = ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::White],
+        };
+        apply_cost_modifications_in_order(&mut mana_cost, &collected);
+
+        assert_eq!(
+            mana_cost,
+            ManaCost::Cost {
+                generic: 0,
+                shards: vec![],
+            },
+            "{label}: CR 601.2f entitles the caster to the cheapest ordering, so \
+             collection order must not change the result"
+        );
+    }
+}
+
 /// CR 601.2f + CR 102.2/102.3: Heliod, the Warped Eclipse, in a 3-player
 /// game. "Spells you cast cost {1} less to cast for each card your opponents
 /// have drawn this turn." With opponents having drawn 2 and 3, the SUM-across-

@@ -2051,9 +2051,10 @@ pub enum StaticMode {
     LegendRuleDoesntApply,
     /// Speed may increase beyond 4, and 4+ still counts as max speed for that player.
     SpeedCanIncreaseBeyondFour,
-    /// CR 118.12a: Defiler cycle — "As an additional cost to cast [color] permanent
-    /// spells, you may pay [N] life. Those spells cost {C} less to cast."
-    /// Optional life payment during casting with conditional mana reduction.
+    /// CR 118.8 + CR 118.8b: Defiler cycle — "As an additional cost to cast [color]
+    /// permanent spells, you may pay [N] life. Those spells cost {C} less to cast."
+    /// The life payment is an OPTIONAL additional cost (CR 118.8b), announced per
+    /// CR 601.2b, with the conditional mana reduction constrained by CR 118.7b/c/d.
     DefilerCostReduction {
         /// The color of permanent spells this applies to
         color: ManaColor,
