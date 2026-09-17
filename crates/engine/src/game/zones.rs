@@ -1125,6 +1125,12 @@ pub fn apply_resolved_zone_change(
             command.cause,
         );
     }
+    // CR 704.5m + CR 704.5n + CR 702.26i: the command carries no attachment
+    // payload, so replay re-runs the same severing authority the live
+    // transition used. Idempotent, so the live path's earlier call is not
+    // double-applied; the returned ids are dropped because replay reproduces
+    // state, not events (the live transition already emitted them).
+    let _ = sever_battlefield_attachment_graph_on_exit(state, command.object.object_id);
     remove_from_zone(state, command.object.object_id, command.from, command.owner);
     add_to_zone(state, command.object.object_id, command.to, command.owner);
 
@@ -1440,8 +1446,7 @@ pub(crate) fn move_to_zone_with_entry_flags(
     };
     zone_change_record.sync_trigger_source_context();
 
-    let severed_attachments =
-        sever_battlefield_attachment_graph_on_exit(state, object_id, &unattached_from);
+    let severed_attachments = sever_battlefield_attachment_graph_on_exit(state, object_id);
     // CR 730.2d + CR 111.7: for a merged permanent whose topmost component
     // temporarily changed the survivor's token-ness, the ZoneChanged record above
     // must retain the merged permanent's event-time token-ness. Restore the
@@ -2054,12 +2059,28 @@ pub(crate) fn capture_linked_exile_snapshot(
 /// resolves to `ExactLive` and observes the freshly cleared `None`. Emitting the
 /// event cannot double-fire with that fallback arm for the same reason: the arm
 /// requires `attached_to` to still name the departing host.
+///
+/// This is a SHARED live/replay authority, called from `move_to_zone`,
+/// `move_to_library_at_index`, and `apply_resolved_zone_change` — the same
+/// arrangement `prune_object_bound_effects_on_exit` uses, and for the same
+/// reason: a `ResolvedZoneChangeCommand` carries no attachment payload, so a
+/// replay that did not re-run this would rebuild a state whose attachment graph
+/// still held the edges the live transition severed. It derives the departing
+/// object's own attachment edge from live state rather than taking it as a
+/// parameter, so both paths cannot drift, and it is idempotent: a second call
+/// finds an empty `attachments` list and a `None` `attached_to` and returns
+/// `Vec::new()` without touching anything. That matters because the live
+/// `move_to_zone` severs before delegating to `apply_resolved_zone_change`, and
+/// the Command/Stack routes bypass the resolved-command path entirely.
 fn sever_battlefield_attachment_graph_on_exit(
     state: &mut GameState,
     object_id: ObjectId,
-    unattached_from: &Option<crate::types::ability::TargetRef>,
 ) -> Vec<ObjectId> {
-    if unattached_from.is_some() {
+    let is_attached = state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| obj.attached_to.is_some());
+    if is_attached {
         if let Some(old_target_id) = state
             .objects
             .get(&object_id)
@@ -2084,33 +2105,39 @@ fn sever_battlefield_attachment_graph_on_exit(
     if severed_attachments.is_empty() {
         return Vec::new();
     }
-    // Only clear the back-pointer when it still names this host: an attachment
-    // re-pointed elsewhere by a concurrent effect must keep its live edge, and
-    // must not announce an unattach it did not undergo.
+    // The back-pointer is cleared only when it still names THIS host: an
+    // attachment re-pointed elsewhere by a concurrent effect must keep its live
+    // edge, and must not announce an unattach it did not undergo.
     //
-    // CR 702.26b: a phased-out permanent is treated as though it doesn't exist,
-    // so a phased-out attachment is skipped here for the same reason
-    // `sba::check_unattached_equipment` skips it — its relationship is not the
-    // departing host's to sever. The host's `attachments` list is still emptied
-    // above, matching the pre-existing behavior for this case.
-    let severed_attachments: Vec<ObjectId> = severed_attachments
-        .into_iter()
-        .filter(|attachment_id| {
-            let severable = state.objects.get(attachment_id).is_some_and(|attachment| {
-                attachment.is_phased_in()
-                    && attachment.attached_to.and_then(|target| target.as_object())
-                        == Some(object_id)
-            });
-            if severable {
-                if let Some(attachment) = state.objects.get_mut(attachment_id) {
-                    attachment.attached_to = None;
-                }
-            }
-            severable
-        })
-        .collect();
+    // CR 702.26i: a directly phased-out attachment "will phase in attached to
+    // the object ... it was attached to when it phased out, IF that object is
+    // still in the same zone. If not, ... phases in unattached." The host is
+    // leaving that zone right now, and `phasing::phase_in_object` re-validates
+    // only that the named host is on the battlefield — not that it is the same
+    // incarnation — so a host that leaves and returns to the same `ObjectId`
+    // slot would otherwise re-adopt the attachment on phase-in. The pointer is
+    // therefore cleared for phased-out attachments too.
+    //
+    // CR 702.26j: "Abilities that trigger when a permanent becomes attached or
+    // unattached ... don't trigger when that permanent phases in or out", and
+    // CR 702.26b treats a phased-out permanent as though it does not exist. So
+    // a phased-out attachment is severed SILENTLY — only phased-in attachments
+    // are returned for `GameEvent::Unattached` emission.
+    let mut severed_and_announced = Vec::new();
+    for attachment_id in severed_attachments {
+        let Some(attachment) = state.objects.get_mut(&attachment_id) else {
+            continue;
+        };
+        if attachment.attached_to.and_then(|target| target.as_object()) != Some(object_id) {
+            continue;
+        }
+        attachment.attached_to = None;
+        if attachment.is_phased_in() {
+            severed_and_announced.push(attachment_id);
+        }
+    }
     crate::game::layers::mark_layers_full(state);
-    severed_attachments
+    severed_and_announced
 }
 
 pub(crate) fn capture_combat_status(
@@ -2244,8 +2271,7 @@ pub fn move_to_library_at_index(
     );
     zone_change_record.sync_trigger_source_context();
 
-    let severed_attachments =
-        sever_battlefield_attachment_graph_on_exit(state, object_id, &unattached_from);
+    let severed_attachments = sever_battlefield_attachment_graph_on_exit(state, object_id);
 
     // CR 608.2h: hand the LKI the PRE-SEVER attachment set captured above.
     apply_zone_exit_cleanup(
@@ -5305,6 +5331,155 @@ mod tests {
                 GameEvent::Unattached { attachment_id, .. } if *attachment_id == equipment
             )),
             "an attachment that did not become unattached must not announce one: {events:?}"
+        );
+    }
+
+    #[test]
+    fn host_exit_severing_is_reproduced_by_resolved_command_replay() {
+        // The live transition severs the attachment graph BEFORE delegating to
+        // `resolve_and_apply_zone_change`, and `ResolvedZoneChangeCommand`
+        // carries no attachment payload. If replay did not re-run the same
+        // severing authority, a state rebuilt from the journal would still hold
+        // the edges the live transition cut — a live/replay divergence.
+        use crate::game::effects::attach::attach_to;
+        use crate::types::card_type::CoreType;
+
+        let mut live = setup();
+        let host = create_object(
+            &mut live,
+            CardId(1),
+            PlayerId(0),
+            "Host".to_string(),
+            Zone::Battlefield,
+        );
+        live.objects
+            .get_mut(&host)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let equipment = create_object(
+            &mut live,
+            CardId(2),
+            PlayerId(0),
+            "Equipment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = live.objects.get_mut(&equipment).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Equipment".to_string());
+        }
+        attach_to(&mut live, equipment, host);
+
+        // Clone BEFORE the move: this is the pre-cleanup shape replay starts from.
+        let mut replayed = live.clone();
+
+        move_to_zone(&mut live, host, Zone::Exile, &mut Vec::new());
+        let command = live
+            .resolved_rules_journal
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.command.as_ref())
+            .find_map(|command| match command {
+                crate::types::resolved_commands::ResolvedRulesCommand::ZoneChange(command)
+                    if command.object.object_id == host =>
+                {
+                    Some(command.as_ref().clone())
+                }
+                _ => None,
+            })
+            .expect("the live battlefield exit records its zone command");
+
+        assert_eq!(live.objects[&equipment].attached_to, None);
+        assert!(live.objects[&host].attachments.is_empty());
+
+        apply_resolved_zone_change(&mut replayed, &command)
+            .expect("the recorded exit replays from the pre-cleanup state");
+
+        assert_eq!(
+            replayed.objects[&equipment].attached_to, live.objects[&equipment].attached_to,
+            "replay must reproduce the severed back-pointer"
+        );
+        assert_eq!(
+            replayed.objects[&host].attachments, live.objects[&host].attachments,
+            "replay must reproduce the emptied host attachment list"
+        );
+    }
+
+    #[test]
+    fn phased_out_attachment_does_not_readopt_a_returned_host() {
+        // CR 702.26i: a directly phased-out attachment phases in attached to
+        // its old host only "if that object is still in the same zone". The
+        // host leaves and returns to the SAME `ObjectId` slot, so
+        // `phasing::phase_in_object`'s battlefield check would re-adopt it
+        // unless the pointer was cleared when the host left.
+        //
+        // CR 702.26j: that severing is silent — no unattach trigger fires for a
+        // phased-out attachment.
+        use crate::game::effects::attach::attach_to;
+        use crate::game::game_object::{PhaseOutCause, PhaseStatus};
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Host".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&host)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let equipment = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Equipment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&equipment).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Equipment".to_string());
+        }
+        attach_to(&mut state, equipment, host);
+        state.objects.get_mut(&equipment).unwrap().phase_status = PhaseStatus::PhasedOut {
+            cause: PhaseOutCause::Directly,
+        };
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
+
+        assert_eq!(
+            state.objects[&equipment].attached_to, None,
+            "CR 702.26i: the phased-out attachment must not keep a pointer to a host \
+             that left the zone"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                GameEvent::Unattached { attachment_id, .. } if *attachment_id == equipment
+            )),
+            "CR 702.26j: severing a phased-out attachment is silent: {events:?}"
+        );
+
+        // The host returns to the very same ObjectId slot.
+        move_to_zone(&mut state, host, Zone::Battlefield, &mut events);
+        crate::game::phasing::phase_in_object(&mut state, equipment, &mut events);
+
+        assert_eq!(
+            state.objects[&equipment].attached_to, None,
+            "CR 702.26i: it must phase in UNATTACHED, not re-adopt the returned permanent"
+        );
+        assert!(
+            !state.objects[&host].attachments.contains(&equipment),
+            "the returned permanent must not list the attachment"
         );
     }
 
