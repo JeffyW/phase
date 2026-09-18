@@ -168,12 +168,9 @@ fn urianger_board_with_exiled_land(
         .add_creature_to_exile(P0, "Arcanum Spell", 2, 2)
         .with_mana_cost(ManaCost::generic(cost))
         .id();
-    let land = scenario.add_land_to_hand(P0, "Arcanum Island").id();
+    let land = scenario.add_land_to_exile(P0, "Arcanum Island").id();
     scenario.with_mana_pool(P0, generic_mana(pool));
     let mut runner = scenario.build();
-    engine::game::zones::remove_from_zone(runner.state_mut(), land, Zone::Hand, P0);
-    runner.state_mut().objects[&land].zone = Zone::Exile;
-    engine::game::zones::add_to_zone(runner.state_mut(), land, Zone::Exile, P0);
     link_exiled_with(&mut runner, spell, urianger);
     link_exiled_with(&mut runner, land, urianger);
     grant_play_arcanum(&mut runner, urianger);
@@ -307,6 +304,9 @@ fn urianger_land_companion_plays_a_land_without_consuming_spell_reduction() {
         Zone::Battlefield,
         "the linked land must enter the battlefield through GameAction::PlayLand"
     );
+    // Playing a land from exile fires Urianger's first printed ability. Resolve
+    // that trigger through priority before casting the sorcery-speed spell.
+    runner.pass_both_players();
     assert_eq!(
         cast_permission(&runner, spell).cast_cost_modifier(),
         Some(&CastCostModifier::reduce(ManaCost::generic(2))),
@@ -498,8 +498,8 @@ fn urianger_has_no_unimplemented_clause() {
     );
     assert_eq!(
         parsed.triggers.len(),
-        1,
-        "reach guard: Urianger's printed exile-play trigger must lower"
+        2,
+        "reach guard: Urianger's two disjunctive exile-play events must lower separately"
     );
     assert!(
         parsed.abilities.iter().any(|ability| {
