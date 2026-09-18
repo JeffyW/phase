@@ -1289,6 +1289,7 @@ mod until_source_leaves_cr610_3b;
 mod urborg_scavengers_source_exiled_keyword_grant;
 mod ureni_attack_trigger;
 mod urge_to_feed_regression;
+mod urianger_augurelt;
 mod urza_lord_high_artificer_shuffle_exile_free_cast;
 mod urzas_saga_chapter_two;
 mod urzas_tower_conditional_mana;

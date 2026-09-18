@@ -37,10 +37,11 @@ use super::lower::{
     append_remember_card_to_standalone_exiled_choice, apply_where_x_ability_expression,
     apply_where_x_to_latest_def, attach_alt_ability_cost_to_previous_play_from_exile,
     attach_any_color_mana_rider_to_previous_play_from_exile,
-    attach_cast_cost_raise_to_previous_play_from_exile,
+    attach_cast_cost_modifier_to_previous_play_from_exile,
+    attach_cast_cost_modifier_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
-    attach_land_enters_tapped_to_previous_play_from_exile, cast_cost_raise_rider,
+    attach_land_enters_tapped_to_previous_play_from_exile, cast_cost_modifier_rider,
     clone_would_transplant_gated_referent, consolidate_die_and_coin_defs,
     definition_targets_self_source, effect_publishes_revealed_subject,
     extract_bounded_target_multi_target, extract_exact_target_multi_target,
@@ -2390,18 +2391,40 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             }
         }
 
-        // CR 601.2f + CR 614.1c: Lightstall Inquisitor's "Each spell cast this
-        // way costs {1} more to cast." / "Each land played this way enters
-        // tapped." rider sentences scope to the preceding `PlayFromExile`
-        // grant. Fold each into the grant (`cast_cost_raise` /
-        // `land_enter_tapped`) instead of emitting a standalone cost-modify
-        // static or board-wide ETB-tapped replacement — "this way" binds them
-        // to the exile-play permission, not to all spells/lands.
-        if let Some(cost) = cast_cost_raise_rider(clause_ir) {
-            if attach_cast_cost_raise_to_previous_play_from_exile(&mut defs, cost) {
+        // CR 601.2f + CR 608.2c + CR 614.1c: "Each spell cast this way costs {1}
+        // more to cast." (Lightstall Inquisitor), "Spells you cast this way cost
+        // {2} less to cast." (Urianger Augurelt), and "Each land played this way
+        // enters tapped." are rider sentences scoped by "this way" to the
+        // immediately-preceding grant. Fold each into that grant
+        // (`cast_cost_modifier` / `land_enter_tapped`) instead of emitting a
+        // standalone cost-modify static or board-wide ETB-tapped replacement.
+        //
+        // The cost rider has two hosts. A prior `Effect::CastFromZone` is tried
+        // first: it is the instruction that states the rider, and its resolver
+        // decides which of the permissions it builds may carry it (CR 305.1 —
+        // never the land-play companion). A prior `PlayFromExile` grant is the
+        // fallback for the class whose permission is built by the parser.
+        //
+        // When NEITHER host can carry it — no grant precedes the rider, or the
+        // one that does is on a `CastFromZone` driver with no cost-modifier slot
+        // — the rider must not lower as a clause of its own. Its own grammar
+        // ("[each/a] spell cast this way costs …") reads to the generic head
+        // dispatch as a cast instruction, so the fall-through produced a bare
+        // `Effect::CastFromZone` over every card, and at the line-classification
+        // layer a board-wide `StaticMode::ModifyCost` that prices EVERY spell
+        // its controller casts — both counted as supported by `cargo coverage`.
+        // Refuse instead: one honest gap, priced at nothing, counted as red.
+        let mut unabsorbed_rider_gap = None;
+        if let Some(modifier) = cast_cost_modifier_rider(clause_ir) {
+            if attach_cast_cost_modifier_to_prior_cast_from_zone(&mut defs, modifier.clone()) {
                 prev_boundary = clause_ir.boundary;
                 continue;
             }
+            if attach_cast_cost_modifier_to_previous_play_from_exile(&mut defs, modifier.clone()) {
+                prev_boundary = clause_ir.boundary;
+                continue;
+            }
+            unabsorbed_rider_gap = Some(cast_cost_modifier_without_host_gap(&modifier));
         }
         if is_land_enters_tapped_rider(clause_ir)
             && attach_land_enters_tapped_to_previous_play_from_exile(&mut defs)
@@ -2419,8 +2442,12 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
         }
 
         // ── Build AbilityDefinition from ClauseIr ──
-        let is_target_only = matches!(clause_ir.parsed.effect, Effect::TargetOnly { .. });
-        let mut def = AbilityDefinition::new(kind, clause_ir.parsed.effect.clone());
+        // The refused rider above substitutes its gap for this clause's lowered
+        // effect, so it travels the ordinary def-construction path (boundary
+        // link, condition, provenance) rather than a bespoke emit.
+        let clause_effect = unabsorbed_rider_gap.unwrap_or_else(|| clause_ir.parsed.effect.clone());
+        let is_target_only = matches!(clause_effect, Effect::TargetOnly { .. });
+        let mut def = AbilityDefinition::new(kind, clause_effect);
         // CR 702.26a: Preserve clause provenance on parent-target tap riders so
         // host-bound phase-in rewrites can match the exact printed phrase without
         // falling back to whole-trigger text.

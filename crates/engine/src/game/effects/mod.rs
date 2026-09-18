@@ -18505,6 +18505,7 @@ mod tests {
                     },
                     mana_spend_permission: None,
                     additional_cost: None,
+                    cast_cost_modifier: None,
                 },
                 vec![],
                 ObjectId(1),
@@ -27018,6 +27019,7 @@ mod tests {
                         enters_with_counter: None,
                         enters_with_modifications: Vec::new(),
                         mana_spend_permission: None,
+                        cast_cost_modifier: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -27122,6 +27124,7 @@ mod tests {
                         enters_with_counter: None,
                         enters_with_modifications: Vec::new(),
                         mana_spend_permission: None,
+                        cast_cost_modifier: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -27199,6 +27202,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 },
                 target: TargetFilter::TrackedSet {
                     id: TrackedSetId(0),
@@ -29102,7 +29106,7 @@ mod tests {
                     card_filter: None,
                     single_use_group: None,
                     single_use: false,
-                    cast_cost_raise: None,
+                    cast_cost_modifier: None,
                     alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 },
@@ -33158,7 +33162,7 @@ mod tests {
                     card_filter: None,
                     single_use_group: None,
                     single_use: false,
-                    cast_cost_raise: None,
+                    cast_cost_modifier: None,
                     alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 },
@@ -36751,6 +36755,7 @@ mod tests {
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
         );
         let ability = build_resolved_from_def(&pure_peek_definition(cast, 1), source, PlayerId(0));
@@ -36819,6 +36824,7 @@ mod tests {
                     driver: CastFromZoneDriver::DuringResolution,
                     mana_spend_permission: None,
                     additional_cost: None,
+                    cast_cost_modifier: None,
                 },
             )
             .optional();
@@ -36942,6 +36948,7 @@ mod tests {
                         driver,
                         mana_spend_permission: None,
                         additional_cost: None,
+                        cast_cost_modifier: None,
                     },
                     vec![],
                     ObjectId(900),
@@ -36977,6 +36984,7 @@ mod tests {
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![],
             ObjectId(900),
@@ -37145,6 +37153,7 @@ mod tests {
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![TargetRef::Object(spell)],
             source,
@@ -37184,6 +37193,7 @@ mod tests {
                     driver: CastFromZoneDriver::DuringResolution,
                     mana_spend_permission: None,
                     additional_cost: None,
+                    cast_cost_modifier: None,
                 },
                 vec![],
                 ObjectId(900),
@@ -37309,6 +37319,7 @@ mod tests {
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
         )
         .optional();
@@ -37431,6 +37442,7 @@ mod tests {
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
         );
         let dig_def = AbilityDefinition::new(

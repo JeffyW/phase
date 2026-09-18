@@ -5588,6 +5588,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
                         enters_with_counter: None,
                         enters_with_modifications: Vec::new(),
                         mana_spend_permission: None,
+                        cast_cost_modifier: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -14272,7 +14273,7 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -14414,7 +14415,7 @@ fn try_parse_cast_from_tracked_exile_grant(tp: TextPair<'_>) -> Option<ParsedEff
             card_filter,
             single_use_group: None,
             single_use,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -14524,7 +14525,7 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -14772,7 +14773,7 @@ fn try_parse_play_from_exile(tp: TextPair, ctx: &ParseContext) -> Option<ParsedE
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation,
@@ -14853,7 +14854,7 @@ fn try_parse_play_the_exiled_card_grant(tp: TextPair) -> Option<ParsedEffectClau
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
@@ -15030,7 +15031,7 @@ pub(crate) fn parse_exile_top_each_library_with_collection_counter_ir(
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
@@ -22084,6 +22085,7 @@ fn try_parse_per_opponent_graveyard_free_cast(lower: &str) -> Option<Effect> {
         driver: CastFromZoneDriver::DuringResolution,
         mana_spend_permission: None,
         additional_cost: None,
+        cast_cost_modifier: None,
     })
 }
 
@@ -26582,6 +26584,7 @@ fn from_among_batch_cast_effect(
         driver,
         mana_spend_permission: None,
         additional_cost: None,
+        cast_cost_modifier: None,
     }
 }
 
@@ -27418,6 +27421,51 @@ fn parse_owned_plus_lesser_exiled_subject(i: &str) -> OracleResult<'_, ()> {
     Ok((i, ()))
 }
 
+/// CR 406.6 + CR 607.2a: the SOURCE-ANCHORED tail of the plural exiled-cards
+/// anaphor — `" with <host-self-ref>"` ("cards exiled with ~", "cards exiled
+/// with this Class", "cards exiled with this enchantment").
+///
+/// This is the plural analogue of the singular `"the exiled card"` split that
+/// [`resolve_singular_exiled_card_target`] already performs: a permission
+/// naming its own source refers to that source's DURABLE exile ledger
+/// (CR 607.1/607.2a linked abilities), which spans resolutions, whereas the
+/// sibling `"cards exiled this way"` tail refers only to the cards the SAME
+/// resolution just produced and must keep its same-chain `ParentTarget`
+/// binding.
+///
+/// Deliberately accepts only `TargetFilter::SelfRef` — the HOST self-reference
+/// tokens (`~`, "this creature", "this Class", …) that `normalize_card_name_refs`
+/// folds the printed card name into. `TargetFilter::GrantingObject` — the
+/// placeholder a quoted granted body's by-name reference to its GRANTER is
+/// masked to — is rejected: that ledger belongs to the granting object, not to
+/// the granted one that carries the permission, so `ExiledBySource` resolved
+/// against the carrier would name the wrong object.
+fn parse_host_anchored_exiled_cards_tail(i: &str) -> OracleResult<'_, ()> {
+    let (i, _) = verify(
+        preceded(tag(" with "), nom_target::parse_self_reference),
+        |filter: &TargetFilter| matches!(filter, TargetFilter::SelfRef),
+    )
+    .parse(i)?;
+    Ok((i, ()))
+}
+
+/// Which anaphor opened a "cast/play <anaphor>" clause, insofar as the choice
+/// changes how the referent binds. CR 607.2a: a singular "the exiled card" and
+/// the source-anchored plural "cards exiled with ~" both read their source's
+/// durable exile ledger, while every other anaphor refers to the batch this
+/// resolution produced. Typed rather than a matched `&str` so the binding rule
+/// is an exhaustive match instead of stringly-typed dispatch.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CastAnaphor {
+    /// "the exiled card" — singular, binds to the source's ledger.
+    SingularExiledCard,
+    /// "cards exiled …" — splits further on its tail (see
+    /// `parse_host_anchored_exiled_cards_tail`).
+    PluralCardsExiled,
+    /// Every other anaphor; keeps `TargetFilter::ParentTarget`.
+    Other,
+}
+
 /// 1. Anaphoric — "cast it", "cast that spell", "cast those cards" — target is
 ///    `ParentTarget` (refers to the cards exiled / chosen by a prior effect).
 /// 2. Constrained — "cast a [type-phrase] [from <zone>] [with mana value <bound>]
@@ -27507,16 +27555,16 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
     // Branch 1: anaphoric forms. Order longer-first ("one of those cards"
     // before "those cards") so the prefix-match doesn't shadow the longer
     // anaphor.
-    if let Ok((_, matched_anaphor)) = alt((
-        tag::<_, _, E>("one of those cards"),
-        tag("the exiled card"),
-        tag("those cards"),
-        tag("cards exiled"),
-        tag("that card"),
-        tag("that spell"),
-        tag("the copy"),
-        tag("them"),
-        tag("it"),
+    if let Ok((after_anaphor, matched_anaphor)) = alt((
+        value(CastAnaphor::Other, tag::<_, _, E>("one of those cards")),
+        value(CastAnaphor::SingularExiledCard, tag("the exiled card")),
+        value(CastAnaphor::Other, tag("those cards")),
+        value(CastAnaphor::PluralCardsExiled, tag("cards exiled")),
+        value(CastAnaphor::Other, tag("that card")),
+        value(CastAnaphor::Other, tag("that spell")),
+        value(CastAnaphor::Other, tag("the copy")),
+        value(CastAnaphor::Other, tag("them")),
+        value(CastAnaphor::Other, tag("it")),
     ))
     .parse(rest)
     {
@@ -27582,11 +27630,29 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
         // separately-resolved ETB); otherwise it keeps `ParentTarget`
         // (Creative Technique later widens `ParentTarget` to `TrackedSet{0}`
         // via the `needs_tracked_set` pass; Discover the Impossible's
-        // same-chain `Dig`-to-exile keeps `ParentTarget` as-is). All other
-        // anaphors in this branch are unaffected.
-        let target = if matched_anaphor == "the exiled card"
-            && ctx.current_ability_exile_cost_zone.is_none()
-        {
+        // same-chain `Dig`-to-exile keeps `ParentTarget` as-is).
+        //
+        // CR 607.2a: the plural "cards exiled …" anaphor splits on its tail.
+        // The SOURCE-ANCHORED form ("cards exiled with ~ / with this Class /
+        // with this enchantment" — Urianger Augurelt's Play Arcanum, Rogue
+        // Class, Pick Up the Pace) names the permission's own source and so
+        // reads that source's durable exile ledger across resolutions; it gets
+        // the same treatment as the singular anaphor. The sibling "cards exiled
+        // this way" form (Chandra, Heart of Fire; Dream Harvest) refers to the
+        // batch this very resolution produced and must keep `ParentTarget`.
+        // Both still defer to `chain_has_prior_exile_producer`, so a
+        // source-anchored tail in a chain that ALSO exiles keeps its
+        // same-chain binding.
+        //
+        // All other anaphors in this branch are unaffected.
+        let anchors_to_source_exile_ledger = match matched_anaphor {
+            CastAnaphor::SingularExiledCard => ctx.current_ability_exile_cost_zone.is_none(),
+            CastAnaphor::PluralCardsExiled => {
+                parse_host_anchored_exiled_cards_tail(after_anaphor).is_ok()
+            }
+            CastAnaphor::Other => false,
+        };
+        let target = if anchors_to_source_exile_ledger {
             resolve_singular_exiled_card_target(
                 ctx.chain_has_prior_exile_producer,
                 TargetFilter::ParentTarget,
@@ -27605,6 +27671,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             driver,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         });
     }
 
@@ -27912,6 +27979,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             duration: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            cast_cost_modifier: None,
             additional_cost: None,
         });
     }
@@ -27973,6 +28041,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             duration: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            cast_cost_modifier: None,
             additional_cost: None,
         });
     }
@@ -28028,6 +28097,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             driver,
             mana_spend_permission: None,
             additional_cost,
+            cast_cost_modifier: None,
         };
         crate::parser::oracle_ir::ast::refuse_additional_cost_on_lingering_cast(&mut effect);
         return Some(effect);
@@ -28045,6 +28115,7 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
         driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         mana_spend_permission: None,
         additional_cost: None,
+        cast_cost_modifier: None,
     })
 }
 
@@ -28555,6 +28626,13 @@ fn attach_alt_cost_to_prior_cast_from_zone(
             // CR 601.2b: the fourth seam that can leave a cast grant on the
             // lingering mechanism; an additional cost cannot stay on it.
             crate::parser::oracle_ir::ast::refuse_additional_cost_on_lingering_cast(
+                def.effect.as_mut(),
+            );
+            // CR 601.2f: the mirror obligation for the opposite mechanism — the
+            // re-derivation above can move an already-absorbed "cast this way"
+            // cost rider OFF `LingeringPermission`, the only driver whose
+            // resolver stamps it onto the permissions it builds.
+            crate::parser::oracle_ir::ast::refuse_cast_cost_modifier_on_unsupported_driver(
                 def.effect.as_mut(),
             );
             return true;

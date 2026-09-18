@@ -8532,6 +8532,7 @@ mod tests {
             granted_to,
             duration: None,
             source_id: None,
+            cast_cost_modifier: None,
         }];
         (state, card)
     }
@@ -8678,6 +8679,7 @@ mod tests {
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             }];
             (state, id)
         };

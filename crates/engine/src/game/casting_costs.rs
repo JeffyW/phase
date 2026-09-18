@@ -11036,6 +11036,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission,
+                cast_cost_modifier: None,
             };
         }
         let waiting_for = handle_resolution_cast_success(
@@ -20321,6 +20322,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             (state, hit, vec![miss_a, miss_b])
@@ -20448,6 +20450,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             let outcome = evaluate_cascade_constraint_with_resulting_mv(
@@ -20530,6 +20533,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             let outcome = evaluate_cascade_constraint_with_resulting_mv(
@@ -20580,6 +20584,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20639,6 +20644,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20656,6 +20662,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20707,6 +20714,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             state.players[0].mana_pool.add(ManaUnit {
                 color: ManaType::Colorless,
@@ -20778,6 +20786,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20814,6 +20823,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20885,6 +20895,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20902,6 +20913,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -24941,6 +24953,7 @@ its replicate cost was paid.)\nDraw a card.";
                 granted_to: Some(PlayerId(0)),
                 duration: None,
                 source_id: None,
+                cast_cost_modifier: None,
             });
 
         let ability = ResolvedAbility::new(

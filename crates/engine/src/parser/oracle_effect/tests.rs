@@ -12,8 +12,8 @@ use crate::parser::parse_oracle_text;
 use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
-    AbilityUseTally, AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction,
+    AbilityUseTally, AttachmentKind, CardSelectionMode, CastCostModifier, CastManaObjectScope,
+    CastManaSpentMetric, CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction,
     MassLibraryShuffleMode, ModalChoice, PerpetualModification, PileSource, SeatDirection,
     TurnJournalKind, VoteTally, VoteVisibility, VoterScope,
 };
@@ -25359,6 +25359,7 @@ fn parse_linked_exile_owner_may_cast_that_card_is_owner_scoped_resolution_cast()
             driver,
             mana_spend_permission,
             additional_cost,
+            cast_cost_modifier,
         } = &*def.effect
         else {
             panic!("{subject}: expected CastFromZone, got {:?}", def.effect);
@@ -25373,6 +25374,7 @@ fn parse_linked_exile_owner_may_cast_that_card_is_owner_scoped_resolution_cast()
         assert_eq!(duration, &None, "{subject}");
         assert_eq!(driver, &DuringResolution, "{subject}");
         assert_eq!(mana_spend_permission, &None, "{subject}");
+        assert_eq!(cast_cost_modifier, &None, "{subject}");
         assert!(def.optional, "{subject}");
         assert_eq!(def.optional_for, None, "{subject}");
         assert_eq!(
@@ -67491,4 +67493,324 @@ fn amount_reads_the_antecedent_accepts_only_anaphoric_subject_scopes() {
         "only an amount read through the anaphoric subject names the antecedent as \
          the damage source; every other object scope and a constant amount must be rejected"
     );
+}
+
+/// CR 601.2f + CR 608.2c: the "cast this way" cost rider is composed over two
+/// independent axes ? the SUBJECT noun phrase and the DIRECTION ? so the
+/// grammar covers the cross product without enumerating it. Every combination
+/// must fold into the preceding `CastFromZone` grant that states it, never
+/// lower to a standalone cost static or an unimplemented clause.
+#[test]
+fn cast_this_way_cost_rider_covers_the_subject_by_direction_cross_product() {
+    use crate::types::mana::ManaCost;
+
+    const HOST: &str = "Until end of turn, you may play cards exiled with ~.";
+    let subjects = [
+        "A spell cast this way",
+        "Each spell cast this way",
+        "Spells you cast this way",
+    ];
+    let directions = [
+        (
+            "costs {2} more to cast.",
+            CastCostModifier::raise(ManaCost::generic(2)),
+        ),
+        (
+            "cost {1} less to cast.",
+            CastCostModifier::reduce(ManaCost::generic(1)),
+        ),
+    ];
+
+    for subject in subjects {
+        for (tail, expected) in &directions {
+            let text = format!("{HOST} {subject} {tail}");
+            let def = parse_effect_chain(&text, AbilityKind::Spell);
+            assert!(
+                def.sub_ability.is_none(),
+                "{text}: the rider must fold into the grant, not trail it: {:?}",
+                def.sub_ability
+            );
+            let Effect::CastFromZone {
+                cast_cost_modifier, ..
+            } = &*def.effect
+            else {
+                panic!("{text}: expected CastFromZone, got {:?}", def.effect);
+            };
+            assert_eq!(
+                cast_cost_modifier.as_ref(),
+                Some(expected),
+                "{text}: the rider must fold into the grant's cast_cost_modifier"
+            );
+        }
+    }
+}
+
+/// Reach guard for the test above: the bare host alone carries NO modifier, so
+/// the assertions there are reading the rider and not a default.
+#[test]
+fn cast_this_way_cost_rider_is_absent_without_the_rider_sentence() {
+    let def = parse_effect_chain(
+        "Until end of turn, you may play cards exiled with ~.",
+        AbilityKind::Spell,
+    );
+    let Effect::CastFromZone {
+        cast_cost_modifier, ..
+    } = &*def.effect
+    else {
+        panic!("expected CastFromZone, got {:?}", def.effect);
+    };
+    assert_eq!(*cast_cost_modifier, None);
+}
+
+/// Collect every `Effect` in a definition tree — the clause's own effect plus
+/// its `sub_ability` / `else_ability` spines — so a rider refused into a sibling
+/// clause is visible wherever the assembler placed it.
+fn effects_in_tree(def: &AbilityDefinition) -> Vec<&Effect> {
+    let mut out = vec![def.effect.as_ref()];
+    for nested in [def.sub_ability.as_deref(), def.else_ability.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        out.extend(effects_in_tree(nested));
+    }
+    out
+}
+
+fn tree_holds_unabsorbed_rider_gap(def: &AbilityDefinition) -> bool {
+    effects_in_tree(def).into_iter().any(|effect| {
+        matches!(effect, Effect::Unimplemented { name, .. }
+            if name == crate::types::ability::CAST_COST_MODIFIER_WITHOUT_HOST_GAP)
+    })
+}
+
+/// CR 601.2f + CR 608.2c: a "[each/a] spell cast this way costs {N} more/less to
+/// cast" rider that NO preceding grant can carry must lower to the honest
+/// `CAST_COST_MODIFIER_WITHOUT_HOST_GAP`.
+///
+/// "this way" is a CR 608.2c back-reference, so the rider is never a standalone
+/// instruction — but its own grammar reads to the generic head dispatch as a
+/// cast ("each spell cast …"), which lowered an unabsorbed rider to a bare
+/// `Effect::CastFromZone` over every card while `cargo coverage` counted the
+/// clause supported. Both directions of the modifier and all three subject
+/// forms are covered, because the refusal must not be narrower than the grammar
+/// that produces the modifier.
+#[test]
+fn unabsorbed_cast_this_way_cost_rider_lowers_to_the_honest_gap() {
+    let cases = [
+        // No preceding clause at all.
+        "Each spell cast this way costs {1} more to cast.",
+        "Spells you cast this way cost {2} less to cast.",
+        "A spell cast this way costs {2} more to cast.",
+        // A preceding clause that is not a cast grant.
+        "Draw a card. Each spell cast this way costs {1} more to cast.",
+        // A preceding cast grant on a driver with no cost-modifier slot:
+        // `DuringResolution` casts through `initiate_cast_during_resolution`,
+        // which records no rider.
+        "You may cast target instant or sorcery card from your graveyard. \
+         Spells you cast this way cost {2} less to cast.",
+    ];
+    for text in cases {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(
+            tree_holds_unabsorbed_rider_gap(&def),
+            "{text}: an unabsorbed \"cast this way\" cost rider must be refused, got {:?}",
+            effects_in_tree(&def)
+        );
+    }
+}
+
+/// Reach guard for the test above, and the CR 305.1 / CR 608.2c host contract:
+/// the refusal must fire ONLY where no host can carry the rider. Both supported
+/// hosts — the `LingeringPermission` `CastFromZone` (Urianger Augurelt) and the
+/// parser-built `PlayFromExile` grant (Lightstall Inquisitor's class) — must
+/// still absorb, with no gap anywhere in the tree.
+#[test]
+fn cast_this_way_cost_rider_absorbs_on_both_supported_hosts() {
+    let cast_from_zone_host = parse_effect_chain(
+        "Until end of turn, you may play cards exiled with ~. Spells you cast this way cost \
+         {2} less to cast.",
+        AbilityKind::Spell,
+    );
+    assert!(!tree_holds_unabsorbed_rider_gap(&cast_from_zone_host));
+    let Effect::CastFromZone {
+        cast_cost_modifier, ..
+    } = &*cast_from_zone_host.effect
+    else {
+        panic!(
+            "expected CastFromZone, got {:?}",
+            cast_from_zone_host.effect
+        );
+    };
+    assert_eq!(
+        *cast_cost_modifier,
+        Some(CastCostModifier::reduce(ManaCost::generic(2)))
+    );
+
+    let play_from_exile_host = parse_effect_chain(
+        "Exile the top card of your library. Until end of turn, you may cast that card. \
+         Each spell cast this way costs {1} more to cast.",
+        AbilityKind::Spell,
+    );
+    assert!(!tree_holds_unabsorbed_rider_gap(&play_from_exile_host));
+    let absorbed =
+        effects_in_tree(&play_from_exile_host)
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::GrantCastingPermission { permission, .. } => {
+                    permission.cast_cost_modifier()
+                }
+                _ => None,
+            });
+    assert_eq!(
+        absorbed,
+        Some(&CastCostModifier::raise(ManaCost::generic(1))),
+        "the rider must fold into the granted permission: {:?}",
+        effects_in_tree(&play_from_exile_host)
+    );
+}
+
+/// CR 601.2f: every printed carrier of the rider class parses through
+/// `parse_oracle_text` with the modifier ABSORBED onto its grant and no refusal
+/// gap anywhere — the four cards are the corpus-wide population of the grammar
+/// (`a spell cast this way costs` / `each spell cast this way costs` /
+/// `spells you cast this way cost`), so this is the whole class, not samples.
+#[test]
+fn every_printed_cast_this_way_cost_rider_card_absorbs_its_modifier() {
+    let cases: [(&str, &str, &[&str], CastCostModifier); 4] = [
+        (
+            "Elite Spellbinder",
+            "Flying\nWhen this creature enters, look at target opponent's hand. You may exile \
+             a nonland card from it. For as long as that card remains exiled, its owner may \
+             play it. A spell cast this way costs {2} more to cast.",
+            &["Creature"],
+            CastCostModifier::raise(ManaCost::generic(2)),
+        ),
+        (
+            "Invasion of Gobakhan",
+            "When this Siege enters, look at target opponent's hand. You may exile a nonland \
+             card from it. For as long as that card remains exiled, its owner may play it. A \
+             spell cast this way costs {2} more to cast.",
+            &["Battle"],
+            CastCostModifier::raise(ManaCost::generic(2)),
+        ),
+        (
+            "Lightstall Inquisitor",
+            "Vigilance\nWhen this creature enters, each opponent exiles a card from their hand \
+             and may play that card for as long as it remains exiled. Each spell cast this way \
+             costs {1} more to cast. Each land played this way enters tapped.",
+            &["Creature"],
+            CastCostModifier::raise(ManaCost::generic(1)),
+        ),
+        (
+            "Urianger Augurelt",
+            "Whenever you play a land from exile or cast a spell from exile, you gain 2 life.\n\
+             Draw Arcanum — {T}: Look at the top card of your library. You may exile it face \
+             down.\nPlay Arcanum — {T}: Until end of turn, you may play cards exiled with \
+             Urianger Augurelt. Spells you cast this way cost {2} less to cast.",
+            &["Creature"],
+            CastCostModifier::reduce(ManaCost::generic(2)),
+        ),
+    ];
+    for (name, oracle, types, expected) in cases {
+        let types: Vec<String> = types.iter().map(|t| (*t).to_string()).collect();
+        let parsed = parse_oracle_text(oracle, name, &[], &types, &[]);
+        let roots: Vec<&AbilityDefinition> = parsed
+            .abilities
+            .iter()
+            .chain(
+                parsed
+                    .triggers
+                    .iter()
+                    .filter_map(|trigger| trigger.execute.as_deref()),
+            )
+            .collect();
+        assert!(
+            !roots
+                .iter()
+                .any(|root| tree_holds_unabsorbed_rider_gap(root)),
+            "{name}: the rider must find its host, not the refusal gap"
+        );
+        let absorbed = roots
+            .iter()
+            .flat_map(|root| effects_in_tree(root))
+            .find_map(|effect| match effect {
+                Effect::GrantCastingPermission { permission, .. } => {
+                    permission.cast_cost_modifier()
+                }
+                Effect::CastFromZone {
+                    cast_cost_modifier, ..
+                } => cast_cost_modifier.as_ref(),
+                _ => None,
+            });
+        assert_eq!(
+            absorbed,
+            Some(&expected),
+            "{name}: the printed rider must fold onto its grant"
+        );
+    }
+}
+
+/// CR 601.2f + CR 608.2c: the driver-degradation guard, exercised directly.
+///
+/// It has no printed carrier today — the absorption site refuses a non-
+/// `LingeringPermission` host up front — so its behavior is asserted at the
+/// building-block level rather than through a card, the same way its twin
+/// `refuse_additional_cost_on_lingering_cast` guards a zero-carrier seam.
+#[test]
+fn refuse_cast_cost_modifier_on_unsupported_driver_spares_only_the_lingering_driver() {
+    use crate::parser::oracle_ir::ast::refuse_cast_cost_modifier_on_unsupported_driver;
+    use crate::types::ability::{CastFromZoneDriver, ResolutionCastWindow};
+
+    let cast_from_zone = |driver: CastFromZoneDriver| Effect::CastFromZone {
+        target: TargetFilter::ExiledBySource,
+        without_paying_mana_cost: false,
+        mode: Cast,
+        cast_transformed: false,
+        alt_ability_cost: None,
+        constraint: None,
+        duration: None,
+        driver,
+        mana_spend_permission: None,
+        additional_cost: None,
+        cast_cost_modifier: Some(CastCostModifier::reduce(ManaCost::generic(2))),
+    };
+
+    let mut kept = cast_from_zone(LingeringPermission);
+    refuse_cast_cost_modifier_on_unsupported_driver(&mut kept);
+    assert!(
+        matches!(
+            kept,
+            Effect::CastFromZone {
+                cast_cost_modifier: Some(_),
+                ..
+            }
+        ),
+        "the lingering-permission driver is the one route that stamps the rider: {kept:?}"
+    );
+
+    for driver in [
+        DuringResolution,
+        CastFromZoneDriver::ResolutionWindow {
+            bounds: ResolutionCastWindow::UNBOUNDED,
+        },
+    ] {
+        let mut refused = cast_from_zone(driver);
+        refuse_cast_cost_modifier_on_unsupported_driver(&mut refused);
+        assert!(
+            matches!(&refused, Effect::Unimplemented { name, .. }
+                if name == crate::types::ability::CAST_COST_MODIFIER_WITHOUT_HOST_GAP),
+            "a driver with no cost-modifier slot must refuse the rider, got {refused:?}"
+        );
+    }
+
+    // Reach guard: with no modifier stamped there is nothing to refuse.
+    let mut untouched = cast_from_zone(DuringResolution);
+    if let Effect::CastFromZone {
+        cast_cost_modifier, ..
+    } = &mut untouched
+    {
+        *cast_cost_modifier = None;
+    }
+    refuse_cast_cost_modifier_on_unsupported_driver(&mut untouched);
+    assert!(matches!(untouched, Effect::CastFromZone { .. }));
 }

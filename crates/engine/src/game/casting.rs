@@ -2,9 +2,9 @@ use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityBlockKind, AbilityBlockReason, AbilityCondition,
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, ActivationManaPaymentRestriction,
     AdditionalCost, BoardWideCostModifier, CardPlayMode, CardSelectionMode, CardTypeSetSource,
-    CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification, CostObjectCount,
-    CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, EffectKind, FilterProp,
-    GameRestriction, ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope,
+    CastCostModifier, CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification,
+    CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, EffectKind,
+    FilterProp, GameRestriction, ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope,
     ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
     RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
     TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
@@ -4306,50 +4306,73 @@ pub(crate) fn player_may_look_at_facedown_exile(
     play_from_exile_permission_source(state, obj, player, state.turn_number, None).is_some()
 }
 
-/// CR 601.2f: The printed mana-cost increase a spell incurs when it is cast via
-/// an active [`CastingPermission::PlayFromExile`] grant that carries
-/// `cast_cost_raise` ("Each spell cast this way costs {N} more to cast." —
-/// Lightstall Inquisitor). Returns the increase from the first grant that
-/// authorizes `player`. Mirrors the grantee gate used by
-/// [`player_can_spend_as_any_color_for_spell`] for `mana_spend_permission`: the
-/// spell object retains its exile-play permissions while it is on the stack, so
-/// the raise is readable throughout cost determination (CR 601.2b–f). The cost
-/// raise is a property of the grant, not a board-wide static, so it applies only
-/// to spells cast via this permission.
-fn exile_play_cast_cost_raise(
+/// CR 601.2f: The printed mana-cost modification a spell incurs when it is cast
+/// via the ELECTED object-local casting permission — "Each spell cast this way
+/// costs {1} more to cast." (Lightstall Inquisitor), "Spells you cast this way
+/// cost {2} less to cast." (Urianger Augurelt). Read through
+/// [`CastingPermission::cast_cost_modifier`], the single authority for which
+/// permission variants can carry one.
+///
+/// Only the ELECTED permission is consulted (`casting_permission_index`, or the
+/// election [`selected_object_cast_permission_index`] would make): the rider is
+/// a property of one grant, not a board-wide static, so a sibling grant on the
+/// same object must not price this cast. Mirrors the grantee gate used by
+/// [`player_can_spend_as_any_color_for_spell`] for `mana_spend_permission` — the
+/// spell object retains its exile permissions while it is on the stack, so the
+/// modifier stays readable throughout cost determination (CR 601.2b–f).
+///
+/// CR 118.9d: an alternative-cost grant is a legitimate carrier, because
+/// increases and reductions apply to a total cost built from an alternative
+/// cost exactly as to one built from the printed mana cost.
+///
+/// CR 305.1: this is the SPELL-cast path. A land played under a `mode: Play`
+/// grant is never a spell and never reaches here.
+fn selected_permission_cast_cost_modifier<'a>(
     state: &GameState,
-    obj: &crate::game::game_object::GameObject,
+    obj: &'a crate::game::game_object::GameObject,
     player: PlayerId,
     casting_permission_index: Option<CastingPermissionIndex>,
     casting_variant: Option<CastingVariant>,
-) -> Option<ManaCost> {
-    let CastingPermissionIndex(index) = casting_permission_index
+) -> Option<&'a CastCostModifier> {
+    let index = casting_permission_index
         .or_else(|| selected_object_cast_permission_index(state, obj, player, casting_variant))?;
-    obj.casting_permissions.get(index).and_then(|p| match p {
-        CastingPermission::PlayFromExile {
-            granted_to,
-            cast_cost_raise: Some(raise),
-            ..
-        } if *granted_to == player
-            && play_from_exile_permission_source_at_index(
-                state,
-                obj,
-                player,
-                CastingPermissionIndex(index),
-                Some(CardPlayMode::Cast),
-            )
-            .is_some() =>
-        {
-            Some(raise.clone())
+    let permission = obj.casting_permissions.get(index.0)?;
+    let modifier = permission.cast_cost_modifier()?;
+    // CR 601.2a: the elected permission must actually authorize THIS player's
+    // cast before its rider prices it — the same authority check each carrying
+    // form already answers for the cast itself.
+    let authorizes_cast = match permission {
+        CastingPermission::PlayFromExile { granted_to, .. } => {
+            *granted_to == player
+                && play_from_exile_permission_source_at_index(
+                    state,
+                    obj,
+                    player,
+                    index,
+                    Some(CardPlayMode::Cast),
+                )
+                .is_some()
         }
-        _ => None,
-    })
+        CastingPermission::ExileWithAltCost { .. }
+        | CastingPermission::ExileWithAltAbilityCost { .. } => {
+            exile_alt_cost_permission_supports_cast(state, obj, player, permission, None)
+        }
+        // CR 715.3d + CR 702.185a + CR 702.170a + CR 702.143a: the card-native
+        // exile casting methods carry no rider slot, so `cast_cost_modifier()`
+        // above has already returned `None` for them.
+        CastingPermission::AdventureCreature
+        | CastingPermission::ExileWithEnergyCost
+        | CastingPermission::WarpExile { .. }
+        | CastingPermission::Plotted { .. }
+        | CastingPermission::Foretold { .. } => false,
+    };
+    authorizes_cast.then_some(modifier)
 }
 
 /// CR 614.1c: Whether a land played via an active `PlayFromExile` grant must
 /// enter the battlefield tapped ("Each land played this way enters tapped." —
 /// Lightstall Inquisitor). Mirrors the grantee gate of
-/// [`exile_play_cast_cost_raise`]; consumed by `handle_play_land` to seed the
+/// [`selected_permission_cast_cost_modifier`]; consumed by `handle_play_land` to seed the
 /// tap state on the land's entry event.
 pub(crate) fn exile_play_land_enters_tapped(
     state: &GameState,
@@ -8580,23 +8603,6 @@ fn apply_non_floor_cost_modifiers(
     casting_variant: Option<CastingVariant>,
     casting_permission_index: Option<CastingPermissionIndex>,
 ) {
-    // CR 601.2f: A spell cast via a `PlayFromExile` grant may carry a printed
-    // cost increase ("Each spell cast this way costs {N} more to cast." —
-    // Lightstall Inquisitor). Apply it FIRST, as an increase, so a later
-    // reduction cannot be applied to the pre-raise cost — CR 601.2f determines
-    // the total as base + increases − reductions, and a reduction can never take
-    // the mana component below {0}.
-    if let Some(obj) = state.objects.get(&object_id) {
-        if let Some(raise) = exile_play_cast_cost_raise(
-            state,
-            obj,
-            player,
-            casting_permission_index,
-            casting_variant,
-        ) {
-            *mana_cost = super::restrictions::add_mana_cost(mana_cost, &raise);
-        }
-    }
     // CR 601.2f: collect self-spell statics ("This spell costs
     // {N} less ...") and battlefield statics together so all increases apply
     // before any reductions across both passes.
@@ -8609,6 +8615,19 @@ fn apply_non_floor_cost_modifiers(
         None,
         false,
         casting_variant,
+    ));
+    // CR 601.2f: the ELECTED casting permission's own "spells cast this way cost
+    // {N} more/less to cast" rider joins the SAME collection as the statics, so
+    // the single ordering pass below applies it together with every other
+    // modifier — all increases first, then all reductions, with one {0} floor on
+    // the mana component. Adding it positionally ahead of the pass instead would
+    // let a rider REDUCTION be taken from the pre-increase cost and floor early.
+    collected.extend(collect_selected_permission_cost_modifier(
+        state,
+        player,
+        object_id,
+        casting_variant,
+        casting_permission_index,
     ));
     apply_cost_modifications_in_order(mana_cost, &collected);
     // CR 702.102b: derive the pre-payment fused hint from the casting variant so a
@@ -8742,16 +8761,6 @@ pub(crate) fn compute_spend_only_on_x_generic_count(
 
     let casting_variant = Some(pending.casting_variant);
 
-    if let Some(raise) = exile_play_cast_cost_raise(
-        state,
-        obj,
-        pending.ability.controller,
-        pending.casting_permission_index,
-        casting_variant,
-    ) {
-        cost = super::restrictions::add_mana_cost(&cost, &raise);
-    }
-
     let mut collected = collect_self_spell_cost_modifiers(
         state,
         pending.ability.controller,
@@ -8767,6 +8776,18 @@ pub(crate) fn compute_spend_only_on_x_generic_count(
         Some(&pending.ability),
         false,
         casting_variant,
+    ));
+    // CR 601.2f: the elected permission's rider belongs to the SAME collection
+    // here as in `apply_non_floor_cost_modifiers`, so this projection measures
+    // the increases and reductions production actually applied — a rider
+    // reduction must be counted in the reductions loop below, not folded into
+    // the base before `generic_after_increases` is read.
+    collected.extend(collect_selected_permission_cost_modifier(
+        state,
+        pending.ability.controller,
+        pending.object_id,
+        casting_variant,
+        pending.casting_permission_index,
     ));
 
     // Apply all raises first (CR 601.2f increases before reductions)
@@ -9062,7 +9083,7 @@ pub(super) fn apply_cost_modifiers_to_base(
 /// Variant-aware core of [`apply_cost_modifiers_to_base`]: a projection that has
 /// already COMMITTED to a casting method threads that method and its elected
 /// permission through, so `StaticCondition::CastingAsVariant` modifiers and the
-/// elected `PlayFromExile` grant's `cast_cost_raise` apply exactly as they do in
+/// elected permission's `cast_cost_modifier` apply exactly as they do in
 /// the real cast's `apply_all_cost_modifiers` call (CR 601.2b + CR 601.2f).
 pub(super) fn apply_cost_modifiers_to_base_for_variant(
     state: &GameState,
@@ -9169,6 +9190,46 @@ struct CostModification {
     is_raise: bool,
     amount: ManaCost,
     multiplier: u32,
+}
+
+/// CR 601.2f: Project the ELECTED casting permission's "spells cast this way
+/// cost {N} more/less to cast" rider into the same [`CostModification`] shape
+/// the statics passes produce, so one ordering pass applies every modifier.
+///
+/// Keeping the rider in the shared collection — rather than adding it
+/// positionally before the pass — is what makes CR 601.2f hold for it: every
+/// increase is applied before every reduction, and the mana component is
+/// floored at `{0}` once, at the end.
+fn collect_selected_permission_cost_modifier(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    casting_variant: Option<CastingVariant>,
+    casting_permission_index: Option<CastingPermissionIndex>,
+) -> Option<CostModification> {
+    let obj = state.objects.get(&object_id)?;
+    let modifier = selected_permission_cast_cost_modifier(
+        state,
+        obj,
+        player,
+        casting_permission_index,
+        casting_variant,
+    )?;
+    let is_raise = match modifier.mode() {
+        CostModifyMode::Raise => true,
+        CostModifyMode::Reduce => false,
+        // CR 601.2f: the cost floor is a separate, board-wide last step with no
+        // per-grant form. Both `CastCostModifier::new` and its `Deserialize`
+        // refuse `Minimum`, so no value of this type can reach here carrying it.
+        CostModifyMode::Minimum => {
+            unreachable!("CastCostModifier::new and Deserialize reject CostModifyMode::Minimum")
+        }
+    };
+    Some(CostModification {
+        is_raise,
+        amount: modifier.amount().clone(),
+        multiplier: 1,
+    })
 }
 
 fn self_spell_cost_condition_matches(
@@ -12443,8 +12504,8 @@ fn effective_face_down_cast_cost(
     // face-down prepare will elect (`selected_object_cast_permission_index`
     // with the explicit `FaceDown` variant). With no variant the election
     // infers Foretell first for a foretold exile card, while the real cast
-    // routes through `PlayFromExile` — and only that grant carries a
-    // `cast_cost_raise`, so the projections would price different casts.
+    // routes through `PlayFromExile` — and a `Foretold` grant carries no
+    // `cast_cost_modifier`, so the projections would price different casts.
     let casting_permission_index = blanked_state.objects.get(&object_id).and_then(|obj| {
         selected_object_cast_permission_index(
             blanked_state,
@@ -13332,6 +13393,7 @@ fn install_resolution_cast_permission(
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission,
+            cast_cost_modifier: None,
         });
     Ok(ResolutionCastPermission {
         index,
@@ -24229,6 +24291,7 @@ mod castable_zone_authority_tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
 
         let mut ungranteed = bare.clone();
@@ -24265,6 +24328,7 @@ mod castable_zone_authority_tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         }];
 
         assert!(
@@ -24360,6 +24424,7 @@ mod castable_zone_authority_tests {
             granted_to: Some(PlayerId(0)),
             duration: None,
             source_id: None,
+            cast_cost_modifier: None,
         }];
         assert!(
             has_potentially_authorizing_object_cast_permission(&granted, PlayerId(0)),
@@ -24450,6 +24515,7 @@ mod castable_zone_authority_tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
 
         assert!(
@@ -24676,6 +24742,7 @@ mod castable_zone_authority_tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
 
         let land_id = card(&mut state, 1, PlayerId(0), Zone::Graveyard);
@@ -24810,6 +24877,7 @@ mod castable_zone_authority_tests {
                         enters_with_counter: None,
                         enters_with_modifications: Vec::new(),
                         mana_spend_permission: None,
+                        cast_cost_modifier: None,
                     }];
                 }
                 let non_land = state.objects[&id].clone();

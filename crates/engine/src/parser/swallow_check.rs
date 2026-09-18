@@ -11692,7 +11692,7 @@ mod detect_condition_if_replacement_exemption_tests {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: Some(AbilityCost::PayLife {
                 amount: QuantityExpr::Fixed { value: 0 },
             }),
@@ -11770,7 +11770,7 @@ mod detect_condition_if_replacement_exemption_tests {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: Some(AbilityCost::PayLife {
                 amount: QuantityExpr::Fixed { value: 0 },
             }),
