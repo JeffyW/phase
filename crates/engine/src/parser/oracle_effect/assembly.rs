@@ -43,7 +43,7 @@ use super::lower::{
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
     attach_land_enters_tapped_to_previous_play_from_exile, cast_cost_modifier_rider,
-    cast_cost_raise_rider, chain_references_chosen_card, clone_would_transplant_gated_referent,
+    chain_references_chosen_card, clone_would_transplant_gated_referent,
     consolidate_die_and_coin_defs, definition_targets_self_source,
     effect_publishes_revealed_subject, ensure_remember_card_after_object_choice,
     extract_bounded_target_multi_target, extract_exact_target_multi_target,
