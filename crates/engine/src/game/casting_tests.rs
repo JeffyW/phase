@@ -12310,7 +12310,7 @@ fn morophon_reduces_colored_mana_for_chosen_creature_type() {
 /// fix — it returned {1} when the reductions were applied in collection order.
 #[test]
 fn mixed_reach_reductions_do_not_let_collection_order_decide_the_cost() {
-    fn reducer(reach: CostReductionReach) -> CostModification {
+    fn reducer(reach: CostReductionReach, ordinal: u8) -> CostModification {
         CostModification {
             is_raise: false,
             amount: ManaCost::Cost {
@@ -12319,6 +12319,11 @@ fn mixed_reach_reductions_do_not_let_collection_order_decide_the_cost() {
             },
             multiplier: 1,
             reach,
+            provenance: crate::types::casting_costs::ReductionProvenance::Static {
+                source: ObjectId(900),
+                ordinal,
+            },
+            display_name: "Test reducer".to_string(),
         }
     }
 
@@ -12326,15 +12331,15 @@ fn mixed_reach_reductions_do_not_let_collection_order_decide_the_cost() {
         (
             "colored-only collected first",
             vec![
-                reducer(CostReductionReach::ColoredManaOnly),
-                reducer(CostReductionReach::SpillsToGeneric),
+                reducer(CostReductionReach::ColoredManaOnly, 0),
+                reducer(CostReductionReach::SpillsToGeneric, 1),
             ],
         ),
         (
             "spillover collected first",
             vec![
-                reducer(CostReductionReach::SpillsToGeneric),
-                reducer(CostReductionReach::ColoredManaOnly),
+                reducer(CostReductionReach::SpillsToGeneric, 0),
+                reducer(CostReductionReach::ColoredManaOnly, 1),
             ],
         ),
     ] {

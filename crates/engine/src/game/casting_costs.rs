@@ -11,6 +11,7 @@ use crate::types::ability::{
     TapCreaturesSelectionMode, TargetFilter, ThisWayCause, TypeFilter, TypedFilter, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
+use crate::types::casting_costs::{CostReductionEntry, ReductionProvenance};
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActivationResidual, ActivationTargetSelection, AssistState, CastOccurrence, CastPaymentMode,
@@ -1522,7 +1523,11 @@ pub(crate) fn finish_pending_cost_or_cast(
         state.pending_cast = Some(Box::new(pending));
         return enter_payment_step(state, player, None, events);
     }
-    let waiting_for = pay_and_push(
+    // CR 601.2f: carry this cast's declared additional mana costs and any
+    // reduction the caster already accepted into the lock seam — the seam
+    // recomputes the total from `base_cost` and would otherwise drop them.
+    let lock = CostLockInput::from_pending(&pending);
+    let waiting_for = pay_and_push_with_lock(
         state,
         player,
         pending.object_id,
@@ -1536,6 +1541,7 @@ pub(crate) fn finish_pending_cost_or_cast(
         pending.distribute,
         pending.origin_zone,
         pending.payment_mode,
+        lock,
         events,
     )?;
     Ok(drain_deferred_triggers_after_stack_object_announcement(
@@ -7558,6 +7564,8 @@ struct DefilerReduction {
     life_cost: u32,
     mana_reduction: crate::types::mana::ManaCost,
     reach: CostReductionReach,
+    /// Display label for the CR 601.2f ordering prompt.
+    source_name: String,
 }
 
 /// CR 601.2b: Find the first applicable Defiler cost reduction for a spell being
@@ -7614,6 +7622,7 @@ fn find_defiler_static(
                     life_cost: *life_cost,
                     mana_reduction: mana_reduction.clone(),
                     reach: *reach,
+                    source_name: bf_obj.name.clone(),
                 });
             }
         }
@@ -7646,6 +7655,34 @@ fn find_defiler_reduction(
     Some(reduction)
 }
 
+/// CR 601.2b + CR 601.2f: Package an accepted Defiler life payment as a cost
+/// reduction so it joins the CR 601.2f ordered reduction set instead of being
+/// shaved off an already-floored total.
+///
+/// `display_name` is re-derived from the board for the ordering prompt. The
+/// Defiler itself is a battlefield permanent that is still there in every
+/// realistic case; when it is not, the label falls back to a generic one. Only
+/// the label is re-derived — the amount and reach come from the announced
+/// prompt, which is what CR 601.2f locked in.
+fn accepted_defiler_reduction_entry(
+    state: &GameState,
+    player: PlayerId,
+    spell_id: ObjectId,
+    mana_reduction: &crate::types::mana::ManaCost,
+    reach: CostReductionReach,
+) -> CostReductionEntry {
+    let display_name = find_defiler_static(state, player, spell_id)
+        .map(|found| found.source_name)
+        .unwrap_or_else(|| "Defiler cost reduction".to_string());
+    CostReductionEntry {
+        amount: mana_reduction.clone(),
+        multiplier: 1,
+        reach,
+        provenance: ReductionProvenance::Defiler,
+        display_name,
+    }
+}
+
 /// CR 601.2f + CR 118.7: Preview the locked mana obligation after an
 /// affordable Defiler life-payment reduction, without paying life or mutating
 /// the spell's announced cost.
@@ -7675,7 +7712,7 @@ pub(crate) fn handle_defiler_payment(
     pay: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let mut cost = pending.cost.clone();
+    let cost = pending.cost.clone();
 
     if pay {
         super::life_safety::begin_defiler_payment_attempt(
@@ -7698,9 +7735,29 @@ pub(crate) fn handle_defiler_payment(
             PayLifeCostResult::Paid { .. } => {}
             PayLifeCostResult::PaidWithDeferredSubstitution { .. }
             | PayLifeCostResult::DeferredReplacementChoice { .. } => {
-                apply_defiler_mana_reduction(&mut cost, mana_reduction, reach);
+                // CR 601.2b + CR 601.2f: a life-payment replacement effect
+                // paused mid-cost. Record the accepted reduction on the parked
+                // `PendingCast` instead of subtracting it from the announced
+                // cost here: the resume runs `finish_pending_cost_or_cast`,
+                // which rebuilds the `CostLockInput` from this pending, so the
+                // reduction re-enters the CR 601.2f lock seam and is ordered
+                // against the board's reductions before the floor — exactly as
+                // on the unpaused path. Baking it into `pending.cost` instead
+                // would apply it AFTER the announced cost's floor (a total no
+                // legal CR 601.2f order can produce) and would leave
+                // `accepted_cost_reductions` empty, so a board that later
+                // raises an election would drop the discount the caster just
+                // paid life for.
                 let mut pending = pending;
-                pending.cost = cost;
+                pending
+                    .accepted_cost_reductions
+                    .push(accepted_defiler_reduction_entry(
+                        state,
+                        player,
+                        pending.object_id,
+                        mana_reduction,
+                        reach,
+                    ));
                 state.pending_deferred_life_cost_resume =
                     Some(crate::types::game_state::DeferredLifeCostResume::Cast {
                         player,
@@ -7713,7 +7770,8 @@ pub(crate) fn handle_defiler_payment(
             PayLifeCostResult::InsufficientLife | PayLifeCostResult::Prohibited => {
                 // Proceed with the original cost; no reduction.
                 let base_cost = pending.base_cost.clone();
-                return pay_and_push(
+                let lock = CostLockInput::from_pending(&pending);
+                return pay_and_push_with_lock(
                     state,
                     player,
                     pending.object_id,
@@ -7727,16 +7785,39 @@ pub(crate) fn handle_defiler_payment(
                     pending.distribute,
                     pending.origin_zone,
                     pending.payment_mode,
+                    lock,
                     events,
                 );
             }
         }
-
-        apply_defiler_mana_reduction(&mut cost, mana_reduction, reach);
     }
 
+    // CR 601.2b + CR 601.2f: hand the accepted reduction to the lock seam as an
+    // ordinary member of the reduction set instead of subtracting it from the
+    // already-floored announced cost. That is a real behaviour change and it is
+    // the rules-correct one: a cost floor (Trinisphere, CR 601.2f "effects that
+    // directly affect the total cost") is applied AFTER every reduction, so a
+    // {W} permanent spell reduced to {0} by an accepted Defiler floors up to
+    // {3}, where the old post-floor subtraction produced {2}.
+    let lock = CostLockInput {
+        accepted: if pay {
+            let mut accepted = pending.accepted_cost_reductions.clone();
+            accepted.push(accepted_defiler_reduction_entry(
+                state,
+                player,
+                pending.object_id,
+                mana_reduction,
+                reach,
+            ));
+            accepted
+        } else {
+            pending.accepted_cost_reductions.clone()
+        },
+        ..CostLockInput::from_pending(&pending)
+    };
+
     let base_cost = pending.base_cost.clone();
-    pay_and_push(
+    pay_and_push_with_lock(
         state,
         player,
         pending.object_id,
@@ -7750,6 +7831,54 @@ pub(crate) fn handle_defiler_payment(
         pending.distribute,
         pending.origin_zone,
         pending.payment_mode,
+        lock,
+        events,
+    )
+}
+
+/// CR 601.2f: Apply the caster's elected cost-reduction order and continue the
+/// cast.
+///
+/// `order` is validated as a strict permutation of the prompt's `reductions`
+/// (no duplicates, no out-of-range indices, exact length). A malformed order is
+/// rejected with `InvalidAction` and the prompt stays live, so the caster can
+/// answer again — the cast is not silently resolved with an order nobody chose.
+pub(crate) fn handle_order_cost_reductions(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: PendingCast,
+    reductions: &[CostReductionEntry],
+    order: &[usize],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    super::casting::validate_cost_reduction_order(order, reductions)
+        .map_err(EngineError::InvalidAction)?;
+
+    let election: Vec<ReductionProvenance> = order
+        .iter()
+        .map(|&index| reductions[index].provenance)
+        .collect();
+
+    let lock = CostLockInput {
+        election: Some(election),
+        ..CostLockInput::from_pending(&pending)
+    };
+    let base_cost = pending.base_cost.clone();
+    pay_and_push_with_lock(
+        state,
+        player,
+        pending.object_id,
+        pending.card_id,
+        *pending.ability,
+        &pending.cost,
+        base_cost,
+        pending.casting_variant,
+        pending.casting_permission_index,
+        pending.cast_timing_permission,
+        pending.distribute,
+        pending.origin_zone,
+        pending.payment_mode,
+        lock,
         events,
     )
 }
@@ -9630,6 +9759,12 @@ pub(super) fn can_pay_jumpstart_additional_cost(
     !super::casting::find_eligible_discard_targets(state, player, object_id, None).is_empty()
 }
 
+/// CR 601.2f: Announce-time entry to the lock seam, for the paths that reach it
+/// with no `PendingCast` in hand — nothing has been declared, accepted or
+/// elected yet. Any caller that DOES hold a `PendingCast` must call
+/// [`pay_and_push_with_lock`] with [`CostLockInput::from_pending`] instead, so
+/// the cast's declared additional mana costs and accepted reductions survive
+/// the seam's recompute.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pay_and_push(
     state: &mut GameState,
@@ -9647,6 +9782,142 @@ pub(super) fn pay_and_push(
     payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    pay_and_push_with_lock(
+        state,
+        player,
+        object_id,
+        card_id,
+        ability,
+        cost,
+        base_cost,
+        casting_variant,
+        casting_permission_index,
+        cast_timing_permission,
+        distribute,
+        origin_zone,
+        payment_mode,
+        CostLockInput::default(),
+        events,
+    )
+}
+
+/// CR 601.2f: What the lock seam at the head of [`pay_and_push_with_lock`] needs
+/// beyond the board to determine the total cost.
+///
+/// The seam rebuilds a probe [`PendingCast`] from `pay_and_push`'s exploded
+/// parameters and hands it to [`super::casting::recompute_pending_mana_total_with`].
+/// EVERY `PendingCast` field that recompute reads and that is not one of those
+/// exploded parameters has to be carried here, or the probe silently drops its
+/// contribution from the locked total. Build it with
+/// [`CostLockInput::from_pending`] whenever a real `PendingCast` is in hand.
+#[derive(Debug, Clone, Default)]
+pub(super) struct CostLockInput {
+    /// CR 601.2b + CR 601.2f: the mana components of additional costs already
+    /// declared for this cast — kicker and every "as an additional cost, pay
+    /// {N}" (`split_declared_mana_addition_and_residual`), splice, and
+    /// modal-only mana. `base_cost` is the announcement-time base ONLY, so a
+    /// recomputing branch that does not re-add these underpays the spell by
+    /// exactly the declared amount (CR 601.2f: base plus all additional costs
+    /// minus reductions).
+    pub declared_mana_additions: Vec<ManaCost>,
+    /// Reductions the caster has accepted that no static reproduces — today
+    /// exactly an accepted Defiler life payment (CR 601.2b).
+    pub accepted: Vec<CostReductionEntry>,
+    /// The caster's answer to `WaitingFor::OrderCostReductions`, when the
+    /// prompt has already been shown and answered. `Some` also means "do not
+    /// re-analyze", which is what keeps the resume from prompting forever.
+    pub election: Option<Vec<ReductionProvenance>>,
+}
+
+impl CostLockInput {
+    /// Carry a live cast's cost-determination state into the seam. Use this in
+    /// preference to building the struct field-by-field: it is the single place
+    /// a newly added `PendingCast` cost input has to be wired up.
+    pub(super) fn from_pending(pending: &PendingCast) -> Self {
+        Self {
+            declared_mana_additions: pending.declared_mana_additions.clone(),
+            accepted: pending.accepted_cost_reductions.clone(),
+            election: pending.cost_reduction_election.clone(),
+        }
+    }
+
+    /// Stamp the carried state back onto a `PendingCast` the payment pipeline
+    /// builds from exploded fields, so the cast that is stashed in
+    /// `state.pending_cast` can still recompute its own total (CR 601.2f) —
+    /// the `{X}` re-derivation in `apply_post_x_cost_modifiers` reads exactly
+    /// these fields.
+    fn apply_to(&self, pending: &mut PendingCast) {
+        pending
+            .declared_mana_additions
+            .clone_from(&self.declared_mana_additions);
+        pending.accepted_cost_reductions.clone_from(&self.accepted);
+        pending.cost_reduction_election.clone_from(&self.election);
+    }
+}
+
+/// CR 601.2f: The single seam where a spell's total cost becomes "locked in".
+///
+/// Both the ordinary cast path and the Defiler resume funnel through here, so
+/// an accepted Defiler reduction is ordered against the board's reductions
+/// instead of being shaved off an already-floored total. If two legal reduction
+/// orders lock in different costs, the caster is asked which they want
+/// (`WaitingFor::OrderCostReductions`) before any mana is paid — CR 601.2g puts
+/// mana abilities *after* the total cost is determined, so the prompt has to
+/// come first.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pay_and_push_with_lock(
+    state: &mut GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    card_id: CardId,
+    ability: ResolvedAbility,
+    cost: &crate::types::mana::ManaCost,
+    base_cost: Option<ManaCost>,
+    casting_variant: CastingVariant,
+    casting_permission_index: Option<CastingPermissionIndex>,
+    cast_timing_permission: Option<CastTimingPermission>,
+    distribute: Option<DistributionUnit>,
+    origin_zone: Zone,
+    payment_mode: CastPaymentMode,
+    lock: CostLockInput,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    let build_pending = |cost: &crate::types::mana::ManaCost| {
+        let mut pending = PendingCast::new(object_id, card_id, ability.clone(), cost.clone());
+        pending.base_cost = base_cost.clone();
+        pending.casting_variant = casting_variant;
+        pending.casting_permission_index = casting_permission_index;
+        pending.cast_timing_permission = cast_timing_permission;
+        pending.distribute = distribute.clone();
+        pending.origin_zone = origin_zone;
+        pending.payment_mode = payment_mode;
+        lock.apply_to(&mut pending);
+        pending
+    };
+
+    let probe = build_pending(cost);
+    let locked_cost = match super::casting::lock_in_total_cost(
+        state,
+        player,
+        &probe,
+        &lock.accepted,
+        lock.election.as_deref(),
+    ) {
+        super::casting::CostLockOutcome::Locked(locked) => locked,
+        super::casting::CostLockOutcome::Election {
+            reductions,
+            outcomes,
+        } => {
+            return Ok(WaitingFor::OrderCostReductions {
+                player,
+                reductions,
+                outcomes,
+                pending_cast: Box::new(probe),
+            });
+        }
+    };
+    let cost = &locked_cost;
+
     // CR 702.180a/b: Harmonize — offer optional creature tap to reduce generic mana cost.
     // CR 601.2b: Creature chosen and tapped as part of cost payment step.
     // CR 302.6: Summoning sickness does not restrict tapping for costs.
@@ -9677,6 +9948,7 @@ pub(super) fn pay_and_push(
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.origin_zone = origin_zone;
                 pending.payment_mode = payment_mode;
+                lock.apply_to(&mut pending);
                 return Ok(WaitingFor::HarmonizeTapChoice {
                     player,
                     eligible_creatures: eligible,
@@ -9700,6 +9972,7 @@ pub(super) fn pay_and_push(
         distribute,
         origin_zone,
         payment_mode,
+        lock,
         events,
     )
 }
@@ -9719,6 +9992,7 @@ pub(super) fn pay_and_push_adventure(
     distribute: Option<DistributionUnit>,
     origin_zone: Zone,
     payment_mode: CastPaymentMode,
+    lock: CostLockInput,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     // CR 702.51a: Convoke lets players tap creatures to reduce mana cost.
@@ -9770,6 +10044,11 @@ pub(super) fn pay_and_push_adventure(
         pending.distribute = distribute;
         pending.origin_zone = origin_zone;
         pending.payment_mode = payment_mode;
+        // CR 601.2f: the `{X}` route re-derives the whole total in
+        // `apply_post_x_cost_modifiers` once X is concrete. Without these the
+        // re-derivation would drop the declared additional costs and silently
+        // discard the caster's elected reduction order.
+        lock.apply_to(&mut pending);
         state.pending_cast = Some(Box::new(pending));
         return enter_payment_step(state, player, convoke_mode, events);
     }
@@ -9787,6 +10066,7 @@ pub(super) fn pay_and_push_adventure(
     pending.distribute = distribute;
     pending.origin_zone = origin_zone;
     pending.payment_mode = payment_mode;
+    lock.apply_to(&mut pending);
 
     // CR 702.132a: Assist — the cost is now fully locked (no X / convoke / manual
     // step pending), so before finalizing, a spell with assist and a generic
@@ -15375,6 +15655,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: Some(0),
@@ -16253,6 +16535,7 @@ mod tests {
             None,
             Zone::Hand,
             CastPaymentMode::Manual,
+            CostLockInput::default(),
             &mut events,
         )
         .expect("manual payment should pause before paying mana");
@@ -16411,6 +16694,7 @@ mod tests {
             None,
             Zone::Hand,
             CastPaymentMode::Auto,
+            CostLockInput::default(),
             &mut events,
         )
         .expect("auto payment should fall back to manual mana payment");
@@ -21102,6 +21386,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21241,6 +21527,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21349,6 +21637,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21446,6 +21736,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -21576,6 +21868,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,

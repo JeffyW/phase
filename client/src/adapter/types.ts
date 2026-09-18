@@ -1947,6 +1947,43 @@ export interface PendingCast {
   // CR 118.3a: pip ids the caster pinned to direct payment. `#[serde(default,
   // skip_serializing_if = "Vec::is_empty")]` — absent when no pin is recorded.
   pinned_pool_units?: number[];
+  // CR 601.2b + CR 601.2f: reductions the caster accepted that no board static
+  // reproduces (today: an accepted Defiler life payment). `#[serde(default,
+  // skip_serializing_if = "Vec::is_empty")]` — absent when none.
+  accepted_cost_reductions?: CostReductionEntry[];
+  // CR 601.2f: the caster's elected reduction order, once
+  // `WaitingFor::OrderCostReductions` has been answered. `#[serde(default,
+  // skip_serializing_if = "Option::is_none")]` — absent when the order was
+  // never observable for this cast.
+  cost_reduction_election?: ReductionProvenance[];
+}
+
+/// CR 601.2f: where one snapshotted cost reduction came from. Typed rather
+/// than an object id because Affinity (CR 702.41a), Undaunted (CR 702.125a)
+/// and the one-shot pending reductions have no producing permanent.
+export type ReductionProvenance =
+  | { type: "Static"; data: { source: ObjectId; ordinal: number } }
+  | { type: "Defiler" }
+  | { type: "PendingOneShot"; data: { index: number } }
+  | { type: "Affinity" }
+  | { type: "Undaunted" };
+
+/// CR 601.2f: one cost reduction, snapshotted at the lock seam. `amount` ×
+/// `multiplier` is the effective reduction — every dynamic count is already
+/// resolved, so the frontend renders these fields and computes nothing.
+export interface CostReductionEntry {
+  amount: ManaCost;
+  multiplier: number;
+  reach?: CostReductionReach;
+  provenance: ReductionProvenance;
+  display_name: string;
+}
+
+/// CR 601.2f: one legal outcome — a representative order and the total cost it
+/// locks in. The engine authors both; the modal never derives a cost.
+export interface CostReductionOutcome {
+  order: number[];
+  locked_cost: ManaCost;
 }
 
 export interface TargetSelectionSlot {
@@ -2236,6 +2273,10 @@ export type WaitingFor =
   | { type: "CostTypeChoice"; data: { player: PlayerId; choice_type: string | Record<string, unknown>; options: string[]; pending_cast: PendingCast } }
   | { type: "SpliceOffer"; data: { player: PlayerId; pending_cast: PendingCast; eligible: ObjectId[] } }
   | { type: "DefilerPayment"; data: { player: PlayerId; life_cost: number; mana_reduction: ManaCost; reach?: CostReductionReach; pending_cast: PendingCast } }
+  // CR 601.2f: "If multiple cost reductions apply, the player may apply them in
+  // any order." Only raised when two legal orders lock in different total
+  // costs; `outcomes` is one representative per distinct cost, cheapest first.
+  | { type: "OrderCostReductions"; data: { player: PlayerId; reductions: CostReductionEntry[]; outcomes: CostReductionOutcome[]; pending_cast: PendingCast } }
   | { type: "CastOffer"; data: { player: PlayerId; kind: CastOfferKind } }
   | { type: "ModalFaceChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId } }
   // `keyword.type` mirrors engine `AlternativeCastKeyword` (game_state.rs) 1:1.
@@ -2772,6 +2813,9 @@ export type GameAction =
   | { type: "ChooseReplacement"; data: { index: number } }
   | { type: "ChooseEntryController"; data: { opponent: PlayerId } }
   | { type: "OrderTriggers"; data: { order: number[] } }
+  // CR 601.2f: the caster's elected cost-reduction order — a permutation of
+  // indices into the prompt's `reductions`; index 0 is applied first.
+  | { type: "OrderCostReductions"; data: { order: number[] } }
   | { type: "CancelCast" }
   | { type: "Equip"; data: { equipment_id: ObjectId; target_id: ObjectId } }
   | { type: "CrewVehicle"; data: { vehicle_id: ObjectId; creature_ids: ObjectId[] } }

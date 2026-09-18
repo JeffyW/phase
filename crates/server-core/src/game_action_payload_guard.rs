@@ -465,6 +465,16 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         GameAction::OrderTriggers { order } => {
             bound_list("OrderTriggers.order", order.len())?;
         }
+        // CR 601.2f: the caster's elected reduction order. The engine rejects a
+        // non-permutation, but bound the transport payload here too — both the
+        // list length and each index, so a client cannot force an allocation
+        // with a huge index before the engine ever sees it.
+        GameAction::OrderCostReductions { order } => {
+            bound_list("OrderCostReductions.order", order.len())?;
+            for index in order {
+                bound_list("OrderCostReductions.order index", *index)?;
+            }
+        }
         GameAction::SelectCards { cards } => {
             bound_list("SelectCards.cards", cards.len())?;
         }

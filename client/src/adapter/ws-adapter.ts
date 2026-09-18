@@ -209,6 +209,17 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 72 — CR 601.2f caster-elected cost-reduction ordering:
+ *      WaitingFor.OrderCostReductions and GameAction.OrderCostReductions are
+ *      new variants on two externally-tagged enums with no serde fallback, so
+ *      a v71 peer fails deserialization outright on either tag. A PARSE bump
+ *      like 27 and 34, not a capability bump like 24 — and a CONDITIONAL one:
+ *      the prompt only forms when two legal reduction orders lock in different
+ *      total costs, which needs a ColoredManaOnly reduction to meet a
+ *      SpillsToGeneric one over the same pip. Every other cast's frames are
+ *      byte-identical to v71. PendingCast.accepted_cost_reductions and
+ *      PendingCast.cost_reduction_election are additive and omitted when empty,
+ *      so they ride this condition rather than forcing it.
  * 71 — DraftKind.Winston and DraftAction::SharedStackDecision are serialized
  *      by draft WebSocket messages. A PARSE bump like 27 and 34, not a
  *      capability bump like 24 — but a CONDITIONAL one: neither type carries
@@ -504,7 +515,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 71;
+export const PROTOCOL_VERSION = 72;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

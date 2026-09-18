@@ -81,6 +81,25 @@ pub(super) fn handle_defiler_payment(
     )
 }
 
+/// CR 601.2f: Apply the caster's elected cost-reduction order.
+pub(super) fn handle_order_cost_reductions(
+    state: &mut GameState,
+    player: PlayerId,
+    pending_cast: PendingCast,
+    reductions: &[crate::types::casting_costs::CostReductionEntry],
+    order: &[usize],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    casting_costs::handle_order_cost_reductions(
+        state,
+        player,
+        pending_cast,
+        reductions,
+        order,
+        events,
+    )
+}
+
 pub(super) fn handle_discard_for_cost(
     state: &mut GameState,
     player: PlayerId,
@@ -445,6 +464,7 @@ pub(super) fn handle_harmonize_tap_choice(
     }
 
     let base_cost = pending.base_cost.clone();
+    let lock = casting_costs::CostLockInput::from_pending(&pending);
     casting_costs::pay_and_push_adventure(
         state,
         player,
@@ -459,6 +479,7 @@ pub(super) fn handle_harmonize_tap_choice(
         pending.distribute,
         pending.origin_zone,
         pending.payment_mode,
+        lock,
         events,
     )
 }

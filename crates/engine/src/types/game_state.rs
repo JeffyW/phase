@@ -6957,6 +6957,21 @@ pub struct PendingCast {
     /// apply cost modifiers and floors in total-cost order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_mana_additions: Vec<ManaCost>,
+    /// CR 601.2b + CR 601.2f: Cost reductions the caster has affirmatively
+    /// accepted for this cast and that no static on the board can reproduce —
+    /// today exactly the Defiler cycle's optional life payment. They join the
+    /// ordered reduction set at the CR 601.2f lock seam, so they are ordered
+    /// against the board's reductions instead of being shaved off an
+    /// already-floored total.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_cost_reductions: Vec<crate::types::casting_costs::CostReductionEntry>,
+    /// CR 601.2f: The caster's elected reduction order ("If multiple cost
+    /// reductions apply, the player may apply them in any order"), recorded
+    /// once `WaitingFor::OrderCostReductions` is answered. `None` means the
+    /// order was never observable for this cast and the engine's
+    /// caster-optimal default governs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_reduction_election: Option<Vec<crate::types::casting_costs::ReductionProvenance>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_cost: Option<AbilityCost>,
     /// CR 601.2h: Random cost elements are paid after every nonrandom element.
@@ -7616,6 +7631,8 @@ impl PendingCast {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -13514,6 +13531,33 @@ pub enum WaitingFor {
         reach: crate::types::statics::CostReductionReach,
         pending_cast: Box<PendingCast>,
     },
+    /// CR 601.2f: "If multiple cost reductions apply, the player may apply them
+    /// in any order." Presented only when the order is *observable* — when two
+    /// permutations of the applicable reductions lock in genuinely different
+    /// total costs, which needs a `ColoredManaOnly` reduction (the printed
+    /// "This effect reduces only the amount of colored mana you pay" rider) to
+    /// meet a `SpillsToGeneric` one over the same pip. Ordinary casts never
+    /// reach this prompt: a reduction with no colored/colorless component
+    /// commutes with every other reduction, so it is excluded from the
+    /// permutation set outright.
+    ///
+    /// CR 601.2h: `reductions` is a snapshot taken when the total cost is being
+    /// determined, not a live re-read of the board — the Altar's Reap /
+    /// Thunderscape Familiar example turns on a reduction staying determined
+    /// after its source has left the battlefield.
+    OrderCostReductions {
+        player: PlayerId,
+        /// The order-relevant reductions, in canonical collection order. A
+        /// submitted `GameAction::OrderCostReductions` order is a permutation
+        /// of indices into this vec; index 0 is applied first.
+        reductions: Vec<crate::types::casting_costs::CostReductionEntry>,
+        /// One representative order per distinct locked total cost, cheapest
+        /// first. Orders that lock the same cost are indistinguishable to the
+        /// game (a reduction emits no event, and converge/sunburst read the
+        /// mana actually paid in CR 601.2h), so only one is offered.
+        outcomes: Vec<crate::types::casting_costs::CostReductionOutcome>,
+        pending_cast: Box<PendingCast>,
+    },
     /// CR 715.3a + CR 702.94a + CR 702.35a + CR 702.85a + CR 701.57a + CR 702.xxx:
     /// A player is offered a card to cast via a special rule.
     CastOffer {
@@ -15192,6 +15236,7 @@ impl WaitingFor {
             WaitingFor::ChooseGiftRecipient { .. } => "ChooseGiftRecipient",
             WaitingFor::SpliceOffer { .. } => "SpliceOffer",
             WaitingFor::DefilerPayment { .. } => "DefilerPayment",
+            WaitingFor::OrderCostReductions { .. } => "OrderCostReductions",
             WaitingFor::CastOffer { .. } => "CastOffer",
             WaitingFor::ModalFaceChoice { .. } => "ModalFaceChoice",
             WaitingFor::AlternativeCastChoice { .. } => "AlternativeCastChoice",
@@ -15350,6 +15395,7 @@ impl WaitingFor {
             | WaitingFor::ChooseGiftRecipient { player, .. }
             | WaitingFor::SpliceOffer { player, .. }
             | WaitingFor::DefilerPayment { player, .. }
+            | WaitingFor::OrderCostReductions { player, .. }
             | WaitingFor::AbilityModeChoice { player, .. }
             | WaitingFor::MultiTargetSelection { player, .. }
             | WaitingFor::CastOffer { player, .. }
@@ -15510,6 +15556,7 @@ impl WaitingFor {
             | WaitingFor::ChooseGiftRecipient { pending_cast, .. }
             | WaitingFor::SpliceOffer { pending_cast, .. }
             | WaitingFor::DefilerPayment { pending_cast, .. }
+            | WaitingFor::OrderCostReductions { pending_cast, .. }
             | WaitingFor::ActivationCostOneOfChoice { pending_cast, .. }
             | WaitingFor::CostTypeChoice { pending_cast, .. }
             | WaitingFor::BlightChoice { pending_cast, .. }
@@ -15545,6 +15592,7 @@ impl WaitingFor {
             | WaitingFor::ChooseGiftRecipient { pending_cast, .. }
             | WaitingFor::SpliceOffer { pending_cast, .. }
             | WaitingFor::DefilerPayment { pending_cast, .. }
+            | WaitingFor::OrderCostReductions { pending_cast, .. }
             | WaitingFor::ActivationCostOneOfChoice { pending_cast, .. }
             | WaitingFor::CostTypeChoice { pending_cast, .. }
             | WaitingFor::BlightChoice { pending_cast, .. }
@@ -35433,6 +35481,8 @@ mod tests {
                 prepaid_actual_mana_spent: None,
                 base_cost: None,
                 declared_mana_additions: Vec::new(),
+                accepted_cost_reductions: Vec::new(),
+                cost_reduction_election: None,
                 activation_cost: None,
                 deferred_random_discard_cost: None,
                 activation_ability_index: None,
@@ -35837,7 +35887,14 @@ mod tests {
             reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             pending_cast: dummy_pending(),
         }));
-        assert_eq!(variants.len(), 39);
+        // CR 601.2f: the caster-elected cost-reduction ordering prompt.
+        variants.push(Box::new(WaitingFor::OrderCostReductions {
+            player: PlayerId(0),
+            reductions: Vec::new(),
+            outcomes: Vec::new(),
+            pending_cast: dummy_pending(),
+        }));
+        assert_eq!(variants.len(), 40);
     }
 
     #[test]
@@ -35865,6 +35922,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,

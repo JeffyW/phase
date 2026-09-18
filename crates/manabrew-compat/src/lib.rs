@@ -1733,6 +1733,15 @@ fn build_prompt_input(
                     .collect(),
             }))
         }
+        // CR 601.2f: `ReorderItem` requires a rendered card per item, and a
+        // reduction's provenance is not always an object (Affinity and Undaunted
+        // are derived from the spell's own keywords; a one-shot pending reduction
+        // has no source permanent at all). Rather than fabricate a card DTO,
+        // report the prompt as unsupported so a manabrew client fails loudly
+        // instead of being handed a list it cannot map back.
+        WaitingFor::OrderCostReductions { .. } => {
+            unsupported_prompt(waiting_for, "local.cost-reduction-order-unsupported")
+        }
         WaitingFor::AssignBlockerDamage { .. } => {
             unsupported_prompt(waiting_for, "local.blocker-damage-banding-unsupported")
         }
@@ -2718,6 +2727,12 @@ pub fn convert_available_action(
         }
         // Answered through the Reorder prompt for `WaitingFor::OrderTriggers`.
         GameAction::OrderTriggers { .. } => AvailableActionConversion::Skip,
+        // CR 601.2f: the cost-reduction ordering prompt has no upstream prompt
+        // family that can carry a non-object reduction (Affinity, Undaunted and
+        // the one-shot pending reductions have no producing permanent, so there
+        // is no card for a `ReorderItem` to render). It projects as an
+        // unsupported prompt, so its answering action never reaches the wire.
+        GameAction::OrderCostReductions { .. } => AvailableActionConversion::Skip,
         GameAction::Equip { .. }
         | GameAction::CrewVehicle { .. }
         | GameAction::ActivateStation { .. }

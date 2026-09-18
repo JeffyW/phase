@@ -332,6 +332,14 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
                 cmp_val(a0, b0)
             }
         }
+        GameAction::OrderCostReductions { order: a0 } => {
+            let GameAction::OrderCostReductions { order: b0 } = b else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            {
+                cmp_val(a0, b0)
+            }
+        }
         GameAction::CancelCast => {
             let GameAction::CancelCast = b else {
                 unreachable!("cmp_payload: same-variant invariant");

@@ -11423,6 +11423,32 @@ fn apply_non_priority_pass_action(
             },
             GameAction::CancelCast,
         ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events)?,
+        // CR 601.2f: "If multiple cost reductions apply, the player may apply
+        // them in any order." The caster submits that order here.
+        (
+            WaitingFor::OrderCostReductions {
+                player,
+                reductions,
+                pending_cast,
+                ..
+            },
+            GameAction::OrderCostReductions { order },
+        ) => engine_casting::handle_order_cost_reductions(
+            state,
+            *player,
+            *pending_cast.clone(),
+            &reductions.clone(),
+            &order,
+            &mut events,
+        )?,
+        (
+            WaitingFor::OrderCostReductions {
+                player,
+                pending_cast,
+                ..
+            },
+            GameAction::CancelCast,
+        ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events)?,
         // CR 118.3 + CR 601.2b + CR 605.3b: Player selected objects to pay a
         // cost. The single `PayCost` state dispatches on `kind` (which action)
         // and `resume` (spell-cast vs mana-ability pipeline) to the

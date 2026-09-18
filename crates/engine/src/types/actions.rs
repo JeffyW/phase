@@ -349,6 +349,14 @@ pub enum GameAction {
     OrderTriggers {
         order: Vec<usize>,
     },
+    /// CR 601.2f: Caster submits the order in which the applicable cost
+    /// reductions are applied ("If multiple cost reductions apply, the player
+    /// may apply them in any order"). `order` is a permutation of indices into
+    /// the `WaitingFor::OrderCostReductions.reductions` vec the caster was
+    /// prompted with; index 0 = applied first.
+    OrderCostReductions {
+        order: Vec<usize>,
+    },
     CancelCast,
     Equip {
         equipment_id: ObjectId,
@@ -1933,6 +1941,7 @@ impl GameAction {
             | Self::ChooseReplacement { .. }
             | Self::ChooseEntryController { .. }
             | Self::OrderTriggers { .. }
+            | Self::OrderCostReductions { .. }
             | Self::CancelCast
             | Self::SubmitSideboard { .. }
             | Self::ChoosePlayDraw { .. }
@@ -2272,6 +2281,7 @@ impl GameAction {
             | GameAction::ChooseReplacement { .. }
             | GameAction::ChooseEntryController { .. }
             | GameAction::OrderTriggers { .. }
+            | GameAction::OrderCostReductions { .. }
             | GameAction::CancelCast
             | GameAction::BackToManaPayment
             | GameAction::SubmitSideboard { .. }

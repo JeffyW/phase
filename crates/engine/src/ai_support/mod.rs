@@ -371,6 +371,11 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         (WaitingFor::OrderTriggers { triggers, .. }, GameAction::OrderTriggers { order }) => {
             !crate::game::triggers::is_valid_permutation(order, triggers.len())
         }
+        // CR 601.2f: same strict-permutation check the engine handler enforces.
+        (
+            WaitingFor::OrderCostReductions { reductions, .. },
+            GameAction::OrderCostReductions { order },
+        ) => !crate::game::triggers::is_valid_permutation(order, reductions.len()),
         (
             WaitingFor::CopyTargetChoice { valid_targets, .. },
             GameAction::ChooseTarget { target },
@@ -1285,6 +1290,7 @@ fn classify_flat_priority_action(action: &GameAction) -> FlatPriorityActionClass
         | GameAction::ChooseReplacement { .. }
         | GameAction::ChooseEntryController { .. }
         | GameAction::OrderTriggers { .. }
+        | GameAction::OrderCostReductions { .. }
         | GameAction::CancelCast
         | GameAction::Equip { .. }
         | GameAction::CrewVehicle { .. }
