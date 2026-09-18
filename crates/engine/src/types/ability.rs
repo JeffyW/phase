@@ -2416,18 +2416,32 @@ pub enum ChosenAttribute {
     /// label is stored case-canonicalised to match `ChoiceType::Labeled`'s
     /// capitalised option list.
     Label(String),
-    /// CR 613.1f + CR 611.2c + CR 400.7: A remembered card object — the "last
+    /// CR 607.2d + CR 608.2c + CR 400.7: A remembered card object — the "last
     /// chosen card" for cards like Koh, the Face Stealer ("Koh has all activated
     /// and triggered abilities of the last chosen card"). Unlike every other
     /// variant, this is NOT a player-prompted choice category: it is written by
     /// `Effect::RememberCard` directly from the resolution chain's tracked set,
     /// not produced through `ChoiceType`/`ChoiceValue`/`from_choice` (the same
     /// engine-set precedent as `TributeOutcome`). It is consumed by
-    /// `TargetFilter::ChosenCard` at Layer-6 grant evaluation, and — being stored
-    /// in `chosen_attributes` — is cleared automatically when the source permanent
-    /// changes zones (CR 400.7), which is exactly the lifetime Koh's grant needs.
-    /// Replace-on-rechoose: `RememberCard` removes any prior `Card` before pushing.
-    Card(ObjectId),
+    /// `TargetFilter::ChosenCard` — the zone-agnostic remembered-object reader —
+    /// on both the live-object path and the CR 603.10a leaves-the-battlefield
+    /// look-back path. A reader whose linked ability requires a zone (CR 607.2a
+    /// "exiled with") composes `FilterProp::InZone` at its emission site rather
+    /// than in the shared reader. Being stored in `chosen_attributes`, the value
+    /// is cleared automatically when the source permanent changes zones
+    /// (CR 400.7). Replace-on-rechoose: `RememberCard` removes any prior `Card`
+    /// before pushing.
+    ///
+    /// CR 400.7: the value is an [`ObjectIncarnationRef`] pin — the chosen
+    /// object's storage id AND its incarnation at choice time (captured by
+    /// `RememberCard` from the live object). An object that changes zones
+    /// becomes a new object at the same storage id with a bumped incarnation,
+    /// so a stale pin deliberately does not match the returned object. The
+    /// pre-migration wire form stored a bare `ObjectId`; the
+    /// `ObjectIncarnationRef` compat shim deserializes that legacy shape to
+    /// [`LEGACY_INCARNATION`], a value no real incarnation can equal, so a
+    /// legacy record matches nothing (fail-closed).
+    Card(ObjectIncarnationRef),
     /// CR 608.2d + CR 122.1: The counter kind chosen from a `ChoiceType::CounterKind`
     /// option list (The Caves of Androzani "choose a counter on it"). Read by
     /// `Effect::PutChosenCounter` ("put an additional counter of that kind on
@@ -7467,14 +7481,29 @@ pub enum TargetFilter {
     /// the newly created token, or an existing Army — never re-derived by
     /// rescanning the battlefield for "an Army you control".
     AmassedArmy,
-    /// CR 613.1f + CR 611.2c + CR 400.7: Resolves to the single card most recently
-    /// recorded on the FILTER's source object via `ChosenAttribute::Card` (written
-    /// by `Effect::RememberCard`). Models "the last chosen card" — Koh, the Face
-    /// Stealer's Layer-6 grant source. Live, not snapshotted: re-evaluated each
-    /// layer pass, so re-choosing replaces the grant and the chosen card leaving
-    /// its zone (CR 400.7 — a new object) drops the grant. The object matcher
-    /// reads `chosen_attributes` from the source (not the resolving ability), so
-    /// the static grant resolves it against the permanent that HAS the static.
+    /// CR 607.2d + CR 608.2c + CR 613.1f: The zone-agnostic remembered-object
+    /// reader — matches the object most recently recorded on the FILTER's source
+    /// object via `ChosenAttribute::Card` (written by `Effect::RememberCard`).
+    /// Models "the chosen ‹object›" links of the object axis, including "the last
+    /// chosen card" (Koh, the Face Stealer's Layer-6 grant source).
+    ///
+    /// Identity only: the reader compares the candidate occurrence against the
+    /// source's stored [`ChosenAttribute::Card`] pin on BOTH object paths — the
+    /// live matcher (`filter_inner_for_object`, CR 607.2d) and the
+    /// leaves-the-battlefield look-back path (`zone_change_filter_inner`,
+    /// CR 603.10a). CR 400.7: the pin carries the remembered object's
+    /// incarnation, so an object that left and returned at the same storage id
+    /// is a new object and does not re-match (a legacy bare-id pin deserializes
+    /// to `LEGACY_INCARNATION` and matches nothing). A reader whose linked
+    /// ability requires a zone (e.g. Koh's CR 607.2a "exiled with" pin) composes
+    /// `FilterProp::InZone` at its emission site instead of hardcoding a zone
+    /// here; that is what lets one reader serve both a live Layer-6 grant and a
+    /// departure trigger.
+    ///
+    /// Live, not snapshotted: re-evaluated each layer pass, so re-choosing
+    /// replaces the grant. The object matcher reads `chosen_attributes` from the
+    /// source (not the resolving ability), so a static grant resolves it against
+    /// the permanent that HAS the static.
     ChosenCard,
     /// Matches exactly the objects in a tracked set.
     /// CR 603.7: Delayed triggers act on specific objects from the originating effect.
@@ -17874,16 +17903,23 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<ChooseFromZoneConstraint>,
     },
-    /// CR 608.2c + CR 613.1f: Record the card selected by a preceding selection
+    /// CR 608.2c + CR 607.2d: Record the card selected by a preceding selection
     /// effect (typically `ChooseFromZone`) onto the resolving ability's SOURCE as
     /// `ChosenAttribute::Card`, so a companion Layer-6 static ("[this] has all
     /// activated and triggered abilities of the last chosen card" — Koh, the Face
-    /// Stealer) can read it via `TargetFilter::ChosenCard`. Composable building
-    /// block: the choice UI/zone search stays in `ChooseFromZone`; this effect is
-    /// the persistent writer. `target` reads the chosen object(s) — Koh passes
+    /// Stealer) can read it via `TargetFilter::ChosenCard`, and so a companion
+    /// leaves-the-battlefield trigger can re-identify the same object through the
+    /// CR 603.10a look-back path. Composable building block: the choice UI/zone
+    /// search stays in `ChooseFromZone`; this effect is the persistent writer.
+    /// `target` reads the chosen object(s) — Koh passes
     /// `TrackedSet { id: TrackedSetId(0) }` (the resolution chain's published
     /// pick, resolved via `resolve_tracked_set_sentinel`); the single recorded
     /// card replaces any prior `ChosenAttribute::Card` (replace-on-rechoose).
+    /// CR 400.7: the stored value is the chosen object's
+    /// `ObjectIncarnationRef` pin (id + incarnation at choice time), so an
+    /// object that left and returned at the same storage id is a new object and
+    /// no longer matches; a reader that needs the object in a specific zone
+    /// composes `FilterProp::InZone` at its emission site.
     RememberCard {
         target: TargetFilter,
     },

@@ -277,16 +277,47 @@ pub fn resolve(
         }
         if let Some(source_zone) = target_filter.extract_in_zone() {
             if matches!(source_zone, Zone::Hand | Zone::Library) {
+                let choosing_player = crate::game::effects::controller_for_relative_filter(
+                    state,
+                    ability,
+                    &target_filter,
+                );
+                // CR 608.2d: a choice offered while an effect resolves is made
+                // while applying that effect. For "target opponent puts", the
+                // relative filter identifies that instructed opponent as the
+                // player who chooses their card.
+                let ctx = crate::game::filter::FilterContext::from_ability_with_controller(
+                    ability,
+                    choosing_player,
+                );
                 let eligible: Vec<_> = match source_zone {
-                    Zone::Hand => state.players[ability.controller.0 as usize]
+                    Zone::Hand => state.players[choosing_player.0 as usize]
                         .hand
                         .iter()
                         .copied()
+                        .filter(|&id| {
+                            crate::game::filter::matches_target_filter_for_zone(
+                                state,
+                                id,
+                                source_zone,
+                                &target_filter,
+                                &ctx,
+                            )
+                        })
                         .collect(),
-                    Zone::Library => state.players[ability.controller.0 as usize]
+                    Zone::Library => state.players[choosing_player.0 as usize]
                         .library
                         .iter()
                         .copied()
+                        .filter(|&id| {
+                            crate::game::filter::matches_target_filter_for_zone(
+                                state,
+                                id,
+                                source_zone,
+                                &target_filter,
+                                &ctx,
+                            )
+                        })
                         .collect(),
                     _ => unreachable!(),
                 };
@@ -300,7 +331,7 @@ pub fn resolve(
                     return Ok(());
                 }
                 state.waiting_for = WaitingFor::EffectZoneChoice {
-                    player: ability.controller,
+                    player: choosing_player,
                     cards: eligible,
                     count: expected.min(eligible_count),
                     min_count: 0,

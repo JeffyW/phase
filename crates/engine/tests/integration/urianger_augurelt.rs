@@ -16,6 +16,7 @@ use engine::types::ability::{
     CardPlayMode, CastCostModifier, CastingPermission, Duration, Effect, PlayFromExileProvenance,
     TargetFilter,
 };
+use engine::types::actions::GameAction;
 use engine::types::game_state::{ExileLink, ExileLinkKind};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
@@ -152,6 +153,33 @@ fn urianger_board(cost: u32, pool: usize) -> (GameRunner, ObjectId, ObjectId) {
     (runner, urianger, spell)
 }
 
+/// Build Urianger's grant over both a spell and a land in exile. Fixture setup
+/// places the land in exile; the test exercises its actual land-play delivery.
+fn urianger_board_with_exiled_land(
+    cost: u32,
+    pool: usize,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let urianger = scenario
+        .add_creature_from_oracle(P0, "Urianger Augurelt", 2, 3, URIANGER_ORACLE)
+        .id();
+    let spell = scenario
+        .add_creature_to_exile(P0, "Arcanum Spell", 2, 2)
+        .with_mana_cost(ManaCost::generic(cost))
+        .id();
+    let land = scenario.add_land_to_hand(P0, "Arcanum Island").id();
+    scenario.with_mana_pool(P0, generic_mana(pool));
+    let mut runner = scenario.build();
+    engine::game::zones::remove_from_zone(runner.state_mut(), land, Zone::Hand, P0);
+    runner.state_mut().objects[&land].zone = Zone::Exile;
+    engine::game::zones::add_to_zone(runner.state_mut(), land, Zone::Exile, P0);
+    link_exiled_with(&mut runner, spell, urianger);
+    link_exiled_with(&mut runner, land, urianger);
+    grant_play_arcanum(&mut runner, urianger);
+    (runner, urianger, spell, land)
+}
+
 /// The elected permission for `spell` ? the one the cast pipeline prices
 /// against.
 fn cast_permission(runner: &GameRunner, spell: ObjectId) -> &CastingPermission {
@@ -257,6 +285,39 @@ fn urianger_land_look_companion_carries_no_cost_modifier() {
         outcome.mana_pool_total(P0),
         4,
         "CR 601.2f: the cast half of the same grant is still reduced {{3}} -> {{1}}"
+    );
+}
+
+/// Playing Urianger's actual exiled-land companion must consume only that land
+/// permission and leave the linked spell's reduce rider intact for the real
+/// cast pipeline.
+#[test]
+fn urianger_land_companion_plays_a_land_without_consuming_spell_reduction() {
+    let (mut runner, _urianger, spell, land) = urianger_board_with_exiled_land(3, 5);
+    let land_card_id = runner.state().objects[&land].card_id;
+
+    runner
+        .act(GameAction::PlayLand {
+            object_id: land,
+            card_id: land_card_id,
+        })
+        .expect("Urianger's mode: Play grant must surface a legal land-play action");
+    assert_eq!(
+        runner.state().objects[&land].zone,
+        Zone::Battlefield,
+        "the linked land must enter the battlefield through GameAction::PlayLand"
+    );
+    assert_eq!(
+        cast_permission(&runner, spell).cast_cost_modifier(),
+        Some(&CastCostModifier::reduce(ManaCost::generic(2))),
+        "playing the land must not select or consume the spell's cast permission"
+    );
+
+    let outcome = runner.cast(spell).resolve();
+    assert_eq!(
+        outcome.mana_pool_total(P0),
+        4,
+        "the spell still costs {{1}} after the companion land was played"
     );
 }
 
@@ -434,6 +495,20 @@ fn urianger_has_no_unimplemented_clause() {
         &[],
         &["Creature".to_string()],
         &["Elf".to_string(), "Advisor".to_string()],
+    );
+    assert_eq!(
+        parsed.triggers.len(),
+        1,
+        "reach guard: Urianger's printed exile-play trigger must lower"
+    );
+    assert!(
+        parsed.abilities.iter().any(|ability| {
+            ability
+                .description
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Play Arcanum"))
+        }),
+        "reach guard: Urianger's Play Arcanum activated ability must lower"
     );
     let rendered = format!(
         "{:?}{:?}{:?}",

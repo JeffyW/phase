@@ -65993,6 +65993,54 @@ fn into_the_fire_mode_two_any_number_placement_takes_up_to_count_shape() {
     );
 }
 
+/// Distinct target phrases own distinct target slots (CR 115.3): a player
+/// subject owns the outer slot, while an announced card set in its
+/// positional-library predicate owns the inner slots.
+#[test]
+fn target_opponent_puts_up_to_three_target_cards_keeps_inner_target_set() {
+    let parsed = parse_oracle_text(
+        "Target opponent puts up to three target creature cards from their graveyard on top of their library.",
+        "Subject placement probe",
+        &[],
+        &[],
+        &[],
+    );
+    let outer = parsed
+        .abilities
+        .first()
+        .expect("subject placement parses one ability");
+    let Effect::TargetOnly { target } = outer.effect.as_ref() else {
+        panic!("expected outer opponent target, got {:?}", outer.effect);
+    };
+    assert!(
+        matches!(target, TargetFilter::Typed(filter) if filter.controller == Some(ControllerRef::Opponent)),
+        "the player subject remains the outer target, got {target:?}"
+    );
+
+    let inner = outer
+        .sub_ability
+        .as_deref()
+        .expect("the positional placement is nested under the opponent target");
+    assert_eq!(
+        inner.multi_target,
+        Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 3 })),
+        "the announced card set must remain on the nested placement"
+    );
+    assert_eq!(
+        inner.target_choice_timing,
+        TargetChoiceTiming::Stack,
+        "explicit target cards are announced on the stack, not chosen at resolution"
+    );
+    let Effect::PutAtLibraryPosition { count, .. } = inner.effect.as_ref() else {
+        panic!("expected nested placement, got {:?}", inner.effect);
+    };
+    assert_eq!(
+        *count,
+        QuantityExpr::Fixed { value: 1 },
+        "announced cardinality must not overwrite the placement effect count"
+    );
+}
+
 /// B-5 — Ransack's "put any number of THEM on the bottom" is a pronoun
 /// partition of the Dig continuation: its recipient is the deterministic
 /// anaphor `ParentTarget`, not a population, so the untargeted any-number arm
@@ -67506,24 +67554,24 @@ fn cast_this_way_cost_rider_covers_the_subject_by_direction_cross_product() {
 
     const HOST: &str = "Until end of turn, you may play cards exiled with ~.";
     let subjects = [
-        "A spell cast this way",
-        "Each spell cast this way",
-        "Spells you cast this way",
+        ("A spell cast this way", "costs"),
+        ("Each spell cast this way", "costs"),
+        ("Spells you cast this way", "cost"),
     ];
     let directions = [
         (
-            "costs {2} more to cast.",
+            "{2} more to cast.",
             CastCostModifier::raise(ManaCost::generic(2)),
         ),
         (
-            "cost {1} less to cast.",
+            "{1} less to cast.",
             CastCostModifier::reduce(ManaCost::generic(1)),
         ),
     ];
 
-    for subject in subjects {
+    for (subject, verb) in subjects {
         for (tail, expected) in &directions {
-            let text = format!("{HOST} {subject} {tail}");
+            let text = format!("{HOST} {subject} {verb} {tail}");
             let def = parse_effect_chain(&text, AbilityKind::Spell);
             assert!(
                 def.sub_ability.is_none(),
@@ -67581,6 +67629,35 @@ fn tree_holds_unabsorbed_rider_gap(def: &AbilityDefinition) -> bool {
         matches!(effect, Effect::Unimplemented { name, .. }
             if name == crate::types::ability::CAST_COST_MODIFIER_WITHOUT_HOST_GAP)
     })
+}
+
+/// A single permission-local modifier slot cannot silently overwrite an
+/// earlier rider. The first rider remains attached to its host and the second
+/// is an honest unsupported clause until the model is extended to represent a
+/// composable rider list.
+#[test]
+fn second_cast_this_way_cost_rider_preserves_the_first_and_is_refused() {
+    let def = parse_effect_chain(
+        "Until end of turn, you may play cards exiled with ~. Each spell cast this way costs \
+         {2} more to cast. Spells you cast this way cost {1} less to cast.",
+        AbilityKind::Spell,
+    );
+    let Effect::CastFromZone {
+        cast_cost_modifier, ..
+    } = &*def.effect
+    else {
+        panic!("expected CastFromZone, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *cast_cost_modifier,
+        Some(CastCostModifier::raise(ManaCost::generic(2))),
+        "the second rider must never replace the first"
+    );
+    assert!(
+        tree_holds_unabsorbed_rider_gap(&def),
+        "the second rider must remain an honest gap rather than disappear: {:?}",
+        effects_in_tree(&def)
+    );
 }
 
 /// CR 601.2f + CR 608.2c: a "[each/a] spell cast this way costs {N} more/less to
@@ -67813,4 +67890,835 @@ fn refuse_cast_cost_modifier_on_unsupported_driver_spares_only_the_lingering_dri
     }
     refuse_cast_cost_modifier_on_unsupported_driver(&mut untouched);
     assert!(matches!(untouched, Effect::CastFromZone { .. }));
+}
+
+// ─── Zenos yae Galvus phase-2 controls (Step 0, 2-C1) ─────────────────────────
+
+/// The verbatim Zenos yae Galvus trigger-1 body, card name normalized to `~`
+/// (the same normalization `parse_oracle_text` performs before clause parsing).
+const ZENOS_TRIGGER_ONE_BODY: &str =
+    "choose a creature an opponent controls. Until end of turn, creatures other than ~ and the chosen creature get -2/-2.";
+
+/// CR 607.2d + CR 608.2c: POST-CHANGE control (`2-C1`/`2-C2`/`2-C5`/`2-C6`).
+/// The Step 0 baseline (`zenos_trigger_one_pump_baseline_before_phase2`, captured
+/// failing before this update) pinned the degraded base: head `TargetOnly` and
+/// `Pump { Any }`. After the phase-2 arms this body must lower to the full
+/// linked-choice chain: the tracked-set battlefield-object choice, the
+/// `RememberCard` writer spliced between head and pump, and the population pump
+/// whose filter excludes the source (`Another`) and the remembered object
+/// (`Not { ChosenCard }`).
+#[test]
+fn zenos_trigger_one_pump_lowers_to_the_choice_chain() {
+    let def = parse_effect_chain(ZENOS_TRIGGER_ONE_BODY, AbilityKind::Spell);
+
+    let Effect::ChooseObjectsIntoTrackedSet {
+        chooser,
+        filter,
+        min,
+        max,
+        cardinality,
+        eligibility,
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "head must be the tracked-set battlefield-object choice, got {:#?}",
+            def
+        );
+    };
+    assert_eq!(chooser, &TargetFilter::Controller);
+    assert_eq!(
+        filter,
+        &TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::Opponent)),
+        "the chosen filter must be the exact opponent-creature class filter"
+    );
+    assert_eq!((*min, *max), (1, Some(1)));
+    assert_eq!(*cardinality, None);
+    assert_eq!(*eligibility, None);
+
+    let remember = def
+        .sub_ability
+        .as_deref()
+        .expect("the splice must put RememberCard between head and pump");
+    assert_eq!(
+        remember.effect.as_ref(),
+        &Effect::RememberCard {
+            target: TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+        },
+        "the pick must be persisted via the chain's tracked-set sentinel (CR 608.2c)"
+    );
+    assert_eq!(
+        remember.sub_link,
+        SubAbilityLink::ContinuationStep,
+        "the splice takes no link from the choice head: the writer is a resolution step of it"
+    );
+
+    let pump = remember
+        .sub_ability
+        .as_deref()
+        .expect("the pump continuation must move under the writer");
+    assert_eq!(
+        pump.effect.as_ref(),
+        &Effect::PumpAll {
+            power: PtValue::Fixed(-2),
+            toughness: PtValue::Fixed(-2),
+            target: TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::Another])
+                    ),
+                    TargetFilter::Not {
+                        filter: Box::new(TargetFilter::ChosenCard),
+                    },
+                ],
+            },
+        },
+        "the pump must be the population form with the two exclusions composed (CR 607.2d)"
+    );
+    assert_eq!(pump.duration, Some(Duration::UntilEndOfTurn));
+    assert_eq!(
+        pump.sub_link,
+        SubAbilityLink::SequentialSibling,
+        "the pump keeps its own parser-produced link (never re-stamped by the splice)"
+    );
+}
+
+/// Build the `parse_choose_ast` environment for a chunk in a chain: the only
+/// chain fact Gate A reads is `ctx.effect_chain_full_lower`.
+fn choose_ast_in_chain(chunk: &str, chain_lower: &str) -> Option<ChooseImperativeAst> {
+    let lower = chunk.to_ascii_lowercase();
+    let mut ctx = ParseContext {
+        effect_chain_full_lower: Some(chain_lower.to_owned()),
+        ..ParseContext::default()
+    };
+    super::imperative::parse_choose_ast(chunk, &lower, &mut ctx)
+}
+
+/// CR 607.2d + CR 608.2c: Gate A's four ordered conjuncts (`2-C2` + `2-C11`).
+/// Positive: Zenos's own head chunk in Zenos's own chain context. The paired
+/// head-gate controls use the SAME chunk text ("choose a land you control") in a
+/// head-led reader-bearing chain (fires) and in the measured Canoptek Wraith
+/// nested position (declines) — so the head-prefix conjunct is exactly what
+/// separates them. Ticking Mime Bomb's measured chunk+chain and a no-chain
+/// context close the negatives.
+#[test]
+fn gate_a_requires_chain_context_head_and_reader() {
+    use crate::parser::oracle_ir::ast::ChooseImperativeAst;
+
+    let zenos_chain = ZENOS_TRIGGER_ONE_BODY.to_ascii_lowercase();
+    assert_eq!(
+        choose_ast_in_chain("choose a creature an opponent controls", &zenos_chain),
+        Some(ChooseImperativeAst::BattlefieldObject {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::Opponent)
+            ),
+            min: 1,
+            max: Some(1),
+        }),
+        "Gate A must recognize the Zenos head chunk"
+    );
+
+    // Head-gate pair (2-C11): same chunk, head-led vs nested.
+    let land_chunk = "choose a land you control";
+    let head_led_reader_chain = "choose a land you control. then search your library for a basic land card with the same name as the chosen land.";
+    assert!(
+        matches!(
+            choose_ast_in_chain(land_chunk, head_led_reader_chain),
+            Some(ChooseImperativeAst::BattlefieldObject {
+                min: 1,
+                max: Some(1),
+                ..
+            })
+        ),
+        "a head-led reader-bearing chain must fire (positive reach-guard for the head gate)"
+    );
+    let canoptek_chain = "you may pay {3} and sacrifice it. if you do, choose a land you control. then search your library for up to two basic land cards which have the same name as the chosen land, put them onto the battlefield tapped, then shuffle.";
+    assert!(
+        !matches!(
+            choose_ast_in_chain(land_chunk, canoptek_chain),
+            Some(ChooseImperativeAst::BattlefieldObject { .. })
+        ),
+        "Canoptek Wraith's nested choose chunk must decline — Gate B's root-only \
+         reconcile could not see it (measured chain context)"
+    );
+
+    let tmb_chunk = "choose a creature you don't control";
+    let tmb_chain = "without speaking or indicating any specific creature, pantomime to a person outside the game, then they choose a creature you don't control. this creature deals damage equal to twice the number of robots you control to the chosen creature.";
+    assert!(
+        !matches!(
+            choose_ast_in_chain(tmb_chunk, tmb_chain),
+            Some(ChooseImperativeAst::BattlefieldObject { .. })
+        ),
+        "Ticking Mime Bomb's nested choose chunk must decline in its measured chain context"
+    );
+
+    // Positive reach-guard for that nested negative: the SAME chunk, head-led in
+    // a reader-bearing chain, must fire. Without this the negative is vacuous —
+    // a chain-head gate that rejected the chunk outright (rather than at the
+    // nested position) would decline it identically.
+    let tmb_head_led_chain = "choose a creature you don't control. then this creature deals damage equal to twice the number of robots you control to the chosen creature.";
+    let tmb_head_led = choose_ast_in_chain(tmb_chunk, tmb_head_led_chain);
+    let Some(ChooseImperativeAst::BattlefieldObject {
+        filter: TargetFilter::Typed(tf),
+        min: 1,
+        max: Some(1),
+    }) = tmb_head_led
+    else {
+        panic!("the head-led TMB chunk must fire, got {tmb_head_led:?}");
+    };
+    assert_eq!(
+        tf.controller,
+        Some(ControllerRef::Opponent),
+        "the head-led TMB chunk's class must be the opponent-controlled creature"
+    );
+
+    // Fail-closed: the same positive chunk with NO chain context declines (the
+    // permanent control `zenos_bare_parse_effect_choice_stays_target_only`
+    // pins the same fact through the public `parse_effect` seam).
+    let mut bare_ctx = ParseContext::default();
+    assert!(
+        !matches!(
+            super::imperative::parse_choose_ast(
+                "choose a creature an opponent controls",
+                "choose a creature an opponent controls",
+                &mut bare_ctx,
+            ),
+            Some(ChooseImperativeAst::BattlefieldObject { .. })
+        ),
+        "without chain context Gate A must decline (fail-closed)"
+    );
+}
+
+/// CR 115.10 + CR 607.2d + CR 608.2c: the "another " quantifier scopes the
+/// chosen class to exclude the source. The core consumes "another " as a bare
+/// count of 1, so the exclusion is re-applied to the parsed filter through the
+/// same recursive helper the sacrifice grammar uses. Plain "a "/"an " stay a
+/// bare count of 1. The composite axis matters because the class predicate
+/// admits `Or` of typed legs — "another " must reach every leg, not just a lone
+/// `Typed`.
+#[test]
+fn battlefield_object_choice_another_scopes_out_the_source() {
+    use crate::parser::oracle_ir::ast::ChooseImperativeAst;
+
+    const ANOTHER_CHAIN: &str = "Choose another creature you control. Until end of turn, \
+         creatures other than ~ and the chosen creature get -2/-2.";
+    const ANOTHER_COMPOSITE_CHAIN: &str =
+        "Choose another creature or planeswalker you control. Until end of turn, \
+         creatures other than ~ and the chosen creature get -2/-2.";
+    const PLAIN_CHAIN: &str = "Choose a creature you control. Until end of turn, \
+         creatures other than ~ and the chosen creature get -2/-2.";
+    const AN_PLAIN_CHAIN: &str = "Choose an artifact you control. Until end of turn, \
+         creatures other than ~ and the chosen artifact get -2/-2.";
+
+    let with_another = TargetFilter::Typed(
+        TypedFilter::creature()
+            .controller(ControllerRef::You)
+            .properties(vec![FilterProp::Another]),
+    );
+    let with_another_composite = TargetFilter::Or {
+        filters: vec![
+            TargetFilter::Typed(
+                TypedFilter::creature()
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::Another]),
+            ),
+            TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Planeswalker)
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::Another]),
+            ),
+        ],
+    };
+    let plain = TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+    let plain_an =
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact).controller(ControllerRef::You));
+
+    // AST-level: the shared core is exactly where the quantifier word is
+    // consumed, so pin every side of the article axis there.
+    assert_eq!(
+        choose_ast_in_chain(
+            "choose another creature you control",
+            &ANOTHER_CHAIN.to_ascii_lowercase()
+        ),
+        Some(ChooseImperativeAst::BattlefieldObject {
+            filter: with_another.clone(),
+            min: 1,
+            max: Some(1),
+        }),
+        "\"choose another …\" must carry FilterProp::Another"
+    );
+    assert_eq!(
+        choose_ast_in_chain(
+            "choose another creature or planeswalker you control",
+            &ANOTHER_COMPOSITE_CHAIN.to_ascii_lowercase()
+        ),
+        Some(ChooseImperativeAst::BattlefieldObject {
+            filter: with_another_composite.clone(),
+            min: 1,
+            max: Some(1),
+        }),
+        "\"choose another …\" must reach EVERY typed leg of a composite class"
+    );
+    assert_eq!(
+        choose_ast_in_chain(
+            "choose a creature you control",
+            &PLAIN_CHAIN.to_ascii_lowercase()
+        ),
+        Some(ChooseImperativeAst::BattlefieldObject {
+            filter: plain.clone(),
+            min: 1,
+            max: Some(1),
+        }),
+        "\"choose a …\" must stay a bare count of 1 with no source exclusion"
+    );
+    assert_eq!(
+        choose_ast_in_chain(
+            "choose an artifact you control",
+            &AN_PLAIN_CHAIN.to_ascii_lowercase()
+        ),
+        Some(ChooseImperativeAst::BattlefieldObject {
+            filter: plain_an,
+            min: 1,
+            max: Some(1),
+        }),
+        "\"choose an …\" must stay a bare count of 1 with no source exclusion"
+    );
+
+    // Lowered: the same facts must survive the tracked-set choice head.
+    let def = parse_effect_chain(ANOTHER_CHAIN, AbilityKind::Spell);
+    let Effect::ChooseObjectsIntoTrackedSet {
+        chooser,
+        filter,
+        min,
+        max,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("the Gate-A-eligible chain must lower to the tracked-set choice, got {def:#?}");
+    };
+    assert_eq!(chooser, &TargetFilter::Controller);
+    assert_eq!((*min, *max), (1, Some(1)));
+    assert_eq!(
+        filter, &with_another,
+        "the lowered choice must exclude the source"
+    );
+
+    let composite_def = parse_effect_chain(ANOTHER_COMPOSITE_CHAIN, AbilityKind::Spell);
+    let Effect::ChooseObjectsIntoTrackedSet { filter, .. } = composite_def.effect.as_ref() else {
+        panic!(
+            "the composite Gate-A-eligible chain must lower to the tracked-set choice, got \
+             {composite_def:#?}"
+        );
+    };
+    assert_eq!(
+        filter, &with_another_composite,
+        "the lowered composite choice must exclude the source on every leg"
+    );
+
+    let plain_def = parse_effect_chain(PLAIN_CHAIN, AbilityKind::Spell);
+    let Effect::ChooseObjectsIntoTrackedSet { filter, .. } = plain_def.effect.as_ref() else {
+        panic!(
+            "the plain-article control must lower to the tracked-set choice, got {plain_def:#?}"
+        );
+    };
+    assert_eq!(
+        filter, &plain,
+        "the positive control must NOT carry FilterProp::Another"
+    );
+}
+
+/// CR 115.1 + CR 110.1: the class predicate is conservative on every axis it
+/// claims — typal, battlefield-only zones, absolute controller, no `Card` type
+/// (a card is never a battlefield permanent). Building-block test over the
+/// predicate's full input matrix, not one card's phrase.
+#[test]
+fn battlefield_object_class_predicate_rejects_every_off_class_axis() {
+    use super::imperative::is_battlefield_object_class_filter;
+
+    assert!(is_battlefield_object_class_filter(&TargetFilter::Typed(
+        TypedFilter::creature()
+    )));
+    assert!(is_battlefield_object_class_filter(&TargetFilter::Typed(
+        TypedFilter::creature().controller(ControllerRef::You)
+    )));
+    assert!(is_battlefield_object_class_filter(&TargetFilter::Or {
+        filters: vec![
+            TargetFilter::Typed(TypedFilter::creature()),
+            TargetFilter::Typed(TypedFilter::new(
+                crate::types::ability::TypeFilter::Planeswalker
+            )),
+        ],
+    }));
+
+    assert!(
+        !is_battlefield_object_class_filter(&TargetFilter::Typed(TypedFilter::default())),
+        "an empty type list names no class"
+    );
+    assert!(
+        !is_battlefield_object_class_filter(&TargetFilter::Typed(TypedFilter::new(
+            crate::types::ability::TypeFilter::Card
+        ))),
+        "CR 110.1: a card denotes a zone object, never a battlefield permanent"
+    );
+    assert!(
+        !is_battlefield_object_class_filter(&TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::InZone {
+                zone: Zone::Graveyard
+            }])
+        )),
+        "an explicit non-battlefield zone declines"
+    );
+    assert!(
+        !is_battlefield_object_class_filter(&TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::TargetPlayer)
+        )),
+        "a relative/context controller belongs to a different grammar"
+    );
+    assert!(!is_battlefield_object_class_filter(&TargetFilter::Any));
+    assert!(!is_battlefield_object_class_filter(
+        &TargetFilter::ParentTarget
+    ));
+    assert!(!is_battlefield_object_class_filter(&TargetFilter::Not {
+        filter: Box::new(TargetFilter::ChosenCard),
+    }));
+}
+
+/// CR 608.2c + CR 607.2d + CR 609.3: the multi-item exclusion subject composes
+/// exactly the new class, and every form the existing single-referent path
+/// already consumes keeps its existing composition (`2-C5` + `2-C10` + hostile
+/// siblings).
+#[test]
+fn exclusion_list_subject_composes_only_the_new_class() {
+    use super::lower::filter_tree_has_chosen_card;
+    use super::subject::parse_subject_application;
+
+    let parse = |subject: &str| {
+        parse_subject_application(subject, &mut ParseContext::default())
+            .unwrap_or_else(|| panic!("subject must parse: {subject}"))
+    };
+
+    assert_eq!(
+        parse("creatures other than ~ and the chosen creature").affected,
+        TargetFilter::And {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Another])),
+                TargetFilter::Not {
+                    filter: Box::new(TargetFilter::ChosenCard),
+                },
+            ],
+        },
+        "the measured Zenos subject must compose Another + Not{{ChosenCard}}"
+    );
+
+    assert_eq!(
+        parse("creatures other than ~").affected,
+        TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Another])),
+        "the existing single-referent path (parse_other_than_exclusion) keeps charge"
+    );
+
+    assert_eq!(
+        parse("creatures other than enchanted creature").affected,
+        TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Not {
+            prop: Box::new(FilterProp::EnchantedBy),
+        }])),
+        "the existing enchanted-creature composition is not hijacked by the new arm"
+    );
+
+    assert_eq!(
+        parse("each creature you control other than the chosen creature").affected,
+        TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+        "Loki's 'each …' base is out of scope and keeps its existing shape (S3)"
+    );
+
+    // Hostile: a list item that is neither a self-reference nor a chosen-object
+    // reader is refused whole, so the existing path (or honest fallback) runs.
+    let hostile = parse_subject_application(
+        "creatures other than those that attacked this turn",
+        &mut ParseContext::default(),
+    );
+    assert!(
+        hostile.is_none_or(|application| !filter_tree_has_chosen_card(&application.affected)),
+        "an unparseable list must never compose a ChosenCard exclusion"
+    );
+
+    // A filter carrier with no reader stays out of the walk.
+    assert!(!filter_tree_has_chosen_card(&TargetFilter::Typed(
+        TypedFilter::creature()
+    )));
+}
+
+/// CR 607.2d + CR 611.2a/c: the standalone pump chunk of the class lowers to the
+/// population form with the composite exclusion (the measured `2-C5` claim on
+/// the production clause path, independent of the choice head).
+#[test]
+fn pump_all_excludes_source_and_chosen_object() {
+    let def = parse_effect_chain(
+        "Until end of turn, creatures other than ~ and the chosen creature get -2/-2.",
+        AbilityKind::Spell,
+    );
+    assert_eq!(
+        def.effect.as_ref(),
+        &Effect::PumpAll {
+            power: PtValue::Fixed(-2),
+            toughness: PtValue::Fixed(-2),
+            target: TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::Another])
+                    ),
+                    TargetFilter::Not {
+                        filter: Box::new(TargetFilter::ChosenCard),
+                    },
+                ],
+            },
+        }
+    );
+    assert_eq!(def.duration, Some(Duration::UntilEndOfTurn));
+}
+
+/// CR 607.2d + CR 611.2a/c: a composite base ("creatures and planeswalkers")
+/// must carry the source exclusion on EVERY typed leg. The lone-`Typed`
+/// composition decorates the whole `Or`, which leaves the source legal on both
+/// type axes; the recursion-aware helper must reach each leg. Companion to
+/// `pump_all_excludes_source_and_chosen_object` (lone-`Typed` base).
+#[test]
+fn pump_all_composite_exclusion_reaches_every_typed_leg() {
+    let def = parse_effect_chain(
+        "Until end of turn, creatures and planeswalkers other than ~ and the chosen creature get -2/-2.",
+        AbilityKind::Spell,
+    );
+    let Effect::PumpAll {
+        target: TargetFilter::And { filters },
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected composite PumpAll, got {:?}", def.effect);
+    };
+    assert_eq!(
+        filters,
+        &vec![
+            TargetFilter::Or {
+                filters: vec![
+                    TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::Another])
+                    ),
+                    TargetFilter::Typed(
+                        TypedFilter::new(TypeFilter::Planeswalker)
+                            .properties(vec![FilterProp::Another])
+                    ),
+                ],
+            },
+            TargetFilter::Not {
+                filter: Box::new(TargetFilter::ChosenCard),
+            },
+        ],
+        "every typed leg of the composite base must exclude the source, and the \
+         chosen-object reader must be appended"
+    );
+    assert_eq!(def.duration, Some(Duration::UntilEndOfTurn));
+}
+
+/// N5 (`2-C10`): the reader must never leak into `parse_target` — "the chosen
+/// creature" on the TARGET channel keeps its `ParentTarget` anaphor reading
+/// (Celestial Regulator / Duel for Dominance class).
+#[test]
+fn chosen_object_reader_never_touches_parse_target() {
+    let (filter, rest) = parse_target("the chosen creature");
+    assert_eq!(filter, TargetFilter::ParentTarget);
+    assert_eq!(rest, "");
+
+    let (filter, rest) = parse_target("the last chosen card");
+    assert_eq!(filter, TargetFilter::ParentTarget);
+    assert_eq!(rest, "");
+}
+
+/// CR 115.1 + CR 608.2c + CR 608.2d + CR 614.1a + CR 614.9: Gate B restores Gideon's Sacrifice
+/// byte-for-byte (`2-C3`): the head-shape detector and the reader TEXT both
+/// match ("the chosen permanent"), but the assembled tree's reader is
+/// `DamageRedirectTarget::ChosenTarget` — not the remembered-object reader — so
+/// the choice must be restored to the pre-phase-2 `TargetOnly` shape with no
+/// writer spliced. The corpus snapshot gate pins the serialized bytes.
+#[test]
+fn gideon_sacrifice_restores_target_only_and_never_remembers() {
+    use crate::types::ability::{DamageRedirectTarget, RedirectionLifetime};
+
+    let parsed = parse_oracle_text(
+        "Choose a creature or planeswalker you control. All damage that would be dealt this turn to you and permanents you control is dealt to the chosen permanent instead (if it's still on the battlefield).",
+        "Gideon's Sacrifice",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    let def = parsed
+        .abilities
+        .iter()
+        .find(|ability| matches!(ability.effect.as_ref(), Effect::TargetOnly { .. }))
+        .unwrap_or_else(|| {
+            panic!(
+                "Gideon's spell ability must be restored to the TargetOnly head, got {:#?}",
+                parsed.abilities
+            )
+        });
+
+    let Effect::TargetOnly {
+        target: TargetFilter::Or { filters },
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "Gideon's head must be restored to TargetOnly{{Or}}, got {:#?}",
+            def
+        );
+    };
+    assert_eq!(
+        filters,
+        &vec![
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            TargetFilter::Typed(
+                TypedFilter::new(crate::types::ability::TypeFilter::Planeswalker)
+                    .controller(ControllerRef::You)
+            ),
+        ]
+    );
+
+    let redirect = def.sub_ability.as_deref().expect("redirect continuation");
+    assert!(
+        matches!(
+            redirect.effect.as_ref(),
+            Effect::CreateDamageReplacement {
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                ..
+            }
+        ),
+        "Gideon's sub must keep its ChosenTarget redirect axis, got {:?}",
+        redirect.effect
+    );
+
+    // Negative: no writer and no choice node anywhere in the tree.
+    let mut cursor = Some(def);
+    while let Some(node) = cursor {
+        assert!(
+            !matches!(
+                node.effect.as_ref(),
+                Effect::ChooseObjectsIntoTrackedSet { .. } | Effect::RememberCard { .. }
+            ),
+            "the restore arm must leave no choice/writer node: {:?}",
+            node.effect
+        );
+        cursor = node.sub_ability.as_deref();
+    }
+}
+
+/// F8 (`2-C3`): the root `ChooseObjectsIntoTrackedSet` family with NO
+/// chosen-object reader text in its chain must be untouched by the reconcile —
+/// otherwise the chain reader-text conjunct is missing and the
+/// choose-up-to-destroy-rest class (Duneblast, Mount Doom) and the
+/// converted-head Saga chapter (The Day of the Doctor) get downgraded.
+#[test]
+fn choose_up_to_family_is_never_downgraded() {
+    for (text, max) in [
+        ("Choose up to one creature. Destroy the rest.", 1u32),
+        ("Choose up to two creatures, then destroy the rest.", 2),
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::ChooseObjectsIntoTrackedSet {
+            max: got_max,
+            filter,
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!(
+                "F8: `{text}` root must stay ChooseObjectsIntoTrackedSet, got {:#?}",
+                def
+            );
+        };
+        assert_eq!(*got_max, Some(max));
+        assert_eq!(
+            filter,
+            &TargetFilter::Typed(TypedFilter::creature()),
+            "the choose-up-to filter must be untouched"
+        );
+        assert!(
+            !def.sub_ability
+                .as_deref()
+                .is_some_and(|sub| matches!(sub.effect.as_ref(), Effect::RememberCard { .. })),
+            "no writer may be spliced without a reader: {text}"
+        );
+    }
+
+    // The Day of the Doctor IV: the converted-Unimplemented producer path
+    // (`maybe_convert_choose_head_into_tracked_set`), whose head fragment
+    // ("choose up to three doctors") passes the head-shape detector.
+    let dotd = parse_effect_chain(
+        "Choose up to three Doctors. You may exile all other creatures. If you do, this Saga deals 13 damage to you.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(
+            dotd.effect.as_ref(),
+            Effect::ChooseObjectsIntoTrackedSet { .. }
+        ),
+        "F8: The Day of the Doctor's converted head must stay a tracked-set choice, got {:#?}",
+        dotd
+    );
+}
+
+/// `2-C6` (F2): the reader tree walk must find a reader carried by the
+/// population family, whose filters `Effect::target_filter()` deliberately does
+/// not surface — `PumpAll` is the Zenos witness. Removing the explicit
+/// `PumpAll` arm makes the first assertion fail (revert probe).
+#[test]
+fn chain_reader_walk_finds_population_family_readers() {
+    use super::lower::chain_references_chosen_card;
+
+    let pump_all_with_reader = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PumpAll {
+            power: PtValue::Fixed(-2),
+            toughness: PtValue::Fixed(-2),
+            target: TargetFilter::Not {
+                filter: Box::new(TargetFilter::ChosenCard),
+            },
+        },
+    );
+    assert!(
+        chain_references_chosen_card(&pump_all_with_reader),
+        "PumpAll is the witness variant target_filter() does not surface"
+    );
+
+    let pump_all_plain = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PumpAll {
+            power: PtValue::Fixed(-2),
+            toughness: PtValue::Fixed(-2),
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        },
+    );
+    assert!(!chain_references_chosen_card(&pump_all_plain));
+
+    // A reader behind a within-clause sub chain counts; a `ChosenTarget`
+    // redirect axis does not (it is a different CR 607.2d reader shape).
+    let head = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        },
+    )
+    .sub_ability(pump_all_with_reader.clone());
+    assert!(chain_references_chosen_card(&head));
+
+    let chosen_target_only = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::CreateDamageReplacement {
+            source_filter: None,
+            combat_scope: None,
+            target_filter: None,
+            modification: None,
+            redirect_to: Some(crate::types::ability::DamageRedirectTarget::ChosenTarget),
+            redirect_amount: None,
+            redirect_object_filter: None,
+            recipient_object_filter: None,
+            redirect_lifetime: Default::default(),
+        },
+    );
+    assert!(
+        !chain_references_chosen_card(&chosen_target_only),
+        "a ChosenTarget redirect is not the remembered-object reader"
+    );
+}
+
+/// `2-C6`: the durability appender splices the writer only for a choice head
+/// with a continuation; a headless choice or a non-choice head is untouched.
+#[test]
+fn object_choice_appender_requires_a_choice_head_and_a_continuation() {
+    use super::lower::ensure_remember_card_after_object_choice;
+
+    let pump = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PumpAll {
+            power: PtValue::Fixed(-2),
+            toughness: PtValue::Fixed(-2),
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        },
+    );
+
+    let mut head_with_continuation = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChooseObjectsIntoTrackedSet {
+            chooser: TargetFilter::Controller,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            min: 1,
+            max: Some(1),
+            cardinality: None,
+            eligibility: None,
+        },
+    )
+    .sub_ability(pump.clone());
+    ensure_remember_card_after_object_choice(&mut head_with_continuation);
+    assert!(matches!(
+        head_with_continuation
+            .sub_ability
+            .as_deref()
+            .map(|node| node.effect.as_ref()),
+        Some(Effect::RememberCard { .. })
+    ));
+
+    let mut head_without_continuation = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChooseObjectsIntoTrackedSet {
+            chooser: TargetFilter::Controller,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            min: 1,
+            max: Some(1),
+            cardinality: None,
+            eligibility: None,
+        },
+    );
+    ensure_remember_card_after_object_choice(&mut head_without_continuation);
+    assert!(
+        head_without_continuation.sub_ability.is_none(),
+        "a choice with no consumer must not gain a writer"
+    );
+
+    let mut non_choice_head = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::TargetOnly {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        },
+    )
+    .sub_ability(pump);
+    ensure_remember_card_after_object_choice(&mut non_choice_head);
+    assert!(
+        matches!(
+            non_choice_head
+                .sub_ability
+                .as_deref()
+                .map(|node| node.effect.as_ref()),
+            Some(Effect::PumpAll { .. })
+        ),
+        "a non-choice head keeps its continuation unchanged"
+    );
+}
+
+/// Step 0 PERMANENT fail-closed control (`2-C1` + `F4`): a bare
+/// `parse_effect` call has no chain context (`ctx.effect_chain_full_lower ==
+/// None`), so Gate A must DECLINE and the clause stays `TargetOnly`. This
+/// control is NEVER updated: it fails if Gate A ever fires without chain
+/// context, which would turn every standalone "choose a <type>" clause in the
+/// corpus into a resolution-time object choice.
+#[test]
+fn zenos_bare_parse_effect_choice_stays_target_only() {
+    let effect = parse_effect("choose a creature an opponent controls");
+    assert!(
+        matches!(
+            effect,
+            Effect::TargetOnly {
+                target: TargetFilter::Typed(ref tf)
+            } if tf.type_filters == vec![crate::types::ability::TypeFilter::Creature]
+                && tf.controller == Some(crate::types::ability::ControllerRef::Opponent)
+        ),
+        "no chain context ⇒ Gate A must decline (fail-closed); got {effect:?}"
+    );
 }

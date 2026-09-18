@@ -1581,6 +1581,22 @@ pub(crate) enum ChooseImperativeAst {
         domain: CounterKindDomain,
         chooser: CounterKindChooser,
     },
+    /// CR 115.1 + CR 608.2d: A standalone, NON-target battlefield-object choice
+    /// ("choose a creature an opponent controls"). The chooser is the ability's
+    /// controller; the pick is made while the effect resolves (CR 608.2d), not
+    /// as a declared target. Parser IR only — it lowers onto the existing
+    /// `Effect::ChooseObjectsIntoTrackedSet`, which publishes the pick into the
+    /// resolution chain's tracked set so a linked "the chosen ‹object›" reader
+    /// (CR 607.2d) can consume it.
+    ///
+    /// `min`/`max` carry the printed quantifier ("a"/"an"/"another" → `(1, Some(1))`,
+    /// "up to N" → `(0, Some(N))` with a dynamic N collapsing to `None`,
+    /// "any number of" → `(0, None)`).
+    BattlefieldObject {
+        filter: TargetFilter,
+        min: u32,
+        max: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

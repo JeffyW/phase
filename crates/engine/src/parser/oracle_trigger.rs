@@ -36,6 +36,7 @@ use super::oracle_nom::filter::{
 use super::oracle_nom::primitives::{
     self as nom_primitives, scan_contains, scan_preceded, scan_split_at_phrase,
 };
+use super::oracle_nom::target::parse_chosen_object_reference;
 use super::oracle_nom::target::parse_type_phrase as parse_type_phrase_nom;
 use super::oracle_static::{parse_commander_subject_filter_prefix, typed_filter_for_subtype};
 use super::oracle_target::{
@@ -11717,6 +11718,18 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
         if noun_end > 0 {
             return (TargetFilter::ParentTarget, rest[noun_end..].trim_start());
         }
+    }
+
+    // CR 607.2d + CR 603.6c + CR 603.10a: "the chosen <object noun>" names the
+    // object a LINKED choice recorded (CR 607.2d: "the chosen [value]" refers
+    // only to the choice made by the linked ability). The engine carries that
+    // object on the source as `ChosenAttribute::Card`, read by
+    // `TargetFilter::ChosenCard`; a leaves-the-battlefield trigger on it looks
+    // back in time (CR 603.10a). Object-axis only: the player/color/label
+    // choice axes have their own readers and are refused by the atom's noun
+    // set + boundary peek.
+    if let Ok((rest, filter)) = parse_chosen_object_reference(text) {
+        return (filter, rest.trim_start());
     }
 
     // Parser heuristic (no CR citation — this is Oracle-text interpretation, not a

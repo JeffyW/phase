@@ -30531,3 +30531,47 @@ fn unless_pay_survives_the_choose_one_of_branch_lift() {
         "the branch definition's modifier must reach the ResolvedAbility the runtime reads"
     );
 }
+
+// ─── Zenos yae Galvus phase-2 trigger test (2-C4) ─────────────────────────────
+
+/// CR 607.2d + CR 603.6c + CR 603.10a: POST-CHANGE control (`2-C4`). The Step 0
+/// baseline (`zenos_leaves_trigger_baseline_before_phase2`, captured failing
+/// before this update) pinned the measured base `TriggerMode::Unknown` /
+/// `valid_card: None`; after the U3 arm the subject is the remembered-object
+/// reader and the event lowers to a leaves-the-battlefield trigger, with the
+/// source required on the battlefield (`trigger_zones == [Battlefield]`) and the
+/// body still transforming the source.
+#[test]
+fn zenos_leaves_trigger_targets_the_chosen_creature() {
+    let def = crate::parser::oracle_trigger::parse_trigger_line(
+        "When the chosen creature leaves the battlefield, transform ~.",
+        "Zenos yae Galvus",
+    );
+    assert_eq!(
+        def.mode,
+        TriggerMode::LeavesBattlefield,
+        "the chosen-object subject must route to the LTB event"
+    );
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::ChosenCard),
+        "the subject must be the CR 607.2d remembered-object reader"
+    );
+    assert_eq!(
+        def.trigger_zones,
+        vec![crate::types::zones::Zone::Battlefield],
+        "the chosen-object LTB subject must stay battlefield-active"
+    );
+    let execute = def.execute.as_deref().expect("transform execute ability");
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::Transform {
+                target: TargetFilter::SelfRef,
+                ..
+            }
+        ),
+        "the trigger body must keep transforming the source, got {:?}",
+        execute.effect
+    );
+}

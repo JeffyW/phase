@@ -32,7 +32,9 @@ use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::error::OracleResult;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
-use super::super::oracle_nom::target::{parse_event_context_ref, parse_supertype_word};
+use super::super::oracle_nom::target::{
+    parse_event_context_ref, parse_object_exclusion_list, parse_supertype_word, ObjectExclusion,
+};
 use super::super::oracle_quantity;
 use super::super::oracle_static::{
     classify_block_exception, parse_additive_type_clause_modifications,
@@ -2885,6 +2887,17 @@ fn parse_subject_application_for(
         return subject_filter_application(TargetFilter::ParentTarget, false);
     }
 
+    // CR 608.2c + CR 607.2d: "creatures other than ~ and the chosen creature" —
+    // a bare-plural population subject carrying a multi-item exclusion list.
+    // Must precede the bare-plural arm below (which would consume "creatures"
+    // and silently drop the exclusions) while declining every form that arm or
+    // `parse_other_than_exclusion` already consumes: the list must parse whole
+    // (all_consuming) and contain at least one chosen-object item, and the base
+    // must be an unquantified bare plural.
+    if let Some(application) = try_parse_exclusion_list_subject(lower.as_str(), ctx) {
+        return Some(application);
+    }
+
     // Bare plural noun phrase subjects ("creatures you control", "other creatures you control")
     // are implicit "all X" forms — strip any "other " prefix and route through parse_target.
     let (had_other, noun_subject) =
@@ -4071,6 +4084,82 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
             .unwrap_or(TargetFilter::TriggeringSource),
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
+    }
+}
+
+/// CR 608.2c + CR 607.2d: Subject form "‹bare plural base› other than ‹ref›
+/// [and ‹ref›]" — a population subject whose exclusion list names the ability
+/// source ("~") and/or the remembered chosen object ("the chosen creature").
+///
+/// Recognition only; composition is [`apply_object_exclusions`]. Deliberately
+/// declines every form the existing single-referent `parse_other_than_exclusion`
+/// path already consumes (P1–P7: "other than ~", "other than enchanted
+/// creature") and the target/all/each bases with their own grammar (Loki's
+/// "each creature you control other than the chosen creature" keeps its
+/// existing path), because the list `all_consuming` parse refuses any item that
+/// is not a self-reference or a chosen-object reader.
+fn try_parse_exclusion_list_subject(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<SubjectApplication> {
+    let (_, (base, list)) = nom_primitives::split_once_on(lower, " other than ").ok()?;
+    let base = base.trim_end();
+    if base.is_empty() || list.trim().is_empty() {
+        return None;
+    }
+    // Scope gate mirroring the bare-plural arm below: "target "/"all "/"each "
+    // subjects are handled by their own grammar, never silently re-scoped here.
+    if alt((
+        tag::<_, _, OracleError<'_>>("target "),
+        tag("all "),
+        tag("each "),
+    ))
+    .parse(base)
+    .is_ok()
+    {
+        return None;
+    }
+    let (_, exclusions) = parse_object_exclusion_list(list.trim()).ok()?;
+    if !exclusions.contains(&ObjectExclusion::ChosenObject) {
+        return None;
+    }
+    // The base is a bare plural ("creatures") — normalize to its implicit
+    // "all ‹base›" form, exactly as the bare-plural arm below does, and thread
+    // `ctx` for the same controller-suffix reason (a "that player controls"
+    // relative suffix must bind the enclosing scope, not default to `You`).
+    let normalized = format!("all {base}");
+    let (filter, rest) = parse_target_with_ctx(&normalized, ctx);
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    subject_filter_application(apply_object_exclusions(filter, &exclusions), false)
+}
+
+/// CR 608.2c + CR 607.2d: Compose an "other than ‹ref› [and ‹ref›]" exclusion
+/// list onto the base population filter. The source item reuses the shared
+/// `FilterProp::Another` composition — the recursion-aware
+/// `imperative::add_another_to_filter_recursive`, so every typed leg of a
+/// composite base ("creatures and planeswalkers") excludes the source; the
+/// chosen object is `Not { ChosenCard }` — the shared CR 607.2d
+/// remembered-object reader.
+fn apply_object_exclusions(
+    mut filter: TargetFilter,
+    exclusions: &[ObjectExclusion],
+) -> TargetFilter {
+    if exclusions.contains(&ObjectExclusion::Source) {
+        imperative::add_another_to_filter_recursive(&mut filter);
+    }
+    if exclusions.contains(&ObjectExclusion::ChosenObject) {
+        TargetFilter::And {
+            filters: vec![
+                filter,
+                TargetFilter::Not {
+                    filter: Box::new(TargetFilter::ChosenCard),
+                },
+            ],
+        }
+    } else {
+        filter
     }
 }
 
@@ -7480,7 +7569,12 @@ pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
     None
 }
 
-/// Add `FilterProp::Another` to a target filter, ensuring the source is excluded.
+/// Add `FilterProp::Another` to a lone `Typed` target filter, ensuring the
+/// source is excluded.
+///
+/// Composite (`Or`/`And`) classes use the recursion-aware
+/// `imperative::add_another_to_filter_recursive` instead — this helper is the
+/// single-`Typed` form consumed by the subject-composition paths below.
 fn add_another_property(filter: TargetFilter) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut tf) => {

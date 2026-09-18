@@ -17682,151 +17682,107 @@ fn is_ownership_candidate(reading: GuardReading, effect: &Effect) -> bool {
         && crate::game::effects::cast_from_zone::graveyard_destination_rider(effect).is_some()
 }
 
+fn refine_put_at_library_position(
+    clause: &mut ParsedEffectClause,
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<MultiTargetSpec> {
+    // "put [N] [type] on top/bottom of library" — the imperative parser
+    // returns PutAtLibraryPosition { target: Any, count: Fixed(1) }
+    // because it dispatches on the positional suffix without extracting
+    // the noun phrase. This patch re-inspects the imperative text and
+    // assigns both the target filter and the cardinality. Covers:
+    //   - "put target X on top of Y's library"           (count = 1)
+    //   - "put target X on the bottom of Y's library"    (count = 1)
+    //   - "put target X into Y's library Nth from top"   (count = 1)
+    //   - "put two cards from your hand on top of your library in any order"
+    //     (Cavalier of Gales / Brainstorm class — count = N, filter = Card+InZone:Hand)
+    let mut placement_target_set = None;
+    if let Effect::PutAtLibraryPosition {
+        ref mut target,
+        ref mut count,
+        ..
+    } = clause.effect
+    {
+        if parse_exiled_cards_not_cast_cleanup(&text.to_lowercase()).is_some() {
+            *target = TargetFilter::ExiledBySource;
+            *count = QuantityExpr::Fixed { value: 0 };
+            return placement_target_set;
+        }
+        let lower_put = text.to_lowercase();
+        if matches!(*target, TargetFilter::Any | TargetFilter::ParentTarget)
+            && (nom_primitives::scan_contains(&lower_put, "put them on top")
+                || nom_primitives::scan_contains(&lower_put, "put the exiled cards on top")
+                || nom_primitives::scan_contains(&lower_put, "cards exiled this way"))
+        {
+            *target = TargetFilter::ExiledBySource;
+            if matches!(*count, QuantityExpr::Fixed { value: 1 }) {
+                *count = QuantityExpr::Ref {
+                    qty: QuantityRef::CardsExiledBySource,
+                };
+            }
+        }
+        let extracted = (|| -> Option<(Option<TargetFilter>, LibraryPlacementCardinality)> {
+            let lower = text.to_lowercase();
+            let (after_put, _) = tag::<_, _, OracleError<'_>>("put ")
+                .parse(lower.as_str())
+                .ok()?;
+            // Isolate the noun phrase before the first positional terminator.
+            let (_, before) = alt((
+                take_until::<_, _, OracleError<'_>>(" on top of"),
+                take_until(" on the bottom of"),
+                take_until(" into "),
+            ))
+            .parse(after_put)
+            .ok()?;
+            let (cardinality, after_count) = peel_library_placement_cardinality(before);
+            // CR 608.2k: thread the real trigger context so a bare object
+            // pronoun ("put it on the bottom …") binds to the trigger's
+            // `object_pronoun_ref` (the cast spell for spell-cast triggers)
+            // rather than defaulting to `ParentTarget`. `parse_target`
+            // spins up a fresh empty context, which loses that antecedent.
+            let (filter, _) = parse_target_with_ctx(after_count, ctx);
+            let new_target = if matches!(filter, TargetFilter::Any) {
+                None
+            } else {
+                Some(filter)
+            };
+            Some((new_target, cardinality))
+        })();
+        if let Some((maybe_filter, cardinality)) = extracted {
+            if *target == TargetFilter::Any {
+                if let Some(filter) = maybe_filter {
+                    *target = filter;
+                }
+            }
+            match cardinality {
+                LibraryPlacementCardinality::Unstated => {}
+                LibraryPlacementCardinality::Exact(count_expr) => *count = count_expr,
+                // CR 601.2c + CR 115.1: the announced targets, rather than the
+                // effect's default count, define a targeted placement's size.
+                LibraryPlacementCardinality::TargetSet(spec) => placement_target_set = Some(spec),
+                // CR 107.1c + CR 115.10a + CR 608.2d: untargeted "any number"
+                // selects zero through every card in the named population on resolution.
+                LibraryPlacementCardinality::AnyNumber => {
+                    if target.names_enumerable_population() {
+                        *count = QuantityExpr::up_to(QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount {
+                                filter: target.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+    placement_target_set
+}
+
 fn lower_clause_ast(ast: ClauseAst, ctx: &mut ParseContext) -> ParsedEffectClause {
     match ast {
         ClauseAst::Imperative { text } => {
             let mut clause = lower_imperative_clause(&text, ctx);
-            // "put [N] [type] on top/bottom of library" — the imperative parser
-            // returns PutAtLibraryPosition { target: Any, count: Fixed(1) }
-            // because it dispatches on the positional suffix without extracting
-            // the noun phrase. This patch re-inspects the imperative text and
-            // assigns both the target filter and the cardinality. Covers:
-            //   - "put target X on top of Y's library"           (count = 1)
-            //   - "put target X on the bottom of Y's library"    (count = 1)
-            //   - "put target X into Y's library Nth from top"   (count = 1)
-            //   - "put two cards from your hand on top of your library in any order"
-            //     (Cavalier of Gales / Brainstorm class — count = N, filter = Card+InZone:Hand)
-            // CR 115.1: an announced target set is a CLAUSE-level property, so it
-            // is carried out of the effect-shaped block below and attached after it.
-            let mut placement_target_set: Option<MultiTargetSpec> = None;
-            if let Effect::PutAtLibraryPosition {
-                ref mut target,
-                ref mut count,
-                ..
-            } = clause.effect
-            {
-                if parse_exiled_cards_not_cast_cleanup(&text.to_lowercase()).is_some() {
-                    *target = TargetFilter::ExiledBySource;
-                    *count = QuantityExpr::Fixed { value: 0 };
-                    return clause;
-                }
-                let lower_put = text.to_lowercase();
-                if matches!(*target, TargetFilter::Any | TargetFilter::ParentTarget)
-                    && (nom_primitives::scan_contains(&lower_put, "put them on top")
-                        || nom_primitives::scan_contains(&lower_put, "put the exiled cards on top")
-                        || nom_primitives::scan_contains(&lower_put, "cards exiled this way"))
-                {
-                    *target = TargetFilter::ExiledBySource;
-                    if matches!(*count, QuantityExpr::Fixed { value: 1 }) {
-                        *count = QuantityExpr::Ref {
-                            qty: QuantityRef::CardsExiledBySource,
-                        };
-                    }
-                }
-                let extracted =
-                    (|| -> Option<(Option<TargetFilter>, LibraryPlacementCardinality)> {
-                        let lower = text.to_lowercase();
-                        let (after_put, _) = tag::<_, _, OracleError<'_>>("put ")
-                            .parse(lower.as_str())
-                            .ok()?;
-                        // Isolate the noun phrase before the first positional terminator.
-                        let before = [" on top of", " on the bottom of", " into "]
-                            .iter()
-                            .find_map(|term| {
-                                take_until::<_, _, OracleError<'_>>(*term)
-                                    .parse(after_put)
-                                    .ok()
-                                    .map(|(_, before)| before)
-                            })?;
-                        // Peel the leading cardinality. Recognized forms:
-                        //   - "two cards ..."            → Exact(Fixed(2))
-                        //   - "x cards ..."              → Exact(Variable("X"))
-                        //   - "any number of target ..." → TargetSet(unlimited(0))
-                        //   - "up to N target ..."       → TargetSet(up_to(N))
-                        //   - "any number of cards ..."  → AnyNumber (count = UpTo(ObjectCount))
-                        // The remainder (e.g. "cards from your hand", "target creature
-                        // card from your graveyard" — the article is deliberately left
-                        // in place) is then handed to `parse_target` for filter
-                        // extraction. With no cardinality prefix the noun phrase is fed
-                        // to `parse_target` unchanged (covers "target X" / "it" / "that
-                        // card" — count stays 1).
-                        let (cardinality, after_count) = peel_library_placement_cardinality(before);
-                        // CR 608.2k: thread the real trigger context so a bare object
-                        // pronoun ("put it on the bottom …") binds to the trigger's
-                        // `object_pronoun_ref` (the cast spell for spell-cast triggers)
-                        // rather than defaulting to `ParentTarget`. `parse_target`
-                        // spins up a fresh empty context, which loses that antecedent.
-                        let (filter, _) = parse_target_with_ctx(after_count, ctx);
-                        let new_target = if matches!(filter, TargetFilter::Any) {
-                            None
-                        } else {
-                            Some(filter)
-                        };
-                        Some((new_target, cardinality))
-                    })();
-                if let Some((maybe_filter, cardinality)) = extracted {
-                    if *target == TargetFilter::Any {
-                        if let Some(filter) = maybe_filter {
-                            *target = filter;
-                        }
-                    }
-                    match cardinality {
-                        LibraryPlacementCardinality::Unstated => {}
-                        LibraryPlacementCardinality::Exact(c) => *count = c,
-                        // CR 601.2c + CR 115.1 (CR 115.1a spells / CR 115.1d
-                        // triggers; activated abilities via CR 602.2b): the
-                        // announced target set owns the cardinality. `count` stays
-                        // at the lowering default and is deliberately NOT consulted
-                        // by `put_on_top::resolve` for such an ability (see its
-                        // `multi_target` rule).
-                        LibraryPlacementCardinality::TargetSet(spec) => {
-                            placement_target_set = Some(spec)
-                        }
-                        // CR 107.1c + CR 115.10a + CR 608.2d: an untargeted "any
-                        // number of <population>" is a resolution-time choice of
-                        // zero through every eligible object — the same `UpTo`
-                        // encoding as "sacrifice any number of …". The recipient
-                        // must NAME a population: a deterministic anaphor ("any
-                        // number of them" → `ParentTarget`, the Dig-tail partition
-                        // owned by the Dig continuation grammar) or an unclassified
-                        // recipient (`Any` / a contentless `Typed`) keeps its base
-                        // shape. `names_enumerable_population` is the authored
-                        // population predicate for exactly that question.
-                        LibraryPlacementCardinality::AnyNumber => {
-                            if target.names_enumerable_population() {
-                                *count = QuantityExpr::up_to(QuantityExpr::Ref {
-                                    qty: QuantityRef::ObjectCount {
-                                        filter: target.clone(),
-                                    },
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-            // CR 115.1 (+ CR 115.1d for the trigger cohort): attach the announced
-            // target-set spec. This is a CLAUSE-level spec, consulted LAST in
-            // `assembly`'s six-arm precedence chain (four `MULTI_TARGET_VERBS`-gated
-            // text extractors, then the CHUNK-level `clause_ir.multi_target` — the
-            // per-opponent fanout spec — then this one), so an outer authority wins
-            // without this seam having to know about it.
-            //
-            // The `is_none()` check ENCODES THAT PRECEDENCE — it is not input
-            // validation, so do not delete it as unreachable-therefore-dead. It
-            // is the rule itself: a clause-level spec must never overwrite a
-            // spec an outer authority already set.
-            //
-            // It is also unreachable TODAY, and that is a separate fact about
-            // the current call graph rather than a reason to drop the rule:
-            // `lower_imperative_clause` above runs the post-parse multi-target
-            // fixups, but each of them gates on
-            // `MULTI_TARGET_VERBS` — three (`extract_exact_target_multi_target`,
-            // `extract_bounded_target_multi_target`,
-            // `extract_optional_target_multi_target`) directly, and
-            // `extract_verb_up_to_multi_target` indirectly through
-            // `strip_any_number_quantifier`'s first-word check — and that list (in
-            // `lower.rs`) contains no `put`, so a placement clause reaches here with
-            // the field unset.
+            let placement_target_set = refine_put_at_library_position(&mut clause, &text, ctx);
             if clause.multi_target.is_none() {
                 clause.multi_target = placement_target_set;
             }
@@ -24101,6 +24057,10 @@ fn lower_subject_predicate_ast(
             // pick rewrite in the player-target wrapper below), so sibling
             // predicates keep their original scope.
             let mut clause = lower_imperative_clause(&text, ctx);
+            let placement_target_set = refine_put_at_library_position(&mut clause, &text, ctx);
+            if clause.multi_target.is_none() {
+                clause.multi_target = placement_target_set;
+            }
             // CR 601.2c + CR 603.3d: a printed subject on the sentence that
             // ANNOUNCES this ability's target overrides the default announcer.
             // Recorded on the chunk's `ParseContext`, which `parse_effect_chain_ir`
@@ -24223,7 +24183,9 @@ fn lower_subject_predicate_ast(
             {
                 if matches!(
                     clause.effect,
-                    Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. }
+                    Effect::ChangeZone { .. }
+                        | Effect::ChangeZoneAll { .. }
+                        | Effect::PutAtLibraryPosition { .. }
                 ) {
                     // CR 115.1c + CR 115.10a + CR 608.2d (issues #6505 / #6446):
                     // reuse `change_zone_target_choice_timing` so battlefield
@@ -24242,6 +24204,9 @@ fn lower_subject_predicate_ast(
                                 clause.multi_target.is_some(),
                                 &pred_lower,
                             ) == crate::types::ability::TargetChoiceTiming::Resolution
+                        }
+                        Effect::PutAtLibraryPosition { .. } => {
+                            !nom_primitives::scan_contains(&pred_lower, "target ")
                         }
                         _ => false,
                     };
@@ -24271,7 +24236,8 @@ fn lower_subject_predicate_ast(
                     if moved_object_is_they_control_pick {
                         match &mut clause.effect {
                             Effect::ChangeZone { target, .. }
-                            | Effect::ChangeZoneAll { target, .. } => {
+                            | Effect::ChangeZoneAll { target, .. }
+                            | Effect::PutAtLibraryPosition { target, .. } => {
                                 rebind_controller_scope(
                                     target,
                                     ControllerRef::You,
@@ -24283,7 +24249,8 @@ fn lower_subject_predicate_ast(
                     } else if !moved_object_is_resolution_pick {
                         match &mut clause.effect {
                             Effect::ChangeZone { target, .. }
-                            | Effect::ChangeZoneAll { target, .. } => {
+                            | Effect::ChangeZoneAll { target, .. }
+                            | Effect::PutAtLibraryPosition { target, .. } => {
                                 rebind_owned_scope(target, ControllerRef::TargetPlayer);
                             }
                             _ => {}
@@ -25650,7 +25617,6 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         | Effect::Draw { target, .. }
         | Effect::Scry { target, .. }
         | Effect::Surveil { target, .. }
-        | Effect::PutAtLibraryPosition { target, .. }
             if *target == TargetFilter::Any || *target == TargetFilter::Controller =>
         {
             *target = subject_filter;
