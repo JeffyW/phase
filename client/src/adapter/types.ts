@@ -1309,6 +1309,14 @@ export type CastingPermission =
       /** Non-mana alternative cost carried by the same exile-cast grant. */
       type: "ExileWithAltAbilityCost";
       cost: SerializedAbilityCost;
+      /** Optional engine-enforced condition for using this grant. */
+      constraint?: Record<string, unknown>;
+      /** Player to whom the engine granted this permission. */
+      granted_to?: PlayerId;
+      /** Grant lifetime; unit variants serialize as strings and payload variants as objects. */
+      duration?: string | Record<string, unknown>;
+      /** Source whose identity can bound the grant's duration. */
+      source_id?: ObjectId;
       /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. */
       cast_cost_modifier?: CastCostModifier;
     }
