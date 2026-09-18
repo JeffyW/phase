@@ -1306,6 +1306,13 @@ export type CastingPermission =
       cast_cost_modifier?: CastCostModifier;
     }
   | {
+      /** Non-mana alternative cost carried by the same exile-cast grant. */
+      type: "ExileWithAltAbilityCost";
+      cost: SerializedAbilityCost;
+      /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. */
+      cast_cost_modifier?: CastCostModifier;
+    }
+  | {
       type: "PlayFromExile";
       duration: string;
       /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. CR 305.1: a
