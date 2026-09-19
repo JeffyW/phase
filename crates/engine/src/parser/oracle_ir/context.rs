@@ -92,6 +92,59 @@ pub(crate) enum ChosenColorQualifierScope {
     ChainBound,
 }
 
+/// Parser-only provenance: the enclosing trigger body is resolving a PROVEN
+/// zone-change event, and the pair it pins.
+///
+// CR 603.10 + CR 400.7 + CR 122.2: a trigger-body past-tense predicate ("… if
+// it had a death counter on it") reads the zone-change event object's
+// last-known information, because CR 122.2 makes the counters cease to exist
+// the moment the object changes zones. Only a trigger head whose shape PROVES
+// the pair (today: the dies head, battlefield → graveyard) may establish it.
+//
+/// SAFE BY DEFAULT. `Clone` deliberately RESETS to empty instead of copying.
+/// `ParseContext` is cloned at dozens of sites, and most of them start an
+/// INDEPENDENT body — a CR 603.7 delayed trigger, a CR 603.12 reflexive
+/// trigger, a speculative probe whose result is discarded. Inheriting the outer
+/// event's authority at any of those would let an unrelated body claim support
+/// for a predicate it cannot evaluate. A site that genuinely continues the SAME
+/// trigger body opts back in, by name, with
+/// [`Self::copied_for_same_trigger_body`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TriggerZoneChangeProvenance(Option<(Zone, Zone)>);
+
+impl Clone for TriggerZoneChangeProvenance {
+    /// Resets. See the type doc: a derived context is an independent body until
+    /// it says otherwise.
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl TriggerZoneChangeProvenance {
+    /// No enclosing zone-change authority.
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    /// The enclosing trigger head PROVED this origin → destination pair.
+    pub(crate) fn established(origin: Zone, destination: Zone) -> Self {
+        Self(Some((origin, destination)))
+    }
+
+    /// Opt back in: this derived context continues the SAME trigger body, so it
+    /// keeps the enclosing event's authority. Copying an empty provenance stays
+    /// empty, so the call is safe at a site whose caller may or may not have it.
+    pub(crate) fn copied_for_same_trigger_body(&self) -> Self {
+        Self(self.0)
+    }
+
+    /// The proven `(origin, destination)` pair, or `None` when this parse has no
+    /// enclosing zone-change authority.
+    pub(crate) fn as_pair(&self) -> Option<(Zone, Zone)> {
+        self.0
+    }
+}
+
 /// Unified parsing context — threaded through all parser branches for
 /// pronoun/reference resolution ("it", "that creature", "that many").
 ///
@@ -487,6 +540,14 @@ pub(crate) struct ParseContext {
     /// lingering path. Mirrors `chain_has_prior_exile_producer`.
     // CR 608.2g + CR 701.20e
     pub chain_prior_self_library_peek: bool,
+    /// CR 603.10 + CR 400.7 + CR 122.2: the enclosing trigger body's PROVEN
+    /// zone-change event pair, when this parse continues that body. Consumed by
+    /// the trigger-body past-tense counter grammar in
+    /// `oracle_effect::conditions::strip_counter_conditional`, which may only
+    /// emit an `AbilityCondition::ZoneChangeObjectMatchesFilter` while the pair
+    /// is present. See [`TriggerZoneChangeProvenance`] for the reset-on-`Clone`
+    /// contract that makes every derived context independent by default.
+    pub trigger_zone_change: TriggerZoneChangeProvenance,
 }
 
 impl ParseContext {
@@ -586,5 +647,60 @@ mod tests {
         });
 
         assert_eq!(ctx.diagnostics.len(), 2);
+    }
+
+    /// CR 603.10: a fresh context carries no zone-change authority.
+    #[test]
+    fn trigger_zone_change_provenance_defaults_to_empty() {
+        assert_eq!(ParseContext::default().trigger_zone_change.as_pair(), None);
+        assert_eq!(TriggerZoneChangeProvenance::none().as_pair(), None);
+    }
+
+    /// CR 603.7 + CR 603.12: a plain `.clone()` starts an INDEPENDENT body, so
+    /// the outer event's authority must not survive it. This is the invariant
+    /// every delayed/reflexive/probe sub-parse relies on.
+    #[test]
+    fn trigger_zone_change_provenance_resets_on_clone() {
+        let ctx = ParseContext {
+            trigger_zone_change: TriggerZoneChangeProvenance::established(
+                Zone::Battlefield,
+                Zone::Graveyard,
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ctx.clone().trigger_zone_change.as_pair(),
+            None,
+            "a derived context must be independent by default"
+        );
+        assert_eq!(
+            ctx.clone_throwaway().trigger_zone_change.as_pair(),
+            None,
+            "a throwaway sub-parse must be independent by default"
+        );
+        assert_eq!(
+            ctx.trigger_zone_change.as_pair(),
+            Some((Zone::Battlefield, Zone::Graveyard)),
+            "cloning must not disturb the source context"
+        );
+    }
+
+    /// CR 608.2c: the same trigger body opts back in explicitly.
+    #[test]
+    fn trigger_zone_change_provenance_copies_for_same_trigger_body() {
+        let established =
+            TriggerZoneChangeProvenance::established(Zone::Battlefield, Zone::Graveyard);
+        assert_eq!(
+            established.copied_for_same_trigger_body().as_pair(),
+            Some((Zone::Battlefield, Zone::Graveyard))
+        );
+        assert_eq!(
+            TriggerZoneChangeProvenance::none()
+                .copied_for_same_trigger_body()
+                .as_pair(),
+            None,
+            "copying an absent provenance stays absent"
+        );
     }
 }
