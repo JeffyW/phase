@@ -6285,21 +6285,12 @@ fn parse_if_keyword(input: &str) -> OracleResult<'_, ()> {
 }
 
 /// CR 608.2c: the connectors that open the ELSE branch of a written-order
-/// if/else pair. Kept in lockstep with the `Otherwise` connector alternation in
-/// `oracle_effect::parse_effect_chain_ir` — the trigger side must decline to
-/// hoist exactly the antecedents the effect side is able to bind.
+/// if/else pair. Delegates to the single shared authority in `oracle_nom`, which
+/// the effect-side chain binder calls too — the trigger side must decline to
+/// hoist exactly the antecedents the effect side is able to bind, and one
+/// combinator is what makes that agreement structural rather than conventional.
 fn parse_otherwise_branch_connector(input: &str) -> OracleResult<'_, ()> {
-    value(
-        (),
-        alt((
-            tag("otherwise, "),
-            tag("otherwise "),
-            tag("if not, "),
-            tag("if no player does, "),
-            tag("if no one does, "),
-        )),
-    )
-    .parse(input)
+    crate::parser::oracle_nom::condition::parse_otherwise_branch_connector(input)
 }
 
 /// Extract an intervening-if condition from effect text.
