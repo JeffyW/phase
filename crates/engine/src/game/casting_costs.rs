@@ -1876,6 +1876,41 @@ fn next_declared_kicker_cost(pending: &mut PendingCast) -> Option<AbilityCost> {
     costs.get(index).cloned()
 }
 
+/// CR 601.2h + CR 602.2b + CR 400.7j: Capture the post-cost provenance of every
+/// object a non-mana cost is about to consume, BEFORE the cost's own move, so
+/// each entry's `lki` records pre-move characteristics (CR 608.2h). The callers
+/// then hand the result to
+/// `ResolvedAbility::add_cost_paid_objects_recursive`, and the shared
+/// `repin_cost_paid_object_recursive` traversal re-pins every entry once the
+/// cost's moves complete.
+///
+/// A missing object row here is a PROGRAMMER/state invariant violation, not a
+/// player-reachable outcome: every caller has already verified the selection
+/// against a live eligibility list (`find_eligible_discard_targets`,
+/// `find_eligible_sacrifice_targets`, the exile revalidation closure) and no
+/// legal intervening action can remove a chosen row between that check and this
+/// capture. It deliberately panics rather than returning a user-visible `Err`,
+/// which would abort an otherwise-valid cast or activation.
+fn capture_cost_paid_snapshots(
+    state: &GameState,
+    chosen: &[ObjectId],
+    invariant: &'static str,
+) -> Vec<CostPaidObjectSnapshot> {
+    debug_assert!(
+        chosen
+            .iter()
+            .all(|object_id| state.objects.contains_key(object_id)),
+        "{invariant}"
+    );
+    chosen
+        .iter()
+        .map(|object_id| {
+            let object = state.objects.get(object_id).expect(invariant);
+            CostPaidObjectSnapshot::capture(object, object.snapshot_for_mana_spent())
+        })
+        .collect()
+}
+
 /// Complete the discard-for-cost flow: discard selected cards, then continue casting.
 pub(crate) fn handle_discard_for_cost(
     state: &mut GameState,
@@ -1901,25 +1936,27 @@ pub(crate) fn handle_discard_for_cost(
         }
     }
 
-    // CR 117.1 + CR 400.7j + CR 608.2k: Capture the discarded card's public
+    // CR 117.1 + CR 400.7j + CR 608.2k: Capture each discarded card's public
     // characteristics BEFORE it leaves the hand, so cost-paid-object property
     // references can resolve at ability resolution.
-    if let Some(&first) = chosen.first() {
-        if let Some(obj) = state.objects.get(&first) {
-            pending
-                .ability
-                .set_cost_paid_object_recursive(CostPaidObjectSnapshot::capture(
-                    obj,
-                    obj.snapshot_for_mana_spent(),
-                ));
-        }
+    let cost_paid_snapshots = capture_cost_paid_snapshots(
+        state,
+        chosen,
+        "discard cost selection must be live before cost move",
+    );
+    if let Some(first) = cost_paid_snapshots.first() {
+        pending
+            .ability
+            .set_cost_paid_object_recursive(first.clone());
     }
     // CR 601.2h + CR 602.2b (issue #4948): Record EVERY discarded card, not
     // just `chosen.first()` above, so this SAME ability's own target
     // selection excludes all of them — a multi-card non-self discard cost
     // paid before targets are chosen can otherwise let a just-discarded card
     // leak into the ability's own "target card in your graveyard" pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&cost_paid_snapshots);
 
     // CR 601.2h + CR 616.1: Discard each chosen card through the replacement pipeline
     // so Madness (CR 702.35) etc. can intercept.
@@ -1953,6 +1990,18 @@ pub(crate) fn handle_discard_for_cost(
         }
     }
     let cost_event_end = events.len();
+
+    // CR 400.7j + CR 400.7 + CR 608.2k: The discard moves above are this cost's
+    // OWN, and they delivered the cards to a public zone (the graveyard —
+    // CR 701.9a), so CR 400.7j keeps this ability's effects able to find them.
+    // The snapshots were necessarily captured pre-move (their `lki` must record
+    // pre-move characteristics — CR 608.2h), so re-pin every cost-paid referent
+    // to the incarnation the cost's own move produced; only a LATER zone change
+    // reads as stale from here. Mirrors `finish_cost_object_moves` and
+    // `handle_sacrifice_for_cost`, which already do this on their move seams.
+    // The `NeedsReplacementChoice` arm above returns early and its resumed
+    // suffix re-pins in `resume_interrupted_cost_payment`.
+    pending.ability.repin_cost_paid_object_recursive(state);
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -1994,11 +2043,16 @@ fn commit_random_discard_cost_picks(
     pending: &mut PendingCast,
     picks: &[crate::types::game_state::RandomDiscardCostPick],
 ) {
-    let ids = picks
+    // CR 601.2h + CR 701.9b (issue #4948): consume the payment's OWN snapshots,
+    // captured by `discard_at_random` from the live hand object before each card
+    // left (`RandomDiscardCostPick::snapshot`). The plural authority is never
+    // reconstructed from raw ids, so it cannot bind a different incarnation than
+    // the one the random payment actually took.
+    let snapshots = picks
         .iter()
-        .map(|pick| pick.occurrence.object_id)
+        .map(|pick| pick.snapshot.clone())
         .collect::<Vec<_>>();
-    pending.ability.add_cost_paid_object_ids_recursive(&ids);
+    pending.ability.add_cost_paid_objects_recursive(&snapshots);
 
     // CR 400.7j + CR 608.2k + CR 701.9c: A cost-paid card remains a usable
     // referent only when its move delivered it to a public zone. If a future
@@ -2016,6 +2070,14 @@ fn commit_random_discard_cost_picks(
                 .set_cost_paid_object_recursive(pick.snapshot.clone());
         }
     }
+
+    // CR 400.7j + CR 400.7 + CR 608.2k: this commit runs only after the random
+    // discard move(s) it is committing have already completed (CR 701.9a: the
+    // card is in the graveyard), so re-pin every cost-paid referent to the
+    // incarnation the cost's own move produced. Same step as
+    // `finish_cost_object_moves` / `handle_sacrifice_for_cost`, through the same
+    // single traversal authority.
+    pending.ability.repin_cost_paid_object_recursive(state);
 }
 
 fn pay_deferred_random_discard_cost(
@@ -2561,6 +2623,12 @@ pub(crate) fn resume_interrupted_cost_payment(
                 .take()
                 .and_then(super::casting::remove_selected_discard_cost);
         }
+        // CR 400.7j + CR 400.7 + CR 608.2k: the resumed discard suffix has now
+        // completed this cost's own moves, so re-pin exactly as the unpaused
+        // `handle_discard_for_cost` path does. A replacement-redirected discard
+        // is precisely the case where the post-move incarnation cannot be
+        // predicted from the pre-move capture.
+        pending.ability.repin_cost_paid_object_recursive(state);
         let cost_event_end = events.len();
         let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
         park_cost_payment_triggers_if_paused(
@@ -3437,36 +3505,35 @@ pub(crate) fn handle_sacrifice_for_cost(
         }
     });
 
-    // CR 117.1 + CR 400.7j + CR 608.2k: Capture the sacrificed object's public
-    // characteristics BEFORE it leaves the battlefield, stamping it onto the
+    // CR 117.1 + CR 400.7j + CR 608.2k: Capture every sacrificed object's public
+    // characteristics BEFORE it leaves the battlefield, stamping them onto the
     // resolving ability for later cost-paid-object references.
-    if let Some(&first) = chosen.first() {
-        if let Some(snapshot) = state
-            .objects
-            .get(&first)
-            .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
-        {
-            pending
-                .ability
-                .set_cost_paid_object_recursive(snapshot.clone());
-            // CR 400.7d: also stamp the spell object on the stack directly. A
-            // permanent spell whose only cost-paid-object reference lives in an
-            // ETB *trigger* (Adipose Offspring's "where X is the sacrificed
-            // creature's toughness") has no on-resolve Spell ability, so the
-            // ability-gated normalization in `stack::resolve` is skipped and the
-            // pipeline's `CastLinkSnapshot` would otherwise capture `None`.
-            // Stamping the stack object here fulfills the "already-stamped"
-            // contract that the resolution epilogue relies on for ability-less
-            // permanent spells, so the snapshot survives `reset_for_battlefield_entry`.
-            //
-            // Gated to spell casts only: activated-ability sacrifice costs share
-            // this resolver (`activation_ability_index` is set), but their
-            // `object_id` is the source permanent, whose own cast provenance must
-            // not be overwritten. A spell cast leaves this field `None`.
-            if pending.activation_ability_index.is_none() {
-                if let Some(spell_obj) = state.objects.get_mut(&pending.object_id) {
-                    spell_obj.cast_cost_paid_object = Some(snapshot);
-                }
+    let cost_paid_snapshots = capture_cost_paid_snapshots(
+        state,
+        chosen,
+        "sacrifice cost selection must be live before cost move",
+    );
+    if let Some(snapshot) = cost_paid_snapshots.first().cloned() {
+        pending
+            .ability
+            .set_cost_paid_object_recursive(snapshot.clone());
+        // CR 400.7d: also stamp the spell object on the stack directly. A
+        // permanent spell whose only cost-paid-object reference lives in an
+        // ETB *trigger* (Adipose Offspring's "where X is the sacrificed
+        // creature's toughness") has no on-resolve Spell ability, so the
+        // ability-gated normalization in `stack::resolve` is skipped and the
+        // pipeline's `CastLinkSnapshot` would otherwise capture `None`.
+        // Stamping the stack object here fulfills the "already-stamped"
+        // contract that the resolution epilogue relies on for ability-less
+        // permanent spells, so the snapshot survives `reset_for_battlefield_entry`.
+        //
+        // Gated to spell casts only: activated-ability sacrifice costs share
+        // this resolver (`activation_ability_index` is set), but their
+        // `object_id` is the source permanent, whose own cast provenance must
+        // not be overwritten. A spell cast leaves this field `None`.
+        if pending.activation_ability_index.is_none() {
+            if let Some(spell_obj) = state.objects.get_mut(&pending.object_id) {
+                spell_obj.cast_cost_paid_object = Some(snapshot);
             }
         }
     }
@@ -3476,7 +3543,9 @@ pub(crate) fn handle_sacrifice_for_cost(
     // — a sacrifice cost paid before targets are chosen (this engine's
     // documented ordering shortcut, see issue #1301) can otherwise let a
     // just-sacrificed object leak into the ability's own candidate pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&cost_paid_snapshots);
 
     // CR 702.48c / CR 702.119a: Offering and Emerge use different reduction
     // rules, but both must read the sacrificed permanent before it leaves.
@@ -4790,9 +4859,16 @@ fn finish_exile_selection_for_cost(
         recompute_pending_cast_cost_after_additional_cost(state, player, &mut pending);
     }
 
-    // CR 608.2k: Capture the first exiled object's public characteristics BEFORE
-    // it leaves the zone, stamping it recursively onto the resolving ability so
-    // `TargetFilter::CostPaidObject` resolves during ability resolution.
+    // CR 608.2k: Capture the exiled objects' public characteristics BEFORE they
+    // leave the zone, stamping them recursively onto the resolving ability so
+    // `TargetFilter::CostPaidObject` resolves during ability resolution. The
+    // capture happens after the live revalidation loop above, so every chosen
+    // row is guaranteed present.
+    let cost_paid_snapshots = capture_cost_paid_snapshots(
+        state,
+        chosen,
+        "exile cost selection must be live before cost move",
+    );
     if let Some(&first) = chosen.first() {
         if let Some(obj) = state.objects.get(&first) {
             // CR 107.3a + CR 118.9: Shoal-style alternative costs ("exile a
@@ -4809,13 +4885,12 @@ fn finish_exile_selection_for_cost(
                     .ability
                     .set_chosen_x_recursive(obj.effective_mana_value());
             }
-            pending
-                .ability
-                .set_cost_paid_object_recursive(CostPaidObjectSnapshot::capture(
-                    obj,
-                    obj.snapshot_for_mana_spent(),
-                ));
         }
+    }
+    if let Some(snapshot) = cost_paid_snapshots.first() {
+        pending
+            .ability
+            .set_cost_paid_object_recursive(snapshot.clone());
     }
     // CR 601.2h + CR 602.2b (issue #4948): Record EVERY exiled object, not
     // just `chosen.first()` above, so this SAME ability's own target
@@ -4824,7 +4899,14 @@ fn finish_exile_selection_for_cost(
     // battlefield-permanent exile costs (Food Chain class) — either can
     // otherwise let a just-exiled object leak into an ability's own
     // "target card/permanent in exile" pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    //
+    // CR 400.7j: `finish_cost_object_moves` below re-pins every entry once the
+    // exile moves complete, so these snapshots name the cards AS THE COST LEFT
+    // THEM in exile — the exact referent Coin of Fate's "one of the exiled
+    // cards" needs.
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&cost_paid_snapshots);
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();

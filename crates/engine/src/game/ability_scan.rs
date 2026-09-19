@@ -275,7 +275,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         distribution: _,                 // concrete pre-assigned (TargetRef, u32) portions
         chosen_x: _,                     // concrete cast-time X
         cost_paid_object: _,             // concrete captured-object snapshot
-        cost_paid_object_ids: _,         // concrete captured-object ids
+        cost_paid_objects: _,            // concrete captured-object snapshots
         effect_context_object: _,        // concrete captured-object snapshot
         amassed_army_object: _,          // concrete captured-object snapshot
         ability_index: _,                // usize provenance

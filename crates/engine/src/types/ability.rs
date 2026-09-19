@@ -9904,6 +9904,30 @@ impl CostPaidObjectSnapshot {
     }
 }
 
+/// CR 601.2h + CR 602.2b: Compare two plural cost-paid provenance authorities
+/// by their object-id sequence only, in payment order, without allocating.
+///
+/// `ResolvedAbility::cost_paid_objects` replaced a raw `Vec<ObjectId>`, whose
+/// equality compared exactly these ids. A full `CostPaidObjectSnapshot`
+/// comparison would additionally fold in `lki` and `incarnation`, which would
+/// silently narrow every identity check that reaches `ResolvedAbility`
+/// equality — stack copy/batch identity most of all. This helper is the single
+/// authority that preserves the pre-existing id-sequence semantics, and both
+/// `ResolvedAbility`'s manual `PartialEq` and `stack.rs`'s inert-trigger run
+/// identity route through it.
+///
+/// Note the deliberate asymmetry with the SINGULAR `cost_paid_object`, which
+/// keeps full-snapshot equality: that field is a resolution-time referent whose
+/// incarnation is part of its meaning, and its equality behavior is unchanged.
+pub(crate) fn cost_paid_object_snapshot_ids_eq(
+    a: &[CostPaidObjectSnapshot],
+    b: &[CostPaidObjectSnapshot],
+) -> bool {
+    a.iter()
+        .map(|snapshot| snapshot.object_id)
+        .eq(b.iter().map(|snapshot| snapshot.object_id))
+}
+
 /// CR 106.1b + CR 400.7 + CR 602.2b (issue #6504): The mana type(s) spent to
 /// pay one activated ability's own mana sub-cost, snapshotted onto
 /// `ResolvedAbility::noted_mana_payment` at the moment that specific
@@ -30881,7 +30905,7 @@ impl AttachTargetBindings {
 }
 
 /// Runtime ability data passed to effect handlers at resolution time.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedAbility {
     pub effect: Effect,
     pub targets: Vec<TargetRef>,
@@ -31137,13 +31161,23 @@ pub struct ResolvedAbility {
     /// see issue #1301's `exclude_cost_paid_object_that_left_battlefield`),
     /// so any object that already left its zone to pay that cost was never
     /// actually a legal target under the real target-before-cost order — no
-    /// matter how many objects the cost consumed. Read only by
-    /// `exclude_cost_paid_object_that_left_battlefield`
-    /// (`game/ability_utils.rs`) to strip those ids from this ability's own
-    /// candidate lists; never a resolution-time referent (use
-    /// `cost_paid_object` for that).
+    /// matter how many objects the cost consumed.
+    ///
+    /// CR 400.7 + CR 400.7j: this is the SINGLE authority for "the objects
+    /// this ability's cost moved". Each entry is a full
+    /// [`CostPaidObjectSnapshot`], so it carries the referent's post-cost
+    /// INCARNATION and not just its reusable storage id — the engine reuses
+    /// `ObjectId`, so an id alone cannot tell "still the object the cost
+    /// moved" from "a new object that later took the same id" (CR 400.7).
+    /// Readers that only need membership (target-candidate exclusion) may
+    /// project `snapshot.object_id`; readers that act on the LIVE object must
+    /// resolve through [`CostPaidObjectSnapshot::live_object_id`].
+    ///
+    /// Deliberately NOT a second lockstep id vector: there is no parallel raw
+    /// field to drift out of sync with these snapshots. `cost_paid_object`
+    /// remains the separate SINGULAR resolution-time referent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cost_paid_object_ids: Vec<ObjectId>,
+    pub cost_paid_objects: Vec<CostPaidObjectSnapshot>,
     /// Public characteristics of an object chosen or moved by an earlier
     /// effect in the same resolving ability. This is distinct from
     /// `cost_paid_object`: the object was not paid as a cost, but later
@@ -31249,6 +31283,218 @@ pub struct ResolvedAbility {
     pub parent_target_missing_reason: Option<ParentTargetMissingReason>,
 }
 
+/// CR 400.7 + CR 601.2h: Structural equality for [`ResolvedAbility`].
+///
+/// Hand-written rather than derived for exactly ONE reason: `cost_paid_objects`
+/// must compare by object-id SEQUENCE (see
+/// `cost_paid_object_snapshot_ids_eq`) so it preserves the semantics of the
+/// raw `Vec<ObjectId>` it replaced. Folding a full `CostPaidObjectSnapshot`
+/// comparison in would make `lki` and `incarnation` participate in every
+/// identity check that reaches `ResolvedAbility` equality — `GameState`'s own
+/// `PartialEq` over `stack` / `waiting_for` included — silently narrowing them.
+/// Every OTHER field compares exactly as the derive did, including the singular
+/// `cost_paid_object`, whose incarnation is part of its resolution-time meaning.
+///
+/// Both sides are destructured exhaustively with no wildcard arm, so a new
+/// `ResolvedAbility` field is a compile error here (missing binding) or a
+/// denied `unused_variables` warning (bound but not compared) rather than a
+/// silent equality hole.
+impl PartialEq for ResolvedAbility {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            effect: a_effect,
+            targets: a_targets,
+            source_id: a_source_id,
+            cast_occurrence: a_cast_occurrence,
+            source_incarnation: a_source_incarnation,
+            trigger_source: a_trigger_source,
+            trigger_definition_ref: a_trigger_definition_ref,
+            force_block_attacker: a_force_block_attacker,
+            target_incarnations: a_target_incarnations,
+            selected_target_incarnations: a_selected_target_incarnations,
+            illegal_target_slots: a_illegal_target_slots,
+            controller: a_controller,
+            original_controller: a_original_controller,
+            scoped_player: a_scoped_player,
+            kind: a_kind,
+            sub_ability: a_sub_ability,
+            else_ability: a_else_ability,
+            duration: a_duration,
+            condition: a_condition,
+            context: a_context,
+            optional_targeting: a_optional_targeting,
+            optional: a_optional,
+            optional_player: a_optional_player,
+            optional_for: a_optional_for,
+            multi_target: a_multi_target,
+            target_constraints: a_target_constraints,
+            target_choice_timing: a_target_choice_timing,
+            description: a_description,
+            selected_mode_labels: a_selected_mode_labels,
+            modal_instruction_ordinal: a_modal_instruction_ordinal,
+            detached_remainder: a_detached_remainder,
+            repeat_for: a_repeat_for,
+            min_x_value: a_min_x_value,
+            announced_x: a_announced_x,
+            cant_be_copied: a_cant_be_copied,
+            copy_count_status: a_copy_count_status,
+            forward_result: a_forward_result,
+            unless_pay: a_unless_pay,
+            distribution: a_distribution,
+            distribute: a_distribute,
+            player_scope: a_player_scope,
+            starting_with: a_starting_with,
+            chosen_x: a_chosen_x,
+            cost_paid_object: a_cost_paid_object,
+            noted_mana_payment: a_noted_mana_payment,
+            cost_paid_objects: a_cost_paid_objects,
+            effect_context_object: a_effect_context_object,
+            amassed_army_object: a_amassed_army_object,
+            ability_index: a_ability_index,
+            may_trigger_origin: a_may_trigger_origin,
+            target_selection_mode: a_target_selection_mode,
+            target_chooser: a_target_chooser,
+            chosen_players: a_chosen_players,
+            repeat_until: a_repeat_until,
+            replacement_applied: a_replacement_applied,
+            sub_link: a_sub_link,
+            sibling_condition: a_sibling_condition,
+            modal: a_modal,
+            mode_abilities: a_mode_abilities,
+            parent_target_missing_reason: a_parent_target_missing_reason,
+        } = self;
+        let Self {
+            effect: b_effect,
+            targets: b_targets,
+            source_id: b_source_id,
+            cast_occurrence: b_cast_occurrence,
+            source_incarnation: b_source_incarnation,
+            trigger_source: b_trigger_source,
+            trigger_definition_ref: b_trigger_definition_ref,
+            force_block_attacker: b_force_block_attacker,
+            target_incarnations: b_target_incarnations,
+            selected_target_incarnations: b_selected_target_incarnations,
+            illegal_target_slots: b_illegal_target_slots,
+            controller: b_controller,
+            original_controller: b_original_controller,
+            scoped_player: b_scoped_player,
+            kind: b_kind,
+            sub_ability: b_sub_ability,
+            else_ability: b_else_ability,
+            duration: b_duration,
+            condition: b_condition,
+            context: b_context,
+            optional_targeting: b_optional_targeting,
+            optional: b_optional,
+            optional_player: b_optional_player,
+            optional_for: b_optional_for,
+            multi_target: b_multi_target,
+            target_constraints: b_target_constraints,
+            target_choice_timing: b_target_choice_timing,
+            description: b_description,
+            selected_mode_labels: b_selected_mode_labels,
+            modal_instruction_ordinal: b_modal_instruction_ordinal,
+            detached_remainder: b_detached_remainder,
+            repeat_for: b_repeat_for,
+            min_x_value: b_min_x_value,
+            announced_x: b_announced_x,
+            cant_be_copied: b_cant_be_copied,
+            copy_count_status: b_copy_count_status,
+            forward_result: b_forward_result,
+            unless_pay: b_unless_pay,
+            distribution: b_distribution,
+            distribute: b_distribute,
+            player_scope: b_player_scope,
+            starting_with: b_starting_with,
+            chosen_x: b_chosen_x,
+            cost_paid_object: b_cost_paid_object,
+            noted_mana_payment: b_noted_mana_payment,
+            cost_paid_objects: b_cost_paid_objects,
+            effect_context_object: b_effect_context_object,
+            amassed_army_object: b_amassed_army_object,
+            ability_index: b_ability_index,
+            may_trigger_origin: b_may_trigger_origin,
+            target_selection_mode: b_target_selection_mode,
+            target_chooser: b_target_chooser,
+            chosen_players: b_chosen_players,
+            repeat_until: b_repeat_until,
+            replacement_applied: b_replacement_applied,
+            sub_link: b_sub_link,
+            sibling_condition: b_sibling_condition,
+            modal: b_modal,
+            mode_abilities: b_mode_abilities,
+            parent_target_missing_reason: b_parent_target_missing_reason,
+        } = other;
+
+        a_effect == b_effect
+            && a_targets == b_targets
+            && a_source_id == b_source_id
+            && a_cast_occurrence == b_cast_occurrence
+            && a_source_incarnation == b_source_incarnation
+            && a_trigger_source == b_trigger_source
+            && a_trigger_definition_ref == b_trigger_definition_ref
+            && a_force_block_attacker == b_force_block_attacker
+            && a_target_incarnations == b_target_incarnations
+            && a_selected_target_incarnations == b_selected_target_incarnations
+            && a_illegal_target_slots == b_illegal_target_slots
+            && a_controller == b_controller
+            && a_original_controller == b_original_controller
+            && a_scoped_player == b_scoped_player
+            && a_kind == b_kind
+            && a_sub_ability == b_sub_ability
+            && a_else_ability == b_else_ability
+            && a_duration == b_duration
+            && a_condition == b_condition
+            && a_context == b_context
+            && a_optional_targeting == b_optional_targeting
+            && a_optional == b_optional
+            && a_optional_player == b_optional_player
+            && a_optional_for == b_optional_for
+            && a_multi_target == b_multi_target
+            && a_target_constraints == b_target_constraints
+            && a_target_choice_timing == b_target_choice_timing
+            && a_description == b_description
+            && a_selected_mode_labels == b_selected_mode_labels
+            && a_modal_instruction_ordinal == b_modal_instruction_ordinal
+            && a_detached_remainder == b_detached_remainder
+            && a_repeat_for == b_repeat_for
+            && a_min_x_value == b_min_x_value
+            && a_announced_x == b_announced_x
+            && a_cant_be_copied == b_cant_be_copied
+            && a_copy_count_status == b_copy_count_status
+            && a_forward_result == b_forward_result
+            && a_unless_pay == b_unless_pay
+            && a_distribution == b_distribution
+            && a_distribute == b_distribute
+            && a_player_scope == b_player_scope
+            && a_starting_with == b_starting_with
+            && a_chosen_x == b_chosen_x
+            && a_cost_paid_object == b_cost_paid_object
+            && a_noted_mana_payment == b_noted_mana_payment
+            // CR 601.2h: id-sequence only — see the impl doc comment above.
+            && cost_paid_object_snapshot_ids_eq(a_cost_paid_objects, b_cost_paid_objects)
+            && a_effect_context_object == b_effect_context_object
+            && a_amassed_army_object == b_amassed_army_object
+            && a_ability_index == b_ability_index
+            && a_may_trigger_origin == b_may_trigger_origin
+            && a_target_selection_mode == b_target_selection_mode
+            && a_target_chooser == b_target_chooser
+            && a_chosen_players == b_chosen_players
+            && a_repeat_until == b_repeat_until
+            && a_replacement_applied == b_replacement_applied
+            && a_sub_link == b_sub_link
+            && a_sibling_condition == b_sibling_condition
+            && a_modal == b_modal
+            && a_mode_abilities == b_mode_abilities
+            && a_parent_target_missing_reason == b_parent_target_missing_reason
+    }
+}
+
+/// Equality above is reflexive, symmetric, and transitive: every field either
+/// delegates to its own `Eq` impl or (for `cost_paid_objects`) compares a
+/// projected `ObjectId` sequence, which is itself an equivalence relation.
+impl Eq for ResolvedAbility {}
+
 impl ResolvedAbility {
     /// Whether this ability chain contains a zone change bounded by `event`.
     pub(crate) fn contains_duration_event(&self, event: DurationEvent) -> bool {
@@ -31325,7 +31571,7 @@ impl ResolvedAbility {
             chosen_x: None,
             cost_paid_object: None,
             noted_mana_payment: None,
-            cost_paid_object_ids: Vec::new(),
+            cost_paid_objects: Vec::new(),
             effect_context_object: None,
             amassed_army_object: None,
             ability_index: None,
@@ -32132,8 +32378,15 @@ impl ResolvedAbility {
     }
 
     /// CR 400.7 + CR 608.2k: Re-pin this ability's (and every sub/else branch's)
-    /// cost-paid referent to its current incarnation, once the cost's own object
-    /// moves are complete. Mirrors `set_cost_paid_object_recursive`'s traversal.
+    /// cost-paid referents to their current incarnation, once the cost's own
+    /// object moves are complete. Mirrors `set_cost_paid_object_recursive`'s
+    /// traversal.
+    ///
+    /// This is the SINGLE traversal authority for cost-paid provenance
+    /// repinning: it covers the singular `cost_paid_object` referent AND every
+    /// entry of the plural `cost_paid_objects` authority, so a cost-payment
+    /// seam that already calls it cannot forget one of the two. Do not add a
+    /// parallel traversal.
     ///
     /// See `CostPaidObjectSnapshot::repin_to_current_incarnation`: the cost's own
     /// move must not make the reference stale, only a later one.
@@ -32142,6 +32395,9 @@ impl ResolvedAbility {
         state: &crate::types::game_state::GameState,
     ) {
         if let Some(snapshot) = self.cost_paid_object.as_mut() {
+            snapshot.repin_to_current_incarnation(state);
+        }
+        for snapshot in self.cost_paid_objects.iter_mut() {
             snapshot.repin_to_current_incarnation(state);
         }
         if let Some(sub) = self.sub_ability.as_mut() {
@@ -32193,20 +32449,23 @@ impl ResolvedAbility {
     /// CR 601.2h + CR 602.2b (issue #4948): Record EVERY object
     /// paid as part of this ability's own cost (mirrors
     /// `set_cost_paid_object_recursive`'s recursion into `sub_ability` /
-    /// `else_ability`, but accumulates every id instead of overwriting a
-    /// single referent). Call this alongside — not instead of —
+    /// `else_ability`, but accumulates every referent instead of overwriting a
+    /// single one). Call this alongside — not instead of —
     /// `set_cost_paid_object_recursive` at every non-self
     /// Sacrifice/Discard/Exile cost-payment site; the singular field keeps
-    /// its own resolution-time referent semantics and this one only feeds
-    /// `exclude_cost_paid_object_that_left_battlefield`'s target-candidate
-    /// filter.
-    pub fn add_cost_paid_object_ids_recursive(&mut self, ids: &[ObjectId]) {
-        self.cost_paid_object_ids.extend_from_slice(ids);
+    /// its own resolution-time referent semantics.
+    ///
+    /// CR 400.7: the appended entries are full snapshots captured BEFORE the
+    /// cost's own move, so `repin_cost_paid_object_recursive` must run once the
+    /// cost's moves complete — it repins these entries through the same single
+    /// traversal that repins `cost_paid_object`.
+    pub fn add_cost_paid_objects_recursive(&mut self, snapshots: &[CostPaidObjectSnapshot]) {
+        self.cost_paid_objects.extend_from_slice(snapshots);
         if let Some(sub) = self.sub_ability.as_mut() {
-            sub.add_cost_paid_object_ids_recursive(ids);
+            sub.add_cost_paid_objects_recursive(snapshots);
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
-            else_branch.add_cost_paid_object_ids_recursive(ids);
+            else_branch.add_cost_paid_objects_recursive(snapshots);
         }
     }
 
@@ -38357,6 +38616,54 @@ mod ability_use_count_serde_tests {
         assert_eq!(
             serde_json::from_str::<AbilityCondition>(&json).unwrap(),
             condition
+        );
+    }
+}
+
+#[cfg(test)]
+mod cost_paid_provenance_serde_tests {
+    use super::*;
+
+    fn sample_ability() -> ResolvedAbility {
+        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0))
+    }
+
+    /// CR 400.7: A restored `ResolvedAbility` with no recorded cost-paid
+    /// provenance must come back with an EMPTY authority. `#[serde(default)]`
+    /// is what makes the restore/P2P path fail closed rather than erroring or
+    /// inventing a referent.
+    #[test]
+    fn missing_cost_paid_objects_restores_empty() {
+        let json = serde_json::to_value(sample_ability()).expect("ability serializes");
+        assert!(
+            json.get("cost_paid_objects").is_none(),
+            "an empty authority is elided on the wire: {json}"
+        );
+        let restored: ResolvedAbility =
+            serde_json::from_value(json).expect("an ability with no provenance restores");
+        assert!(restored.cost_paid_objects.is_empty());
+    }
+
+    /// CR 400.7: Saves written before the snapshot authority existed carry a raw
+    /// `cost_paid_object_ids` list. Those are STORAGE ids the engine reuses, so
+    /// they cannot prove which incarnation they named — rebinding them would
+    /// silently name whatever object holds the id today. They are ignored
+    /// outright, the same fail-closed reading `LEGACY_INCARNATION` gives a
+    /// snapshot that predates the incarnation field.
+    #[test]
+    fn legacy_raw_id_field_is_ignored_and_never_rebound() {
+        let mut json = serde_json::to_value(sample_ability()).expect("ability serializes");
+        json.as_object_mut()
+            .expect("a resolved ability serializes as a JSON object")
+            .insert(
+                "cost_paid_object_ids".to_string(),
+                serde_json::json!([11, 12]),
+            );
+        let restored: ResolvedAbility =
+            serde_json::from_value(json).expect("a legacy payload still restores");
+        assert!(
+            restored.cost_paid_objects.is_empty(),
+            "legacy raw ids must never be rebound into the snapshot authority"
         );
     }
 }
