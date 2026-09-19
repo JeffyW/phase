@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::identifiers::ObjectId;
-use crate::types::mana::ManaCost;
+use crate::types::mana::{ManaCost, ManaCostShard};
 use crate::types::statics::CostReductionReach;
 
 /// Where one snapshot reduction came from.
@@ -66,6 +66,30 @@ pub enum ReductionProvenance {
     /// RESERVED (see the type-level note). CR 702.125a: Undaunted, derived from
     /// the spell's own keyword. Reduces generic mana only.
     Undaunted,
+}
+
+/// CR 601.2b + CR 601.2f: everything the caster elects at the cost-determination
+/// seam, as one value.
+///
+/// The two axes are separate rules steps but a single decision, because they
+/// are not independent: CR 601.2b's hybrid announcement fixes WHICH pips exist
+/// for CR 601.2f's reductions to cancel, so the reachable locked totals are a
+/// function of the PAIR. Carrying them apart would let a caller apply an order
+/// against an un-announced cost and lock a total the caster never saw.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CostReductionElection {
+    /// CR 601.2f: the order-relevant reductions, in the order the caster elected
+    /// to apply them. Identified by provenance rather than index because the
+    /// target-independent and target-dependent collection passes have no shared
+    /// index space.
+    pub order: Vec<ReductionProvenance>,
+    /// CR 601.2b: the announced nonhybrid equivalent for each *announceable*
+    /// hybrid symbol in the cost, in cost order — see
+    /// [`crate::game::casting::announceable_hybrid_positions`] for which symbols
+    /// those are and why. Empty means "announce nothing", which leaves every
+    /// hybrid symbol in the locked cost and defers the same choice to payment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hybrid_announcement: Vec<ManaCostShard>,
 }
 
 /// One cost reduction, snapshotted at the CR 601.2f lock seam.
@@ -121,14 +145,20 @@ pub fn amount_is_order_relevant(amount: &ManaCost) -> bool {
     matches!(amount, ManaCost::Cost { shards, .. } if !shards.is_empty())
 }
 
-/// One legal CR 601.2f outcome: a representative reduction order together with
-/// the total cost it locks in.
+/// One legal CR 601.2b + CR 601.2f outcome: a representative election together
+/// with the total cost it locks in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostReductionOutcome {
     /// A permutation of indices into the prompt's `reductions` vec. Index 0 is
     /// applied first.
     pub order: Vec<usize>,
-    /// The total cost this order locks in (CR 601.2f), floors included.
+    /// CR 601.2b: the announced nonhybrid equivalents this outcome was computed
+    /// under, one per entry of the prompt's `hybrid_symbols` vec. Empty means
+    /// the outcome announces nothing and every hybrid symbol survives into the
+    /// locked cost.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hybrid_announcement: Vec<ManaCostShard>,
+    /// The total cost this outcome locks in (CR 601.2f), floors included.
     pub locked_cost: ManaCost,
 }
 
@@ -150,6 +180,10 @@ pub struct CostReductionAnalysis {
     /// The order-relevant snapshot entries the permutations range over, in
     /// canonical collection order.
     pub reductions: Vec<CostReductionEntry>,
+    /// CR 601.2b: the hybrid symbols this cast announces a nonhybrid equivalent
+    /// for, in cost order. Each outcome's `hybrid_announcement` is parallel to
+    /// this vec.
+    pub hybrid_symbols: Vec<ManaCostShard>,
     /// One representative per distinct locked cost, caster-optimal first.
     pub outcomes: Vec<CostReductionOutcome>,
     pub coverage: CostReductionCoverage,

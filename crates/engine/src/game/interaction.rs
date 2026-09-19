@@ -5798,9 +5798,16 @@ fn project_action_payload(
             }
         }
         // CR 601.2f: indices into the prompt's snapshotted reduction list.
-        GameAction::OrderCostReductions { order } => {
+        // CR 601.2b: the announced nonhybrid equivalents ride the same action.
+        GameAction::OrderCostReductions {
+            order,
+            hybrid_announcement,
+        } => {
             for index in order {
                 push_value_surface(surfaces, InteractionRoleCode::OptionIndex, index);
+            }
+            for shard in hybrid_announcement {
+                push_value_surface(surfaces, InteractionRoleCode::Option, shard.symbol());
             }
         }
         GameAction::Equip { target_id, .. } => {

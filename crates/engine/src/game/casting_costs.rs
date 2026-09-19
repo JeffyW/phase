@@ -11,7 +11,7 @@ use crate::types::ability::{
     TapCreaturesSelectionMode, TargetFilter, ThisWayCause, TypeFilter, TypedFilter, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
-use crate::types::casting_costs::{CostReductionEntry, ReductionProvenance};
+use crate::types::casting_costs::{CostReductionElection, CostReductionEntry, ReductionProvenance};
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActivationResidual, ActivationTargetSelection, AssistState, CastOccurrence, CastPaymentMode,
@@ -7836,28 +7836,40 @@ pub(crate) fn handle_defiler_payment(
     )
 }
 
-/// CR 601.2f: Apply the caster's elected cost-reduction order and continue the
-/// cast.
+/// CR 601.2b + CR 601.2f: Apply the caster's elected cost-determination choices
+/// and continue the cast.
 ///
 /// `order` is validated as a strict permutation of the prompt's `reductions`
-/// (no duplicates, no out-of-range indices, exact length). A malformed order is
-/// rejected with `InvalidAction` and the prompt stays live, so the caster can
-/// answer again — the cast is not silently resolved with an order nobody chose.
+/// (no duplicates, no out-of-range indices, exact length) and
+/// `hybrid_announcement` as a legal nonhybrid equivalent for each of the
+/// prompt's hybrid symbols. A malformed election is rejected with
+/// `InvalidAction` and the prompt stays live, so the caster can answer again —
+/// the cast is not silently resolved with an election nobody chose.
 pub(crate) fn handle_order_cost_reductions(
     state: &mut GameState,
     player: PlayerId,
     pending: PendingCast,
     reductions: &[CostReductionEntry],
     order: &[usize],
+    hybrid_announcement: &[crate::types::mana::ManaCostShard],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    super::casting::validate_cost_reduction_order(order, reductions)
-        .map_err(EngineError::InvalidAction)?;
+    let hybrid_symbols = super::casting::prompt_hybrid_symbols(&pending, reductions);
+    super::casting::validate_cost_reduction_election(
+        order,
+        hybrid_announcement,
+        reductions,
+        &hybrid_symbols,
+    )
+    .map_err(EngineError::InvalidAction)?;
 
-    let election: Vec<ReductionProvenance> = order
-        .iter()
-        .map(|&index| reductions[index].provenance)
-        .collect();
+    let election = CostReductionElection {
+        order: order
+            .iter()
+            .map(|&index| reductions[index].provenance)
+            .collect(),
+        hybrid_announcement: hybrid_announcement.to_vec(),
+    };
 
     let lock = CostLockInput {
         election: Some(election),
@@ -9826,7 +9838,7 @@ pub(super) struct CostLockInput {
     /// The caster's answer to `WaitingFor::OrderCostReductions`, when the
     /// prompt has already been shown and answered. `Some` also means "do not
     /// re-analyze", which is what keeps the resume from prompting forever.
-    pub election: Option<Vec<ReductionProvenance>>,
+    pub election: Option<CostReductionElection>,
 }
 
 impl CostLockInput {
@@ -9901,16 +9913,18 @@ pub(super) fn pay_and_push_with_lock(
         player,
         &probe,
         &lock.accepted,
-        lock.election.as_deref(),
+        lock.election.as_ref(),
     ) {
         super::casting::CostLockOutcome::Locked(locked) => locked,
         super::casting::CostLockOutcome::Election {
             reductions,
+            hybrid_symbols,
             outcomes,
         } => {
             return Ok(WaitingFor::OrderCostReductions {
                 player,
                 reductions,
+                hybrid_symbols,
                 outcomes,
                 pending_cast: Box::new(probe),
             });

@@ -11432,13 +11432,17 @@ fn apply_non_priority_pass_action(
                 pending_cast,
                 ..
             },
-            GameAction::OrderCostReductions { order },
+            GameAction::OrderCostReductions {
+                order,
+                hybrid_announcement,
+            },
         ) => engine_casting::handle_order_cost_reductions(
             state,
             *player,
             *pending_cast.clone(),
             &reductions.clone(),
             &order,
+            &hybrid_announcement,
             &mut events,
         )?,
         (

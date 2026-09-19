@@ -12,8 +12,8 @@ use crate::types::ability::{
 use crate::types::actions::{AlternativeCastDecision, GameAction};
 use crate::types::card::LayoutKind;
 use crate::types::casting_costs::{
-    amount_is_order_relevant, CostReductionAnalysis, CostReductionCoverage, CostReductionEntry,
-    CostReductionOutcome, ReductionProvenance,
+    amount_is_order_relevant, CostReductionAnalysis, CostReductionCoverage, CostReductionElection,
+    CostReductionEntry, CostReductionOutcome, ReductionProvenance,
 };
 use crate::types::events::{ActivatedAbilityKind, GameEvent};
 use crate::types::game_state::{
@@ -8405,8 +8405,8 @@ pub(super) struct CostFinalizeContext {
     /// whose acceptance lives in the answer to `WaitingFor::DefilerPayment`
     /// rather than in any static.
     extra: Vec<CostModification>,
-    /// The caster's CR 601.2f election, once made.
-    election: Option<Vec<ReductionProvenance>>,
+    /// The caster's CR 601.2b + CR 601.2f election, once made.
+    election: Option<CostReductionElection>,
 }
 
 impl CostFinalizeContext {
@@ -8436,7 +8436,17 @@ impl CostFinalizeContext {
     }
 
     fn election(&self) -> Option<&[ReductionProvenance]> {
-        self.election.as_deref()
+        self.election
+            .as_ref()
+            .map(|election| election.order.as_slice())
+    }
+
+    /// CR 601.2b: the caster's announced nonhybrid equivalents, or an empty
+    /// slice when they announced nothing (or have not been asked).
+    fn hybrid_announcement(&self) -> &[ManaCostShard] {
+        self.election
+            .as_ref()
+            .map_or(&[], |election| election.hybrid_announcement.as_slice())
     }
 }
 
@@ -8694,11 +8704,14 @@ fn order_relevant_reductions(modifiers: &CollectedCostModifiers) -> Vec<CostRedu
 }
 
 /// CR 601.2f: cheap structural pre-gate for the ordering analysis — "could this
-/// cast have two order-relevant reductions at all?"
+/// cast have `needed` order-relevant reductions at all?"
 ///
 /// Only a SHARD-bearing reduction is order-relevant
-/// ([`CostReductionEntry::is_order_relevant`]), and an election needs two of
-/// them. This answers the question by pattern-matching static MODES in place —
+/// ([`CostReductionEntry::is_order_relevant`]). A pure ordering election needs
+/// two of them; a CR 601.2b hybrid announcement is observable with ONE, because
+/// the announcement decides whether that single reduction finds a matching pip
+/// — which is why the caller passes the threshold in rather than assuming two.
+/// This answers the question by pattern-matching static MODES in place —
 /// the same loop-invariant existence idiom as
 /// [`super::functioning_abilities::any_functioning_static_mode`], which likewise
 /// walks `game_functioning_statics` with a discriminant-only predicate and is
@@ -8721,6 +8734,7 @@ fn cast_can_have_order_relevant_reductions(
     state: &GameState,
     pending: &PendingCast,
     ctx: &CostFinalizeContext,
+    needed: usize,
 ) -> bool {
     fn mode_is_order_relevant_reduction(mode: &StaticMode) -> bool {
         matches!(
@@ -8733,15 +8747,13 @@ fn cast_can_have_order_relevant_reductions(
         )
     }
 
-    const NEEDED: usize = 2;
-
     let mut found = ctx
         .extra
         .iter()
         .filter(|m| !m.is_raise && amount_is_order_relevant(&m.amount))
-        .take(NEEDED)
+        .take(needed)
         .count();
-    if found < NEEDED {
+    if found < needed {
         // A self-spell reducer ("This spell costs {W} less to cast") lives on a
         // card in hand, which the functioning-statics walk below does not cover.
         if let Some(obj) = state.objects.get(&pending.object_id) {
@@ -8749,17 +8761,17 @@ fn cast_can_have_order_relevant_reductions(
                 .static_definitions
                 .iter_all()
                 .filter(|def| mode_is_order_relevant_reduction(&def.mode))
-                .take(NEEDED - found)
+                .take(needed - found)
                 .count();
         }
     }
-    if found < NEEDED {
+    if found < needed {
         found += super::functioning_abilities::game_functioning_statics(state)
             .filter(|(_, def)| mode_is_order_relevant_reduction(&def.mode))
-            .take(NEEDED - found)
+            .take(needed - found)
             .count();
     }
-    found >= NEEDED
+    found >= needed
 }
 
 /// Upper bound on order-relevant reductions the analyzer will permute.
@@ -8775,16 +8787,146 @@ fn cast_can_have_order_relevant_reductions(
 /// `game_functioning_statics` regardless of `n!`.
 const COST_REDUCTION_ORDER_MAX_ENTRIES: usize = 8;
 
-/// CR 601.2f: Work out whether the reduction order is *observable* for this
-/// cast, and if so what the distinct locked costs are.
+/// Upper bound on the candidate elections (announcement × order pairs) the
+/// analyzer will evaluate.
 ///
-/// Every candidate order is evaluated by running the real application path
+/// `8!` is the pure-ordering ceiling, so a cast with nothing to announce keeps
+/// exactly the budget it had before hybrid announcement joined the election.
+/// When there IS something to announce, the product is capped here by degrading
+/// the order enumeration to rotations and then, if still over, by truncating
+/// the announcement set — both marked [`CostReductionCoverage::Partial`], never
+/// silently resolved.
+const COST_REDUCTION_MAX_CANDIDATES: usize = 40_320;
+
+/// CR 601.2b: the positions in `cost`'s shard list that this cast announces a
+/// nonhybrid equivalent for, paired with the two halves each may be announced
+/// as.
+///
+/// Two filters narrow "every hybrid symbol in the cost" to "every hybrid symbol
+/// whose announcement the caster can observe here":
+///
+///  1. [`ManaCostShard::announceable_halves`] — only symbols whose both halves
+///     are single mana symbols. `{2/W}` and the Phyrexian symbols keep the
+///     engine's existing payment-time resolution, where CR 601.2b's choice is
+///     still made; their non-mana half (two generic mana, 2 life) is not a
+///     shard substitution and belongs to those seams, not to this one.
+///  2. A reduction in the snapshot must be able to match the symbol. Announcing
+///     a half that no reduction can cancel cannot change the mana VALUE of the
+///     locked cost — it can only replace a hybrid symbol with one of the two
+///     things that symbol was already payable with (CR 107.4e), which strictly
+///     narrows payment and decides nothing the caster does not still decide in
+///     CR 601.2h. Filtering it out is what keeps ordinary hybrid casts silent.
+fn announceable_hybrid_positions(
+    cost: &ManaCost,
+    reductions: &[CostReductionEntry],
+) -> Vec<(usize, ManaCostShard)> {
+    let ManaCost::Cost { shards, .. } = cost else {
+        return Vec::new();
+    };
+    shards
+        .iter()
+        .enumerate()
+        .filter(|(_, shard)| shard.announceable_halves().is_some())
+        .filter(|(_, shard)| {
+            reductions.iter().any(|entry| {
+                entry.multiplier > 0
+                    && matches!(&entry.amount, ManaCost::Cost { shards, .. }
+                        if shards.iter().any(|r| cost_shard_matches_reduction(**shard, *r)))
+            })
+        })
+        .map(|(index, shard)| (index, *shard))
+        .collect()
+}
+
+/// CR 601.2b: replace each announceable hybrid symbol with the nonhybrid
+/// equivalent the caster announced.
+///
+/// `announcement` is parallel to `positions`; a short announcement leaves the
+/// trailing symbols hybrid, which is the same "announce nothing" state an empty
+/// announcement expresses. Applied BEFORE the CR 601.2f total is determined, so
+/// the reductions see the announced pips rather than the hybrid ones.
+fn apply_hybrid_announcement(
+    cost: &mut ManaCost,
+    positions: &[(usize, ManaCostShard)],
+    announcement: &[ManaCostShard],
+) {
+    let ManaCost::Cost { shards, .. } = cost else {
+        return;
+    };
+    for ((index, _), announced) in positions.iter().zip(announcement) {
+        if let Some(shard) = shards.get_mut(*index) {
+            *shard = *announced;
+        }
+    }
+}
+
+/// CR 601.2b: the cost the announcement is made against — the announcement-time
+/// base plus the chosen `{X}` and every declared additional mana cost, which is
+/// exactly what [`recompute_pending_mana_total_using`] starts from.
+///
+/// `None` for a cast with no captured `base_cost`: that path returns the
+/// already-announced `pending.cost` untouched by any modifier, so no reduction
+/// can consume a pip and no announcement is observable.
+fn announcement_base_cost(pending: &PendingCast, x: Option<u32>) -> Option<ManaCost> {
+    let base = pending.base_cost.as_ref()?;
+    let mut cost = base.clone();
+    if let Some(x) = x {
+        cost.concretize_x(x);
+    }
+    for addition in &pending.declared_mana_additions {
+        let addition = match x {
+            Some(x) if casting_costs::cost_has_x(addition) => {
+                let mut addition = addition.clone();
+                addition.concretize_x(x);
+                addition
+            }
+            _ => addition.clone(),
+        };
+        cost = super::restrictions::add_mana_cost(&cost, &addition);
+    }
+    Some(cost)
+}
+
+/// CR 601.2b: every announcement the caster may make over `positions`, as the
+/// cartesian product of each symbol's two halves, in a deterministic order.
+///
+/// The un-announced baseline is NOT included here — [`analyze_cost_reduction_order`]
+/// evaluates it first and separately, because it is the option every announced
+/// candidate is measured against.
+fn hybrid_announcements(positions: &[(usize, ManaCostShard)]) -> Vec<Vec<ManaCostShard>> {
+    let mut all: Vec<Vec<ManaCostShard>> = vec![Vec::new()];
+    for (_, symbol) in positions {
+        let halves = symbol
+            .announceable_halves()
+            .expect("announceable positions are filtered on `announceable_halves`");
+        all = all
+            .into_iter()
+            .flat_map(|prefix| {
+                halves.into_iter().map(move |half| {
+                    let mut next = prefix.clone();
+                    next.push(half);
+                    next
+                })
+            })
+            .collect();
+    }
+    all
+}
+
+/// CR 601.2b + CR 601.2f: Work out whether the caster's cost-determination
+/// choices are *observable* for this cast, and if so what the distinct locked
+/// costs are.
+///
+/// Two axes are enumerated together, because they are not independent:
+/// CR 601.2b's hybrid announcement decides which pips exist, and CR 601.2f's
+/// reduction order decides which reducer gets each pip. Every candidate
+/// (announcement, order) pair is evaluated by running the real application path
 /// ([`recompute_pending_mana_total_using`]), so the analyzer cannot drift from
 /// what the caster's answer will actually do — the preview it shows is produced
 /// by the same arithmetic that will later lock the cost in. The board inputs to
 /// that path are collected ONCE ([`CollectedCastCosts`]) and shared by every
-/// candidate: the collection is order-independent by construction, so hoisting
-/// it out of the loop is an optimization, not a semantic change.
+/// candidate: the collection depends on neither axis by construction, so
+/// hoisting it out of the loop is an optimization, not a semantic change.
 ///
 /// Outcomes are deduped by the resulting [`ManaCost`]. That is rules-safe:
 /// applying a cost reduction emits no event and is not a game action any
@@ -8793,80 +8935,157 @@ const COST_REDUCTION_ORDER_MAX_ENTRIES: usize = 8;
 /// costs") and converge (an ability word with no rules meaning of its own,
 /// CR 207.2c, which likewise counts colors of mana spent) — read the mana
 /// actually spent in CR 601.2h, not which reducer cancelled which pip. Two
-/// orders that lock the same total cost are therefore indistinguishable to the
-/// game, and offering both would be a prompt with no decision in it.
+/// candidates that lock the same total cost are therefore indistinguishable to
+/// the game, and offering both would be a prompt with no decision in it.
+///
+/// An ANNOUNCED candidate is additionally kept only when it lowers the locked
+/// mana value below what the same order reaches un-announced. Both halves of an
+/// announceable symbol have the hybrid symbol's own mana value (CR 202.3f), so
+/// the locked mana value moves if and only if the announcement changed how many
+/// reduction units found a pip — the thing CR 601.2b's timing exists to let the
+/// caster control. When it does not move, the announced cost is payable only by
+/// a strict subset of what the hybrid form it replaced is payable with
+/// (CR 107.4e), while costing exactly as much, so it is dominated by the
+/// un-announced candidate that is already offered, and the same choice is still
+/// open to the caster when mana is actually spent (CR 601.2h).
 fn analyze_cost_reduction_order(
     state: &GameState,
     player: PlayerId,
     pending: &PendingCast,
     ctx: &CostFinalizeContext,
 ) -> CostReductionAnalysis {
+    let empty = |reductions: Vec<CostReductionEntry>| CostReductionAnalysis {
+        reductions,
+        hybrid_symbols: Vec::new(),
+        outcomes: Vec::new(),
+        coverage: CostReductionCoverage::Exhaustive,
+    };
+
+    // CR 601.2b: a cast with an announceable hybrid symbol can need an election
+    // off a SINGLE reduction, so the structural pre-gate's threshold depends on
+    // whether the cost carries one at all. `announceable_halves` is a `match` on
+    // the shard — no board read — so asking first is free.
+    let cost_has_announceable_hybrid = announcement_base_cost(pending, pending.ability.chosen_x)
+        .is_some_and(|cost| {
+            matches!(&cost, ManaCost::Cost { shards, .. }
+                if shards.iter().any(|s| s.announceable_halves().is_some()))
+        });
+    let needed = if cost_has_announceable_hybrid { 1 } else { 2 };
+
     // CR 601.2f: structural pre-gate, so a board carrying only generic-only
     // reducers never pays for the snapshot's two full collector walks. Never an
-    // election shortcut: `false` means no two order-relevant reductions can
-    // exist, which is the same "nothing to permute" verdict the snapshot below
-    // would reach.
-    if !cast_can_have_order_relevant_reductions(state, pending, ctx) {
-        return CostReductionAnalysis {
-            reductions: Vec::new(),
-            outcomes: Vec::new(),
-            coverage: CostReductionCoverage::Exhaustive,
-        };
+    // election shortcut: `false` means the cast cannot reach `needed`
+    // order-relevant reductions, which is the same "nothing to enumerate"
+    // verdict the snapshot below would reach.
+    if !cast_can_have_order_relevant_reductions(state, pending, ctx, needed) {
+        return empty(Vec::new());
     }
 
     let modifiers = CollectedCostModifiers::collect(state, player, pending, ctx);
     let reductions = order_relevant_reductions(&modifiers);
 
-    // CR 601.2f: zero or one order-relevant reduction has nothing to permute.
-    if reductions.len() < 2 {
-        return CostReductionAnalysis {
-            reductions,
-            outcomes: Vec::new(),
-            coverage: CostReductionCoverage::Exhaustive,
-        };
+    // CR 601.2b: which hybrid symbols this cast announces, measured against the
+    // reductions that were actually snapshotted.
+    let announce_base = announcement_base_cost(pending, pending.ability.chosen_x);
+    let positions = announce_base
+        .as_ref()
+        .map(|cost| announceable_hybrid_positions(cost, &reductions))
+        .unwrap_or_default();
+
+    // Nothing to enumerate: no reduction can consume a pip, or the single
+    // reduction there is commutes with itself and has no announcement to
+    // interact with.
+    if reductions.is_empty() || (reductions.len() < 2 && positions.is_empty()) {
+        return empty(reductions);
     }
 
-    let (coverage, orders) = if reductions.len() <= COST_REDUCTION_ORDER_MAX_ENTRIES {
-        (
-            CostReductionCoverage::Exhaustive,
-            permutations(reductions.len()),
-        )
+    let mut coverage = CostReductionCoverage::Exhaustive;
+    let mut orders = if reductions.len() <= COST_REDUCTION_ORDER_MAX_ENTRIES {
+        permutations(reductions.len())
     } else {
         // Budget exhausted. Per the "never silently elect" rule we do not fall
         // back to picking an order; we present the rotations we can evaluate,
         // every one of which is a legal CR 601.2f order, and mark the result
         // `Partial` so callers know the set may be incomplete.
-        (CostReductionCoverage::Partial, rotations(reductions.len()))
+        coverage = CostReductionCoverage::Partial;
+        rotations(reductions.len())
     };
+    let mut announcements = hybrid_announcements(&positions);
+    if orders.len().saturating_mul(announcements.len()) > COST_REDUCTION_MAX_CANDIDATES {
+        orders = rotations(reductions.len());
+        coverage = CostReductionCoverage::Partial;
+    }
+    if orders.len().saturating_mul(announcements.len()) > COST_REDUCTION_MAX_CANDIDATES {
+        announcements.truncate(COST_REDUCTION_MAX_CANDIDATES / orders.len().max(1));
+        coverage = CostReductionCoverage::Partial;
+    }
 
     let provenances: Vec<ReductionProvenance> =
         reductions.iter().map(|entry| entry.provenance).collect();
 
-    // The collected board inputs are identical for every candidate order — only
-    // the ORDER they are applied in differs — so they are hoisted out of the
-    // factorial loop. Each iteration below re-runs only the arithmetic.
+    // The collected board inputs are identical for every candidate — only the
+    // announcement and the ORDER differ — so they are hoisted out of the loop.
+    // Each iteration below re-runs only the arithmetic.
     let collected = CollectedCastCosts::with_modifiers(modifiers);
 
-    let mut outcomes: Vec<CostReductionOutcome> = Vec::new();
-    for order in orders {
-        let elected: Vec<ReductionProvenance> =
-            order.iter().map(|&index| provenances[index]).collect();
+    let locked_for = |order: &[usize], announcement: &[ManaCostShard]| {
         let candidate_ctx = CostFinalizeContext {
             extra: ctx.extra.clone(),
-            election: Some(elected),
+            election: Some(CostReductionElection {
+                order: order.iter().map(|&index| provenances[index]).collect(),
+                hybrid_announcement: announcement.to_vec(),
+            }),
         };
-        let locked_cost = recompute_pending_mana_total_using(
+        recompute_pending_mana_total_using(
             state,
             player,
             pending,
             pending.ability.chosen_x,
             &candidate_ctx,
             &collected,
-        );
+        )
+    };
+
+    let mut outcomes: Vec<CostReductionOutcome> = Vec::new();
+    let push = |outcomes: &mut Vec<CostReductionOutcome>,
+                order: Vec<usize>,
+                hybrid_announcement: Vec<ManaCostShard>,
+                locked_cost: ManaCost| {
         if outcomes.iter().any(|o| o.locked_cost == locked_cost) {
-            continue;
+            return;
         }
-        outcomes.push(CostReductionOutcome { order, locked_cost });
+        outcomes.push(CostReductionOutcome {
+            order,
+            hybrid_announcement,
+            locked_cost,
+        });
+    };
+
+    // The un-announced baselines come first, so a locked cost reachable both
+    // with and without an announcement is represented by the more payable
+    // un-announced candidate (CR 107.4e) rather than by an arbitrary one.
+    let baselines: Vec<ManaCost> = orders.iter().map(|order| locked_for(order, &[])).collect();
+    for (order, locked_cost) in orders.iter().zip(&baselines) {
+        push(
+            &mut outcomes,
+            order.clone(),
+            Vec::new(),
+            locked_cost.clone(),
+        );
+    }
+    for announcement in announcements.iter().filter(|a| !a.is_empty()) {
+        for (order, baseline) in orders.iter().zip(&baselines) {
+            let locked_cost = locked_for(order, announcement);
+            if locked_cost.mana_value() >= baseline.mana_value() {
+                continue;
+            }
+            push(
+                &mut outcomes,
+                order.clone(),
+                announcement.clone(),
+                locked_cost,
+            );
+        }
     }
 
     // Caster-optimal first: cheapest total, then fewest colored pips, so the
@@ -8884,6 +9103,7 @@ fn analyze_cost_reduction_order(
 
     CostReductionAnalysis {
         reductions,
+        hybrid_symbols: positions.iter().map(|(_, symbol)| *symbol).collect(),
         outcomes,
         coverage,
     }
@@ -8921,27 +9141,30 @@ fn rotations(n: usize) -> Vec<Vec<usize>> {
         .collect()
 }
 
-/// CR 601.2f: the verdict of the lock seam for one cast.
+/// CR 601.2b + CR 601.2f: the verdict of the lock seam for one cast.
 pub(super) enum CostLockOutcome {
-    /// The reduction order is unobservable for this cast (or has already been
-    /// elected): this is the total cost that becomes "locked in".
+    /// The caster's cost-determination choices are unobservable for this cast
+    /// (or have already been elected): this is the total cost that becomes
+    /// "locked in".
     Locked(ManaCost),
-    /// Two or more legal orders lock in different total costs, so CR 601.2f's
-    /// "the player may apply them in any order" is a real decision and the
-    /// caster has to make it.
+    /// Two or more legal elections lock in different total costs, so
+    /// CR 601.2f's "the player may apply them in any order" — and, where the
+    /// cost carries an announceable hybrid symbol, CR 601.2b's nonhybrid
+    /// announcement — is a real decision and the caster has to make it.
     Election {
         reductions: Vec<CostReductionEntry>,
+        hybrid_symbols: Vec<ManaCostShard>,
         outcomes: Vec<CostReductionOutcome>,
     },
 }
 
-/// CR 601.2f: Determine the total cost that becomes "locked in" for `pending`,
-/// asking the caster to order the reductions when — and only when — the order
-/// is observable.
+/// CR 601.2b + CR 601.2f: Determine the total cost that becomes "locked in" for
+/// `pending`, asking the caster for their election when — and only when — it is
+/// observable.
 ///
 /// `extra` carries reductions the board cannot reproduce (an accepted Defiler
 /// life payment); `election` carries the caster's answer once they have given
-/// one. With neither, and with an unobservable order, the already-computed
+/// one. With neither, and with an unobservable election, the already-computed
 /// `pending.cost` is returned untouched — the pure-preview pipeline that
 /// produced it used the caster-optimal default, which is one of the legal
 /// CR 601.2f orders, so nothing needs recomputing and nothing changes.
@@ -8950,7 +9173,7 @@ pub(super) fn lock_in_total_cost(
     player: PlayerId,
     pending: &PendingCast,
     extra: &[CostReductionEntry],
-    election: Option<&[ReductionProvenance]>,
+    election: Option<&CostReductionElection>,
 ) -> CostLockOutcome {
     // Hot path. `pay_and_push` runs this on EVERY cast, including the simulated
     // ones the AI search drives, so the overwhelmingly common board — no
@@ -8964,7 +9187,7 @@ pub(super) fn lock_in_total_cost(
 
     let ctx = CostFinalizeContext {
         extra: extra.iter().cloned().map(reduction_entry_to_mod).collect(),
-        election: election.map(<[ReductionProvenance]>::to_vec),
+        election: election.cloned(),
     };
 
     // The caster has already answered: apply exactly what they chose.
@@ -8976,6 +9199,7 @@ pub(super) fn lock_in_total_cost(
     if analysis.needs_election() {
         return CostLockOutcome::Election {
             reductions: analysis.reductions,
+            hybrid_symbols: analysis.hybrid_symbols,
             outcomes: analysis.outcomes,
         };
     }
@@ -9044,15 +9268,23 @@ fn reduction_entry_to_mod(entry: CostReductionEntry) -> CostModification {
     }
 }
 
-/// CR 601.2f: Validate a submitted reduction order against the prompt.
+/// CR 601.2b + CR 601.2f: Validate a submitted election against the prompt.
 ///
-/// The submission must be a permutation of `0..reductions.len()` — every index
+/// The `order` must be a permutation of `0..reductions.len()` — every index
 /// present exactly once. A short, long, duplicated or out-of-range order is
 /// rejected rather than coerced, so a malformed client can never silently get
 /// a different total cost than the one it asked for.
-pub(super) fn validate_cost_reduction_order(
+///
+/// The `hybrid_announcement` must be either empty ("announce nothing") or
+/// exactly as long as `hybrid_symbols`, with every entry one of the two halves
+/// its symbol may be announced as (CR 107.4e). An announcement naming a symbol
+/// the cost does not carry would otherwise lock a cost no legal announcement
+/// can reach.
+pub(super) fn validate_cost_reduction_election(
     order: &[usize],
+    hybrid_announcement: &[ManaCostShard],
     reductions: &[CostReductionEntry],
+    hybrid_symbols: &[ManaCostShard],
 ) -> Result<(), String> {
     if order.len() != reductions.len() {
         return Err(format!(
@@ -9076,7 +9308,49 @@ pub(super) fn validate_cost_reduction_order(
         }
         *slot = true;
     }
+    if hybrid_announcement.is_empty() {
+        return Ok(());
+    }
+    if hybrid_announcement.len() != hybrid_symbols.len() {
+        return Err(format!(
+            "Hybrid announcement must name all {} hybrid symbols (or none), got {}",
+            hybrid_symbols.len(),
+            hybrid_announcement.len()
+        ));
+    }
+    for (announced, symbol) in hybrid_announcement.iter().zip(hybrid_symbols) {
+        let legal = symbol
+            .announceable_halves()
+            .is_some_and(|halves| halves.contains(announced));
+        if !legal {
+            return Err(format!(
+                "{} is not a nonhybrid equivalent of {}",
+                announced.symbol(),
+                symbol.symbol()
+            ));
+        }
+    }
     Ok(())
+}
+
+/// CR 601.2b: the hybrid symbols a live prompt's election ranges over,
+/// re-derived from the snapshot the caster was shown.
+///
+/// The handler validates against this rather than against a freshly analyzed
+/// board: CR 601.2h keeps the snapshot determined once the total cost is being
+/// determined, and `reductions` is that snapshot.
+pub(super) fn prompt_hybrid_symbols(
+    pending: &PendingCast,
+    reductions: &[CostReductionEntry],
+) -> Vec<ManaCostShard> {
+    announcement_base_cost(pending, pending.ability.chosen_x)
+        .map(|cost| {
+            announceable_hybrid_positions(&cost, reductions)
+                .into_iter()
+                .map(|(_, symbol)| symbol)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// CR 601.2f: Apply every NON-FLOOR cost modifier to `mana_cost` in CR-correct
@@ -9368,6 +9642,16 @@ fn recompute_pending_mana_total_using(
         cost = super::restrictions::add_mana_cost(&cost, &addition);
     }
     let modifiers = collected.modifiers(state, player, pending, ctx);
+    // CR 601.2b: the nonhybrid equivalent is announced BEFORE the total cost is
+    // determined (CR 601.2f), so the reductions below see the announced pips.
+    // Re-derived from the same inputs the analyzer enumerated over, and skipped
+    // outright when the caster announced nothing — which is every cast that
+    // never reached the election.
+    let announcement = ctx.hybrid_announcement();
+    if !announcement.is_empty() {
+        let positions = announceable_hybrid_positions(&cost, &order_relevant_reductions(modifiers));
+        apply_hybrid_announcement(&mut cost, &positions, announcement);
+    }
     apply_non_floor_cost_modifiers_using(&mut cost, modifiers, ctx.election());
     apply_target_dependent_cost_modifiers_using(
         state,

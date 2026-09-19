@@ -1683,16 +1683,21 @@ pub fn fallback_action(
 
         // CR 601.2f: cost-reduction order. Take the engine's caster-optimal
         // representative (`outcomes` is sorted cheapest-first), falling back to
-        // the identity permutation when the prompt somehow carries no outcome.
+        // the identity permutation with nothing announced when the prompt
+        // somehow carries no outcome.
         WaitingFor::OrderCostReductions {
             reductions,
             outcomes,
             ..
-        } => Some(GameAction::OrderCostReductions {
-            order: outcomes
-                .first()
-                .map(|outcome| outcome.order.clone())
-                .unwrap_or_else(|| (0..reductions.len()).collect()),
+        } => Some(match outcomes.first() {
+            Some(outcome) => GameAction::OrderCostReductions {
+                order: outcome.order.clone(),
+                hybrid_announcement: outcome.hybrid_announcement.clone(),
+            },
+            None => GameAction::OrderCostReductions {
+                order: (0..reductions.len()).collect(),
+                hybrid_announcement: Vec::new(),
+            },
         }),
 
         // CR 103.5 + 103.5b: Mulligan default. In `Declare`, keep unless the AI

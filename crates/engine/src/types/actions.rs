@@ -349,13 +349,19 @@ pub enum GameAction {
     OrderTriggers {
         order: Vec<usize>,
     },
-    /// CR 601.2f: Caster submits the order in which the applicable cost
-    /// reductions are applied ("If multiple cost reductions apply, the player
-    /// may apply them in any order"). `order` is a permutation of indices into
-    /// the `WaitingFor::OrderCostReductions.reductions` vec the caster was
-    /// prompted with; index 0 = applied first.
+    /// CR 601.2b + CR 601.2f: Caster submits their cost-determination election.
+    /// `order` is a permutation of indices into the
+    /// `WaitingFor::OrderCostReductions.reductions` vec the caster was prompted
+    /// with; index 0 = applied first ("If multiple cost reductions apply, the
+    /// player may apply them in any order"). `hybrid_announcement` is the
+    /// announced nonhybrid equivalent for each entry of that prompt's
+    /// `hybrid_symbols` vec, in the same order ("the player announces the
+    /// nonhybrid equivalent cost they intend to pay"), or empty to announce
+    /// nothing and leave every hybrid symbol in the locked cost.
     OrderCostReductions {
         order: Vec<usize>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hybrid_announcement: Vec<crate::types::mana::ManaCostShard>,
     },
     CancelCast,
     Equip {

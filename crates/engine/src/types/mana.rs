@@ -1783,6 +1783,48 @@ impl ManaCostShard {
         }
     }
 
+    /// CR 107.4e + CR 601.2b: the two nonhybrid mana symbols this hybrid symbol
+    /// can be announced as, when BOTH halves are themselves single mana
+    /// symbols.
+    ///
+    /// CR 601.2b: "If a cost that will be paid as the spell is being cast
+    /// includes hybrid mana symbols, the player announces the nonhybrid
+    /// equivalent cost they intend to pay." CR 107.4e: "Each one represents a
+    /// cost that can be paid in one of two ways, as represented by the two
+    /// halves of the symbol."
+    ///
+    /// `None` for the two hybrid families whose alternative half is NOT a mana
+    /// symbol, and which therefore cannot be expressed as a shard substitution:
+    ///   * the monocolored hybrids `{2/W}`..`{2/G}` (CR 107.4e), whose other
+    ///     half is two generic mana, and
+    ///   * every Phyrexian symbol (CR 107.4f), whose other half is 2 life.
+    ///
+    /// Both of those keep the engine's existing payment-time resolution, where
+    /// the same choice is still made; only the shard-substitutable families
+    /// participate in the CR 601.2f cost-determination election.
+    pub const fn announceable_halves(self) -> Option<[Self; 2]> {
+        match self {
+            Self::WhiteBlue => Some([Self::White, Self::Blue]),
+            Self::WhiteBlack => Some([Self::White, Self::Black]),
+            Self::BlueBlack => Some([Self::Blue, Self::Black]),
+            Self::BlueRed => Some([Self::Blue, Self::Red]),
+            Self::BlackRed => Some([Self::Black, Self::Red]),
+            Self::BlackGreen => Some([Self::Black, Self::Green]),
+            Self::RedWhite => Some([Self::Red, Self::White]),
+            Self::RedGreen => Some([Self::Red, Self::Green]),
+            Self::GreenWhite => Some([Self::Green, Self::White]),
+            Self::GreenBlue => Some([Self::Green, Self::Blue]),
+            // CR 107.4c + CR 107.4e: `{C/W}`'s halves are `{C}` and `{W}`, both
+            // single mana symbols, so this family substitutes cleanly too.
+            Self::ColorlessWhite => Some([Self::Colorless, Self::White]),
+            Self::ColorlessBlue => Some([Self::Colorless, Self::Blue]),
+            Self::ColorlessBlack => Some([Self::Colorless, Self::Black]),
+            Self::ColorlessRed => Some([Self::Colorless, Self::Red]),
+            Self::ColorlessGreen => Some([Self::Colorless, Self::Green]),
+            _ => None,
+        }
+    }
+
     /// Returns true if this shard contributes to devotion for the given color.
     /// CR 700.5: Each mana symbol that is or contains the color counts.
     /// Hybrid symbols count toward each of their colors. A single hybrid symbol

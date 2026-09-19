@@ -32,7 +32,7 @@ use engine::types::ability::{
     Effect, ManaContribution, ManaProduction, SacrificeCost, StaticDefinition, TargetFilter,
 };
 use engine::types::actions::GameAction;
-use engine::types::casting_costs::{CostReductionEntry, ReductionProvenance};
+use engine::types::casting_costs::{CostReductionEntry, CostReductionOutcome, ReductionProvenance};
 use engine::types::game_state::{CastPaymentMode, PendingCast, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
@@ -147,11 +147,59 @@ impl Board {
             .map(|_| ())
     }
 
+    /// Begin the cast in `CastPaymentMode::Manual`, which parks it at its
+    /// payment step with the LOCKED total still readable on `pending_cast`
+    /// rather than already spent — the same lever the Defiler and kicker rows
+    /// above pull to assert a cost SHAPE instead of a tapped-land count.
+    fn begin_manual_cast(&mut self) -> Result<(), engine::game::engine::EngineError> {
+        let card_id = self.runner.state().objects[&self.spell].card_id;
+        self.runner
+            .act(GameAction::CastSpell {
+                object_id: self.spell,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Manual,
+            })
+            .map(|_| ())
+    }
+
+    /// The total cost locked in for a cast parked at its payment step
+    /// (CR 601.2f).
+    fn locked_cost(&self) -> ManaCost {
+        self.runner
+            .state()
+            .pending_cast
+            .as_ref()
+            .map(|pending| pending.cost.clone())
+            .expect("a manual cast parks at its payment step with the locked total")
+    }
+
+    fn prompt_is_live(&self) -> bool {
+        matches!(
+            self.runner.state().waiting_for,
+            WaitingFor::OrderCostReductions { .. }
+        )
+    }
+
     fn tapped_lands(&self) -> usize {
         self.lands
             .iter()
             .filter(|&&id| self.runner.state().objects[&id].tapped)
             .count()
+    }
+
+    /// CR 601.2b: the live prompt's announceable hybrid symbols, together with
+    /// its outcomes in full — each one an `order` AND the `hybrid_announcement`
+    /// it was computed under.
+    fn hybrid_election(&self) -> (Vec<ManaCostShard>, Vec<CostReductionOutcome>) {
+        match &self.runner.state().waiting_for {
+            WaitingFor::OrderCostReductions {
+                hybrid_symbols,
+                outcomes,
+                ..
+            } => (hybrid_symbols.clone(), outcomes.clone()),
+            other => panic!("expected an OrderCostReductions prompt, got {other:?}"),
+        }
     }
 
     fn election(&self) -> (&[CostReductionEntry], Vec<ManaCost>, Vec<Vec<usize>>) {
@@ -292,6 +340,7 @@ fn caster_elects_between_both_legal_cost_reduction_orders() {
         .runner
         .act(GameAction::OrderCostReductions {
             order: cheap_order.clone(),
+            hybrid_announcement: vec![],
         })
         .expect("the cheapest order must be accepted");
     assert_eq!(
@@ -314,6 +363,7 @@ fn caster_elects_between_both_legal_cost_reduction_orders() {
         .runner
         .act(GameAction::OrderCostReductions {
             order: expensive_order,
+            hybrid_announcement: vec![],
         })
         .expect("the deliberately costlier order must also be accepted");
     assert_eq!(
@@ -474,7 +524,10 @@ fn a_malformed_order_is_rejected_and_the_prompt_survives() {
 
         let err = setup
             .runner
-            .act(GameAction::OrderCostReductions { order: bad.clone() })
+            .act(GameAction::OrderCostReductions {
+                order: bad.clone(),
+                hybrid_announcement: vec![],
+            })
             .expect_err("a non-permutation must be refused");
         assert!(
             format!("{err:?}").contains("Cost reduction order"),
@@ -548,7 +601,7 @@ fn ai_candidates_are_exactly_the_engine_representatives() {
     let candidates: Vec<Vec<usize>> = candidate_actions_broad(setup.runner.state())
         .into_iter()
         .filter_map(|candidate| match candidate.action {
-            GameAction::OrderCostReductions { order } => Some(order),
+            GameAction::OrderCostReductions { order, .. } => Some(order),
             _ => None,
         })
         .collect();
@@ -731,7 +784,10 @@ fn the_new_wire_shapes_round_trip_and_old_pending_casts_still_parse() {
         assert_eq!(decoded, provenance);
     }
 
-    let action = GameAction::OrderCostReductions { order: vec![1, 0] };
+    let action = GameAction::OrderCostReductions {
+        order: vec![1, 0],
+        hybrid_announcement: vec![],
+    };
     let encoded = serde_json::to_string(&action).expect("the action must serialize");
     let decoded: GameAction = serde_json::from_str(&encoded).expect("the action must round-trip");
     assert_eq!(decoded, action);
@@ -902,6 +958,7 @@ fn a_declared_kicker_survives_the_cost_reduction_election() {
     runner
         .act(GameAction::OrderCostReductions {
             order: orders[1].clone(),
+            hybrid_announcement: vec![],
         })
         .expect("the costlier order must be accepted");
     let locked = runner
@@ -997,6 +1054,7 @@ fn an_elected_order_survives_x_selection() {
     runner
         .act(GameAction::OrderCostReductions {
             order: orders[1].clone(),
+            hybrid_announcement: vec![],
         })
         .expect("the deliberately costlier order must be accepted");
     assert!(
@@ -1244,7 +1302,7 @@ fn the_ai_offer_seam_classifies_a_live_ordering_prompt() {
     let orders: Vec<Vec<usize>> = legal_actions(setup.runner.state())
         .into_iter()
         .filter_map(|action| match action {
-            GameAction::OrderCostReductions { order } => Some(order),
+            GameAction::OrderCostReductions { order, .. } => Some(order),
             _ => None,
         })
         .collect();
@@ -1252,5 +1310,341 @@ fn the_ai_offer_seam_classifies_a_live_ordering_prompt() {
         orders.len(),
         2,
         "both locked costs must survive the filter as legal answers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CR 601.2b: the hybrid announcement rides the same election.
+//
+// "If a cost that will be paid as the spell is being cast includes hybrid mana
+// symbols, the player announces the nonhybrid equivalent cost they intend to
+// pay." That announcement happens during CR 601.2b, which PRECEDES CR 601.2f's
+// total-cost determination — so which half the caster announces decides which
+// pips the reductions below find, and the reachable locked totals are a
+// function of the (announcement, order) pair rather than of the order alone.
+//
+// The consequence the pure-ordering seam never had: an election can be required
+// off a SINGLE reduction, because the announcement alone can produce two
+// distinct legal locked totals.
+// ---------------------------------------------------------------------------
+
+/// Rigo, Streetwise Mentor's printed cost, `{G/W}{W}{W/U}`.
+///
+/// Built as a bare `ManaCost` rather than loaded from the card database, the
+/// same choice every other board in this file makes: these rows pin the
+/// CR 601.2b + CR 601.2f seam, not the Oracle parser or the card pipeline, and a
+/// printed-card dependency would red them on card-data churn that has nothing to
+/// do with the election. The cost was verified against Rigo's Oracle printing
+/// before being transcribed; what the seam actually consumes is the SHAPE — two
+/// announceable hybrid symbols drawn from different colour pairs, with a plain
+/// pip between them.
+fn hybrid_gw_w_wu() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::GreenWhite,
+            ManaCostShard::White,
+            ManaCostShard::WhiteBlue,
+        ],
+        generic: 0,
+    }
+}
+
+/// [`hybrid_gw_w_wu`] with one generic added, so BOTH elections park at a
+/// payment step with the locked total still readable.
+///
+/// The announced election locks `{0}` on Rigo's printed cost, which is paid
+/// outright and clears `pending_cast` before anything can read it. The extra
+/// generic is inert to the election itself — the printed colored-only rider
+/// disables CR 118.7b's spillover, so no unit of a `{W}{U}{B}{R}{G}` reduction
+/// may reach generic mana. It shifts both legal totals by exactly `{1}` and
+/// changes nothing about which halves are announced. The headline row asserts
+/// that equivalence rather
+/// than assuming it.
+fn one_plus_hybrid_gw_w_wu() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::GreenWhite,
+            ManaCostShard::White,
+            ManaCostShard::WhiteBlue,
+        ],
+        generic: 1,
+    }
+}
+
+/// `{1}{G}{W}{U}` — the announced nonhybrid equivalent of [`hybrid_gw_w_wu`]
+/// with one generic added so the cast parks at a payment step with its locked
+/// total still readable. The control board for "it is the hybrid symbol, not
+/// the reducer, that makes one reduction a decision".
+fn one_g_w_u() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::Green,
+            ManaCostShard::White,
+            ManaCostShard::Blue,
+        ],
+        generic: 1,
+    }
+}
+
+/// The headline CR 601.2b row: ONE hybrid cost, ONE colored-only reducer, TWO
+/// legal locked totals, driven through the production cast pipeline.
+///
+/// Board: Rigo's `{G/W}{W}{W/U}` under a Morophon-style `{W}{U}{B}{R}{G}`
+/// reduction carrying the printed colored-only rider ("This effect reduces only
+/// the amount of colored mana you pay") — an unmatched unit is discarded rather
+/// than spilling onto generic mana the way CR 118.7b would otherwise send it.
+///
+///   * announce nothing — the five reduction units are applied in WUBRG order
+///     and each takes the FIRST pip it matches. CR 107.4e makes a hybrid symbol
+///     a symbol of both its colours, so `{W}` matches `{G/W}` and takes it;
+///     `{U}` then matches `{W/U}` and takes it; `{B}`, `{R}` and `{G}` find no
+///     pip and the rider discards them. Locks `{W}`.
+///   * announce `{G/W}` as `{G}` and `{W/U}` as `{U}` — the cost the reductions
+///     see is `{G}{W}{U}`, three pips the WUBRG amount matches one-for-one.
+///     Locks `{0}`.
+///
+/// Both are legal announcements of the same printed cost, so the engine may not
+/// pick one: it asks, off a single reduction.
+///
+/// The assertions are on the locked `ManaCost` SHAPE, not on a mana value —
+/// `{W}` versus `{0}` versus the un-reduced `{G/W}{W}{W/U}` are three different
+/// shapes, so "the reduction was dropped entirely" cannot masquerade as the
+/// costlier election.
+///
+/// Revert guard: with `apply_hybrid_announcement` neutered, the announced
+/// candidate locks the same `{W}` as the baseline, the analyzer dedupes them
+/// into one outcome, the prompt never opens, and `hybrid_election` panics.
+#[test]
+fn a_hybrid_announcement_and_a_colored_only_reducer_elect_distinct_locked_totals() {
+    let rigo = || {
+        board(
+            hybrid_gw_w_wu(),
+            3,
+            vec![reducer(wubrg(), CostReductionReach::ColoredManaOnly)],
+        )
+    };
+
+    let mut setup = rigo();
+    setup.begin_cast().expect("the cast must begin");
+
+    let (reductions, costs, _) = setup.election();
+    assert_eq!(
+        reductions.len(),
+        1,
+        "CR 601.2b: a SINGLE reduction is enough — the second axis of this \
+         election is the announcement, not another reducer"
+    );
+    let (hybrid_symbols, outcomes) = setup.hybrid_election();
+    assert_eq!(
+        hybrid_symbols,
+        vec![ManaCostShard::GreenWhite, ManaCostShard::WhiteBlue],
+        "CR 601.2b: both hybrid symbols are announceable — each is matched by a \
+         unit of the WUBRG reduction, and each has two mana-symbol halves \
+         (CR 107.4e). The plain {{W}} between them is not a choice"
+    );
+    assert_eq!(
+        costs,
+        vec![ManaCost::generic(0), white()],
+        "the two legal announcements lock {{0}} and {{W}}, cheapest first. A \
+         single {{W}} outcome means the announcement never reached the \
+         reductions; a surviving hybrid shard means it was applied to the wrong \
+         cost"
+    );
+    assert_eq!(
+        outcomes[0].hybrid_announcement,
+        vec![ManaCostShard::Green, ManaCostShard::Blue],
+        "the cheap outcome is reached by announcing {{G/W}} as {{G}} and \
+         {{W/U}} as {{U}}, parallel to the prompt's hybrid_symbols"
+    );
+    assert!(
+        outcomes[1].hybrid_announcement.is_empty(),
+        "the costlier outcome announces nothing, which CR 107.4e leaves strictly \
+         more payable — it must not be represented by an announced candidate"
+    );
+    assert_eq!(
+        outcomes[0].order, outcomes[1].order,
+        "both outcomes apply the one reduction the only way it can be applied — \
+         the ORDER is not what separates them here"
+    );
+
+    let rigo_outcomes = outcomes;
+
+    // Production cast, both elections, asserted on the locked cost SHAPE.
+    //
+    // The parked arm runs on the +{1} board: Rigo's announced election locks
+    // `{0}`, which is paid outright and clears `pending_cast` before anything
+    // can read it, while `{1}` and `{1}{W}` both park at a payment step. The
+    // announcement it elects is asserted identical to Rigo's, which is what
+    // makes the shifted board the same case rather than a different one.
+    for (index, parked_cost, expected_taps) in [
+        (0usize, ManaCost::generic(1), 0usize),
+        (
+            1,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 1,
+            },
+            1,
+        ),
+    ] {
+        let mut parked = board(
+            one_plus_hybrid_gw_w_wu(),
+            4,
+            vec![reducer(wubrg(), CostReductionReach::ColoredManaOnly)],
+        );
+        parked.begin_manual_cast().expect("the cast must begin");
+        let (_, outcomes) = parked.hybrid_election();
+        assert_eq!(
+            outcomes
+                .iter()
+                .map(|o| o.hybrid_announcement.clone())
+                .collect::<Vec<_>>(),
+            rigo_outcomes
+                .iter()
+                .map(|o| o.hybrid_announcement.clone())
+                .collect::<Vec<_>>(),
+            "the extra generic is untouchable by a colored-only reduction, so \
+             the +{{1}} board must elect between exactly the same announcements \
+             as Rigo's printed cost"
+        );
+        let outcome = outcomes[index].clone();
+        parked
+            .runner
+            .act(GameAction::OrderCostReductions {
+                order: outcome.order,
+                hybrid_announcement: outcome.hybrid_announcement,
+            })
+            .expect("a representative the engine itself offered must be accepted");
+        assert_eq!(
+            parked.locked_cost(),
+            parked_cost,
+            "CR 601.2b + CR 601.2f: outcome {index} must lock {parked_cost:?}. A \
+             locked {{1}}{{G/W}}{{W}}{{W/U}} means the reduction was dropped \
+             entirely; a surviving hybrid shard means the announcement never \
+             reached the cost the reductions were applied to"
+        );
+
+        // And Rigo's own printed cost through the auto-paying pipeline, so the
+        // elected total is what actually gets SPENT, not only what was previewed.
+        let mut spent = rigo();
+        spent.begin_cast().expect("the cast must begin");
+        let (_, outcomes) = spent.hybrid_election();
+        let outcome = outcomes[index].clone();
+        spent
+            .runner
+            .act(GameAction::OrderCostReductions {
+                order: outcome.order,
+                hybrid_announcement: outcome.hybrid_announcement,
+            })
+            .expect("a representative the engine itself offered must be accepted");
+        assert_eq!(
+            spent.tapped_lands(),
+            expected_taps,
+            "outcome {index} locks {:?}, so exactly {expected_taps} land(s) may \
+             be tapped — three would mean no reduction applied at all",
+            rigo_outcomes[index].locked_cost
+        );
+    }
+}
+
+/// The single-reducer election exists BECAUSE of the hybrid symbol, not because
+/// the reducer became order-relevant on its own.
+///
+/// Control: the same `{W}{U}{B}{R}{G}` colored-only reducer against the already
+/// nonhybrid `{1}{G}{W}{U}`. One reduction has nothing to permute and nothing to
+/// announce, so the caster is never asked — which is the pre-CR-601.2b
+/// behaviour this whole file's counterweight section pins.
+///
+/// Positive guard on the silent arm: the printed mana value 4 locks as `{1}`,
+/// so all three colored units demonstrably found their pips. A dropped
+/// reduction would leave `{1}{G}{W}{U}`.
+///
+/// Revert guard: restore the structural pre-gate's hardcoded `NEEDED = 2` and
+/// the hybrid arm stops prompting, so `hybrid_election` panics.
+#[test]
+fn a_single_reducer_needs_an_election_only_because_of_the_hybrid_symbol() {
+    let mut control = board(
+        one_g_w_u(),
+        4,
+        vec![reducer(wubrg(), CostReductionReach::ColoredManaOnly)],
+    );
+    control.begin_manual_cast().expect("the cast must begin");
+    assert!(
+        !control.prompt_is_live(),
+        "one reduction over a cost with no announceable hybrid symbol is not a \
+         decision — prompting here would be the ordinary-cast regression"
+    );
+    assert_eq!(
+        control.locked_cost(),
+        ManaCost::generic(1),
+        "positive guard: the WUBRG reduction took all three colored pips off \
+         {{1}}{{G}}{{W}}{{U}} and the rider discarded {{B}} and {{R}} rather \
+         than spending them on the generic"
+    );
+
+    let mut setup = board(
+        hybrid_gw_w_wu(),
+        3,
+        vec![reducer(wubrg(), CostReductionReach::ColoredManaOnly)],
+    );
+    setup.begin_manual_cast().expect("the cast must begin");
+    assert!(
+        setup.prompt_is_live(),
+        "the same single reducer over a cost whose hybrid symbols it can match \
+         IS a decision (CR 601.2b), and the engine must ask"
+    );
+    let (_, outcomes) = setup.hybrid_election();
+    assert_eq!(
+        outcomes.len(),
+        2,
+        "exactly two distinct locked totals are reachable, got {:?}",
+        outcomes
+            .iter()
+            .map(|o| o.locked_cost.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The CR 601.2b counterweight: an announcement that cannot lower the locked
+/// total is not a decision, and the caster is not asked.
+///
+/// `{1}{W/U}` under a `{W}` colored-only reduction. The reduction matches the
+/// hybrid symbol (CR 107.4e), so the symbol IS announceable — this board clears
+/// the same filter the headline row does — but every announcement is dominated:
+///   * announce nothing — `{W}` takes the `{W/U}`, locking `{1}`.
+///   * announce `{W}` — `{W}` takes it, locking the same `{1}`, while the cost
+///     is payable strictly fewer ways.
+///   * announce `{U}` — the reduction finds no pip and the rider discards it,
+///     locking `{1}{U}`, strictly worse.
+///
+/// One distinct locked total, so no prompt. Announcing remains available to the
+/// caster at CR 601.2h, where the mana is actually spent.
+///
+/// Positive guard: the printed mana value 2 locks as `{1}`, so the reduction
+/// really did cancel the hybrid pip — the "no prompt" assertion is not passing
+/// because nothing happened.
+#[test]
+fn an_announcement_that_cannot_lower_the_locked_total_stays_silent() {
+    let mut setup = board(
+        ManaCost::Cost {
+            shards: vec![ManaCostShard::WhiteBlue],
+            generic: 1,
+        },
+        3,
+        vec![reducer(white(), CostReductionReach::ColoredManaOnly)],
+    );
+    setup.begin_manual_cast().expect("the cast must begin");
+
+    assert!(
+        !setup.prompt_is_live(),
+        "every announcement over this board locks the same total — offering \
+         them would be a prompt with no decision in it"
+    );
+    assert_eq!(
+        setup.locked_cost(),
+        ManaCost::generic(1),
+        "positive guard: the colored-only {{W}} reduction cancelled the {{W/U}} \
+         pip. A locked {{1}}{{W/U}} means the reduction never ran, which would \
+         make the silence above vacuous"
     );
 }

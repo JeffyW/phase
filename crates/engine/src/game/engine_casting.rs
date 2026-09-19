@@ -81,13 +81,14 @@ pub(super) fn handle_defiler_payment(
     )
 }
 
-/// CR 601.2f: Apply the caster's elected cost-reduction order.
+/// CR 601.2b + CR 601.2f: Apply the caster's elected cost-determination choices.
 pub(super) fn handle_order_cost_reductions(
     state: &mut GameState,
     player: PlayerId,
     pending_cast: PendingCast,
     reductions: &[crate::types::casting_costs::CostReductionEntry],
     order: &[usize],
+    hybrid_announcement: &[crate::types::mana::ManaCostShard],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     casting_costs::handle_order_cost_reductions(
@@ -96,6 +97,7 @@ pub(super) fn handle_order_cost_reductions(
         pending_cast,
         reductions,
         order,
+        hybrid_announcement,
         events,
     )
 }

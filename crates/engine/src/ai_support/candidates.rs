@@ -2248,6 +2248,7 @@ pub fn candidate_actions_broad_with_probe(
                 candidate(
                     GameAction::OrderCostReductions {
                         order: outcome.order.clone(),
+                        hybrid_announcement: outcome.hybrid_announcement.clone(),
                     },
                     TacticalClass::Selection,
                     Some(*player),

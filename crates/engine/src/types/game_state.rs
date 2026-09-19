@@ -6965,13 +6965,15 @@ pub struct PendingCast {
     /// already-floored total.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_cost_reductions: Vec<crate::types::casting_costs::CostReductionEntry>,
-    /// CR 601.2f: The caster's elected reduction order ("If multiple cost
-    /// reductions apply, the player may apply them in any order"), recorded
-    /// once `WaitingFor::OrderCostReductions` is answered. `None` means the
-    /// order was never observable for this cast and the engine's
-    /// caster-optimal default governs.
+    /// CR 601.2b + CR 601.2f: The caster's cost-determination election — the
+    /// announced nonhybrid equivalent for the cost's hybrid symbols and the
+    /// order the applicable reductions are applied in ("If multiple cost
+    /// reductions apply, the player may apply them in any order") — recorded
+    /// once `WaitingFor::OrderCostReductions` is answered. `None` means neither
+    /// axis was ever observable for this cast and the engine's caster-optimal
+    /// default governs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_reduction_election: Option<Vec<crate::types::casting_costs::ReductionProvenance>>,
+    pub cost_reduction_election: Option<crate::types::casting_costs::CostReductionElection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_cost: Option<AbilityCost>,
     /// CR 601.2h: Random cost elements are paid after every nonrandom element.
@@ -13551,8 +13553,16 @@ pub enum WaitingFor {
         /// submitted `GameAction::OrderCostReductions` order is a permutation
         /// of indices into this vec; index 0 is applied first.
         reductions: Vec<crate::types::casting_costs::CostReductionEntry>,
-        /// One representative order per distinct locked total cost, cheapest
-        /// first. Orders that lock the same cost are indistinguishable to the
+        /// CR 601.2b: the cost's *announceable* hybrid symbols, in cost order.
+        /// A submitted `GameAction::OrderCostReductions.hybrid_announcement` is
+        /// parallel to this vec — one announced nonhybrid half per entry — or
+        /// empty to announce nothing. Empty here means the cast has no hybrid
+        /// symbol any applicable reduction could cancel, so the election is
+        /// purely an ordering.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hybrid_symbols: Vec<crate::types::mana::ManaCostShard>,
+        /// One representative per distinct locked total cost, cheapest
+        /// first. Elections that lock the same cost are indistinguishable to the
         /// game (a reduction emits no event, and converge/sunburst read the
         /// mana actually paid in CR 601.2h), so only one is offered.
         outcomes: Vec<crate::types::casting_costs::CostReductionOutcome>,
@@ -35891,6 +35901,7 @@ mod tests {
         variants.push(Box::new(WaitingFor::OrderCostReductions {
             player: PlayerId(0),
             reductions: Vec::new(),
+            hybrid_symbols: Vec::new(),
             outcomes: Vec::new(),
             pending_cast: dummy_pending(),
         }));
