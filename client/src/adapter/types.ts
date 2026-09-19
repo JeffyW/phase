@@ -705,7 +705,12 @@ export type Zone =
 export type LibraryPosition =
   | { type: "Top" }
   | { type: "Bottom" }
-  | { type: "NthFromTop"; n: number };
+  | { type: "NthFromTop"; n: number }
+  // Engine QuantityExpr values are resolved only by the engine. Keep these
+  // dynamic library positions wire-exact without making the presentation layer
+  // a second quantity evaluator.
+  | { type: "BeneathTop"; depth: Record<string, unknown> }
+  | { type: "RandomWithinTop"; n: Record<string, unknown> };
 
 export type SearchOrderingHint = "Unordered" | "OrderedToLibraryTop";
 
@@ -1050,8 +1055,11 @@ export type CastingVariant =
   | { type: "Freerunning" }
   | { type: "Fuse" };
 
+export type CastingVariantFace = "Current" | "Left" | "Right";
+
 export interface CastingVariantChoiceOption {
   variant: CastingVariant;
+  face: CastingVariantFace;
   mana_cost: ManaCost;
 }
 
@@ -1267,10 +1275,75 @@ export interface DecisionGroupKey {
 
 // ── Casting Permission ───────────────────────────────────────────────────
 
+export interface ResolutionCastFacePolicy {
+  /** Normalized engine filter, preserved verbatim across resolution pauses. */
+  filter: TargetFilter;
+  /** Real resolving source used for source-relative filter evaluation. */
+  source_id: ObjectId;
+  /** Real controller of that resolving source. */
+  controller: PlayerId;
+  /** Fixed cast-time constraint; null is the explicit no-extra-constraint form. */
+  constraint: Record<string, unknown> | null;
+}
+
+/** Opaque identity for a delayed trigger installed by a resolution cast offer. */
+export interface ResolutionCastDelayedTriggerReceipt {
+  token: number;
+  instance: number;
+  source_id: ObjectId;
+}
+
+export interface ResolutionCastCleanup {
+  source_id: ObjectId;
+  face_policy: ResolutionCastFacePolicy;
+  exiled_misses: ObjectId[];
+  reject_action: Record<string, unknown>;
+  success_action: Record<string, unknown>;
+  /** Absent for legacy and empty cleanup payloads. */
+  delayed_trigger_receipts?: ResolutionCastDelayedTriggerReceipt[];
+}
+
+export type CastCostModifier = {
+  /** CR 601.2f: direction only — the engine never serializes a `Minimum`
+   *  here; a cost floor is a board-wide static, not a per-grant rider. */
+  mode: "Raise" | "Reduce";
+  amount: ManaCost;
+};
+
 export type CastingPermission =
   | { type: "AdventureCreature" }
-  | { type: "ExileWithAltCost"; cost: ManaCost }
-  | { type: "PlayFromExile"; duration: string }
+  | {
+      type: "ExileWithAltCost";
+      cost: ManaCost;
+      resolution_cleanup?: ResolutionCastCleanup;
+      /** CR 601.2f: "Spells you cast this way cost {N} more/less to cast."
+       *  Absent when the grant carries no such rider. Display only — the
+       *  engine has already applied it to every cost it reports. */
+      cast_cost_modifier?: CastCostModifier;
+    }
+  | {
+      /** Non-mana alternative cost carried by the same exile-cast grant. */
+      type: "ExileWithAltAbilityCost";
+      cost: SerializedAbilityCost;
+      /** Optional engine-enforced condition for using this grant. */
+      constraint?: Record<string, unknown>;
+      /** Player to whom the engine granted this permission. */
+      granted_to?: PlayerId;
+      /** Grant lifetime; unit variants serialize as strings and payload variants as objects. */
+      duration?: string | Record<string, unknown>;
+      /** Source whose identity can bound the grant's duration. */
+      source_id?: ObjectId;
+      /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. */
+      cast_cost_modifier?: CastCostModifier;
+    }
+  | {
+      type: "PlayFromExile";
+      duration: string;
+      /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. CR 305.1: a
+       *  land played under this same grant is never a spell and is
+       *  unaffected by it. */
+      cast_cost_modifier?: CastCostModifier;
+    }
   | { type: "ExileWithEnergyCost" }
   | { type: "WarpExile"; castable_after_turn: number };
 
@@ -2152,6 +2225,12 @@ export type AlternativeAdditionalCostDescription = {
 
 export type OpeningHandBottomReason = { type: "TinyLeadersMultiCommander" };
 
+/** Mirrors engine `SpellStackToGraveyardReplacement` on a paid cast offer. */
+export type SpellStackToGraveyardReplacement =
+  | { type: "Exile" }
+  | { type: "Library"; position: LibraryPosition }
+  | { type: "Hand" };
+
 export type CastOfferKind =
   | { type: "Adventure"; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode }
   | { type: "Miracle"; object_id: ObjectId; cost: ManaCost }
@@ -2168,6 +2247,15 @@ export type CastOfferKind =
       // copy is fixed — but carried to mirror the serialized shape.
       mana_spend_permission?: "AnyTypeOrColor" | "AnyColor";
       cast_transformed?: boolean;
+      // CR 601.2b: an additional mana cost the grant attaches to this cast
+      // ("by paying {R}{R} in addition to its other costs", Ogre Battlecaster).
+      // Absent for every other paid offer.
+      additional_cost?: ManaCost;
+      // CR 614.1a + CR 608.2n: optional cast-this-way redirect.
+      graveyard_replacement?: SpellStackToGraveyardReplacement;
+      // Frozen resolution authority, including receipts to withdraw if the
+      // accepted offer never becomes a cast.
+      cleanup: ResolutionCastCleanup;
     }
   | {
       type: "FreeCastWindow";
@@ -2177,12 +2265,10 @@ export type CastOfferKind =
       // `None` omits the key rather than sending a sentinel cap.
       remaining_casts?: number;
       remaining_mv_budget?: number;
-      filter: TargetFilter;
+      /** Required bridge carrier; old filter-only windows fail closed. */
+      face_policy: ResolutionCastFacePolicy;
       zones: Zone[];
       exile_instead_of_graveyard?: boolean;
-      // CR 406.6: source of the granting ability (engine serde-default;
-      // absent in payloads predating the field).
-      source?: ObjectId;
       // CR 607.2a: THIS resolution's "exiled this way" batch (Plargg and
       // Nassari); omitted when empty (no batch restriction). Display-only
       // pass-through — the modal renders `candidates`.
@@ -3048,7 +3134,11 @@ export type GameEvent =
   | { type: "AbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId } }
   | { type: "ExhaustAbilityActivated"; data: { player_id: PlayerId; source_id: ObjectId; is_mana_ability: boolean } }
   | { type: "ZoneChanged"; data: { object_id: ObjectId; from: Zone; to: Zone } }
-  | { type: "LifeChanged"; data: { player_id: PlayerId; amount: number } }
+  // `new_total` is the player's life total once this change is applied, supplied
+  // by the engine (`LifeTotalReading`, serialized transparently) so a mid-animation
+  // display can show intermediate totals. Absent on an event from a peer older than
+  // the field; fall back to the state snapshot.
+  | { type: "LifeChanged"; data: { player_id: PlayerId; amount: number; new_total?: number } }
   | { type: "ManaAdded"; data: { player_id: PlayerId; mana_type: ManaType; source_id: ObjectId; tapped_for_mana?: boolean } }
   | { type: "PermanentTapped"; data: { object_id: ObjectId } }
   | { type: "PlayerLost"; data: { player_id: PlayerId } }
@@ -4977,6 +5067,25 @@ export interface TournamentPairingView {
 export type TournamentCredentialRole = "Organizer" | "Player";
 
 /**
+ * `LobbyServerMessage::TournamentCredentialRenewed`'s payload
+ * (`crates/lobby-broker/src/protocol.rs`) — the point reply to
+ * `RenewTournamentCredential`. Carries the secret the caller should hold going
+ * forward. Under lobby protocol v9 (idempotent-nonce replay) this is the newly
+ * MINTED secret when the request presented the current secret, OR — on a retry
+ * that presents the now-superseded secret with the same `rotation_nonce` — the
+ * SAME already-committed secret REPLAYED (the broker mints nothing the second
+ * time). Either way it is the one live secret; the superseded secret is not kept
+ * valid. `role` echoes which authority was rotated, and `expires_at_ms` is the
+ * expiry, measured from the mint. Never broadcast.
+ */
+export interface TournamentCredentialRenewedReply {
+  code: string;
+  role: TournamentCredentialRole;
+  token: string;
+  expires_at_ms: number;
+}
+
+/**
  * One row of the tournament list. Mirrors
  * `crates/lobby-broker/src/protocol.rs:507-528` (citation predates the v6 shift).
  *
@@ -5068,14 +5177,16 @@ export interface TournamentView {
  * (`crates/lobby-broker/src/protocol.rs:830-834`; citation predates the v6 shift).
  * A point reply only — `organizer_token` is minted here and is never broadcast.
  *
- * NOTE (protocol v6, client-render deferred): the wire payload now also carries
- * a required `expires_at_ms` beside the token (credential expiry). It is
- * intentionally not mirrored here yet — the credential-rotation client
- * follow-up adds and consumes it; the unknown field is ignored on parse.
+ * `expires_at_ms` (epoch ms) is when `organizer_token` stops being accepted. It
+ * rides the mint reply because expiry is per-holder and no broadcast frame can
+ * carry it. The credential-rotation client consumes it so a holder can renew
+ * (`RenewTournamentCredential`) before the credential lapses — an already-lapsed
+ * one is unrenewable (`crates/lobby-broker/src/tournament.rs`).
  */
 export interface TournamentCreatedReply {
   code: string;
   organizer_token: string;
+  expires_at_ms: number;
   view: TournamentView;
 }
 
@@ -5084,14 +5195,14 @@ export interface TournamentCreatedReply {
  * (`crates/lobby-broker/src/protocol.rs:837-841`; citation predates the v6 shift).
  * A point reply only — `player_token` is minted here and is never broadcast.
  *
- * NOTE (protocol v6, client-render deferred): the wire payload now also carries
- * a required `expires_at_ms` beside the token (credential expiry). It is
- * intentionally not mirrored here yet — the credential-rotation client
- * follow-up adds and consumes it; the unknown field is ignored on parse.
+ * `expires_at_ms` (epoch ms) is when `player_token` stops being accepted — same
+ * reasoning as {@link TournamentCreatedReply}'s. Consumed by the credential
+ * rotation client to renew before the entrant token lapses.
  */
 export interface TournamentJoinedReply {
   code: string;
   player_token: string;
+  expires_at_ms: number;
   view: TournamentView;
 }
 

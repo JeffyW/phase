@@ -55,6 +55,12 @@ pub enum ReductionProvenance {
     /// `find_defiler_reduction` returns the first matching permanent and stops
     /// — so the bare variant is already unique within one reduction set.
     Defiler,
+    /// CR 601.2f: the ELECTED casting permission's own "spells cast this way
+    /// cost {N} more/less to cast" rider. No source id is carried because only
+    /// ONE permission is elected per cast (`selected_permission_cast_cost_modifier`
+    /// consults `casting_permission_index` alone), so the bare variant is
+    /// already unique within a reduction set.
+    CastingPermission,
     /// RESERVED (see the type-level note): a one-shot
     /// `pending_spell_cost_reductions` entry ("the next spell you cast this
     /// turn costs {2} less"), identified by its index in that vec. Generic-only

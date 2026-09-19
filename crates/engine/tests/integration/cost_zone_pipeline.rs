@@ -4169,7 +4169,7 @@ fn effect_pay_cost_rider_waits_for_scry_post_effect_before_typed_root_settles() 
     let rider_life = resumed
         .events
         .iter()
-        .position(|event| matches!(event, GameEvent::LifeChanged { player_id, amount } if *player_id == P0 && *amount == 1))
+        .position(|event| matches!(event, GameEvent::LifeChanged { player_id, amount, .. } if *player_id == P0 && *amount == 1))
         .expect("the trailing PayCost rider resolves once");
     assert!(
         mana_added < rider_life,
@@ -10728,6 +10728,8 @@ fn cast_from_zone_exile_redirect_pauses_before_lingering_permission_tail() {
             duration: None,
             driver: CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(card)],
         source,
@@ -10814,6 +10816,8 @@ fn cast_from_zone_exile_delivery_stays_synchronous_and_grants_permission() {
             duration: None,
             driver: CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(card), TargetRef::Object(second_card)],
         source,
