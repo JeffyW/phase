@@ -3056,6 +3056,34 @@ fn parse_counter_threshold(text: &str) -> Option<(Comparator, i32, Option<Counte
         return None;
     }
 
+    // CR 107.1 + CR 122.1: strict inequalities ("fewer than two counters on it",
+    // "more than two +1/+1 counters on it"). Routed through the single
+    // comparator-prefix authority in `oracle_nom::condition` rather than a
+    // reduced local grammar, so this past-tense route supports exactly the
+    // bounds the present-tense route does. Placed before the article and
+    // numeric branches, whose `parse_number` would fail on "fewer"/"more".
+    if let Ok((rest, comparator)) =
+        crate::parser::oracle_nom::condition::parse_strict_comparator_prefix(text)
+    {
+        if let Ok((after_n, n)) = nom_primitives::parse_number(rest) {
+            let after_n = after_n.trim_start();
+            if let Ok((after_type, counter_type)) =
+                nom_primitives::parse_counter_type_typed(after_n)
+            {
+                if let Some(after_on) = parse_counter_on_suffix(after_type.trim_start()) {
+                    let consumed = original_len - after_on.len();
+                    return Some((comparator, n as i32, Some(counter_type), consumed));
+                }
+            }
+            // UNTYPED strict form — the gate is on the TOTAL counter count.
+            if let Some(after_on) = parse_counter_on_suffix(after_n) {
+                let consumed = original_len - after_on.len();
+                return Some((comparator, n as i32, None, consumed));
+            }
+        }
+        return None;
+    }
+
     // CR 122.1 + CR 122.1a: an indefinite "a [type] counter" means one or more (>= 1).
     // Placed before the numeric branch, whose `parse_number` fails fast on the
     // article "a"/"an" (Oblivion's Hunger: "a +1/+1 counter on it").
@@ -3139,47 +3167,65 @@ pub(super) fn counter_gate_qty(cond: &AbilityCondition) -> Option<&QuantityRef> 
 
 /// Typed context for [`strip_counter_conditional`].
 ///
-/// Replaces the former bare `in_trigger: bool` parameter: the past-tense
-/// trigger-body grammar needs the enclosing trigger's PROVEN zone-change pair,
-/// not just "are we in a trigger", and a second bool beside the first would be
-/// exactly the bool-soup this codebase forbids.
-pub(super) struct CounterConditionalContext {
-    /// Whether this clause is being parsed inside a trigger body. Gates the
-    /// demonstrative ("that creature has …") subject set, which outside a
-    /// trigger names the spell's target.
-    pub(super) in_trigger: bool,
-    /// CR 603.10 + CR 400.7 + CR 122.2: the enclosing trigger's proven
-    /// zone-change pair, when this clause continues that trigger's body.
-    pub(super) trigger_zone_change: TriggerZoneChangeProvenance,
+/// Replaces the former bare `in_trigger: bool` parameter. The two facts the
+/// grammar needs — "are we inside a trigger body" and "did that trigger head
+/// PROVE a zone-change pair" — are not independent: zone-change authority only
+/// exists inside a trigger body. Modelling them as a bool beside an `Option`
+/// would admit the impossible state (outside a trigger, yet carrying an
+/// established pair), so they are one enum instead.
+pub(super) enum CounterConditionalContext {
+    /// No enclosing trigger body. The demonstrative subject set ("that creature
+    /// has …") names the spell's target here, not an event object.
+    OutsideTrigger,
+    /// Inside a trigger body. `zone_change` carries the enclosing head's PROVEN
+    /// pair when it proved one (CR 603.10 + CR 400.7 + CR 122.2), and is empty
+    /// for every trigger whose head does not prove a zone change.
+    TriggerBody {
+        zone_change: TriggerZoneChangeProvenance,
+    },
 }
 
 impl CounterConditionalContext {
-    /// Derive from the live parse context. The provenance is copied through the
-    /// named same-trigger-body accessor, so the caller's own reset-by-default
-    /// contract is what decides whether the authority is present.
+    /// Whether this clause is being parsed inside a trigger body. Gates the
+    /// demonstrative ("that creature has …") subject set.
+    pub(super) fn in_trigger(&self) -> bool {
+        matches!(self, Self::TriggerBody { .. })
+    }
+
+    /// The enclosing trigger head's proven `(origin, destination)` pair, or
+    /// `None` outside a trigger body or when the head proved nothing.
+    pub(super) fn zone_change_pair(&self) -> Option<(Zone, Zone)> {
+        match self {
+            Self::OutsideTrigger => None,
+            Self::TriggerBody { zone_change } => zone_change.as_pair(),
+        }
+    }
+
+    /// Derive from the live parse context. Ordinary `Clone` on `ParseContext`
+    /// continues the same body, so whatever authority `ctx` holds here is the
+    /// authority this clause may use.
     pub(super) fn from_parse_context(ctx: &ParseContext) -> Self {
-        Self {
-            in_trigger: ctx.in_trigger,
-            trigger_zone_change: ctx.trigger_zone_change.copied_for_same_trigger_body(),
+        if ctx.in_trigger {
+            Self::TriggerBody {
+                zone_change: ctx.trigger_zone_change.clone(),
+            }
+        } else {
+            Self::OutsideTrigger
         }
     }
 
     /// A clause parsed with no enclosing trigger and no zone-change authority.
     #[cfg(test)]
     pub(super) fn standalone() -> Self {
-        Self {
-            in_trigger: false,
-            trigger_zone_change: TriggerZoneChangeProvenance::none(),
-        }
+        Self::OutsideTrigger
     }
 
     /// A trigger-body clause whose enclosing trigger head PROVED `origin` →
     /// `destination`.
     #[cfg(test)]
     pub(super) fn in_trigger_zone_change(origin: Zone, destination: Zone) -> Self {
-        Self {
-            in_trigger: true,
-            trigger_zone_change: TriggerZoneChangeProvenance::established(origin, destination),
+        Self::TriggerBody {
+            zone_change: TriggerZoneChangeProvenance::established(origin, destination),
         }
     }
 }
@@ -3240,7 +3286,7 @@ pub(super) fn strip_counter_conditional(
     text: &str,
     ctx: CounterConditionalContext,
 ) -> (Option<AbilityCondition>, String) {
-    let in_trigger = ctx.in_trigger;
+    let in_trigger = ctx.in_trigger();
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
 
@@ -3356,7 +3402,7 @@ pub(super) fn strip_counter_conditional(
     // reset by default on every derived context (`TriggerZoneChangeProvenance`),
     // so delayed (CR 603.7), reflexive (CR 603.12) and probe sub-parses decline
     // here by construction.
-    if let Some((origin, destination)) = ctx.trigger_zone_change.as_pair() {
+    if let Some((origin, destination)) = ctx.zone_change_pair() {
         if let Some((before, after)) = tp.rsplit_around(" if it ") {
             if let Ok((body, verb_negated)) = parse_past_counter_possession_verb(after.lower) {
                 if let Some((comparator, threshold, counter_type, consumed)) =

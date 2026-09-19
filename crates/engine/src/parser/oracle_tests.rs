@@ -30712,9 +30712,12 @@ fn bogardan_phoenix_trailing_had_counter_otherwise_is_not_intervening_if() {
     );
 }
 
-/// CR 122.2 + CR 400.7 + CR 603.10: the same clause instead binds at the effect
-/// level, where the `Otherwise` branch can attach to it as `else_ability` and
-/// the predicate is answered from the dying object's last-known information.
+/// CR 122.2 + CR 400.7 + CR 603.10 + CR 608.2h: the same clause instead binds at
+/// the effect level, where the `Otherwise` branch can attach to it as
+/// `else_ability`. CR 603.10 is the trigger's look-back that establishes the
+/// zone-change event; CR 608.2h is why the gate is answerable at RESOLUTION
+/// time, when the dying object is no longer in the zone it was expected to be
+/// in, so the effect reads its last known information.
 #[test]
 fn bogardan_phoenix_trailing_counter_condition_binds_otherwise_as_else_branch() {
     use crate::types::counter::{CounterMatch, CounterType};

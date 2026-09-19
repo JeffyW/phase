@@ -1627,14 +1627,11 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     // Keep the condition-established context intact for nested parser payloads.
     // The body parser mutates its working context while it walks clauses, whereas
     // each nested modal mode must begin from the same trigger-level facts.
-    let mut body_context = effect_ctx.clone();
+    let body_context = effect_ctx.clone();
     // CR 608.2c: a nested modal MODE body is ordinary text of THIS trigger body,
-    // so it keeps this trigger's zone-change authority. `ParseContext::clone`
-    // resets the provenance by design (see `TriggerZoneChangeProvenance`), so the
-    // same-body case has to opt back in by name.
-    body_context.trigger_zone_change = effect_ctx
-        .trigger_zone_change
-        .copied_for_same_trigger_body();
+    // so the plain clone correctly carries this trigger's zone-change authority
+    // (see `TriggerZoneChangeProvenance`: ordinary `Clone` continues the same
+    // body; entering an independent one is spelled by name).
     // Snapshot the condition-established scope before body parsing (which may
     // temporarily rebind it via `with_player_scope`) so lowering sees the scope
     // the condition introduced, not a transient nested-clause value.
@@ -1669,10 +1666,13 @@ pub(crate) fn parse_trigger_line_with_index_ir(
             // outer event when its gate is evaluated. Resetting here is the
             // conservative side of that line: a split body that would have been
             // answerable stays an honest gap rather than a guessed binding.
-            let outer_zone_change = std::mem::take(&mut effect_ctx.trigger_zone_change);
-            let mut effect_chain =
-                parse_effect_chain_ir(&reflexive_effect_text, AbilityKind::Spell, &mut effect_ctx);
-            effect_ctx.trigger_zone_change = outer_zone_change;
+            let mut reflexive_ctx = effect_ctx.clone_for_independent_body();
+            let mut effect_chain = parse_effect_chain_ir(
+                &reflexive_effect_text,
+                AbilityKind::Spell,
+                &mut reflexive_ctx,
+            );
+            effect_ctx.diagnostics = reflexive_ctx.diagnostics;
             // CR 118.12 + CR 608.2c: bind a trailing "Otherwise, …" in the
             // reflexive body to the outcome gate that LOWERING stamps onto this
             // chain's root (see `lower_trigger_ir`'s

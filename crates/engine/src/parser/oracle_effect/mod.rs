@@ -35735,22 +35735,22 @@ fn clause_has_anaphoric_control_condition(clause: &ClauseIr) -> bool {
 /// recomputed at lowering") is preserved: the decision is simply completed here
 /// with the one fact the chunk loop could not see.
 ///
-/// FAIL-CLOSED. It upgrades ONLY a `Fallback` branch, ONLY when no clause
-/// already carries its own condition (an antecedent inside the chain is nearer
-/// and stays authoritative), and ONLY when a root clause exists to anchor to.
-/// Anything else keeps the honest `Effect::unimplemented("otherwise", …)`
-/// marker, so a shape this does not genuinely support cannot read as covered.
+/// FAIL-CLOSED. It upgrades ONLY the FIRST `Fallback` branch, ONLY when no
+/// clause BEFORE that branch already carries its own condition (a nearer
+/// antecedent inside the chain stays authoritative), and ONLY when a distinct
+/// root clause exists to anchor to. Any later `Otherwise` keeps its honest
+/// `Effect::unimplemented("otherwise", …)` marker, so a shape this does not
+/// genuinely support cannot read as covered.
 pub(crate) fn bind_otherwise_to_reflexive_chain_root(
     chain: &mut EffectChainIr,
     connector: &AbilityCondition,
 ) {
-    // The root of the lowered chain is the FIRST clause, and `AssemblyEnv`
-    // registers a conditional antecedent off the emitted root def's `condition`
-    // — so stamping clause 0 is what makes `LastWithRole(Conditional)` resolve.
-    if chain.clauses.iter().any(|c| c.condition.is_some()) {
-        return;
-    }
-    let has_fallback_otherwise = chain.clauses.iter().any(|c| {
+    // CR 608.2c: clauses lower in SOURCE ORDER, so only a condition that
+    // PRECEDES the fallback branch can be its nearer antecedent. A whole-chain
+    // scan would let a conditional clause written AFTER the `Otherwise` veto a
+    // binding it can never serve as the antecedent for, leaving the branch as
+    // `Effect::unimplemented`.
+    let Some(fallback_index) = chain.clauses.iter().position(|c| {
         matches!(
             c.disposition,
             ClauseDisposition::BranchOtherwise {
@@ -35758,18 +35758,29 @@ pub(crate) fn bind_otherwise_to_reflexive_chain_root(
                 ..
             }
         )
-    });
-    if !has_fallback_otherwise {
-        return;
-    }
-    let Some(root) = chain.clauses.first_mut() else {
+    }) else {
         return;
     };
-    root.condition = Some(connector.clone());
-    for clause in chain.clauses.iter_mut() {
-        if let ClauseDisposition::BranchOtherwise { kind, .. } = &mut clause.disposition {
-            *kind = OtherwiseKind::Bound;
-        }
+    // The root of the lowered chain is the FIRST clause, and `AssemblyEnv`
+    // registers a conditional antecedent off the emitted root def's `condition`
+    // — so stamping clause 0 is what makes `LastWithRole(Conditional)` resolve.
+    // A branch AT index 0 has no root to anchor to.
+    if fallback_index == 0 {
+        return;
+    }
+    if chain.clauses[..fallback_index]
+        .iter()
+        .any(|c| c.condition.is_some())
+    {
+        return;
+    }
+    chain.clauses[0].condition = Some(connector.clone());
+    // Upgrade ONLY this branch. A second `Otherwise` further down the chain has
+    // a different antecedent question and is not answered by the root stamp.
+    if let ClauseDisposition::BranchOtherwise { kind, .. } =
+        &mut chain.clauses[fallback_index].disposition
+    {
+        *kind = OtherwiseKind::Bound;
     }
 }
 
@@ -38532,8 +38543,8 @@ pub(crate) fn parse_effect_chain_ir(
             // zone-change authority — that is what lets a trailing past-tense
             // predicate ("… if it had a death counter on it") read the event
             // object's LKI. This struct literal REPLACES the parent context, so
-            // the copy has to be spelled; `..Default::default()` would reset it.
-            trigger_zone_change: ctx.trigger_zone_change.copied_for_same_trigger_body(),
+            // the carry has to be spelled; `..Default::default()` would reset it.
+            trigger_zone_change: ctx.trigger_zone_change.clone(),
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;
