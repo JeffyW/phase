@@ -8998,10 +8998,13 @@ const COST_REDUCTION_ORDER_MAX_ENTRIES: usize = 8;
 ///
 /// `8!` is the pure-ordering ceiling, so a cast with nothing to announce keeps
 /// exactly the budget it had before hybrid announcement joined the election.
-/// When there IS something to announce, the product is capped here by degrading
-/// the order enumeration to rotations and then, if still over, by truncating
-/// the announcement set — both marked [`CostReductionCoverage::Partial`], never
-/// silently resolved.
+/// When there IS something to announce, [`CandidatePlan::bounded`] fits the
+/// product under this bound BEFORE anything is enumerated — first by degrading
+/// the order enumeration to rotations, then by capping how many of the
+/// announcements are generated at all — so the bound limits allocation and work
+/// rather than trimming a set that was already built. A narrowed plan is marked
+/// [`CostReductionCoverage::Partial`] and still prompts; it is never silently
+/// resolved.
 const COST_REDUCTION_MAX_CANDIDATES: usize = 40_320;
 
 /// CR 601.2b: the positions in `cost`'s shard list that this cast announces a
@@ -9094,27 +9097,42 @@ fn announcement_base_cost(pending: &PendingCast, x: Option<u32>) -> Option<ManaC
 }
 
 /// CR 601.2b: every announcement the caster may make over `positions`, as the
-/// cartesian product of each symbol's two halves, in a deterministic order.
+/// cartesian product of each symbol's two halves, in a deterministic order —
+/// but never more than `limit` of them.
 ///
 /// The un-announced baseline is NOT included here — [`analyze_cost_reduction_order`]
 /// evaluates it first and separately, because it is the option every announced
 /// candidate is measured against.
-fn hybrid_announcements(positions: &[(usize, ManaCostShard)]) -> Vec<Vec<ManaCostShard>> {
+///
+/// `limit` is the budget [`CandidatePlan`] computed before this was called, and
+/// it bounds the ALLOCATION: the product is grown one symbol at a time and
+/// stops widening the set the moment it is full, so an unaffordable product is
+/// never built and then trimmed. Every announcement returned still names ALL of
+/// `positions` — the wire contract
+/// ([`validate_cost_reduction_election`]) accepts an announcement that is empty
+/// or names every symbol, so a narrowed set has to drop whole announcements
+/// rather than shorten them.
+fn hybrid_announcements(
+    positions: &[(usize, ManaCostShard)],
+    limit: usize,
+) -> Vec<Vec<ManaCostShard>> {
     let mut all: Vec<Vec<ManaCostShard>> = vec![Vec::new()];
     for (_, symbol) in positions {
         let halves = symbol
             .announceable_halves()
             .expect("announceable positions are filtered on `announceable_halves`");
-        all = all
-            .into_iter()
-            .flat_map(|prefix| {
-                halves.into_iter().map(move |half| {
-                    let mut next = prefix.clone();
-                    next.push(half);
-                    next
-                })
-            })
-            .collect();
+        let mut next: Vec<Vec<ManaCostShard>> = Vec::with_capacity(all.len().min(limit));
+        for prefix in &all {
+            for half in halves {
+                if next.len() == limit {
+                    break;
+                }
+                let mut candidate = prefix.clone();
+                candidate.push(half);
+                next.push(candidate);
+            }
+        }
+        all = next;
     }
     all
 }
@@ -9144,16 +9162,20 @@ fn hybrid_announcements(positions: &[(usize, ManaCostShard)]) -> Vec<Vec<ManaCos
 /// candidates that lock the same total cost are therefore indistinguishable to
 /// the game, and offering both would be a prompt with no decision in it.
 ///
-/// An ANNOUNCED candidate is additionally kept only when it lowers the locked
-/// mana value below what the same order reaches un-announced. Both halves of an
-/// announceable symbol have the hybrid symbol's own mana value (CR 202.3f), so
-/// the locked mana value moves if and only if the announcement changed how many
-/// reduction units found a pip — the thing CR 601.2b's timing exists to let the
-/// caster control. When it does not move, the announced cost is payable only by
-/// a strict subset of what the hybrid form it replaced is payable with
-/// (CR 107.4e), while costing exactly as much, so it is dominated by the
-/// un-announced candidate that is already offered, and the same choice is still
-/// open to the caster when mana is actually spent (CR 601.2h).
+/// An ANNOUNCED candidate is additionally discarded only when the
+/// un-announced baseline for the same order DOMINATES it — that is, when every
+/// mana pool that can pay the announced cost can also pay the baseline
+/// ([`ManaCost::is_payable_whenever`]). Only then is the announced candidate a
+/// decision with nothing in it: the caster can reach the same payment through
+/// the baseline, whose hybrid symbols leave them strictly more ways to spend
+/// (CR 107.4e), and the announcement itself is still available at CR 601.2h.
+///
+/// Mana value is NOT that test and must not be used as a proxy for it. Rigo,
+/// Streetwise Mentor's `{G/W}{W}{W/U}` under a `{W}` colored-only reduction
+/// locks `{W}{W/U}` un-announced and `{G}{U}` when `{G/W}` is announced as
+/// `{G}` and `{W/U}` as `{U}`: both cost 2, and a `{G}{U}` pool pays the second
+/// and cannot pay the first. Discarding on equal mana value deletes a legal
+/// payment the caster can reach no other way.
 fn analyze_cost_reduction_order(
     state: &GameState,
     player: PlayerId,
@@ -9205,26 +9227,14 @@ fn analyze_cost_reduction_order(
         return empty(reductions);
     }
 
-    let mut coverage = CostReductionCoverage::Exhaustive;
-    let mut orders = if reductions.len() <= COST_REDUCTION_ORDER_MAX_ENTRIES {
-        permutations(reductions.len())
-    } else {
-        // Budget exhausted. Per the "never silently elect" rule we do not fall
-        // back to picking an order; we present the rotations we can evaluate,
-        // every one of which is a legal CR 601.2f order, and mark the result
-        // `Partial` so callers know the set may be incomplete.
-        coverage = CostReductionCoverage::Partial;
-        rotations(reductions.len())
-    };
-    let mut announcements = hybrid_announcements(&positions);
-    if orders.len().saturating_mul(announcements.len()) > COST_REDUCTION_MAX_CANDIDATES {
-        orders = rotations(reductions.len());
-        coverage = CostReductionCoverage::Partial;
-    }
-    if orders.len().saturating_mul(announcements.len()) > COST_REDUCTION_MAX_CANDIDATES {
-        announcements.truncate(COST_REDUCTION_MAX_CANDIDATES / orders.len().max(1));
-        coverage = CostReductionCoverage::Partial;
-    }
+    // CR 601.2b + CR 601.2f: choose the enumeration's DIMENSIONS before a
+    // single candidate exists. The budget has to bound allocation and work, not
+    // trim a product that was already built, so neither the order enumeration
+    // nor the announcement product is materialized until the plan below says
+    // how much of each fits.
+    let plan = CandidatePlan::bounded(reductions.len(), positions.len());
+    let coverage = plan.coverage;
+    let announcements = hybrid_announcements(&positions, plan.announcements);
 
     let provenances: Vec<ReductionProvenance> =
         reductions.iter().map(|entry| entry.provenance).collect();
@@ -9270,27 +9280,26 @@ fn analyze_cost_reduction_order(
     // The un-announced baselines come first, so a locked cost reachable both
     // with and without an announcement is represented by the more payable
     // un-announced candidate (CR 107.4e) rather than by an arbitrary one.
-    let baselines: Vec<ManaCost> = orders.iter().map(|order| locked_for(order, &[])).collect();
-    for (order, locked_cost) in orders.iter().zip(&baselines) {
-        push(
-            &mut outcomes,
-            order.clone(),
-            Vec::new(),
-            locked_cost.clone(),
-        );
+    //
+    // Only the baseline COSTS are retained between the two passes; the orders
+    // themselves are re-enumerated lazily, so no pass ever holds the candidate
+    // set it is walking.
+    let mut baselines: Vec<ManaCost> = Vec::with_capacity(plan.orders);
+    for order in plan.order_iter(reductions.len()) {
+        let locked_cost = locked_for(&order, &[]);
+        push(&mut outcomes, order, Vec::new(), locked_cost.clone());
+        baselines.push(locked_cost);
     }
     for announcement in announcements.iter().filter(|a| !a.is_empty()) {
-        for (order, baseline) in orders.iter().zip(&baselines) {
-            let locked_cost = locked_for(order, announcement);
-            if locked_cost.mana_value() >= baseline.mana_value() {
+        for (order, baseline) in plan.order_iter(reductions.len()).zip(&baselines) {
+            let locked_cost = locked_for(&order, announcement);
+            // CR 107.4e: the baseline's hybrid symbols are payable every way
+            // the announced cost is, and more. Keep the announced candidate
+            // unless that is PROVEN — an equal mana value proves nothing.
+            if baseline.is_payable_whenever(&locked_cost) {
                 continue;
             }
-            push(
-                &mut outcomes,
-                order.clone(),
-                announcement.clone(),
-                locked_cost,
-            );
+            push(&mut outcomes, order, announcement.clone(), locked_cost);
         }
     }
 
@@ -9315,36 +9324,171 @@ fn analyze_cost_reduction_order(
     }
 }
 
-/// All permutations of `0..n`, in lexicographic order so the enumeration is
-/// deterministic across runs and platforms.
-fn permutations(n: usize) -> Vec<Vec<usize>> {
-    let mut current: Vec<usize> = (0..n).collect();
-    let mut all = vec![current.clone()];
-    loop {
-        // Standard next-lexicographic-permutation step.
-        let Some(pivot) = (0..current.len().saturating_sub(1))
-            .rev()
-            .find(|&i| current[i] < current[i + 1])
-        else {
-            return all;
-        };
-        let successor = (pivot + 1..current.len())
-            .rev()
-            .find(|&j| current[j] > current[pivot])
-            .expect("a pivot always has a larger successor to its right");
-        current.swap(pivot, successor);
-        current[pivot + 1..].reverse();
-        all.push(current.clone());
+/// Which legal CR 601.2f orders of `0..n` an enumeration walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderEnumeration {
+    /// Every order. Exhaustive, and `n!` of them.
+    Permutations,
+    /// The `n` rotations — the budget-exhausted fallback. Every rotation is a
+    /// legal order, so presenting them never invents an outcome the rules do
+    /// not permit; it may only omit one.
+    Rotations,
+}
+
+impl OrderEnumeration {
+    /// How many orders this enumeration yields, WITHOUT yielding any of them.
+    /// Saturating, so an absurd `n` reports "more than the budget" rather than
+    /// wrapping into a small number that would wave the budget through.
+    fn count(self, n: usize) -> u64 {
+        match self {
+            Self::Permutations => (1..=n as u64)
+                .try_fold(1u64, |acc, i| acc.checked_mul(i))
+                .unwrap_or(u64::MAX),
+            Self::Rotations => n as u64,
+        }
+    }
+
+    /// The orders themselves, lazily and in a deterministic sequence
+    /// (lexicographic for permutations, increasing offset for rotations) so
+    /// the enumeration is identical across runs and platforms.
+    fn iter(self, n: usize) -> OrderIter {
+        OrderIter {
+            enumeration: self,
+            n,
+            // Inert for `Rotations`, which walks offsets instead.
+            next: Some((0..n).collect()),
+            offset: 0,
+        }
     }
 }
 
-/// The `n` rotations of `0..n` — the budget-exhausted fallback enumeration.
-/// Every rotation is a legal order, so presenting them never invents an
-/// outcome the rules do not permit; it may only omit one.
-fn rotations(n: usize) -> Vec<Vec<usize>> {
-    (0..n)
-        .map(|offset| (0..n).map(|i| (i + offset) % n).collect())
-        .collect()
+/// The lazy order enumeration behind [`OrderEnumeration::iter`]. Holds one
+/// order at a time, never the whole set.
+struct OrderIter {
+    enumeration: OrderEnumeration,
+    n: usize,
+    next: Option<Vec<usize>>,
+    offset: usize,
+}
+
+impl Iterator for OrderIter {
+    type Item = Vec<usize>;
+
+    fn next(&mut self) -> Option<Vec<usize>> {
+        match self.enumeration {
+            OrderEnumeration::Rotations => {
+                let offset = self.offset;
+                if offset >= self.n {
+                    return None;
+                }
+                self.offset += 1;
+                Some((0..self.n).map(|i| (i + offset) % self.n).collect())
+            }
+            OrderEnumeration::Permutations => {
+                let current = self.next.take()?;
+                // Standard next-lexicographic-permutation step, computed on the
+                // way out so the LAST permutation is still yielded.
+                self.next = (0..current.len().saturating_sub(1))
+                    .rev()
+                    .find(|&i| current[i] < current[i + 1])
+                    .map(|pivot| {
+                        let mut successor = current.clone();
+                        let swap_with = (pivot + 1..successor.len())
+                            .rev()
+                            .find(|&j| successor[j] > successor[pivot])
+                            .expect("a pivot always has a larger successor to its right");
+                        successor.swap(pivot, swap_with);
+                        successor[pivot + 1..].reverse();
+                        successor
+                    });
+                Some(current)
+            }
+        }
+    }
+}
+
+/// CR 601.2b + CR 601.2f: how much of the (announcement × order) space this
+/// cast may enumerate, decided from COUNTS alone — before an order, an
+/// announcement or a candidate has been allocated.
+///
+/// Both axes are capped here rather than trimmed afterwards, so
+/// [`COST_REDUCTION_MAX_CANDIDATES`] bounds the analyzer's allocation and its
+/// work, not just the size of the set it ends up keeping.
+///
+/// Budget exhaustion NEVER resolves the election: a narrowed plan still
+/// presents every candidate it evaluated and reports
+/// [`CostReductionCoverage::Partial`], because the engine may not elect an
+/// order on the caster's behalf.
+#[derive(Debug, Clone, Copy)]
+struct CandidatePlan {
+    enumeration: OrderEnumeration,
+    /// How many of `enumeration`'s orders to evaluate.
+    orders: usize,
+    /// How many announcements of the cast's announceable hybrid symbols to
+    /// enumerate. Each announcement still names every symbol — the wire
+    /// contract accepts an announcement that is empty or complete, so a
+    /// narrowed plan drops whole announcements instead of shortening them.
+    announcements: usize,
+    coverage: CostReductionCoverage,
+}
+
+impl CandidatePlan {
+    fn bounded(reductions: usize, positions: usize) -> Self {
+        /// Each announceable symbol doubles the announcement product
+        /// ([`hybrid_announcements`]), saturating rather than wrapping.
+        fn full_product(positions: usize) -> u64 {
+            1u64.checked_shl(positions as u32).unwrap_or(u64::MAX)
+        }
+
+        const BUDGET: u64 = COST_REDUCTION_MAX_CANDIDATES as u64;
+
+        let mut coverage = CostReductionCoverage::Exhaustive;
+        let mut enumeration = if reductions <= COST_REDUCTION_ORDER_MAX_ENTRIES {
+            OrderEnumeration::Permutations
+        } else {
+            coverage = CostReductionCoverage::Partial;
+            OrderEnumeration::Rotations
+        };
+        let announcements = full_product(positions);
+
+        // Degrade the ORDER axis first: rotations keep every announcement the
+        // caster can make, which is the axis a hybrid cast is actually deciding
+        // on, while the orders they drop are only reachable with more reducers
+        // than any real board carries.
+        if enumeration.count(reductions).saturating_mul(announcements) > BUDGET {
+            enumeration = OrderEnumeration::Rotations;
+            coverage = CostReductionCoverage::Partial;
+        }
+
+        let mut orders = enumeration.count(reductions);
+        // `orders.max(1)`: the announcement axis must be capped even when the
+        // order axis is degenerate, because `hybrid_announcements` allocates
+        // whether or not there is an order to evaluate its output under.
+        let announcements = if orders.max(1).saturating_mul(announcements) > BUDGET {
+            coverage = CostReductionCoverage::Partial;
+            (BUDGET / orders.max(1)).max(1)
+        } else {
+            announcements
+        };
+
+        let affordable_orders = (BUDGET / announcements).max(1);
+        if orders > affordable_orders {
+            orders = affordable_orders;
+            coverage = CostReductionCoverage::Partial;
+        }
+
+        Self {
+            enumeration,
+            orders: orders as usize,
+            announcements: announcements as usize,
+            coverage,
+        }
+    }
+
+    /// The planned orders, lazily and bounded by the budget.
+    fn order_iter(&self, reductions: usize) -> std::iter::Take<OrderIter> {
+        self.enumeration.iter(reductions).take(self.orders)
+    }
 }
 
 /// CR 601.2b + CR 601.2f: the verdict of the lock seam for one cast.
@@ -26196,5 +26340,189 @@ mod castable_zone_authority_tests {
             admitted_lands.is_empty(),
             "CR 305.9: these routes admitted a CoreType::Land object: {admitted_lands:?}"
         );
+    }
+}
+
+/// CR 601.2b + CR 601.2f: the election's enumeration budget is a bound on
+/// ALLOCATION and work, not a post-hoc trim of a set that was already built.
+///
+/// These rows pin the two properties the seam depends on: the plan's product
+/// never exceeds [`COST_REDUCTION_MAX_CANDIDATES`] for ANY input, and a plan
+/// that had to narrow says so ([`CostReductionCoverage::Partial`]) instead of
+/// resolving the election — the engine never elects an order for the caster.
+#[cfg(test)]
+mod candidate_plan_tests {
+    use super::{
+        CandidatePlan, OrderEnumeration, COST_REDUCTION_MAX_CANDIDATES,
+        COST_REDUCTION_ORDER_MAX_ENTRIES,
+    };
+    use crate::types::casting_costs::CostReductionCoverage;
+
+    /// The announcement product the plan admits.
+    fn announcements(plan: &CandidatePlan) -> u64 {
+        plan.announcements as u64
+    }
+
+    #[test]
+    fn an_affordable_cast_enumerates_everything_exhaustively() {
+        for (reductions, positions) in [(1, 1), (2, 0), (2, 2), (3, 3), (8, 0), (4, 6)] {
+            let plan = CandidatePlan::bounded(reductions, positions);
+            assert_eq!(
+                plan.coverage,
+                CostReductionCoverage::Exhaustive,
+                "{reductions} reductions × {positions} symbols fits the budget"
+            );
+            assert_eq!(plan.announcements, 1 << positions);
+            assert_eq!(plan.orders, plan.enumeration.count(reductions) as usize);
+            assert_eq!(plan.enumeration, OrderEnumeration::Permutations);
+            assert_eq!(plan.order_iter(reductions).count(), plan.orders);
+        }
+    }
+
+    /// The pure-ordering ceiling is untouched: a cast with nothing to announce
+    /// keeps every one of its `8!` orders.
+    #[test]
+    fn the_pure_ordering_ceiling_is_unchanged() {
+        let plan = CandidatePlan::bounded(COST_REDUCTION_ORDER_MAX_ENTRIES, 0);
+        assert_eq!(plan.orders, COST_REDUCTION_MAX_CANDIDATES);
+        assert_eq!(plan.announcements, 1);
+        assert_eq!(plan.coverage, CostReductionCoverage::Exhaustive);
+
+        let plan = CandidatePlan::bounded(COST_REDUCTION_ORDER_MAX_ENTRIES + 1, 0);
+        assert_eq!(plan.enumeration, OrderEnumeration::Rotations);
+        assert_eq!(plan.orders, COST_REDUCTION_ORDER_MAX_ENTRIES + 1);
+        assert_eq!(plan.coverage, CostReductionCoverage::Partial);
+    }
+
+    /// The ORDER axis degrades first, because rotations keep every
+    /// announcement the caster can actually make.
+    #[test]
+    fn an_over_budget_product_degrades_the_order_axis_before_the_announcement_axis() {
+        let plan = CandidatePlan::bounded(8, 1);
+        assert_eq!(plan.enumeration, OrderEnumeration::Rotations);
+        assert_eq!(plan.orders, 8);
+        assert_eq!(
+            plan.announcements, 2,
+            "rotations leave room for the whole announcement product"
+        );
+        assert_eq!(plan.coverage, CostReductionCoverage::Partial);
+    }
+
+    /// An announcement product that no order enumeration can afford is capped
+    /// on its own axis, BEFORE it is built — and the announcements that survive
+    /// are whole, because the wire contract only accepts an announcement that
+    /// names every hybrid symbol.
+    #[test]
+    fn an_unaffordable_announcement_product_is_capped_before_it_is_built() {
+        let plan = CandidatePlan::bounded(8, 20);
+        assert_eq!(plan.enumeration, OrderEnumeration::Rotations);
+        assert!(
+            plan.announcements < 1 << 20,
+            "20 symbols is 1,048,576 announcements — the cap must bite"
+        );
+        assert_eq!(plan.coverage, CostReductionCoverage::Partial);
+        assert!(
+            (plan.orders as u64).saturating_mul(announcements(&plan))
+                <= COST_REDUCTION_MAX_CANDIDATES as u64
+        );
+    }
+
+    /// The bound holds for EVERY input, including the absurd ones an AI search
+    /// could reach repeatedly — that is what makes it a budget rather than a
+    /// hint.
+    #[test]
+    fn no_input_can_plan_more_candidates_than_the_budget() {
+        for reductions in [0usize, 1, 2, 7, 8, 9, 20, 64, 1_000, 100_000] {
+            for positions in [0usize, 1, 2, 5, 12, 20, 64, 300] {
+                let plan = CandidatePlan::bounded(reductions, positions);
+                let candidates = (plan.orders as u64).saturating_mul(announcements(&plan));
+                assert!(
+                    candidates <= COST_REDUCTION_MAX_CANDIDATES as u64,
+                    "{reductions} reductions × {positions} symbols planned {candidates} candidates"
+                );
+                assert!(plan.announcements >= 1);
+                if reductions <= COST_REDUCTION_ORDER_MAX_ENTRIES {
+                    assert_eq!(
+                        plan.order_iter(reductions).count(),
+                        plan.orders.min(plan.enumeration.count(reductions) as usize),
+                        "the lazy enumeration must yield exactly what the plan promised"
+                    );
+                }
+                if (plan.announcements as u64)
+                    < 1u64.checked_shl(positions as u32).unwrap_or(u64::MAX)
+                    || plan.enumeration == OrderEnumeration::Rotations
+                    || (plan.orders as u64) < plan.enumeration.count(reductions)
+                {
+                    assert_eq!(
+                        plan.coverage,
+                        CostReductionCoverage::Partial,
+                        "a narrowed plan must report Partial rather than look complete"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The lazy enumeration yields exactly what the eager one did: every
+    /// permutation, in lexicographic order, deterministically.
+    #[test]
+    fn the_lazy_order_enumeration_is_deterministic_and_complete() {
+        assert_eq!(
+            OrderEnumeration::Permutations.iter(3).collect::<Vec<_>>(),
+            vec![
+                vec![0, 1, 2],
+                vec![0, 2, 1],
+                vec![1, 0, 2],
+                vec![1, 2, 0],
+                vec![2, 0, 1],
+                vec![2, 1, 0],
+            ]
+        );
+        assert_eq!(
+            OrderEnumeration::Rotations.iter(3).collect::<Vec<_>>(),
+            vec![vec![0, 1, 2], vec![1, 2, 0], vec![2, 0, 1]]
+        );
+        for n in 0..=7 {
+            assert_eq!(
+                OrderEnumeration::Permutations.iter(n).count() as u64,
+                OrderEnumeration::Permutations.count(n),
+                "the permutation count must predict the enumeration it bounds"
+            );
+            assert_eq!(
+                OrderEnumeration::Rotations.iter(n).count() as u64,
+                OrderEnumeration::Rotations.count(n)
+            );
+        }
+    }
+
+    /// The announcement product is bounded AS IT IS BUILT, and every
+    /// announcement that survives still names every hybrid symbol —
+    /// `validate_cost_reduction_election` accepts an announcement that is empty
+    /// or complete, so a narrowed set may drop announcements but never shorten
+    /// them.
+    #[test]
+    fn the_announcement_product_is_bounded_as_it_is_built() {
+        use crate::types::mana::ManaCostShard;
+
+        let positions = vec![
+            (0usize, ManaCostShard::GreenWhite),
+            (1, ManaCostShard::WhiteBlue),
+            (2, ManaCostShard::BlackRed),
+        ];
+        let full = super::hybrid_announcements(&positions, usize::MAX);
+        assert_eq!(full.len(), 8, "three symbols with two halves each");
+        assert!(full.iter().all(|a| a.len() == positions.len()));
+
+        let bounded = super::hybrid_announcements(&positions, 3);
+        assert_eq!(
+            bounded,
+            full[..3].to_vec(),
+            "a bounded product is the deterministic PREFIX of the full one"
+        );
+        assert!(
+            bounded.iter().all(|a| a.len() == positions.len()),
+            "a bounded announcement still names every symbol"
+        );
+        assert!(super::hybrid_announcements(&positions, 0).is_empty());
     }
 }

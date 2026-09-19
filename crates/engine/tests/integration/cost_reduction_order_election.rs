@@ -1648,3 +1648,158 @@ fn an_announcement_that_cannot_lower_the_locked_total_stays_silent() {
          make the silence above vacuous"
     );
 }
+
+/// CR 601.2b + CR 107.4e: an announcement that leaves the locked MANA VALUE
+/// unchanged can still be the only way to reach a payment, so mana value is not
+/// a filter the engine may discard candidates with.
+///
+/// Board: Rigo, Streetwise Mentor's `{G/W}{W}{W/U}` under an accepted Defiler
+/// of Faith reduction (`{W}`, colored-only). The reduction has exactly one
+/// unit, so every candidate below is the SAME order — the announcement alone
+/// separates them.
+///
+///   * announce nothing — CR 107.4e makes `{G/W}` a white symbol, so the unit
+///     takes the first pip it matches and locks `{W}{W/U}`.
+///   * announce `{G/W}` as `{G}` and `{W/U}` as `{U}` — the reductions see
+///     `{G}{W}{U}`, the unit takes the plain `{W}`, and the cast locks
+///     `{G}{U}`.
+///
+/// Both cost 2. They are NOT interchangeable: `{W}{W/U}` wants a white mana
+/// plus a white-or-blue one, while `{G}{U}` wants green plus blue, so a
+/// `{G}{U}` pool pays the announced cost and cannot pay the un-announced one.
+/// Discarding the announced candidate on equal mana value deletes the only
+/// election that reaches it — and since the discard removes every announced
+/// candidate here, it deletes the whole prompt and silently locks the greedy
+/// result.
+///
+/// Assertions are on locked `ManaCost` SHAPE throughout, because the mana value
+/// is precisely the thing that cannot tell these apart.
+///
+/// Revert guard: restore `if locked_cost.mana_value() >= baseline.mana_value()`
+/// in `analyze_cost_reduction_order` and every announced candidate is discarded,
+/// one outcome survives, the prompt never opens and `hybrid_election` panics.
+#[test]
+fn an_equal_value_announcement_that_changes_what_can_pay_is_still_offered() {
+    fn rigo_under_a_defiler() -> Board {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let land_ids: Vec<ObjectId> = (0..3)
+            .map(|_| scenario.add_basic_land(P0, ManaColor::White))
+            .collect();
+        scenario
+            .add_creature(P0, "Defiler of Faith", 4, 4)
+            .with_static_definition(defiler(ManaColor::White, white()));
+        let spell = scenario
+            .add_creature_to_hand(P0, "Rigo, Streetwise Mentor", 3, 3)
+            .with_mana_cost(hybrid_gw_w_wu())
+            .id();
+        Board {
+            runner: scenario.build(),
+            spell,
+            lands: land_ids,
+        }
+    }
+
+    fn accepted_defiler_cast() -> Board {
+        let mut setup = rigo_under_a_defiler();
+        setup.begin_manual_cast().expect("the cast must begin");
+        setup
+            .runner
+            .act(GameAction::DecideOptionalCost { pay: true })
+            .expect("the Defiler decision must be accepted");
+        setup
+    }
+
+    let green_blue = ManaCost::Cost {
+        shards: vec![ManaCostShard::Green, ManaCostShard::Blue],
+        generic: 0,
+    };
+    let unannounced = ManaCost::Cost {
+        shards: vec![ManaCostShard::White, ManaCostShard::WhiteBlue],
+        generic: 0,
+    };
+    let green_white = ManaCost::Cost {
+        shards: vec![ManaCostShard::Green, ManaCostShard::White],
+        generic: 0,
+    };
+
+    let setup = accepted_defiler_cast();
+    assert!(
+        setup.prompt_is_live(),
+        "CR 601.2b: the announcement reaches a payment the un-announced cast \
+         cannot, so the caster must be asked — a silent cast here is the \
+         equal-mana-value discard"
+    );
+    let (hybrid_symbols, outcomes) = setup.hybrid_election();
+    assert_eq!(
+        hybrid_symbols,
+        vec![ManaCostShard::GreenWhite, ManaCostShard::WhiteBlue],
+        "the single {{W}} reduction matches both hybrid symbols (CR 107.4e), so \
+         both are announceable"
+    );
+    let locked: Vec<ManaCost> = outcomes.iter().map(|o| o.locked_cost.clone()).collect();
+    assert_eq!(
+        locked,
+        vec![unannounced.clone(), green_white, green_blue.clone()],
+        "every locked total here has mana value 2 — the election exists because \
+         they are payable by DIFFERENT pools, not because one is cheaper"
+    );
+    assert!(
+        locked.iter().all(|cost| cost.mana_value() == 2),
+        "control: the same-mana-value un-announced total {unannounced:?} is \
+         offered alongside the announced ones, which is what makes mana value \
+         useless as a discriminator here"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|o| o.order.clone())
+            .collect::<Vec<_>>()
+            .as_slice(),
+        [vec![0], vec![0], vec![0]],
+        "one reduction has exactly one order — the ANNOUNCEMENT is what \
+         separates these outcomes"
+    );
+
+    // Every offered outcome must actually lock, through the production cast
+    // pipeline, to the cost the prompt advertised.
+    for expected in &locked {
+        let mut parked = accepted_defiler_cast();
+        let (_, outcomes) = parked.hybrid_election();
+        let outcome = outcomes
+            .iter()
+            .find(|o| &o.locked_cost == expected)
+            .expect("the prompt's own outcome must be findable")
+            .clone();
+        parked
+            .runner
+            .act(GameAction::OrderCostReductions {
+                order: outcome.order,
+                hybrid_announcement: outcome.hybrid_announcement.clone(),
+            })
+            .expect("a representative the engine itself offered must be accepted");
+        assert_eq!(
+            &parked.locked_cost(),
+            expected,
+            "announcing {:?} must lock {expected:?}",
+            outcome.hybrid_announcement
+        );
+    }
+
+    let announced = outcomes
+        .iter()
+        .find(|o| o.locked_cost == green_blue)
+        .expect("the {G}{U} election must be offered");
+    assert_eq!(
+        announced.hybrid_announcement,
+        vec![ManaCostShard::Green, ManaCostShard::Blue],
+        "{{G}}{{U}} is reached by announcing {{G/W}} as {{G}} and {{W/U}} as \
+         {{U}}, parallel to the prompt's hybrid_symbols"
+    );
+    assert!(
+        !unannounced.is_payable_whenever(&green_blue),
+        "the property the filter must test: a {{G}}{{U}} pool pays {{G}}{{U}} \
+         and cannot pay {{W}}{{W/U}}, so the un-announced candidate does not \
+         dominate the announced one"
+    );
+}
