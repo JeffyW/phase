@@ -22,6 +22,7 @@ use super::mana::{try_parse_activate_only_condition, try_parse_add_mana_effect_w
 use super::token::try_parse_token;
 use super::{
     attach_controller_if_absent, is_bare_object_pronoun, resolve_it_pronoun, ParseContext,
+    PriorZoneChoicePartition,
 };
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -51,7 +52,7 @@ use crate::types::ability::{
     PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount, PreventionScope, PtStat,
     PtValue, QuantityExpr, QuantityRef, ReassembleControlMode, SearchSelectionConstraint,
     StaticDefinition, StickerTicketCostPayment, TapStateChange, TargetFilter, TargetSelectionMode,
-    ThisWayCause, TypeFilter, TypedFilter, ZoneOwner,
+    ThisWayCause, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::Phase;
@@ -2256,12 +2257,20 @@ pub(super) fn parse_targeted_action_ast(
                 // shape resolves to the CHOSEN card (the choice handler
                 // republishes the chosen cards as the fresh tracked set when the
                 // continuation consumes one), i.e. precisely the wrong half. The
-                // rewrite is gated on
-                // `ctx.cost_paid_zone_choice_partition_available`, so every other
+                // rewrite matches `ctx.prior_zone_choice_partition`'s candidate
+                // source EXPLICITLY against `CostPaidObjects`, so every other
                 // "the other" in the corpus — including Wake to Slaughter's
-                // `Legacy` partition — keeps its existing tracked-set binding.
+                // `Legacy` partition — keeps its existing tracked-set binding,
+                // and a future candidate source cannot inherit this rewrite by
+                // being merely "not absent".
                 let complement_lower = target_text.trim().to_ascii_lowercase();
-                let is_cost_paid_complement = ctx.cost_paid_zone_choice_partition_available
+                let follows_cost_paid_partition = matches!(
+                    ctx.prior_zone_choice_partition,
+                    Some(PriorZoneChoicePartition {
+                        candidate_source: ZoneChoiceCandidateSource::CostPaidObjects,
+                    })
+                );
+                let is_cost_paid_complement = follows_cost_paid_partition
                     && all_consuming((tag::<_, _, OracleError<'_>>("the other"), space0, eof))
                         .parse(complement_lower.as_str())
                         .is_ok();

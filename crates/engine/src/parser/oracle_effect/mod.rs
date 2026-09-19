@@ -173,7 +173,8 @@ use self::subject::{
 };
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::{
-    ChosenColorQualifierScope, ParseContext, TokenPtFollowup, TriggerConditionScope,
+    ChosenColorQualifierScope, ParseContext, PriorZoneChoicePartition, TokenPtFollowup,
+    TriggerConditionScope,
 };
 use crate::parser::oracle_ir::effect_chain::{
     AbilityIr, AbilityRootTransform, AbilityShellIr, AbsorbKind, ClauseDisposition, ClauseIr,
@@ -30532,24 +30533,27 @@ fn clause_ir_hand_reveal_target(clause: &ClauseIr) -> Option<TargetFilter> {
     }
 }
 
-/// CR 400.7j + CR 608.2c + CR 608.2d: Does the NEAREST earlier `ChooseFromZone`
-/// clause of this chain partition the ability's OWN cost-paid exile pile?
+/// CR 400.7j + CR 608.2c + CR 608.2d: The NEAREST earlier `ChooseFromZone`
+/// clause of this chain, when it is a single-card exile partition — reported
+/// as a [`PriorZoneChoicePartition`] carrying that pile's
+/// `ZoneChoiceCandidateSource`.
 ///
-/// Feeds `ParseContext::cost_paid_zone_choice_partition_available`, the gate that
-/// lets the very next instruction's bare "the other" name the UNCHOSEN card
-/// (Coin of Fate). The runtime publishes the CHOSEN cards as the continuation's
-/// targets — and, when the continuation consumes one, as the fresh tracked set —
-/// while the complement reaches only the continuation's immediate `sub_ability`
-/// targets. So "the other" must lower to `ParentTarget` on that sub-ability, not
-/// to a `TrackedSet` (which would name the chosen card, i.e. exactly the wrong
-/// half).
+/// Feeds `ParseContext::prior_zone_choice_partition`, the state that lets the
+/// very next instruction's bare "the other" name the UNCHOSEN card (Coin of
+/// Fate). The runtime publishes the CHOSEN cards as the continuation's targets —
+/// and, when the continuation consumes one, as the fresh tracked set — while the
+/// complement reaches only the continuation's immediate `sub_ability` targets.
+/// So "the other" must lower to `ParentTarget` on that sub-ability, not to a
+/// `TrackedSet` (which would name the chosen card, i.e. exactly the wrong half).
 ///
 /// The scan STOPS at the nearest `ChooseFromZone` rather than searching for a
 /// matching one: a chain whose most recent choice is some OTHER provenance is
-/// not this partition, and must keep its existing binding. That is what pins
-/// Wake to Slaughter ("An opponent chooses one of them. … Return the other …",
-/// `Legacy`) in place.
-fn chain_prior_cost_paid_zone_choice(clauses: &[ClauseIr]) -> bool {
+/// not this partition, and must keep its existing binding. Returning the source
+/// rather than a bool is what keeps "no partition here" and "a partition from a
+/// different source" distinguishable — that is what pins Wake to Slaughter ("An
+/// opponent chooses one of them. … Return the other …", `Legacy`) in place while
+/// leaving the distinction visible to consumers.
+fn chain_prior_zone_choice_partition(clauses: &[ClauseIr]) -> Option<PriorZoneChoicePartition> {
     clauses
         .iter()
         .rev()
@@ -30557,14 +30561,16 @@ fn chain_prior_cost_paid_zone_choice(clauses: &[ClauseIr]) -> bool {
             Effect::ChooseFromZone {
                 count: 1,
                 zone: Zone::Exile,
-                candidate_source: ZoneChoiceCandidateSource::CostPaidObjects,
+                candidate_source,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
                 ..
-            } => Some(true),
-            Effect::ChooseFromZone { .. } => Some(false),
+            } => Some(Some(PriorZoneChoicePartition {
+                candidate_source: *candidate_source,
+            })),
+            Effect::ChooseFromZone { .. } => Some(None),
             _ => None,
         })
-        .unwrap_or(false)
+        .flatten()
 }
 
 /// The match arms naming every effect that establishes a NON-targeting
@@ -38408,17 +38414,16 @@ pub(crate) fn parse_effect_chain_ir(
                 .clauses()
                 .iter()
                 .any(clause_ir_is_self_library_peek),
-            // CR 400.7j + CR 608.2c + CR 608.2d: this chunk follows the
-            // source-bound cost-paid exile choice (Coin of Fate), so its bare
-            // "the other" names the UNCHOSEN half of that two-card partition —
-            // the runtime forwards it on the continuation's immediate
-            // sub-ability targets (`ParentTarget`), never on the tracked set.
-            // Keyed to the `CostPaidObjects` shape alone so every other
-            // `ChooseFromZone` partition (Wake to Slaughter) keeps its existing
-            // `TrackedSet` binding.
-            cost_paid_zone_choice_partition_available: chain_prior_cost_paid_zone_choice(
-                builder.clauses(),
-            ),
+            // CR 400.7j + CR 608.2c + CR 608.2d: the nearest earlier single-card
+            // exile partition of this chain, with its candidate provenance. When
+            // that provenance is the source-bound cost-paid pile (Coin of Fate),
+            // this chunk's bare "the other" names the UNCHOSEN half — the runtime
+            // forwards it on the continuation's immediate sub-ability targets
+            // (`ParentTarget`), never on the tracked set. Carrying the source
+            // rather than a bool keeps every other `ChooseFromZone` partition
+            // (Wake to Slaughter's `Legacy`) visibly distinct from "no partition",
+            // and forces the consumer to name `CostPaidObjects` explicitly.
+            prior_zone_choice_partition: chain_prior_zone_choice_partition(builder.clauses()),
             // CR 400.1/400.2 + CR 608.2c: most-recent earlier same-chain
             // `RevealHand` target, so a later "cast a spell from among those
             // cards" anaphor (Silent-Blade Oni) binds to that player's hand

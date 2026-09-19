@@ -1054,24 +1054,43 @@ fn resolve_candidate_cards(
         // objects THIS ability's own cost moved into the requested (public) zone —
         // Coin of Fate's "Exile two creature cards from your graveyard" activation
         // cost, whose effect then says "An opponent chooses one of the exiled
-        // cards". The cost payment recorded those ids on the resolving ability, so
-        // the pool is source-bound: no tracked set, no explicit targets, no direct
-        // zone scan (which would offer every unrelated card sitting in exile).
+        // cards". The cost payment recorded those referents on the resolving
+        // ability, so the pool is source-bound: no tracked set, no explicit
+        // targets, no direct zone scan (which would offer every unrelated card
+        // sitting in exile).
         //
-        // The recorded ids are a SNAPSHOT of the payment; legality is live — an id
-        // whose object no longer exists, or has since left the requested zone (the
-        // sacrificed source, recorded by the same cost and now in the graveyard), is
-        // not a legal choice (CR 608.2d) and is dropped here. Payment order is
-        // preserved so the prompt lists the cards in the order they were paid.
+        // The record is a SNAPSHOT of the payment; legality is live on two axes:
+        //
+        //   * CR 400.7 — identity. A cost-exiled card that LEFT exile and came
+        //     back (e.g. Pull from Eternity to the graveyard, then re-exiled by
+        //     Scrabbling Claws) is a new object with no relation to the one the
+        //     cost moved, so it is no longer one of "the exiled cards". The
+        //     engine reuses `ObjectId` across zone changes, so storage id alone
+        //     cannot separate "still the bound object" from "a new object at the
+        //     same id" — `CostPaidObjectSnapshot::is_current` compares the
+        //     incarnation epoch, which can. That epoch is pinned past the cost's
+        //     OWN move by `repin_cost_paid_object_recursive` (CR 608.2k), so only
+        //     a LATER move reads as stale.
+        //   * CR 608.2d — zone. A referent whose object has since left the
+        //     requested zone (the sacrificed source, recorded by the same cost
+        //     and now in the graveyard), or no longer exists at all, is not a
+        //     legal choice and is dropped.
+        //
+        // Payment order is preserved so the prompt lists the cards in the order
+        // they were paid.
         ZoneChoiceCandidateSource::CostPaidObjects => {
             let mut zones = Vec::with_capacity(1 + additional_zones.len());
             zones.push(zone);
             zones.extend_from_slice(additional_zones);
             let mut candidates: Vec<ObjectId> = Vec::new();
-            for id in ability.cost_paid_object_ids.iter().copied() {
+            for snapshot in ability.cost_paid_objects.iter() {
+                let id = snapshot.object_id;
                 // A cost can stamp the same object through more than one recording
                 // site; an object must not be offered twice.
                 if candidates.contains(&id) {
+                    continue;
+                }
+                if !snapshot.is_current(state) {
                     continue;
                 }
                 if state
