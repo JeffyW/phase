@@ -33305,44 +33305,6 @@ fn reflexive_when_you_do_inside_dies_trigger_does_not_inherit_outer_zone_change(
 /// The multi-clause text here is a grammar fixture, not a claim about a printed
 /// card: it exercises the clause-to-clause carry that a single-clause card
 /// cannot reach.
-/// CR 608.2c: every else-branch connector the SHARED authority accepts must
-/// reach the effect-side binder as a real `else_ability`, not a degraded
-/// `Unimplemented("otherwise")` marker.
-///
-/// This is the lockstep guard for `oracle_nom::condition::parse_otherwise_branch_connector`.
-/// The trigger-side hoist gate and the effect-side chain binder now call one
-/// combinator, but a future phrasing added there is only genuinely supported if
-/// BOTH sides act on it — the trigger declining to hoist (CR 603.4) and the
-/// effect binding the branch. Driving each accepted phrasing end-to-end through
-/// a real dies trigger is what proves the two sides stayed one decision; the
-/// previous two hand-maintained `alt()` lists could drift with nothing failing.
-#[test]
-fn every_shared_otherwise_connector_binds_its_else_branch_end_to_end() {
-    for connector in [
-        "Otherwise, ",
-        "If not, ",
-        "If no player does, ",
-        "If no one does, ",
-    ] {
-        let line = format!(
-            "When ~ dies, exile it if it had a death counter on it. {connector}return it to \
-             the battlefield under your control."
-        );
-        let parsed = parse_trigger_line(&line, "Test Phoenix");
-        let rendered = format!("{parsed:#?}");
-        assert!(
-            !rendered.contains("Unimplemented"),
-            "connector {connector:?} must bind its else branch, not degrade to a \
-             marker — the trigger and effect sides have drifted apart: {parsed:#?}"
-        );
-        assert!(
-            renders_zone_change_object_gate(&parsed),
-            "connector {connector:?} must still leave the gate at the effect level \
-             (the trigger side must decline the CR 603.4 hoist): {parsed:#?}"
-        );
-    }
-}
-
 #[test]
 fn a_later_clause_of_the_same_dies_body_retains_zone_change_provenance() {
     let multi = parse_trigger_line(
@@ -33361,6 +33323,72 @@ fn a_later_clause_of_the_same_dies_body_retains_zone_change_provenance() {
         renders_zone_change_object_gate(&ordinary),
         "reach control: the single-clause same-trigger body still binds: {ordinary:#?}"
     );
+}
+
+/// CR 608.2c: every else-branch connector the SHARED authority accepts must
+/// reach the effect-side binder as a real `else_ability`.
+///
+/// This is the lockstep guard for
+/// `oracle_nom::condition::parse_otherwise_branch_connector`. The trigger-side
+/// hoist gate and the effect-side chain binder now call one combinator, but a
+/// phrasing is only genuinely supported when BOTH sides act on it — the trigger
+/// declining the CR 603.4 hoist, and the effect binding the branch.
+///
+/// The assertion is STRUCTURAL on purpose. Checking only that the debug render
+/// carries no `Unimplemented`, or only that the gate sits at the effect level,
+/// would both still pass if the trailing "return it …" were lowered as an
+/// UNCONDITIONAL sibling effect — which is the pre-fix shape minus its marker,
+/// i.e. the branch firing on both sides of the condition. Reading
+/// `execute.else_ability` is what distinguishes a bound else branch from a
+/// sibling that merely looks clean.
+#[test]
+fn every_shared_otherwise_connector_binds_its_else_branch_end_to_end() {
+    for connector in [
+        "Otherwise, ",
+        "If not, ",
+        "If no player does, ",
+        "If no one does, ",
+    ] {
+        let line = format!(
+            "When ~ dies, exile it if it had a death counter on it. {connector}return it to \
+             the battlefield under your control."
+        );
+        let parsed = parse_trigger_line(&line, "Test Phoenix");
+
+        let execute = parsed
+            .execute
+            .as_deref()
+            .unwrap_or_else(|| panic!("connector {connector:?}: no trigger body: {parsed:#?}"));
+
+        // The gated clause is the `if` branch; the connector's clause must hang
+        // off it as the else branch, not follow it as an unconditional sibling.
+        assert!(
+            execute.condition.is_some(),
+            "connector {connector:?}: the trailing `if` must gate the clause at the \
+             effect level (the trigger side must decline the CR 603.4 hoist): {execute:#?}"
+        );
+        let otherwise = execute.else_ability.as_deref().unwrap_or_else(|| {
+            panic!(
+                "connector {connector:?}: must attach as else_ability — an unconditional \
+                 sibling would fire on both sides of the condition: {execute:#?}"
+            )
+        });
+        assert!(
+            matches!(
+                otherwise.effect.as_ref(),
+                Effect::ChangeZone {
+                    destination: Zone::Battlefield,
+                    ..
+                }
+            ),
+            "connector {connector:?}: else branch must be the return-to-battlefield \
+             effect: {otherwise:#?}"
+        );
+        assert!(
+            !format!("{execute:#?}").contains("Unimplemented"),
+            "connector {connector:?}: body must carry no Unimplemented marker: {execute:#?}"
+        );
+    }
 }
 
 /// CR 603.7: a delayed trigger body fires on a LATER event, so the outer dies
