@@ -24,11 +24,12 @@
 //! silent. Every "no prompt" assertion below carries a positive guard proving
 //! the reductions really did apply.
 
-use engine::ai_support::candidate_actions_broad;
+use engine::ai_support::{candidate_actions_broad, legal_actions};
 use engine::game::perf_counters;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCost, AdditionalCost, AdditionalCostRepeatability, StaticDefinition,
+    AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost, AdditionalCostRepeatability,
+    Effect, ManaContribution, ManaProduction, SacrificeCost, StaticDefinition, TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::casting_costs::{CostReductionEntry, ReductionProvenance};
@@ -50,6 +51,48 @@ fn one_white() -> ManaCost {
     ManaCost::Cost {
         shards: vec![ManaCostShard::White],
         generic: 1,
+    }
+}
+
+/// A five-colour shard reduction — the amount printed on both Morophon, the
+/// Boundless ("Spells you cast of the chosen type cost {W}{U}{B}{R}{G} less to
+/// cast", colored-only rider) and Aang, Master of Elements (the same amount
+/// with no rider, so CR 118.7b/c spillover applies).
+fn wubrg() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::White,
+            ManaCostShard::Blue,
+            ManaCostShard::Black,
+            ManaCostShard::Red,
+            ManaCostShard::Green,
+        ],
+        generic: 0,
+    }
+}
+
+/// Gishath, Sun's Avatar — `{5}{R}{G}{W}`. `eight_rgw` is the same shard
+/// pattern with three more generic, which shifts the whole election up by
+/// exactly `{3}` (see the offer-seam test for why that matters).
+fn five_rgw() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::Red,
+            ManaCostShard::Green,
+            ManaCostShard::White,
+        ],
+        generic: 5,
+    }
+}
+
+fn eight_rgw() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::Red,
+            ManaCostShard::Green,
+            ManaCostShard::White,
+        ],
+        generic: 8,
     }
 }
 
@@ -147,6 +190,65 @@ fn board(spell_cost: ManaCost, lands: usize, reducers: Vec<StaticDefinition>) ->
         runner: scenario.build(),
         spell,
         lands: land_ids,
+    }
+}
+
+/// A Blood Pet: `Sacrifice this: Add {W}`. Auto-tap deliberately refuses to
+/// spend a permanent it would have to sacrifice, so
+/// `can_pay_cost_after_auto_tap` reports "no" for a board whose only mana is
+/// this — which is exactly the shape `post_origin_auto_payment_verdict` exists
+/// to judge, and the shape that misses `SimulationFilter`'s strict fast path.
+fn self_sacrificing_mana_source() -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Mana {
+            produced: ManaProduction::Fixed {
+                colors: vec![ManaColor::White],
+                contribution: ManaContribution::Base,
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+        TargetFilter::SelfRef,
+        1,
+    )))
+}
+
+/// The reported board, with its mana supplied by sacrificial sources so the
+/// cast has to go through the simulating filter rather than the strict fast
+/// path. `lands` here are Blood Pets, not lands.
+fn sacrificial_mana_board(
+    spell_cost: ManaCost,
+    sources: usize,
+    reducers: Vec<StaticDefinition>,
+) -> Board {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source_ids: Vec<ObjectId> = (0..sources)
+        .map(|index| {
+            scenario
+                .add_creature(P0, &format!("Blood Pet {index}"), 1, 1)
+                .with_ability_definition(self_sacrificing_mana_source())
+                .id()
+        })
+        .collect();
+    for (index, def) in reducers.into_iter().enumerate() {
+        scenario
+            .add_creature(P0, &format!("Reducer {index}"), 1, 1)
+            .with_static_definition(def);
+    }
+    let spell = scenario
+        .add_creature_to_hand(P0, "Test Spell", 2, 2)
+        .with_mana_cost(spell_cost)
+        .id();
+    Board {
+        runner: scenario.build(),
+        spell,
+        lands: source_ids,
     }
 }
 
@@ -1025,5 +1127,130 @@ fn a_generic_only_board_does_not_pay_for_the_ordering_snapshot() {
         "the lock seam must not snapshot a board that cannot produce an \
          election. Measured on this board: 9 scans with the pre-gate, 11 \
          without it (the snapshot's two collector walks). Got {scans}"
+    );
+}
+
+/// Regression for a live AI-mode panic (`casting_costs.rs`
+/// `post_origin_auto_payment_verdict`):
+///
+/// ```text
+/// a new inline PendingCast carrier must be classified explicitly:
+/// OrderCostReductions { .. }
+/// ```
+///
+/// A playtester put Morophon, the Boundless (a `ColoredManaOnly`
+/// `{W}{U}{B}{R}{G}` reducer) and Aang, Master of Elements (a `SpillsToGeneric`
+/// `{W}{U}{B}{R}{G}` reducer) onto the battlefield and cast Gishath, Sun's
+/// Avatar (`{5}{R}{G}{W}`). The election arithmetic was right — Morophon first
+/// strips R/G/W and Aang's five units all spill to generic, locking `{0}`;
+/// Aang first matches R/G/W and spills U/B, leaving `{3}` with nothing left for
+/// Morophon to cancel — but `WaitingFor::OrderCostReductions` was never
+/// classified at the offer seam, so it fell into the catch-all arm's
+/// `debug_assert!`.
+///
+/// The only production caller of that seam is the AI legal-action filter
+/// (`ai_support::filter::SimulationFilter::fallback_simulation`): it clones the
+/// state, applies the candidate `CastSpell`, and asks the seam to judge the
+/// resulting spell root. On this board that clone lands on a LIVE
+/// `OrderCostReductions` prompt, which is why only an AI-mode cast tripped it
+/// while the direct-drive tests above stayed green — they call
+/// `GameRunner::act` and never run the filter.
+///
+/// Note on the guard's shape: `debug_assert!` is compiled out of release
+/// builds, so this test is only revert-sensitive because `cargo test` is a
+/// debug build. Do not "optimise" it into a release-profile test — with
+/// `debug_assertions` off the catch-all silently defaults to `false`, and an
+/// unclassified carrier ships with no panic at all.
+///
+/// Revert guard, measured: with the `WaitingFor::OrderCostReductions { .. }`
+/// arm deleted from `post_origin_auto_payment_verdict`, the `legal_actions`
+/// call below panics at `casting_costs.rs:13396` with the message above, its
+/// payload naming both `CostReductionEntry`s and the `[{3}] / [{6}]`
+/// outcomes. With the arm restored, all 17 tests in this file pass.
+#[test]
+fn the_ai_offer_seam_classifies_a_live_ordering_prompt() {
+    let morophon_and_aang = || {
+        vec![
+            reducer(wubrg(), CostReductionReach::ColoredManaOnly),
+            reducer(wubrg(), CostReductionReach::SpillsToGeneric),
+        ]
+    };
+
+    // First pin the reported arithmetic, so a later change to the election
+    // cannot quietly stop this board from reaching the prompt at all.
+    let mut setup = board(five_rgw(), 6, morophon_and_aang());
+    setup.begin_cast().expect("the cast must begin");
+    let (reductions, costs, _) = setup.election();
+    assert_eq!(
+        reductions.len(),
+        2,
+        "both five-colour reductions must be snapshotted for the election"
+    );
+    assert_eq!(
+        costs,
+        vec![ManaCost::generic(0), ManaCost::generic(3)],
+        "CR 601.2f on {{5}}{{R}}{{G}}{{W}}: colored-only first locks {{0}}, \
+         spillover first locks {{3}} — the payload from the reported panic"
+    );
+
+    // Now the path that actually panicked: a board still at the priority
+    // window, run through the AI legal-action filter. The filter simulates the
+    // cast, lands on the live ordering prompt, and asks the offer seam.
+    //
+    // Two deliberate shifts from the board above, both forced by
+    // `SimulationFilter`'s strict fast path (`structurally_valid_priority_cast`),
+    // which short-circuits — and so never reaches the seam — for any targetless
+    // auto cast whose reduced cost auto-tap can already pay:
+    //
+    //   * the printed cost carries three more generic, so the cheaper elected
+    //     order locks `{3}` rather than `{0}`. The whole election is the
+    //     reported one shifted up by `{3}`: `{3}` / `{6}` instead of
+    //     `{0}` / `{3}`. A `{0}` total is payable from an empty board, which
+    //     is why the reported cost alone can never leave the fast path.
+    //   * the mana comes from Blood Pets. Auto-tap will not sacrifice a
+    //     permanent, so `can_pay_cost_after_auto_tap` says "no" while the cast
+    //     is genuinely payable — the offer-side auto-payment shape this seam
+    //     was written for.
+    //
+    // The reducers are the reported ones, unchanged.
+    let setup = sacrificial_mana_board(eight_rgw(), 3, morophon_and_aang());
+    let spell = setup.spell;
+    let actions = legal_actions(setup.runner.state());
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            GameAction::CastSpell { object_id, .. } if *object_id == spell
+        )),
+        "CR 601.2f: an unresolved reduction-order election is not a settled \
+         mana obligation, so the offer seam must DEFER and the cast must stay \
+         on the AI's legal-action list. Got {actions:?}"
+    );
+
+    // And the board really does reach the election, with the shifted totals.
+    let mut setup = sacrificial_mana_board(eight_rgw(), 3, morophon_and_aang());
+    setup.begin_cast().expect("the cast must begin");
+    let (_, costs, _) = setup.election();
+    assert_eq!(
+        costs,
+        vec![ManaCost::generic(3), ManaCost::generic(6)],
+        "the offer-seam board must be the reported election shifted by {{3}}"
+    );
+
+    // The prompt state itself is also an offer-seam input once the AI is the
+    // one answering it: enumerating from the live prompt must stay panic-free
+    // and must still offer both representatives.
+    let mut setup = board(five_rgw(), 6, morophon_and_aang());
+    setup.begin_cast().expect("the cast must begin");
+    let orders: Vec<Vec<usize>> = legal_actions(setup.runner.state())
+        .into_iter()
+        .filter_map(|action| match action {
+            GameAction::OrderCostReductions { order } => Some(order),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        orders.len(),
+        2,
+        "both locked costs must survive the filter as legal answers"
     );
 }

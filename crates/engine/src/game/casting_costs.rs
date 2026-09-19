@@ -13374,6 +13374,11 @@ pub(crate) fn post_origin_auto_payment_verdict(
         | WaitingFor::ChooseGiftRecipient { .. }
         | WaitingFor::SpliceOffer { .. }
         | WaitingFor::DefilerPayment { .. }
+        // CR 601.2f: the reduction-order election is an unresolved inline cost
+        // prompt carrying its own `PendingCast`, exactly like `DefilerPayment`
+        // above — the caster has not yet chosen an order, so the mana
+        // obligation is not settled and the offer seam must defer.
+        | WaitingFor::OrderCostReductions { .. }
         | WaitingFor::ActivationCostOneOfChoice { .. }
         | WaitingFor::CostTypeChoice { .. }
         | WaitingFor::BlightChoice { .. }
