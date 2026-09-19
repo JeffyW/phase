@@ -487,6 +487,25 @@ pub(crate) struct ParseContext {
     /// lingering path. Mirrors `chain_has_prior_exile_producer`.
     // CR 608.2g + CR 701.20e
     pub chain_prior_self_library_peek: bool,
+    /// CR 400.7j + CR 608.2c + CR 608.2d: an EARLIER clause of this same effect
+    /// chain is the source-bound cost-paid exile choice
+    /// (`Effect::ChooseFromZone { count: 1, zone: Exile, candidate_source:
+    /// CostPaidObjects, selection: Chosen }`) that Coin of Fate's "An opponent
+    /// chooses one of the exiled cards" lowers to. That choice partitions a
+    /// two-card pile, so the very next instruction's "the other" names the
+    /// UNCHOSEN card — which the runtime forwards on the continuation's
+    /// immediate `sub_ability` targets, i.e. `TargetFilter::ParentTarget`, NOT
+    /// the chain tracked set (the tracked set, when republished at all, carries
+    /// the CHOSEN cards).
+    ///
+    /// Deliberately keyed to that one candidate-source shape rather than to
+    /// "any preceding `ChooseFromZone`": a `Legacy`/`Tracked`/`Direct` partition
+    /// (Wake to Slaughter's "An opponent chooses one of them. … Return the other
+    /// …") keeps its existing `TrackedSet` binding, so this gate cannot move it.
+    /// Seeded per chunk in `parse_effect_chain_ir` from the clauses already
+    /// built; `false` via `derive(Default)` on every standalone parse, and never
+    /// serialized.
+    pub cost_paid_zone_choice_partition_available: bool,
 }
 
 impl ParseContext {

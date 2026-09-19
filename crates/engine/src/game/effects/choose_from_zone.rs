@@ -997,7 +997,10 @@ fn collect_player_zone_cards(
 /// CR 608.2c + CR 608.2d + CR 603.7: Resolve the candidate card pool for a
 /// tracked-set pick.
 ///
-/// Priority order:
+/// Priority order (the `Legacy` provenance; every other
+/// [`ZoneChoiceCandidateSource`] short-circuits to its single authority — see
+/// the match below, notably `CostPaidObjects`, which reads only this ability's
+/// own cost-paid objects and has no fallback at all):
 /// 1. The current resolution chain's tracked set, including an empty set.
 /// 2. The latest non-empty tracked set from any prior publish in this game.
 /// 3. Explicit `TargetRef::Object` targets on the ability.
@@ -1045,6 +1048,42 @@ fn resolve_candidate_cards(
                 ability,
                 chain_tracked_set_cards(state).unwrap_or_default(),
                 filter,
+            ));
+        }
+        // CR 400.7j + CR 601.2h + CR 602.2b + CR 608.2d: the candidates are the
+        // objects THIS ability's own cost moved into the requested (public) zone —
+        // Coin of Fate's "Exile two creature cards from your graveyard" activation
+        // cost, whose effect then says "An opponent chooses one of the exiled
+        // cards". The cost payment recorded those ids on the resolving ability, so
+        // the pool is source-bound: no tracked set, no explicit targets, no direct
+        // zone scan (which would offer every unrelated card sitting in exile).
+        //
+        // The recorded ids are a SNAPSHOT of the payment; legality is live — an id
+        // whose object no longer exists, or has since left the requested zone (the
+        // sacrificed source, recorded by the same cost and now in the graveyard), is
+        // not a legal choice (CR 608.2d) and is dropped here. Payment order is
+        // preserved so the prompt lists the cards in the order they were paid.
+        ZoneChoiceCandidateSource::CostPaidObjects => {
+            let mut zones = Vec::with_capacity(1 + additional_zones.len());
+            zones.push(zone);
+            zones.extend_from_slice(additional_zones);
+            let mut candidates: Vec<ObjectId> = Vec::new();
+            for id in ability.cost_paid_object_ids.iter().copied() {
+                // A cost can stamp the same object through more than one recording
+                // site; an object must not be offered twice.
+                if candidates.contains(&id) {
+                    continue;
+                }
+                if state
+                    .objects
+                    .get(&id)
+                    .is_some_and(|object| zones.contains(&object.zone))
+                {
+                    candidates.push(id);
+                }
+            }
+            return Ok(retain_matching_candidates(
+                state, ability, candidates, filter,
             ));
         }
         ZoneChoiceCandidateSource::Legacy => {}
