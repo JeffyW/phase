@@ -7551,6 +7551,14 @@ mod tests {
                 zone_choice_for_rw(ZoneChoiceCandidateSource::Legacy, None),
             ),
             (
+                // CR 400.7j + CR 601.2h: the cost-payment record is a per-source
+                // binding this ability carries, so it belongs in this
+                // enumeration explicitly rather than riding along with the
+                // tracked sources in the profile's match arm.
+                "cost-paid provenance",
+                zone_choice_for_rw(ZoneChoiceCandidateSource::CostPaidObjects, None),
+            ),
+            (
                 "reciprocal consumer",
                 zone_choice_for_rw(
                     ZoneChoiceCandidateSource::Direct,

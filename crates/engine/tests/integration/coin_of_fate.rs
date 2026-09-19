@@ -28,8 +28,14 @@
 //!     continuation's targets and the UNCHOSEN complement only on the
 //!     continuation's immediate sub-ability, so the two halves must land in
 //!     different zones.
+//!   * CR 608.2c + CR 609.3 — when the eligible pool has shrunk, the complement
+//!     can be EMPTY (one survivor) or the pool empty outright. An empty
+//!     complement is a bound result, not an unassigned slot: "the other" then
+//!     names no object, the return does as much as possible (nothing), and the
+//!     rest of the printed instruction still happens.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::zone_pipeline::{move_object_for_test, ZoneMoveRequest};
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
@@ -103,6 +109,18 @@ fn activated_ability_index(runner: &GameRunner, coin: ObjectId) -> usize {
         .expect("Coin of Fate must carry an activated ability with a cost")
 }
 
+/// How far [`drive_activation`] runs the activation before handing control back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DriveUntil {
+    /// Stop at the resolution-time `ChooseFromZoneChoice` window.
+    Choice,
+    /// Stop the moment the activated ability leaves the stack — for a
+    /// resolution that raises no choice at all because its eligible pool is
+    /// empty. Measured against the stack depth at the interlude, so Coin's own
+    /// enters-the-battlefield surveil trigger sitting underneath is left alone.
+    AbilityResolved,
+}
+
 /// Announce the activation and answer every cost/priority window the engine
 /// raises until the resolution-time choice opens.
 ///
@@ -111,7 +129,7 @@ fn activated_ability_index(runner: &GameRunner, coin: ObjectId) -> usize {
 /// self-sacrifice leg, should the engine surface it) is answered from its own
 /// `choices`, so this driver never guesses which cost leg it is looking at.
 fn activate_until_choice(board: &mut Board, cost_cards: &[ObjectId]) {
-    activate_until_choice_with_interlude(board, cost_cards, |_| {});
+    drive_activation(board, cost_cards, DriveUntil::Choice, |_| {});
 }
 
 /// As [`activate_until_choice`], but runs `interlude` exactly once at the first
@@ -121,6 +139,15 @@ fn activate_until_choice(board: &mut Board, cost_cards: &[ObjectId]) {
 fn activate_until_choice_with_interlude(
     board: &mut Board,
     cost_cards: &[ObjectId],
+    interlude: impl FnMut(&mut GameRunner),
+) {
+    drive_activation(board, cost_cards, DriveUntil::Choice, interlude);
+}
+
+fn drive_activation(
+    board: &mut Board,
+    cost_cards: &[ObjectId],
+    until: DriveUntil,
     mut interlude: impl FnMut(&mut GameRunner),
 ) {
     let index = activated_ability_index(&board.runner, board.coin);
@@ -133,6 +160,7 @@ fn activate_until_choice_with_interlude(
         .expect("Coin's ability must be activatable with the cost available");
 
     let mut interlude_done = false;
+    let mut stack_depth_at_interlude = 0usize;
     for _ in 0..40 {
         match board.runner.state().waiting_for.clone() {
             WaitingFor::ChooseFromZoneChoice { .. } => return,
@@ -158,8 +186,18 @@ fn activate_until_choice_with_interlude(
             }
             WaitingFor::Priority { .. } => {
                 if !interlude_done && !board.runner.state().stack.is_empty() {
+                    stack_depth_at_interlude = board.runner.state().stack.len();
                     interlude(&mut board.runner);
                     interlude_done = true;
+                }
+                // Stop the instant the activated ability has resolved, so no
+                // later stack entry or turn machinery can move an object this
+                // test is about to assert on.
+                if until == DriveUntil::AbilityResolved
+                    && interlude_done
+                    && board.runner.state().stack.len() < stack_depth_at_interlude
+                {
+                    return;
                 }
                 if board.runner.act(GameAction::PassPriority).is_err() {
                     return;
@@ -168,6 +206,40 @@ fn activate_until_choice_with_interlude(
             _ => return,
         }
     }
+}
+
+/// CR 400.7: Round-trip `card` out of exile and back through the production
+/// zone-change pipeline (proposal → replacement consult → delivery), so the
+/// incarnation bump that makes it a NEW object is the one real cards get.
+fn round_trip_out_of_exile(runner: &mut GameRunner, card: ObjectId) {
+    assert_eq!(
+        runner.state().objects[&card].zone,
+        Zone::Exile,
+        "reach guard: the cost must have exiled {card:?} before the round trip"
+    );
+    let before = runner.state().objects[&card].incarnation;
+    let mut events = Vec::new();
+    assert!(
+        !move_object_for_test(
+            runner.state_mut(),
+            ZoneMoveRequest::effect(card, Zone::Graveyard, card),
+            &mut events,
+        ),
+        "the exile→graveyard leg must complete without pausing on a replacement choice"
+    );
+    assert!(
+        !move_object_for_test(
+            runner.state_mut(),
+            ZoneMoveRequest::effect(card, Zone::Exile, card),
+            &mut events,
+        ),
+        "the graveyard→exile leg must complete without pausing on a replacement choice"
+    );
+    let after = runner.state().objects[&card].incarnation;
+    assert_ne!(
+        before, after,
+        "CR 400.7: leaving and re-entering exile must make {card:?} a new object"
+    );
 }
 
 /// The offered pool at the open zone choice, plus the player being asked.
@@ -400,8 +472,9 @@ fn coin_of_fate_partition_follows_the_opponents_pick_either_way() {
 ///
 /// The round trip is performed at the one seam where it is observable — the
 /// priority window after the cost is paid and before the ability resolves —
-/// using the engine's own `zones::move_to_zone`, which is what bumps the
-/// incarnation (CR 400.7). It stands in for the real-card route (Pull from
+/// through the production zone-change pipeline (`zone_pipeline::move_object`,
+/// reached from a test crate via `move_object_for_test`), which is what bumps
+/// the incarnation (CR 400.7). It stands in for the real-card route (Pull from
 /// Eternity moving the card to its owner's graveyard, then Scrabbling Claws
 /// re-exiling it) without needing both cards on the board.
 ///
@@ -409,32 +482,19 @@ fn coin_of_fate_partition_follows_the_opponents_pick_either_way() {
 /// reference alive across the COST'S OWN move into exile, which
 /// `repin_cost_paid_object_recursive` accounts for. Only a LATER move — this
 /// one — makes the reference stale.
+///
+/// CR 608.2c + CR 609.3: this is also the ONE-SURVIVOR partition case. With a
+/// single eligible card, the opponent's pick is "that card" and "the other" has
+/// no referent at all, so the return clause does as much as possible — nothing —
+/// and the rest of the printed instruction still happens.
 #[test]
 fn coin_of_fate_drops_a_cost_exiled_card_that_left_exile_and_returned() {
     let mut board = board();
-    let (grave_a, grave_b) = (board.grave_a, board.grave_b);
+    let (grave_a, grave_b, filler) = (board.grave_a, board.grave_b, board.library_card);
 
     let mut round_tripped = false;
     activate_until_choice_with_interlude(&mut board, &[grave_a, grave_b], |runner| {
-        assert_eq!(
-            runner.state().objects[&grave_a].zone,
-            Zone::Exile,
-            "reach guard: the cost must have exiled card A before the round trip"
-        );
-        let before = runner.state().objects[&grave_a].incarnation;
-        let mut events = Vec::new();
-        engine::game::zones::move_to_zone(
-            runner.state_mut(),
-            grave_a,
-            Zone::Graveyard,
-            &mut events,
-        );
-        engine::game::zones::move_to_zone(runner.state_mut(), grave_a, Zone::Exile, &mut events);
-        let after = runner.state().objects[&grave_a].incarnation;
-        assert_ne!(
-            before, after,
-            "CR 400.7: leaving and re-entering exile must make card A a new object"
-        );
+        round_trip_out_of_exile(runner, grave_a);
         round_tripped = true;
     });
     assert!(
@@ -470,12 +530,6 @@ fn coin_of_fate_drops_a_cost_exiled_card_that_left_exile_and_returned() {
         "only the untouched half of the cost-exiled pair remains a candidate, got {cards:?}"
     );
 
-    // The resolution still completes on the surviving half, and the round-tripped
-    // card is untouched by BOTH instructions: CR 400.7 makes it a new object, so
-    // neither "that card" nor "the other" can name it. Where the surviving card
-    // itself lands is a degenerate one-card-pile question this test deliberately
-    // does not pin — `coin_of_fate_bottoms_the_chosen_card_and_returns_the_other_tapped`
-    // owns the two-card partition outcome.
     board
         .runner
         .act(GameAction::SelectCards {
@@ -488,15 +542,121 @@ fn coin_of_fate_drops_a_cost_exiled_card_that_left_exile_and_returned() {
         "the ability must finish resolving, got {:?}",
         state.waiting_for
     );
+
+    // Positive reach guard FIRST: the sole survivor really is the card the
+    // opponent put into the library, so every assertion below is about a
+    // resolution that actually did something.
+    assert_eq!(
+        state.objects[&grave_b].zone,
+        Zone::Library,
+        "CR 608.2c: the opponent's pick is 'that card' — it goes to the library"
+    );
+    let library = &state
+        .players
+        .iter()
+        .find(|p| p.id == P0)
+        .expect("P0")
+        .library;
+    assert_eq!(
+        library.last().copied(),
+        Some(grave_b),
+        "the sole survivor goes on the BOTTOM of the library (library: {library:?})"
+    );
+    assert!(
+        library.iter().any(|id| *id == filler),
+        "the pre-seeded library card must still be there, so 'bottom' is a real position"
+    );
+
+    // CR 609.3: "the other" names nothing here, so the return clause does as
+    // much as possible — nothing. The card the opponent chose must NOT come
+    // straight back off the library it was just put on.
+    assert_ne!(
+        state.objects[&grave_b].zone,
+        Zone::Battlefield,
+        "CR 609.3: with no complement, nothing returns — the chosen card must not \
+         be bottomed and then returned to the battlefield as 'the other'"
+    );
+    assert!(
+        !state.battlefield.iter().any(|id| *id == grave_b),
+        "the chosen card must not appear on the battlefield"
+    );
+
     assert_eq!(
         state.objects[&grave_a].zone,
         Zone::Exile,
         "CR 400.7: the round-tripped card is a new object this ability cannot \
          name, so neither instruction moved it"
     );
-    assert_ne!(
-        state.objects[&grave_b].zone,
+    assert_eq!(
+        state.monarch,
+        Some(P0),
+        "CR 608.2c + CR 725.1: the impossible return does not stop the instruction — \
+         'You become the monarch' still happens"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Claim 4 — CR 609.3: an EMPTY eligible pool resolves as far as it can.
+// ---------------------------------------------------------------------------
+
+/// CR 609.3 + CR 608.2c: when BOTH cost-exiled cards leave exile and return
+/// before resolution, the ability has nothing to offer, nothing to bottom and
+/// nothing to return. It must still resolve — no panic, no stranded choice — and
+/// the trailing instruction still happens.
+#[test]
+fn coin_of_fate_with_no_eligible_cost_exiled_card_still_makes_you_the_monarch() {
+    let mut board = board();
+    let (grave_a, grave_b, stale) = (board.grave_a, board.grave_b, board.stale_exile);
+
+    let mut round_tripped = false;
+    drive_activation(
+        &mut board,
+        &[grave_a, grave_b],
+        DriveUntil::AbilityResolved,
+        |runner| {
+            round_trip_out_of_exile(runner, grave_a);
+            round_trip_out_of_exile(runner, grave_b);
+            round_tripped = true;
+        },
+    );
+    assert!(
+        round_tripped,
+        "reach guard: the interlude must have run — otherwise this test asserts nothing"
+    );
+
+    let state = board.runner.state();
+    // Positive reach guard FIRST: the ability really did resolve — its trailing
+    // instruction landed — rather than stranding on an un-answerable choice.
+    assert_eq!(
+        state.monarch,
+        Some(P0),
+        "CR 608.2c + CR 725.1: the impossible halves are skipped, but 'You become \
+         the monarch' still happens"
+    );
+    assert!(
+        !matches!(state.waiting_for, WaitingFor::ChooseFromZoneChoice { .. }),
+        "an empty candidate pool must not raise a choice window, got {:?}",
+        state.waiting_for
+    );
+
+    for card in [grave_a, grave_b] {
+        assert_eq!(
+            state.objects[&card].zone,
+            Zone::Exile,
+            "CR 400.7: {card:?} came back as a new object this ability cannot name, \
+             so neither 'that card' nor 'the other' moved it"
+        );
+    }
+    assert_eq!(
+        state.objects[&stale].zone,
         Zone::Exile,
-        "reach guard: the surviving candidate was actually acted on"
+        "the unrelated exiled card is untouched by this resolution"
+    );
+    assert!(
+        !state
+            .battlefield
+            .iter()
+            .any(|id| *id == grave_a || *id == grave_b),
+        "CR 609.3: with no eligible card, nothing is returned to the battlefield"
     );
 }
