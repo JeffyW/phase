@@ -9931,6 +9931,14 @@ impl CostPaidObjectSnapshot {
 /// invent an [`LKISnapshot`] that CR 608.2h readers would then report as if it
 /// were the departed object's real recorded state).
 ///
+/// CR 701.9c: a LIVE payment reaches the same shape when a random discard cost's
+/// card is redirected into a hidden zone without being revealed — the cost
+/// really did move that card (membership is exact), but its characteristics are
+/// undefined and CR 400.7j licenses finding only an object a cost moved to a
+/// PUBLIC zone. So `MembershipOnly` has two producers, the persisted migration
+/// and that one hidden-destination payment classification; it never means "this
+/// object was not paid".
+///
 /// `MembershipOnly` is deliberately NOT boxed away behind the captured variant:
 /// the enum's whole job is that a migrated record carries NOTHING but an id, and
 /// the vector it lives in holds at most a handful of entries per resolving
@@ -9947,6 +9955,13 @@ pub enum CostPaidObjectRecord {
     /// the CR 601.2c exclusion needs nothing more — but this can NEVER be a
     /// live referent, because no incarnation was ever recorded. Structurally
     /// incapable of resolving live: it holds no snapshot to resolve through.
+    ///
+    /// CR 701.9c + CR 400.7j: also written by a live payment whose own move
+    /// delivered the object into a HIDDEN zone (a random discard cost
+    /// redirected to a library or hand without being revealed). There the
+    /// refusal is a rules requirement rather than a missing record: the
+    /// characteristics are undefined, and only a move to a public zone lets
+    /// the cost's own effects find the object.
     MembershipOnly(ObjectId),
 }
 
@@ -31315,9 +31330,10 @@ pub struct ResolvedAbility {
     /// this ability's cost moved". Each entry is a
     /// [`CostPaidObjectRecord`], which carries either a full payment-time
     /// snapshot (post-cost INCARNATION plus characteristics) or — for a
-    /// pre-migration persisted payload — MEMBERSHIP only. The engine reuses
-    /// `ObjectId`, so an id alone cannot tell "still the object the cost moved"
-    /// from "a new object that later took the same id" (CR 400.7).
+    /// pre-migration persisted payload, and for a payment whose own move
+    /// delivered into a hidden zone (CR 701.9c) — MEMBERSHIP only. The engine
+    /// reuses `ObjectId`, so an id alone cannot tell "still the object the cost
+    /// moved" from "a new object that later took the same id" (CR 400.7).
     /// Readers that only need membership (target-candidate exclusion) project
     /// [`CostPaidObjectRecord::object_id`], which is exact for BOTH variants;
     /// readers that act on the LIVE object must resolve through
@@ -32627,22 +32643,46 @@ impl ResolvedAbility {
     /// CR 400.7: the appended entries are full snapshots captured BEFORE the
     /// cost's own move, so `repin_cost_paid_object_recursive` must run once the
     /// cost's moves complete — it repins these entries through the same single
-    /// traversal that repins `cost_paid_object`. Every LIVE payment seam
-    /// records `CostPaidObjectRecord::Captured`; the id-only
-    /// `MembershipOnly` variant is produced exclusively by the persisted
-    /// `cost_paid_object_ids` migration, never by a payment.
+    /// traversal that repins `cost_paid_object`.
+    ///
+    /// CR 400.7j: this snapshot-taking form is the PUBLIC-DESTINATION front
+    /// door — every one of its callers pays a cost whose own move delivers to a
+    /// public zone (discard → graveyard, sacrifice → graveyard, exile → exile),
+    /// so `Captured` is the right record for all of them. A payment that can
+    /// deliver into a HIDDEN zone must classify per object and call
+    /// [`Self::add_cost_paid_records_recursive`] directly (CR 701.9c:
+    /// a discarded card put into a hidden zone without being revealed has
+    /// undefined characteristics). Both forms share one traversal.
     pub fn add_cost_paid_objects_recursive(&mut self, snapshots: &[CostPaidObjectSnapshot]) {
-        self.cost_paid_objects.extend(
-            snapshots
-                .iter()
-                .cloned()
-                .map(CostPaidObjectRecord::Captured),
-        );
+        let records = snapshots
+            .iter()
+            .cloned()
+            .map(CostPaidObjectRecord::Captured)
+            .collect::<Vec<_>>();
+        self.add_cost_paid_records_recursive(&records);
+    }
+
+    /// CR 601.2h + CR 602.2b + CR 400.7j: the records-taking primitive behind
+    /// [`Self::add_cost_paid_objects_recursive`] and the SINGLE traversal
+    /// authority for appending to the plural cost-paid provenance.
+    ///
+    /// Exists because the record VARIANT is a per-object question at exactly one
+    /// payment seam: a random discard cost (CR 701.9b) whose card a replacement
+    /// effect redirected into a hidden zone is still a card this cost moved
+    /// (exact membership, CR 601.2c), but CR 701.9c leaves its characteristics
+    /// undefined and CR 400.7j licenses finding only an object the cost moved to
+    /// a PUBLIC zone — so that entry must be `CostPaidObjectRecord::MembershipOnly`
+    /// and must never acquire a snapshot or a live reference. Classifying at the
+    /// call site and appending through here keeps that decision out of the
+    /// traversal, so there is still only one recursion for a future sub/else
+    /// branch to be forgotten by.
+    pub fn add_cost_paid_records_recursive(&mut self, records: &[CostPaidObjectRecord]) {
+        self.cost_paid_objects.extend_from_slice(records);
         if let Some(sub) = self.sub_ability.as_mut() {
-            sub.add_cost_paid_objects_recursive(snapshots);
+            sub.add_cost_paid_records_recursive(records);
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
-            else_branch.add_cost_paid_objects_recursive(snapshots);
+            else_branch.add_cost_paid_records_recursive(records);
         }
     }
 

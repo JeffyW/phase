@@ -4,12 +4,12 @@ use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
     is_chosen_remove_counter_cost_count, AbilityCondition, AbilityCost, AbilityDefinition,
     AbilityKind, AdditionalCost, AdditionalCostInstance, AdditionalCostOrigin, AggregateFunction,
-    BeholdCostAction, CastTimingPermission, Comparator, CostPaidObjectSnapshot,
-    CounterCostSelection, Effect, KickerVariant, NotedManaPayment, ObjectProperty, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ResolutionCastCleanup, ResolvedAbility, SacrificeCost,
-    SacrificeRequirement, SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement,
-    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause, TypeFilter,
-    TypedFilter, EXILE_COST_X,
+    BeholdCostAction, CastTimingPermission, Comparator, CostPaidObjectRecord,
+    CostPaidObjectSnapshot, CounterCostSelection, Effect, KickerVariant, NotedManaPayment,
+    ObjectProperty, QuantityExpr, QuantityRef, ReplacementDefinition, ResolutionCastCleanup,
+    ResolvedAbility, SacrificeCost, SacrificeRequirement, SpellCastingOptionKind, SpellContext,
+    SpellStackToGraveyardReplacement, StaticCondition, TapCreaturesSelectionMode, TargetFilter,
+    TargetRef, ThisWayCause, TypeFilter, TypedFilter, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
 use crate::types::casting_costs::{CostReductionElection, CostReductionEntry, ReductionProvenance};
@@ -2048,11 +2048,33 @@ fn commit_random_discard_cost_picks(
     // left (`RandomDiscardCostPick::snapshot`). The plural authority is never
     // reconstructed from raw ids, so it cannot bind a different incarnation than
     // the one the random payment actually took.
-    let snapshots = picks
+    //
+    // CR 400.7j + CR 701.9c: the record VARIANT is chosen PER PICK by where this
+    // cost's own move actually delivered the card, mirroring the singular
+    // referent's public-destination policy below rather than inventing a second
+    // one. A card delivered to a public zone (the graveyard — CR 701.9a) keeps
+    // full `Captured` provenance. A card a replacement instead put into a hidden
+    // zone without revealing it has UNDEFINED characteristics (CR 701.9c) and was
+    // never moved to a public zone, so CR 400.7j does not license this ability's
+    // effects finding it: it is recorded as `MembershipOnly`, which preserves the
+    // exact CR 601.2c / CR 602.2b membership the target-exclusion consumer needs
+    // while refusing captured characteristics and any live reference. A missing
+    // object row reads as not-public for the same fail-closed reason.
+    let records = picks
         .iter()
-        .map(|pick| pick.snapshot.clone())
+        .map(|pick| {
+            let delivered_to_public_zone = state
+                .objects
+                .get(&pick.occurrence.object_id)
+                .is_some_and(|obj| obj.zone.is_public());
+            if delivered_to_public_zone {
+                CostPaidObjectRecord::Captured(pick.snapshot.clone())
+            } else {
+                CostPaidObjectRecord::MembershipOnly(pick.occurrence.object_id)
+            }
+        })
         .collect::<Vec<_>>();
-    pending.ability.add_cost_paid_objects_recursive(&snapshots);
+    pending.ability.add_cost_paid_records_recursive(&records);
 
     // CR 400.7j + CR 608.2k + CR 701.9c: A cost-paid card remains a usable
     // referent only when its move delivered it to a public zone. If a future

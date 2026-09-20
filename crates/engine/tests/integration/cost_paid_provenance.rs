@@ -128,6 +128,19 @@ fn pay_until_on_stack(runner: &mut GameRunner, cost_cards: &[ObjectId]) {
                     .act(GameAction::PassPriority)
                     .expect("the mana cost must finalize from the floating pool");
             }
+            // CR 616.1: a cost's own move can surface a replacement prompt
+            // before the payment completes — the hidden-zone redirect fixture
+            // below installs a graveyard redirect that watches the paid card's
+            // move. A single mandatory candidate applies without asking, so this
+            // arm fires only when the engine genuinely prompts, and index 0 is
+            // then the first offered candidate. It is answered here rather than
+            // skipped so the payment continues down the engine's OWN resumed
+            // cost path (`resume_random_discard_cost_payment`).
+            WaitingFor::ReplacementChoice { .. } => {
+                runner
+                    .act(GameAction::ChooseReplacement { index: 0 })
+                    .expect("the engine's own replacement prompt must accept its first candidate");
+            }
             other => panic!("the activation stalled before reaching the stack at {other:?}"),
         }
     }
@@ -374,6 +387,247 @@ fn random_discard_cost_publishes_a_live_snapshot() {
         Zone::Graveyard,
         before,
         "random discard",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Random discard redirected into a HIDDEN zone — Pyromancy + a graveyard
+// redirect whose outcome is the library
+// ---------------------------------------------------------------------------
+
+/// Verbatim from this repository's own existing coverage for this exact
+/// grammar: the "Shuffle Probe" fixture in
+/// `crates/engine/tests/integration/will_cycle_duration_seam_b1.rs`
+/// (`v3c_shuffle_back_outcome_is_unchanged`), which pins that this printed
+/// static parses to one `Moved` / `destination_zone: Graveyard` replacement
+/// with the shuffle-back outcome. Copied, never paraphrased — a paraphrase can
+/// take a different parser branch and go green while the real grammar changes.
+///
+/// The card is SYNTHETIC on purpose, and so is the case: every printed
+/// shuffle-back redirect (Nexus of Fate, Darksteel/Blightsteel Colossus,
+/// Progenitus) is self-referential, and a hand card's own replacement is not
+/// consulted for the lowered hand → graveyard `ZoneChange`
+/// (`object_replacement_candidate_applies` admits an off-battlefield source only
+/// as it ENTERS, as it is DISCARDED — i.e. for a `ProposedEvent::Discard`, not
+/// the lowered move — or as it leaves the stack). A battlefield-hosted,
+/// non-self redirect of the same family is therefore the minimal shape that
+/// reaches the seam, which is exactly the "synthetic and latent" case under
+/// test. The redirect itself is fully production code: the same printed-static
+/// front door, the same replacement pipeline, the same delivery.
+const HIDDEN_GRAVEYARD_REDIRECT: &str =
+    "If a card would be put into your graveyard from anywhere, shuffle it into its owner's library instead.";
+
+/// One driven Pyromancy random-discard payment, parked on the stack.
+///
+/// A named struct rather than a tuple: the four values are all id-shaped and a
+/// bare tuple both reads ambiguously at the call site and trips
+/// `clippy::type_complexity` on the return type.
+struct RandomDiscardFixture {
+    runner: GameRunner,
+    /// The two seeded hand cards, exactly one of which the RNG pays.
+    hand: Vec<ObjectId>,
+    /// Each hand card's incarnation epoch BEFORE the payment, so the public
+    /// control can prove the cost's own move advanced it (CR 400.7).
+    before: Vec<(ObjectId, u64)>,
+    /// The installed hidden-zone redirect, when this arm installs one.
+    probe: Option<ObjectId>,
+}
+
+/// Pay Pyromancy's random discard cost through the engine's own windows,
+/// optionally with `HIDDEN_GRAVEYARD_REDIRECT` on the battlefield so the paid
+/// card's own cost move is redirected into a hidden zone.
+///
+/// Fixture non-degeneracy: TWO hand cards, so the seeded RNG genuinely selects
+/// one of them and neither arm assumes which; the caller discovers the paid card
+/// from the board.
+fn pay_pyromancy_random_discard(hidden_redirect: bool) -> RandomDiscardFixture {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, colorless_pool(3));
+    let pyromancy = scenario
+        .add_enchantment_from_oracle(P0, "Pyromancy", PYROMANCY)
+        .id();
+    let probe = hidden_redirect.then(|| {
+        scenario
+            .add_enchantment_from_oracle(P0, "Hidden Redirect Probe", HIDDEN_GRAVEYARD_REDIRECT)
+            .id()
+    });
+    let hand: Vec<ObjectId> = (0..2)
+        .map(|i| {
+            scenario
+                .add_creature_to_hand(P0, &format!("Random Filler {i}"), 1, 1)
+                .with_mana_cost(ManaCost::generic(3))
+                .id()
+        })
+        .collect();
+    let mut runner = scenario.build();
+
+    let before: Vec<(ObjectId, u64)> = hand
+        .iter()
+        .map(|&id| (id, incarnation(&runner, id)))
+        .collect();
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: pyromancy,
+            ability_index: 0,
+        })
+        .expect("Pyromancy's random-discard ability must be activatable");
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Player(P1)),
+        })
+        .expect("Pyromancy targets any target");
+    pay_until_on_stack(&mut runner, &hand);
+
+    RandomDiscardFixture {
+        runner,
+        hand,
+        before,
+        probe,
+    }
+}
+
+/// The single hand card that this payment moved into `zone`.
+fn hand_card_now_in(runner: &GameRunner, hand: &[ObjectId], zone: Zone, label: &str) -> ObjectId {
+    let moved: Vec<ObjectId> = hand
+        .iter()
+        .copied()
+        .filter(|id| runner.state().objects[id].zone == zone)
+        .collect();
+    assert_eq!(
+        moved.len(),
+        1,
+        "{label}: reach guard — the production RNG path must have paid exactly one card \
+         and delivered it to {zone:?}"
+    );
+    moved[0]
+}
+
+/// The plural record naming `object_id`, whichever variant the payment chose.
+fn paid_record(ability: &ResolvedAbility, object_id: ObjectId) -> &CostPaidObjectRecord {
+    ability
+        .cost_paid_objects
+        .iter()
+        .find(|record| record.object_id() == object_id)
+        .unwrap_or_else(|| panic!("the payment must record membership for {object_id:?}"))
+}
+
+/// CR 701.9c + CR 400.7j: a random discard cost whose card a replacement put
+/// into an UNREVEALED HIDDEN zone still moved that card — membership is exact
+/// (CR 601.2c / CR 602.2b) — but the card's characteristics are undefined and
+/// CR 400.7j licenses this ability's effects finding only an object the cost
+/// moved to a PUBLIC zone. So the plural authority must publish
+/// `MembershipOnly`: the id, and nothing else.
+///
+/// UNDER REVERT: drop the per-pick classification in
+/// `commit_random_discard_cost_picks` and every pick is published as
+/// `Captured` again. The hidden arm's `snapshot().is_none()` assertion fails
+/// immediately, and `live_object_id(state).is_none()` fails too — the repin
+/// step would have bound that captured record to the card's post-move
+/// incarnation in the hidden zone, which is precisely the live reference
+/// CR 701.9c forbids. The membership assertion holds either way, which is why
+/// it cannot be the discriminator.
+///
+/// Both arms run in ONE test so the pair cannot drift, and the PUBLIC arm is a
+/// load-bearing positive control: without it, the hidden arm's two `None`s
+/// could be satisfied by an authority that publishes nothing at all.
+///
+/// The paused/resumed payment path inherits this identically: every one of
+/// `commit_random_discard_cost_picks`'s five call sites — the completed and the
+/// paused arms of `pay_deferred_random_discard_cost`, the resumed paused pick,
+/// and the completed and re-paused arms of `resume_random_discard_cost_payment`
+/// — classifies through this one function, and the driver above answers any
+/// `ReplacementChoice` prompt rather than bypassing it, so whichever of the two
+/// routes the pipeline takes ends in the same classification.
+#[test]
+fn random_discard_cost_redirected_to_a_hidden_zone_publishes_membership_only() {
+    // ── HIDDEN ARM ────────────────────────────────────────────────────────
+    let fixture = pay_pyromancy_random_discard(true);
+    let runner = &fixture.runner;
+    let probe = fixture.probe.expect("the hidden arm installs the redirect");
+
+    // Reach guard: the fixture's printed static really did parse into a
+    // graveyard-destination replacement. Without this, a parser change that
+    // silently dropped the clause would leave the card in the graveyard and the
+    // arm below would be measuring the PUBLIC path while claiming the hidden one.
+    let hosted = &runner.state().objects[&probe].replacement_definitions;
+    assert_eq!(
+        hosted
+            .iter_unchecked()
+            .filter(|def| def.destination_zone == Some(Zone::Graveyard))
+            .count(),
+        1,
+        "reach guard: the redirect must be hosted as exactly one graveyard-destination \
+         replacement, got {hosted:?}"
+    );
+
+    let paid = hand_card_now_in(runner, &fixture.hand, Zone::Library, "hidden redirect");
+    assert!(
+        !runner.state().objects[&paid].zone.is_public(),
+        "reach guard: CR 701.9c — the cost's own move must have delivered into a \
+         HIDDEN zone, otherwise this arm measures nothing"
+    );
+
+    let ability = ability_on_stack(runner);
+    assert_eq!(
+        paid_ids(ability),
+        vec![paid],
+        "CR 601.2c: membership stays EXACT — the cost really did move this card, \
+         so the target-candidate exclusion must still see it"
+    );
+    let record = paid_record(ability, paid);
+    assert!(
+        matches!(record, CostPaidObjectRecord::MembershipOnly(id) if *id == paid),
+        "CR 701.9c: a card put into an unrevealed hidden zone must be recorded as \
+         membership only, got {record:?}"
+    );
+    assert!(
+        record.snapshot().is_none(),
+        "CR 701.9c: all values of the card's characteristics are undefined, so no \
+         captured snapshot may be exposed"
+    );
+    assert!(
+        record.live_object_id(runner.state()).is_none(),
+        "CR 400.7j: only a cost move to a PUBLIC zone lets this ability's effects \
+         find the object — the hidden result must refuse to resolve live"
+    );
+    assert!(
+        ability.cost_paid_object.is_none(),
+        "the SINGULAR referent already withholds a hidden result; the plural \
+         authority must not expose what the singular one refuses"
+    );
+
+    // ── PUBLIC POSITIVE CONTROL ───────────────────────────────────────────
+    // The same cost, the same driver, the same RNG — only the redirect is gone.
+    let control = pay_pyromancy_random_discard(false);
+    let runner = &control.runner;
+    assert!(
+        control.probe.is_none(),
+        "the control arm installs no redirect"
+    );
+    let paid = hand_card_now_in(runner, &control.hand, Zone::Graveyard, "public control");
+    let before = control
+        .before
+        .iter()
+        .find(|(id, _)| *id == paid)
+        .map(|(_, epoch)| *epoch)
+        .expect("the paid card is one of the seeded hand cards");
+
+    let ability = ability_on_stack(runner);
+    let record = paid_record(ability, paid);
+    assert!(
+        matches!(record, CostPaidObjectRecord::Captured(_)),
+        "CR 400.7j: a payment delivered to the graveyard — a public zone — keeps \
+         full captured provenance, got {record:?}"
+    );
+    assert_repinned_live(
+        runner.state(),
+        captured_snapshot(ability, paid),
+        paid,
+        Zone::Graveyard,
+        before,
+        "random discard, public destination",
     );
 }
 

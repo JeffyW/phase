@@ -6170,8 +6170,9 @@ fn collect_sub_chain_slot_specs(
 /// projecting each record's `object_id` is exact — an object the cost moved
 /// must be excluded whether or not the record still names a current
 /// incarnation, and whether the entry is a payment-time
-/// `CostPaidObjectRecord::Captured` snapshot or a persisted-save
-/// `CostPaidObjectRecord::MembershipOnly` id. Only CAPTURED entries carry
+/// `CostPaidObjectRecord::Captured` snapshot or a `MembershipOnly` id (a
+/// persisted-save migration, or CR 701.9c's hidden-destination payment).
+/// Only CAPTURED entries carry
 /// live/LKI provenance; this filter deliberately needs none of it.
 /// Deliberately NOT `live_object_id`: a cost-moved object that has since
 /// changed zones AGAIN is still an object this cost moved, and a
