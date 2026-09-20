@@ -9904,6 +9904,150 @@ impl CostPaidObjectSnapshot {
     }
 }
 
+/// CR 400.7 + CR 601.2c + CR 602.2b: One entry of the plural cost-paid
+/// provenance authority (`ResolvedAbility::cost_paid_objects`).
+///
+/// The authority answers two questions whose CORRECT failure directions are
+/// opposite:
+///
+/// * MEMBERSHIP — "was this object consumed by this ability's own cost?" Read by
+///   `exclude_cost_paid_object_that_left_battlefield`. Failing OPEN here is a
+///   rules violation: this engine pays a non-self Sacrifice/Discard/Exile cost
+///   BEFORE the same ability's targets are chosen (a documented shortcut past
+///   CR 601.2c / CR 602.2b's real target-before-cost order), so a paid object
+///   that leaks back into the ability's own target pool was never legally
+///   targetable. Membership is incarnation-IRRELEVANT: an object this cost
+///   moved stays an object this cost moved however many times it moves again.
+/// * LIVE PROVENANCE — "which live object, with which recorded characteristics,
+///   did this cost bind?" Read by [`Self::live_object_id`] and every `lki`
+///   consumer. Failing CLOSED is mandatory: `ObjectId` is reusable storage
+///   identity, so an id alone cannot distinguish "still the bound object" from
+///   "a new object at the same id" (CR 400.7).
+///
+/// A pre-migration persisted payload carried object IDS only. That is exact
+/// membership and NO provenance whatsoever, which is precisely why it gets its
+/// own variant instead of being dropped (fails membership open) or rebound into
+/// a synthesized snapshot (fails provenance open, and would additionally have to
+/// invent an [`LKISnapshot`] that CR 608.2h readers would then report as if it
+/// were the departed object's real recorded state).
+///
+/// `MembershipOnly` is deliberately NOT boxed away behind the captured variant:
+/// the enum's whole job is that a migrated record carries NOTHING but an id, and
+/// the vector it lives in holds at most a handful of entries per resolving
+/// ability (the objects one cost consumed). Keeping the snapshot inline also
+/// keeps `Captured`'s wire form byte-identical to the bare snapshot it replaced.
+/// Mirrors the existing `#[allow]`s on `Effect` / `WaitingFor` in this crate.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CostPaidObjectRecord {
+    /// Captured at payment time by [`CostPaidObjectSnapshot::capture`]: public
+    /// characteristics (CR 608.2h) plus the incarnation epoch (CR 400.7).
+    Captured(CostPaidObjectSnapshot),
+    /// A pre-migration payload carried object ids only. Membership is exact —
+    /// the CR 601.2c exclusion needs nothing more — but this can NEVER be a
+    /// live referent, because no incarnation was ever recorded. Structurally
+    /// incapable of resolving live: it holds no snapshot to resolve through.
+    MembershipOnly(ObjectId),
+}
+
+impl CostPaidObjectRecord {
+    /// CR 601.2c: The MEMBERSHIP projection — the storage id of the object this
+    /// cost consumed. Exact for both variants and the only thing the
+    /// target-candidate exclusion needs.
+    pub fn object_id(&self) -> ObjectId {
+        match self {
+            Self::Captured(snapshot) => snapshot.object_id,
+            Self::MembershipOnly(object_id) => *object_id,
+        }
+    }
+
+    /// CR 608.2h: The captured characteristics/incarnation, when this record has
+    /// any. `None` for a migrated id-only record — its LKI was never recorded
+    /// and is deliberately NOT synthesized, since a fabricated `lki` would make
+    /// CR 608.2h readers report characteristics the game never observed.
+    pub fn snapshot(&self) -> Option<&CostPaidObjectSnapshot> {
+        match self {
+            Self::Captured(snapshot) => Some(snapshot),
+            Self::MembershipOnly(_) => None,
+        }
+    }
+
+    /// Mutable twin of [`Self::snapshot`]. The single seam through which the
+    /// repin traversal reaches a captured record, so `MembershipOnly` cannot be
+    /// upgraded into a live referent by any caller.
+    pub fn snapshot_mut(&mut self) -> Option<&mut CostPaidObjectSnapshot> {
+        match self {
+            Self::Captured(snapshot) => Some(snapshot),
+            Self::MembershipOnly(_) => None,
+        }
+    }
+
+    /// CR 400.7: True only when a CAPTURED record still names the live object it
+    /// was bound to. Always false for `MembershipOnly`: with no recorded epoch
+    /// there is nothing that could prove currency, and guessing would rebind a
+    /// reused storage id to a different object.
+    pub fn is_current(&self, state: &crate::types::game_state::GameState) -> bool {
+        self.snapshot()
+            .is_some_and(|snapshot| snapshot.is_current(state))
+    }
+
+    /// CR 400.7 + CR 400.7j: The single authority for resolving this record to a
+    /// LIVE object id. Always `None` for `MembershipOnly` — a membership record
+    /// is never a live referent.
+    pub fn live_object_id(&self, state: &crate::types::game_state::GameState) -> Option<ObjectId> {
+        self.snapshot()
+            .and_then(|snapshot| snapshot.live_object_id(state))
+    }
+
+    /// CR 400.7 + CR 608.2k: Re-pin a captured record to the incarnation the
+    /// cost's OWN move produced. A no-op for `MembershipOnly`, which has no pin
+    /// to refresh and must not acquire one.
+    pub fn repin_to_current_incarnation(&mut self, state: &crate::types::game_state::GameState) {
+        if let Some(snapshot) = self.snapshot_mut() {
+            snapshot.repin_to_current_incarnation(state);
+        }
+    }
+}
+
+/// `Captured` writes EXACTLY the bytes a bare [`CostPaidObjectSnapshot`] writes,
+/// so migrating the field's element type changes no current save, card-data
+/// export, or P2P payload. `MembershipOnly` writes the bare object id, i.e. the
+/// pre-migration `cost_paid_object_ids` element shape, so a migrated record
+/// round-trips through the same wire form it was read from.
+impl Serialize for CostPaidObjectRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Captured(snapshot) => snapshot.serialize(serializer),
+            Self::MembershipOnly(object_id) => object_id.serialize(serializer),
+        }
+    }
+}
+
+/// Shape-directed decode. The two forms are reliably distinguishable:
+/// `CostPaidObjectSnapshot` always writes a JSON OBJECT (`object_id`/`lki` are
+/// never skipped), while `ObjectId` is `#[serde(transparent)]` over `u64` and
+/// therefore always writes a JSON NUMBER. Anything else is a decode error
+/// rather than a silently-dropped (membership-open) entry.
+impl<'de> Deserialize<'de> for CostPaidObjectRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.is_object() {
+            return serde_json::from_value::<CostPaidObjectSnapshot>(value)
+                .map(Self::Captured)
+                .map_err(de::Error::custom);
+        }
+        serde_json::from_value::<ObjectId>(value)
+            .map(Self::MembershipOnly)
+            .map_err(de::Error::custom)
+    }
+}
+
 /// CR 601.2h + CR 602.2b: Compare two plural cost-paid provenance authorities
 /// by their object-id sequence only, in payment order, without allocating.
 ///
@@ -9919,13 +10063,17 @@ impl CostPaidObjectSnapshot {
 /// Note the deliberate asymmetry with the SINGULAR `cost_paid_object`, which
 /// keeps full-snapshot equality: that field is a resolution-time referent whose
 /// incarnation is part of its meaning, and its equality behavior is unchanged.
+///
+/// CR 400.7: comparing [`CostPaidObjectRecord::object_id`] also makes a migrated
+/// `MembershipOnly` record compare equal to the `Captured` record naming the
+/// same object — correct here, because this comparison IS the membership axis.
 pub(crate) fn cost_paid_object_snapshot_ids_eq(
-    a: &[CostPaidObjectSnapshot],
-    b: &[CostPaidObjectSnapshot],
+    a: &[CostPaidObjectRecord],
+    b: &[CostPaidObjectRecord],
 ) -> bool {
     a.iter()
-        .map(|snapshot| snapshot.object_id)
-        .eq(b.iter().map(|snapshot| snapshot.object_id))
+        .map(CostPaidObjectRecord::object_id)
+        .eq(b.iter().map(CostPaidObjectRecord::object_id))
 }
 
 /// CR 106.1b + CR 400.7 + CR 602.2b (issue #6504): The mana type(s) spent to
@@ -31164,20 +31312,36 @@ pub struct ResolvedAbility {
     /// matter how many objects the cost consumed.
     ///
     /// CR 400.7 + CR 400.7j: this is the SINGLE authority for "the objects
-    /// this ability's cost moved". Each entry is a full
-    /// [`CostPaidObjectSnapshot`], so it carries the referent's post-cost
-    /// INCARNATION and not just its reusable storage id — the engine reuses
-    /// `ObjectId`, so an id alone cannot tell "still the object the cost
-    /// moved" from "a new object that later took the same id" (CR 400.7).
-    /// Readers that only need membership (target-candidate exclusion) may
-    /// project `snapshot.object_id`; readers that act on the LIVE object must
-    /// resolve through [`CostPaidObjectSnapshot::live_object_id`].
+    /// this ability's cost moved". Each entry is a
+    /// [`CostPaidObjectRecord`], which carries either a full payment-time
+    /// snapshot (post-cost INCARNATION plus characteristics) or — for a
+    /// pre-migration persisted payload — MEMBERSHIP only. The engine reuses
+    /// `ObjectId`, so an id alone cannot tell "still the object the cost moved"
+    /// from "a new object that later took the same id" (CR 400.7).
+    /// Readers that only need membership (target-candidate exclusion) project
+    /// [`CostPaidObjectRecord::object_id`], which is exact for BOTH variants;
+    /// readers that act on the LIVE object must resolve through
+    /// [`CostPaidObjectRecord::live_object_id`], which yields `None` for a
+    /// membership-only record (fail closed) rather than rebinding a reused id.
+    ///
+    /// CR 601.2c: `alias = "cost_paid_object_ids"` migrates the pre-snapshot
+    /// save shape (a raw id array) into `MembershipOnly` entries. Dropping
+    /// those ids instead would fail the exclusion OPEN — the singular
+    /// `cost_paid_object` fallback holds only the FIRST paid object, so the
+    /// 2nd and later objects of a restored multi-object payment would become
+    /// legal targets for the very ability whose cost consumed them. A payload
+    /// carrying BOTH keys is a serde `duplicate field` error, which is the
+    /// correct reading: two disagreeing authorities must not be merged.
     ///
     /// Deliberately NOT a second lockstep id vector: there is no parallel raw
-    /// field to drift out of sync with these snapshots. `cost_paid_object`
+    /// field to drift out of sync with these records. `cost_paid_object`
     /// remains the separate SINGULAR resolution-time referent.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cost_paid_objects: Vec<CostPaidObjectSnapshot>,
+    #[serde(
+        default,
+        alias = "cost_paid_object_ids",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cost_paid_objects: Vec<CostPaidObjectRecord>,
     /// Public characteristics of an object chosen or moved by an earlier
     /// effect in the same resolving ability. This is distinct from
     /// `cost_paid_object`: the object was not paid as a cost, but later
@@ -31288,9 +31452,10 @@ pub struct ResolvedAbility {
 /// Hand-written rather than derived for exactly ONE reason: `cost_paid_objects`
 /// must compare by object-id SEQUENCE (see
 /// `cost_paid_object_snapshot_ids_eq`) so it preserves the semantics of the
-/// raw `Vec<ObjectId>` it replaced. Folding a full `CostPaidObjectSnapshot`
-/// comparison in would make `lki` and `incarnation` participate in every
-/// identity check that reaches `ResolvedAbility` equality — `GameState`'s own
+/// raw `Vec<ObjectId>` it replaced. Folding a full `CostPaidObjectRecord`
+/// comparison in would make `lki`, `incarnation`, and the captured-vs-migrated
+/// variant participate in every identity check that reaches `ResolvedAbility`
+/// equality — `GameState`'s own
 /// `PartialEq` over `stack` / `waiting_for` included — silently narrowing them.
 /// Every OTHER field compares exactly as the derive did, including the singular
 /// `cost_paid_object`, whose incarnation is part of its resolution-time meaning.
@@ -32390,6 +32555,10 @@ impl ResolvedAbility {
     ///
     /// See `CostPaidObjectSnapshot::repin_to_current_incarnation`: the cost's own
     /// move must not make the reference stale, only a later one.
+    ///
+    /// CR 400.7: a migrated `CostPaidObjectRecord::MembershipOnly` entry has no
+    /// pin to refresh and must never acquire one, so the per-record method
+    /// no-ops for it. The traversal stays the single authority either way.
     pub fn repin_cost_paid_object_recursive(
         &mut self,
         state: &crate::types::game_state::GameState,
@@ -32397,8 +32566,8 @@ impl ResolvedAbility {
         if let Some(snapshot) = self.cost_paid_object.as_mut() {
             snapshot.repin_to_current_incarnation(state);
         }
-        for snapshot in self.cost_paid_objects.iter_mut() {
-            snapshot.repin_to_current_incarnation(state);
+        for record in self.cost_paid_objects.iter_mut() {
+            record.repin_to_current_incarnation(state);
         }
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.repin_cost_paid_object_recursive(state);
@@ -32458,9 +32627,17 @@ impl ResolvedAbility {
     /// CR 400.7: the appended entries are full snapshots captured BEFORE the
     /// cost's own move, so `repin_cost_paid_object_recursive` must run once the
     /// cost's moves complete — it repins these entries through the same single
-    /// traversal that repins `cost_paid_object`.
+    /// traversal that repins `cost_paid_object`. Every LIVE payment seam
+    /// records `CostPaidObjectRecord::Captured`; the id-only
+    /// `MembershipOnly` variant is produced exclusively by the persisted
+    /// `cost_paid_object_ids` migration, never by a payment.
     pub fn add_cost_paid_objects_recursive(&mut self, snapshots: &[CostPaidObjectSnapshot]) {
-        self.cost_paid_objects.extend_from_slice(snapshots);
+        self.cost_paid_objects.extend(
+            snapshots
+                .iter()
+                .cloned()
+                .map(CostPaidObjectRecord::Captured),
+        );
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.add_cost_paid_objects_recursive(snapshots);
         }
@@ -38644,26 +38821,180 @@ mod cost_paid_provenance_serde_tests {
         assert!(restored.cost_paid_objects.is_empty());
     }
 
-    /// CR 400.7: Saves written before the snapshot authority existed carry a raw
-    /// `cost_paid_object_ids` list. Those are STORAGE ids the engine reuses, so
-    /// they cannot prove which incarnation they named — rebinding them would
-    /// silently name whatever object holds the id today. They are ignored
-    /// outright, the same fail-closed reading `LEGACY_INCARNATION` gives a
-    /// snapshot that predates the incarnation field.
+    /// CR 601.2c + CR 400.7: Saves written before the snapshot authority existed
+    /// carry a raw `cost_paid_object_ids` list. Those ids are exact MEMBERSHIP
+    /// ("this cost consumed these objects") and no provenance at all, so they
+    /// migrate to `CostPaidObjectRecord::MembershipOnly`: membership preserved,
+    /// liveness refused.
+    ///
+    /// Dropping them instead — the pre-fix reading — failed the CR 601.2c
+    /// exclusion OPEN, because the singular `cost_paid_object` fallback names
+    /// only the FIRST paid object.
     #[test]
-    fn legacy_raw_id_field_is_ignored_and_never_rebound() {
+    fn a_legacy_raw_id_field_migrates_to_membership_records() {
         let mut json = serde_json::to_value(sample_ability()).expect("ability serializes");
         json.as_object_mut()
             .expect("a resolved ability serializes as a JSON object")
             .insert(
                 "cost_paid_object_ids".to_string(),
-                serde_json::json!([11, 12]),
+                serde_json::json!([11, 12, 13]),
             );
         let restored: ResolvedAbility =
             serde_json::from_value(json).expect("a legacy payload still restores");
+
+        assert_eq!(
+            restored
+                .cost_paid_objects
+                .iter()
+                .map(CostPaidObjectRecord::object_id)
+                .collect::<Vec<_>>(),
+            vec![ObjectId(11), ObjectId(12), ObjectId(13)],
+            "membership must survive the migration, in payment order"
+        );
+        for record in &restored.cost_paid_objects {
+            assert!(
+                matches!(record, CostPaidObjectRecord::MembershipOnly(_)),
+                "a raw id carries no captured provenance: {record:?}"
+            );
+            assert!(
+                record.snapshot().is_none(),
+                "CR 608.2h: a migrated record must expose no LKI — synthesizing one \
+                 would report characteristics the game never observed"
+            );
+        }
+    }
+
+    /// A minimal CAPTURED wire shape. Only `LKISnapshot`'s non-defaulted fields
+    /// are spelled out, because this fixture is about the record's SHAPE (a JSON
+    /// object, versus a legacy id's JSON number), not about LKI content.
+    fn captured_record_json(object_id: u64, incarnation: u64) -> serde_json::Value {
+        serde_json::json!({
+            "object_id": object_id,
+            "lki": {
+                "name": "Paid Object",
+                "power": null,
+                "toughness": null,
+                "mana_value": 0,
+                "controller": 0,
+                "owner": 0
+            },
+            "incarnation": incarnation
+        })
+    }
+
+    /// The migration must not move a single byte of a CURRENT save: a `Captured`
+    /// record decodes from, and re-encodes to, exactly the bare
+    /// `CostPaidObjectSnapshot` wire form it replaced.
+    #[test]
+    fn a_captured_record_is_wire_identical_to_a_bare_snapshot() {
+        let wire = captured_record_json(7, 3);
+        let snapshot: CostPaidObjectSnapshot =
+            serde_json::from_value(wire.clone()).expect("the fixture is a valid snapshot");
+        let record: CostPaidObjectRecord =
+            serde_json::from_value(wire).expect("a JSON object decodes as a captured record");
+
+        assert_eq!(record, CostPaidObjectRecord::Captured(snapshot.clone()));
+        assert_eq!(
+            serde_json::to_value(&record).expect("a captured record serializes"),
+            serde_json::to_value(&snapshot).expect("a bare snapshot serializes"),
+            "a captured record must be byte-identical to the snapshot it wraps"
+        );
+    }
+
+    /// Shape-directed decode, entry by entry: a partially-migrated authority
+    /// (one captured record plus one legacy id) keeps BOTH, each read as what it
+    /// actually is, and round-trips to the same wire form.
+    #[test]
+    fn a_mixed_authority_decodes_each_entry_by_its_own_shape() {
+        let wire = serde_json::json!([captured_record_json(7, 3), 12]);
+        let records: Vec<CostPaidObjectRecord> =
+            serde_json::from_value(wire).expect("a mixed authority decodes");
+
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[0], CostPaidObjectRecord::Captured(_)));
+        assert_eq!(
+            records[1],
+            CostPaidObjectRecord::MembershipOnly(ObjectId(12))
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(CostPaidObjectRecord::object_id)
+                .collect::<Vec<_>>(),
+            vec![ObjectId(7), ObjectId(12)],
+            "CR 601.2c: membership is exact for both variants"
+        );
+        // Each entry re-encodes in the SHAPE it was read from. (Only the shapes
+        // are compared: re-serializing a decoded snapshot also materializes
+        // `LKISnapshot`'s serde-defaulted fields, which the minimal fixture
+        // above deliberately omits.)
+        let round_tripped = serde_json::to_value(&records).expect("a mixed authority serializes");
+        let round_tripped = round_tripped
+            .as_array()
+            .expect("the authority serializes as an array");
         assert!(
-            restored.cost_paid_objects.is_empty(),
-            "legacy raw ids must never be rebound into the snapshot authority"
+            round_tripped[0].is_object(),
+            "a captured record stays a JSON object: {}",
+            round_tripped[0]
+        );
+        assert_eq!(
+            round_tripped[1],
+            serde_json::json!(12),
+            "a membership record stays the bare legacy id"
+        );
+    }
+
+    /// A current snapshot array still decodes as the snapshot authority it
+    /// always was — the alias widens the accepted input, it does not reinterpret
+    /// the existing key.
+    #[test]
+    fn a_current_snapshot_array_still_decodes_as_captured_records() {
+        let mut json = serde_json::to_value(sample_ability()).expect("ability serializes");
+        json.as_object_mut()
+            .expect("a resolved ability serializes as a JSON object")
+            .insert(
+                "cost_paid_objects".to_string(),
+                serde_json::json!([captured_record_json(21, 5), captured_record_json(22, 6)]),
+            );
+        let restored: ResolvedAbility =
+            serde_json::from_value(json).expect("a current payload restores");
+
+        assert_eq!(
+            restored
+                .cost_paid_objects
+                .iter()
+                .map(CostPaidObjectRecord::object_id)
+                .collect::<Vec<_>>(),
+            vec![ObjectId(21), ObjectId(22)]
+        );
+        for record in &restored.cost_paid_objects {
+            assert!(
+                record.snapshot().is_some(),
+                "a captured entry keeps its provenance: {record:?}"
+            );
+        }
+    }
+
+    /// CR 400.7: two disagreeing authorities in one payload must NOT be merged —
+    /// serde's `duplicate field` error is the correct fail-closed reading, and no
+    /// production writer ever emits both keys.
+    #[test]
+    fn a_payload_carrying_both_cost_paid_keys_is_rejected() {
+        let mut json = serde_json::to_value(sample_ability()).expect("ability serializes");
+        let object = json
+            .as_object_mut()
+            .expect("a resolved ability serializes as a JSON object");
+        object.insert(
+            "cost_paid_objects".to_string(),
+            serde_json::json!([captured_record_json(31, 1)]),
+        );
+        object.insert("cost_paid_object_ids".to_string(), serde_json::json!([32]));
+
+        let error = serde_json::from_value::<ResolvedAbility>(json)
+            .expect_err("a payload with two cost-paid authorities must not decode");
+        assert!(
+            error.to_string().contains("duplicate field"),
+            "expected a duplicate-field rejection, got: {error}"
         );
     }
 }

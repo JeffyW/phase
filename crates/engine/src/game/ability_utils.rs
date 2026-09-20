@@ -6154,8 +6154,8 @@ fn collect_sub_chain_slot_specs(
 /// for a different zone, so they are correctly left untouched by this gate.
 ///
 /// Issue #4948 — Samwise Gamgee: checks EVERY object the cost
-/// consumed (`ability.cost_paid_objects`, projected to `snapshot.object_id`),
-/// not just the single referent in
+/// consumed (`ability.cost_paid_objects`, projected to
+/// `CostPaidObjectRecord::object_id`), not just the single referent in
 /// `ability.cost_paid_object`. A multi-object non-self cost (e.g. "Sacrifice
 /// three Foods") can move several objects into the same zone this ability's
 /// own target searches at once; excluding only the first left the rest
@@ -6167,10 +6167,15 @@ fn collect_sub_chain_slot_specs(
 /// `add_cost_paid_objects_recursive`.
 ///
 /// CR 400.7: this reader is MEMBERSHIP-only and order-independent, so
-/// projecting `snapshot.object_id` is exact — an object the cost moved must be
-/// excluded whether or not the snapshot still names a current incarnation.
+/// projecting each record's `object_id` is exact — an object the cost moved
+/// must be excluded whether or not the record still names a current
+/// incarnation, and whether the entry is a payment-time
+/// `CostPaidObjectRecord::Captured` snapshot or a persisted-save
+/// `CostPaidObjectRecord::MembershipOnly` id. Only CAPTURED entries carry
+/// live/LKI provenance; this filter deliberately needs none of it.
 /// Deliberately NOT `live_object_id`: a cost-moved object that has since
-/// changed zones AGAIN is still an object this cost moved.
+/// changed zones AGAIN is still an object this cost moved, and a
+/// membership-only record resolves live to nothing by construction.
 fn exclude_cost_paid_object_that_left_battlefield(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -6190,7 +6195,7 @@ fn exclude_cost_paid_object_that_left_battlefield(
                 let was_paid_as_cost = ability
                     .cost_paid_objects
                     .iter()
-                    .any(|snapshot| snapshot.object_id == *id)
+                    .any(|record| record.object_id() == *id)
                     || ability
                         .cost_paid_object
                         .as_ref()

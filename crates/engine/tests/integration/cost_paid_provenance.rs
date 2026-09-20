@@ -1,5 +1,5 @@
 //! Measurement suite for the SINGLE cost-paid provenance authority,
-//! `ResolvedAbility::cost_paid_objects: Vec<CostPaidObjectSnapshot>`.
+//! `ResolvedAbility::cost_paid_objects: Vec<CostPaidObjectRecord>`.
 //!
 //! This replaced a raw `Vec<ObjectId>`. An `ObjectId` is reusable storage
 //! identity, so an id alone cannot distinguish "the object this ability's cost
@@ -13,7 +13,7 @@
 //! change is a deliberate behavioral no-op for today's consumers — the one
 //! consumer of the plural authority,
 //! `exclude_cost_paid_object_that_left_battlefield`, is membership-only and
-//! reads `snapshot.object_id` exactly as it read the raw ids. The
+//! reads each record's `object_id` exactly as it read the raw ids. The
 //! observable seam being installed here is the incarnation pin. Every
 //! measurement below still drives the REAL pipeline — `GameScenario` +
 //! `GameRunner`, real `GameAction` cost payment through the engine's own cost
@@ -33,7 +33,9 @@
 //!     recorded during payment, never reconstructed at resolution.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{CostPaidObjectSnapshot, ResolvedAbility, TargetRef};
+use engine::types::ability::{
+    CostPaidObjectRecord, CostPaidObjectSnapshot, ResolvedAbility, TargetRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, PayCostKind, WaitingFor};
 use engine::types::identifiers::{ObjectId, LEGACY_INCARNATION};
@@ -148,13 +150,30 @@ fn ability_on_stack(runner: &GameRunner) -> &ResolvedAbility {
 }
 
 /// The object-id projection of the plural authority, in payment order. This is
-/// exactly what the Phase-1 compatibility consumers read.
+/// exactly what the membership consumer
+/// (`exclude_cost_paid_object_that_left_battlefield`) reads, and it is exact
+/// for BOTH record variants.
 fn paid_ids(ability: &ResolvedAbility) -> Vec<ObjectId> {
     ability
         .cost_paid_objects
         .iter()
-        .map(|snapshot| snapshot.object_id)
+        .map(CostPaidObjectRecord::object_id)
         .collect()
+}
+
+/// The CAPTURED snapshot a live payment published for `object_id`. Panics when
+/// the record carries no provenance, which is the correct reading for every
+/// caller here: each of these measurements is of a REAL payment, and a real
+/// payment always records `CostPaidObjectRecord::Captured`.
+fn captured_snapshot(ability: &ResolvedAbility, object_id: ObjectId) -> &CostPaidObjectSnapshot {
+    ability
+        .cost_paid_objects
+        .iter()
+        .filter(|record| record.object_id() == object_id)
+        .find_map(CostPaidObjectRecord::snapshot)
+        .unwrap_or_else(|| {
+            panic!("a live payment must publish a captured snapshot for {object_id:?}")
+        })
 }
 
 /// The core measurement: one plural snapshot names `expected_id`, that object
@@ -258,7 +277,7 @@ fn deterministic_discard_cost_publishes_a_live_snapshot() {
     );
     assert_repinned_live(
         runner.state(),
-        &ability.cost_paid_objects[0],
+        captured_snapshot(ability, paid),
         paid,
         Zone::Graveyard,
         before,
@@ -350,7 +369,7 @@ fn random_discard_cost_publishes_a_live_snapshot() {
     );
     assert_repinned_live(
         runner.state(),
-        &ability.cost_paid_objects[0],
+        captured_snapshot(ability, discarded),
         discarded,
         Zone::Graveyard,
         before,
@@ -420,7 +439,7 @@ fn sacrifice_cost_publishes_a_live_snapshot() {
     );
     assert_repinned_live(
         runner.state(),
-        &ability.cost_paid_objects[0],
+        captured_snapshot(ability, victim),
         victim,
         Zone::Graveyard,
         before,
@@ -523,14 +542,9 @@ fn exile_cost_publishes_live_snapshots_in_payment_order() {
         (grave_a, before_a, "exile (first paid)"),
         (grave_b, before_b, "exile (second paid)"),
     ] {
-        let snapshot = ability
-            .cost_paid_objects
-            .iter()
-            .find(|snapshot| snapshot.object_id == id)
-            .expect("each exiled card has its own snapshot");
         assert_repinned_live(
             board.runner.state(),
-            snapshot,
+            captured_snapshot(ability, id),
             id,
             Zone::Exile,
             before,
@@ -567,7 +581,10 @@ fn plural_cost_paid_identity_is_the_object_id_sequence_only() {
     );
 
     let mut repinned = ability.clone();
-    for snapshot in repinned.cost_paid_objects.iter_mut() {
+    for record in repinned.cost_paid_objects.iter_mut() {
+        let snapshot = record
+            .snapshot_mut()
+            .expect("a live payment publishes captured records");
         snapshot.incarnation = snapshot.incarnation.wrapping_add(1);
     }
     assert_eq!(
@@ -601,12 +618,7 @@ fn a_legacy_snapshot_without_an_incarnation_fails_closed() {
     let (grave_a, grave_b) = (board.grave_a, board.grave_b);
     pay_until_on_stack(&mut board.runner, &[grave_a, grave_b]);
     let ability = ability_on_stack(&board.runner).clone();
-    let live = ability
-        .cost_paid_objects
-        .iter()
-        .find(|snapshot| snapshot.object_id == grave_a)
-        .expect("the cost-exiled card has a snapshot")
-        .clone();
+    let live = captured_snapshot(&ability, grave_a).clone();
     // Reach guard: the record we are about to downgrade really is live now, so
     // the fail-closed assertion below cannot pass for the wrong reason.
     assert_eq!(
@@ -642,19 +654,29 @@ fn a_legacy_snapshot_without_an_incarnation_fails_closed() {
 }
 
 /// The other half of the restore contract: a persisted ability that predates
-/// the snapshot authority carries a raw `cost_paid_object_ids` id list. Those
-/// ids must be IGNORED, never rebound into snapshots — the same reason as
-/// above, one level up. Measured on a REAL resolving ability.
+/// the snapshot authority carries a raw `cost_paid_object_ids` id list.
+///
+/// Those ids are exact MEMBERSHIP and no provenance, and the two halves must be
+/// answered differently (CR 601.2c vs CR 400.7):
+///   * membership PRESERVED — every id comes back, in payment order, so
+///     `exclude_cost_paid_object_that_left_battlefield` still knows which
+///     objects this ability's own cost consumed;
+///   * liveness REFUSED — each migrated record exposes no snapshot and resolves
+///     live to nothing, because a reusable storage id cannot prove which
+///     incarnation it named.
+///
+/// Measured on a REAL resolving ability, downgraded to the legacy shape.
 #[test]
-fn a_legacy_raw_id_payload_never_rebinds_the_authority() {
+fn a_legacy_raw_id_payload_preserves_membership_without_live_authority() {
     let mut board = coin_board();
     let (grave_a, grave_b) = (board.grave_a, board.grave_b);
     pay_until_on_stack(&mut board.runner, &[grave_a, grave_b]);
     let ability = ability_on_stack(&board.runner).clone();
     let live_ids = paid_ids(&ability);
     assert!(
-        !live_ids.is_empty(),
-        "reach guard: the ability must actually carry provenance to downgrade"
+        live_ids.len() >= 2,
+        "reach guard: this measurement needs a real MULTI-object payment to downgrade, got \
+         {live_ids:?}"
     );
 
     let mut json = serde_json::to_value(&ability).expect("a resolved ability serializes");
@@ -678,9 +700,32 @@ fn a_legacy_raw_id_payload_never_rebinds_the_authority() {
 
     let restored: ResolvedAbility =
         serde_json::from_value(json).expect("a pre-migration ability payload must still restore");
-    assert!(
-        restored.cost_paid_objects.is_empty(),
-        "legacy raw ids must not be rebound into the snapshot authority; got {:?}",
-        paid_ids(&restored)
+
+    assert_eq!(
+        paid_ids(&restored),
+        live_ids,
+        "CR 601.2c: membership must survive the migration exactly, in payment order — \
+         dropping it fails the target-candidate exclusion OPEN for every paid object \
+         after the first"
     );
+    for record in &restored.cost_paid_objects {
+        assert!(
+            matches!(record, CostPaidObjectRecord::MembershipOnly(_)),
+            "a raw id can only migrate to a membership record: {record:?}"
+        );
+        assert!(
+            record.snapshot().is_none(),
+            "CR 608.2h: no LKI may be synthesized for a record that never captured one"
+        );
+        assert_eq!(
+            record.live_object_id(board.runner.state()),
+            None,
+            "CR 400.7: fail closed — a membership record must never resolve to a live \
+             object, even though that object is on the board right now"
+        );
+        assert!(
+            !record.is_current(board.runner.state()),
+            "CR 400.7: a membership record can never read as current"
+        );
+    }
 }
