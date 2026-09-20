@@ -9942,6 +9942,14 @@ impl CostPaidObjectSnapshot {
 // no default), while a snapshot element is a map and can never deserialize as a
 // bare id.
 #[serde(untagged)]
+// clippy::large_enum_variant: `Snapshot` is ~392 bytes (it carries an
+// `LKISnapshot`) against `LegacyMembership`'s 8. Boxing the large arm is the
+// wrong trade here: `Snapshot` is the ONLY variant production ever constructs
+// (`From<CostPaidObjectSnapshot>` is the single seam), so boxing would add a
+// heap allocation to every cost payment in live play purely to shrink a variant
+// that can only arrive by deserializing a pre-migration save. The collection is
+// also short — one entry per object a single ability's cost consumed.
+#[allow(clippy::large_enum_variant)]
 pub enum CostPaidObjectRecord {
     /// Current schema: captured at payment time with full CR 400.7 identity.
     Snapshot(CostPaidObjectSnapshot),
