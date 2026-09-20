@@ -13065,6 +13065,77 @@ impl AbilityCost {
         }
     }
 
+    /// Visit every node of this cost tree in pre-order, recursing the container
+    /// arms (`Composite`, `OneOf`, `PerCounter`). The exhaustive match keeps
+    /// the traversal shape in lockstep with the enum — a new container variant
+    /// is a compile error here rather than a silently missed subtree — so every
+    /// cost-tree consumer (containment, coverage's parsed-item and gap
+    /// collectors) traverses the same complete shape.
+    pub(crate) fn for_each_cost_node<'a>(&'a self, visit: &mut impl FnMut(&'a AbilityCost)) {
+        visit(self);
+        match self {
+            AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                for cost in costs {
+                    cost.for_each_cost_node(visit);
+                }
+            }
+            AbilityCost::PerCounter { base, .. } => base.for_each_cost_node(visit),
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Tap
+            | AbilityCost::Untap
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::Sacrifice(_)
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Discard { .. }
+            | AbilityCost::Exile { .. }
+            | AbilityCost::ExileMaterials { .. }
+            | AbilityCost::CollectEvidence { .. }
+            | AbilityCost::ExileWithAggregate { .. }
+            | AbilityCost::TapCreatures { .. }
+            | AbilityCost::RemoveCounter { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::ReturnToHand { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::UnattachFrom { .. }
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Reveal { .. }
+            | AbilityCost::Behold { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::EffectCost { .. }
+            | AbilityCost::KeywordCostOfCastSpell { .. }
+            | AbilityCost::GetPlayerCounters { .. }
+            | AbilityCost::Unimplemented { .. } => {}
+        }
+    }
+
+    /// True when this cost tree contains an [`AbilityCost::Unimplemented`] leaf
+    /// or an [`AbilityCost::EffectCost`] whose embedded payment effect is itself
+    /// [`Effect::Unimplemented`] — either means the cost cannot be paid.
+    ///
+    /// Traversal delegates to [`AbilityCost::for_each_cost_node`], the single
+    /// cost-tree shape authority, so this predicate and coverage's parsed-item
+    /// and gap collectors cannot disagree about which subtrees exist.
+    ///
+    /// Mirrors `StaticCondition::contains_unrecognized`.
+    pub(crate) fn contains_unimplemented(&self) -> bool {
+        let mut found = false;
+        self.for_each_cost_node(&mut |node| {
+            found |= match node {
+                AbilityCost::Unimplemented { .. } => true,
+                AbilityCost::EffectCost { effect } => {
+                    matches!(effect.as_ref(), Effect::Unimplemented { .. })
+                }
+                _ => false,
+            };
+        });
+        found
+    }
+
     /// CR 601.2h + CR 602.2b: a disjunctive cost leg is resolved to the chosen
     /// instruction and the total cost is then paid as a whole.
     ///
@@ -37041,6 +37112,66 @@ mod tests {
                 ],
             })
         );
+    }
+
+    /// `AbilityCost::contains_unimplemented` is the single containment
+    /// authority: it recurses `Composite`/`OneOf`/`PerCounter`, answers `true`
+    /// for a bare `Unimplemented`, and classifies an `EffectCost` by its
+    /// embedded payment effect.
+    #[test]
+    fn contains_unimplemented_recurses_composition_and_classifies_effect_cost() {
+        assert!(AbilityCost::Unimplemented {
+            description: "frobnicate".to_string(),
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::Composite {
+            costs: vec![
+                pay_life_cost(2),
+                AbilityCost::Unimplemented {
+                    description: "sacrifice a thing".to_string(),
+                },
+            ],
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::OneOf {
+            costs: vec![
+                generic_mana_cost(2),
+                AbilityCost::Composite {
+                    costs: vec![AbilityCost::Unimplemented {
+                        description: "frobnicate".to_string(),
+                    }],
+                },
+            ],
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::PerCounter {
+            counter: CounterType::Age,
+            target: TargetFilter::SelfRef,
+            base: Box::new(AbilityCost::Unimplemented {
+                description: "frobnicate".to_string(),
+            }),
+        }
+        .contains_unimplemented());
+        assert!(!AbilityCost::Composite {
+            costs: vec![pay_life_cost(2), generic_mana_cost(1)],
+        }
+        .contains_unimplemented());
+        // An `EffectCost` is classified by its embedded payment effect: an
+        // unimplemented payload is unpayable, a modeled one is not.
+        assert!(AbilityCost::EffectCost {
+            effect: Box::new(Effect::Unimplemented {
+                name: "static_structure".to_string(),
+                description: None,
+            }),
+        }
+        .contains_unimplemented());
+        assert!(!AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+            }),
+        }
+        .contains_unimplemented());
     }
 }
 

@@ -41996,6 +41996,7 @@ pub mod tests {
             | Keyword::Gift(_)
             | Keyword::Discover(_)
             | Keyword::Spree
+            | Keyword::Tiered
             | Keyword::Ravenous
             | Keyword::Daybound
             | Keyword::Nightbound
