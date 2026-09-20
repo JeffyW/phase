@@ -6172,6 +6172,13 @@ fn collect_sub_chain_slot_specs(
 /// true of the storage slot regardless of which incarnation now occupies it.
 /// Only consumers that act on the referent as a LIVE object (e.g.
 /// `ZoneChoiceCandidateSource::CostPaidObjects`) need the incarnation gate.
+///
+/// Because storage identity is all this filter needs, it reads
+/// `CostPaidObjectRecord::object_id` and so treats a
+/// `CostPaidObjectRecord::LegacyMembership` entry — a historical save whose
+/// record was a bare id — exactly like a full snapshot. That is what keeps a
+/// restored pre-migration game excluding EVERY object its multi-object cost
+/// paid rather than only the one the singular `cost_paid_object` names.
 fn exclude_cost_paid_object_that_left_battlefield(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -6191,7 +6198,7 @@ fn exclude_cost_paid_object_that_left_battlefield(
                 let was_paid_as_cost = ability
                     .cost_paid_objects
                     .iter()
-                    .any(|snapshot| snapshot.object_id == *id)
+                    .any(|record| record.object_id() == *id)
                     || ability
                         .cost_paid_object
                         .as_ref()

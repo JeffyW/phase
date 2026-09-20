@@ -3,9 +3,10 @@ use rand::seq::IndexedRandom; // rand 0.9: `choose_multiple` on `[T]` lives here
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::players;
 use crate::types::ability::{
-    ChooseFromZoneConstraint, Effect, EffectError, EffectKind, ForEachCategoryAction,
-    ParentTargetMissingReason, PerPlayerScope, ReciprocalZoneChoiceRole, ResolvedAbility,
-    TargetFilter, TargetRef, ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
+    ChooseFromZoneConstraint, CostPaidObjectRecord, Effect, EffectError, EffectKind,
+    ForEachCategoryAction, ParentTargetMissingReason, PerPlayerScope, ReciprocalZoneChoiceRole,
+    ResolvedAbility, TargetFilter, TargetRef, ZoneChoiceCandidateSource, ZoneChoiceChooser,
+    ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -1083,7 +1084,19 @@ fn resolve_candidate_cards(
             zones.push(zone);
             zones.extend_from_slice(additional_zones);
             let mut candidates: Vec<ObjectId> = Vec::new();
-            for snapshot in ability.cost_paid_objects.iter() {
+            for record in ability.cost_paid_objects.iter() {
+                // CR 400.7: matched explicitly and exhaustively — a record that
+                // is not a full payment snapshot has no incarnation authority,
+                // so it can never be offered here. A restored pre-migration
+                // save (`LegacyMembership`, a bare id with no recorded epoch)
+                // is exactly that case and fails CLOSED: it stays usable as
+                // target-exclusion membership, but it may not name a live card.
+                // No wildcard, so a future variant is a compile error rather
+                // than a silent candidate.
+                let snapshot = match record {
+                    CostPaidObjectRecord::Snapshot(snapshot) => snapshot,
+                    CostPaidObjectRecord::LegacyMembership(_) => continue,
+                };
                 let id = snapshot.object_id;
                 // A cost can stamp the same object through more than one recording
                 // site; an object must not be offered twice.

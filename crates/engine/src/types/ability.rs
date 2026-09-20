@@ -9900,6 +9900,100 @@ impl CostPaidObjectSnapshot {
     }
 }
 
+/// CR 400.7 + CR 601.2h + CR 602.2b: One entry of
+/// [`ResolvedAbility::cost_paid_objects`] — the record of a single object this
+/// ability's own cost consumed.
+///
+/// Two variants because the record carries two DIFFERENT amounts of authority
+/// depending on when it was written, and the engine must never pretend the
+/// weaker one is the stronger:
+///
+/// * [`Self::Snapshot`] — written by a live payment seam
+///   ([`CostPaidObjectSnapshot::capture`]). Carries storage identity, the
+///   pre-move characteristics (CR 608.2h) and the incarnation epoch (CR 400.7),
+///   so it is valid both as a membership record and as a live-object referent.
+/// * [`Self::LegacyMembership`] — a historical save whose wire form was a bare
+///   `ObjectId` (`cost_paid_object_ids`), written before this collection
+///   recorded anything but storage identity. It proves only "this ability's cost
+///   consumed the object that was at this id"; it CANNOT prove which
+///   incarnation, and no `lki` or epoch is invented for it.
+///
+/// The variant split is what lets the two consumers of the collection diverge
+/// correctly on a restored historical game:
+///
+/// * `exclude_cost_paid_object_that_left_battlefield` (`game/ability_utils.rs`)
+///   needs storage identity ONLY, so it reads [`Self::object_id`] from both
+///   variants and a migrated save keeps its full pre-migration exclusion.
+/// * `ZoneChoiceCandidateSource::CostPaidObjects`
+///   (`game/effects/choose_from_zone.rs`) resolves the record to a LIVE object,
+///   so it matches [`Self::Snapshot`] alone: a legacy record has no incarnation
+///   authority and must fail closed rather than name a possibly-new object at a
+///   reused id.
+///
+/// Production code has exactly one construction seam — `From<CostPaidObjectSnapshot>`
+/// via [`ResolvedAbility::add_cost_paid_objects_recursive`] — so
+/// [`Self::LegacyMembership`] can only ever come off the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Untagged so the two historical wire forms of one array both decode, and so a
+// `Snapshot` keeps serializing in exactly its current shape. The forms are
+// structurally disjoint and cannot be confused: `ObjectId` is
+// `#[serde(transparent)]` over `u64`, so a legacy element is a bare JSON number
+// and can never deserialize as `CostPaidObjectSnapshot` (a map whose `lki` has
+// no default), while a snapshot element is a map and can never deserialize as a
+// bare id.
+#[serde(untagged)]
+pub enum CostPaidObjectRecord {
+    /// Current schema: captured at payment time with full CR 400.7 identity.
+    Snapshot(CostPaidObjectSnapshot),
+    /// CR 400.7: a pre-migration record that carried ONLY storage identity.
+    /// Membership-only — valid for target exclusion, NEVER an
+    /// incarnation-authoritative referent, because no epoch was ever recorded.
+    LegacyMembership(ObjectId),
+}
+
+impl CostPaidObjectRecord {
+    /// Storage identity of the recorded payment. Valid for MEMBERSHIP tests
+    /// ("did this ability's own cost consume the object at this id?") on both
+    /// variants; never sufficient on its own to name a live object, because the
+    /// engine reuses `ObjectId` across zone changes (CR 400.7).
+    pub fn object_id(&self) -> ObjectId {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.object_id,
+            Self::LegacyMembership(object_id) => *object_id,
+        }
+    }
+
+    /// CR 400.7: The full payment snapshot, or `None` for a legacy
+    /// membership-only record. Consumers that resolve the record to a LIVE
+    /// object go through here and then through
+    /// [`CostPaidObjectSnapshot::is_current`], so a record with no recorded
+    /// incarnation fails closed instead of naming a new object at a reused id.
+    pub fn snapshot(&self) -> Option<&CostPaidObjectSnapshot> {
+        match self {
+            Self::Snapshot(snapshot) => Some(snapshot),
+            Self::LegacyMembership(_) => None,
+        }
+    }
+
+    /// CR 400.7 + CR 608.2k: Re-pin a captured snapshot past the cost's OWN
+    /// object moves (see [`CostPaidObjectSnapshot::repin_to_current_incarnation`]).
+    /// A legacy membership record is deliberately left alone: re-pinning it
+    /// would INVENT the incarnation authority it never had and promote it to a
+    /// live referent.
+    fn repin_to_current_incarnation(&mut self, state: &crate::types::game_state::GameState) {
+        match self {
+            Self::Snapshot(snapshot) => snapshot.repin_to_current_incarnation(state),
+            Self::LegacyMembership(_) => {}
+        }
+    }
+}
+
+impl From<CostPaidObjectSnapshot> for CostPaidObjectRecord {
+    fn from(snapshot: CostPaidObjectSnapshot) -> Self {
+        Self::Snapshot(snapshot)
+    }
+}
+
 /// CR 106.1b + CR 400.7 + CR 602.2b (issue #6504): The mana type(s) spent to
 /// pay one activated ability's own mana sub-cost, snapshotted onto
 /// `ResolvedAbility::noted_mana_payment` at the moment that specific
@@ -31046,17 +31140,19 @@ pub struct ResolvedAbility {
     /// actually a legal target under the real target-before-cost order — no
     /// matter how many objects the cost consumed.
     ///
-    /// Stored as full [`CostPaidObjectSnapshot`]s rather than bare
-    /// [`ObjectId`]s because this collection serves BOTH consumers of the
-    /// payment record and one of them is identity-sensitive:
+    /// Stored as [`CostPaidObjectRecord`]s rather than bare [`ObjectId`]s
+    /// because this collection serves BOTH consumers of the payment record and
+    /// one of them is identity-sensitive:
     ///
     /// * `exclude_cost_paid_object_that_left_battlefield`
     ///   (`game/ability_utils.rs`) reads STORAGE identity only — an object
     ///   that left the battlefield to pay this cost was never a legal target
-    ///   regardless of which incarnation now sits at that id.
+    ///   regardless of which incarnation now sits at that id — so it reads
+    ///   [`CostPaidObjectRecord::object_id`] from every variant.
     /// * `ZoneChoiceCandidateSource::CostPaidObjects`
     ///   (`game/effects/choose_from_zone.rs`) reads the LIVE object, so it
-    ///   must gate on [`CostPaidObjectSnapshot::is_current`]: CR 400.7 makes a
+    ///   takes [`CostPaidObjectRecord::snapshot`] and gates on
+    ///   [`CostPaidObjectSnapshot::is_current`]: CR 400.7 makes a
     ///   cost-exiled card that left exile and came back a NEW object this
     ///   reference must no longer name, and the engine reuses `ObjectId`
     ///   across zone changes so the id alone cannot tell the two apart.
@@ -31066,8 +31162,22 @@ pub struct ResolvedAbility {
     /// that drift. The incarnation pins are kept honest across the cost's OWN
     /// moves by `repin_cost_paid_object_recursive` (CR 608.2k), so only a
     /// LATER zone change reads as stale.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cost_paid_objects: Vec<CostPaidObjectSnapshot>,
+    ///
+    /// WIRE KEY: `cost_paid_object_ids`, the historical name, deliberately
+    /// kept. Every save ever written used it, and an element of that array was
+    /// a bare id; those elements decode as
+    /// [`CostPaidObjectRecord::LegacyMembership`], which preserves the
+    /// membership fact this filter needs WITHOUT inventing characteristics or
+    /// an incarnation epoch the record never carried. Dropping them instead
+    /// (the field simply defaulting empty) would silently un-exclude every
+    /// object a historical multi-object cost paid but one, because the singular
+    /// `cost_paid_object` fallback can name at most one.
+    #[serde(
+        default,
+        rename = "cost_paid_object_ids",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cost_paid_objects: Vec<CostPaidObjectRecord>,
     /// Public characteristics of an object chosen or moved by an earlier
     /// effect in the same resolving ability. This is distinct from
     /// `cost_paid_object`: the object was not paid as a cost, but later
@@ -32070,8 +32180,8 @@ impl ResolvedAbility {
         if let Some(snapshot) = self.cost_paid_object.as_mut() {
             snapshot.repin_to_current_incarnation(state);
         }
-        for snapshot in self.cost_paid_objects.iter_mut() {
-            snapshot.repin_to_current_incarnation(state);
+        for record in self.cost_paid_objects.iter_mut() {
+            record.repin_to_current_incarnation(state);
         }
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.repin_cost_paid_object_recursive(state);
@@ -32135,8 +32245,14 @@ impl ResolvedAbility {
     /// 608.2h: the `lki` records their pre-move characteristics); the
     /// subsequent `repin_cost_paid_object_recursive` fixes the incarnation
     /// epoch so the cost's own move does not read as stale (CR 608.2k).
+    ///
+    /// Takes `CostPaidObjectSnapshot`s, not [`CostPaidObjectRecord`]s: this is
+    /// the only production seam that appends to the collection, so every record
+    /// the engine itself writes is a full snapshot and
+    /// [`CostPaidObjectRecord::LegacyMembership`] can only arrive off the wire.
     pub fn add_cost_paid_objects_recursive(&mut self, snapshots: &[CostPaidObjectSnapshot]) {
-        self.cost_paid_objects.extend_from_slice(snapshots);
+        self.cost_paid_objects
+            .extend(snapshots.iter().cloned().map(CostPaidObjectRecord::from));
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.add_cost_paid_objects_recursive(snapshots);
         }

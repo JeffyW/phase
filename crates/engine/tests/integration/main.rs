@@ -156,6 +156,7 @@ mod copy_gy_creature_mana_value_x;
 mod copy_retarget_past_rider;
 mod copy_token_except_keyword_and_quoted_ability;
 mod cosmic_intervention_graveyard_redirect;
+mod cost_paid_objects_historical_restore;
 mod cost_x_carrier_runtime;
 mod cost_zone_pipeline;
 mod council_of_four_nth_per_turn;
