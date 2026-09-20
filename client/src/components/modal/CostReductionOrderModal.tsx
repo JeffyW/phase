@@ -157,7 +157,7 @@ export function CostReductionOrderModal() {
                     aria-label={t("costReductionOrder.moveUp")}
                     disabled={position === 0}
                     onClick={() => move(position, position - 1)}
-                    className="min-h-8 rounded border border-white/10 px-2 text-white/80 transition hover:bg-white/10 disabled:opacity-30"
+                    className="min-h-11 min-w-11 rounded border border-white/10 px-2 text-white/80 transition hover:bg-white/10 disabled:opacity-30"
                   >
                     ▲
                   </button>
@@ -166,7 +166,7 @@ export function CostReductionOrderModal() {
                     aria-label={t("costReductionOrder.moveDown")}
                     disabled={position === order.length - 1}
                     onClick={() => move(position, position + 1)}
-                    className="min-h-8 rounded border border-white/10 px-2 text-white/80 transition hover:bg-white/10 disabled:opacity-30"
+                    className="min-h-11 min-w-11 rounded border border-white/10 px-2 text-white/80 transition hover:bg-white/10 disabled:opacity-30"
                   >
                     ▼
                   </button>
@@ -239,7 +239,7 @@ export function CostReductionOrderModal() {
                 key={`${outcome.order.join("-")}|${(outcome.hybrid_announcement ?? []).join("-")}`}
                 type="button"
                 onClick={() => applyOutcome(outcome)}
-                className="min-h-9 rounded-[12px] border border-white/10 px-3 py-2 text-sm text-white/80 transition hover:bg-white/10"
+                className="min-h-11 min-w-11 rounded-[12px] border border-white/10 px-3 py-2 text-sm text-white/80 transition hover:bg-white/10"
               >
                 <ManaCostSymbols cost={outcome.locked_cost} size="xs" />
               </button>

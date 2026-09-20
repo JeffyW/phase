@@ -1875,9 +1875,10 @@ impl ManaCostShard {
     ///
     /// This is the payment model behind [`ManaCost::is_payable_whenever`]: a
     /// symbol with a `Some` answer is paid by one mana, and that mana qualifies
-    /// if and only if its type is in the returned set. Mana can be several
-    /// colors at once (CR 106.4a), which the set model handles — a mana pays
-    /// the symbol when ANY of its types is in the set.
+    /// if and only if its type is in the returned set. The set has more than one
+    /// member when the SYMBOL accepts more than one type — `{W/U}` takes white
+    /// or blue — not because a mana carries several types at once; CR 106.1b
+    /// gives each mana exactly one of six.
     ///
     /// `None` — "not modelled here, assume nothing" — for every symbol that can
     /// be paid some other way, or whose qualifying mana is picked out by
