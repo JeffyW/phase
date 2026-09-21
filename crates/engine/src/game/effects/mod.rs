@@ -3310,6 +3310,41 @@ fn bind_forwarded_result_targets_for_legacy_effect(child: &mut ResolvedAbility) 
     }
 }
 
+/// CR 608.2c + CR 609.3: Resume a chain whose forwarded result is COMPLETE but
+/// EMPTY — the producer ran and moved no object, so an instruction anchored to
+/// that object has no referent and must not silently fall back to an inherited
+/// target or to the ability's own source.
+///
+/// Shared by the two seams that reach that state, which keep their own
+/// DETECTION and delegate only this correction:
+///   * a `forward_result` producer whose move yielded nothing, and
+///   * a zone-choice partition whose complement was exhausted — recorded by
+///     `engine_resolution_choices.rs` as `forwarded_result_context = Some([])`,
+///     the same completed-but-empty vocabulary.
+///
+/// Prunes exactly the dependent nodes, re-stamps the completed-but-empty
+/// context so a nested consumer reads the same fact, and resumes at the first
+/// independent sibling rather than terminating the printed instruction. The
+/// stamped result is unconditionally empty: both callers are guarded on the
+/// forwarded set already being empty, so there is nothing to carry.
+fn resolve_sub_with_missing_forward_result(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    sub: &ResolvedAbility,
+    effect_context_object: Option<&CostPaidObjectSnapshot>,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+) -> Result<(), EffectError> {
+    if let Some(mut remaining) = without_missing_forward_result_dependencies(sub) {
+        apply_parent_chain_context(&mut remaining, ability, effect_context_object, state);
+        remaining.context.forwarded_result_context = Some(Box::new(
+            ForwardedResultContext::from_object_ids(state, &[]),
+        ));
+        resolve_ability_chain(state, &remaining, events, depth + 1)?;
+    }
+    Ok(())
+}
+
 fn apply_parent_chain_context(
     child: &mut ResolvedAbility,
     parent: &ResolvedAbility,
@@ -16112,6 +16147,33 @@ fn resolve_chain_body(
             }
         }
 
+        // CR 608.2c + CR 609.3: A zone-choice partition already bound this sub's
+        // complement, and that binding is EMPTY — the pick exhausted the eligible
+        // pool, so "the other" names no object at all
+        // (`engine_resolution_choices.rs`'s partition forward records it as
+        // `forwarded_result_context = Some([])`, the same completed-but-empty
+        // vocabulary the `forward_result` seam below uses). An instruction that
+        // needs that absent object does as much as possible — nothing — while the
+        // rest of the printed instruction still happens, so reuse the shared
+        // missing-forward-result authority to drop exactly the dependent nodes and
+        // resume at the first independent sibling. Without this the empty `targets`
+        // vec is indistinguishable from "unassigned" and the seams below hand the
+        // clause the CHOSEN half (or, once `targets` stays empty, the ability
+        // source) as its referent.
+        if sub.targets.is_empty()
+            && bound_result_is_empty(sub)
+            && ability_chain_depends_on_missing_forward_result(sub)
+        {
+            return resolve_sub_with_missing_forward_result(
+                state,
+                ability,
+                sub,
+                effect_context_object.as_ref(),
+                events,
+                depth,
+            );
+        }
+
         // Apply forward_result: moved object becomes sub's source.
         //
         // CR 303.4f: Aura entering by non-spell means — controller chooses the enchanted object.
@@ -16181,19 +16243,14 @@ fn resolve_chain_body(
             // dependent sequential siblings and resume at the first independent
             // sibling instead of terminating the entire printed instruction
             // chain.
-            if let Some(mut remaining) = without_missing_forward_result_dependencies(sub) {
-                apply_parent_chain_context(
-                    &mut remaining,
-                    ability,
-                    effect_context_object.as_ref(),
-                    state,
-                );
-                remaining.context.forwarded_result_context = Some(Box::new(
-                    ForwardedResultContext::from_object_ids(state, &forwarded_objects),
-                ));
-                resolve_ability_chain(state, &remaining, events, depth + 1)?;
-            }
-            return Ok(());
+            return resolve_sub_with_missing_forward_result(
+                state,
+                ability,
+                sub,
+                effect_context_object.as_ref(),
+                events,
+                depth,
+            );
         } else if ability.forward_result {
             let mut sub_with_context = sub.as_ref().clone();
             let attachment_candidates = if forwarded_objects.is_empty() {
@@ -16535,6 +16592,25 @@ fn resolve_chain_body(
     }
 
     Ok(())
+}
+
+/// CR 608.2c + CR 609.3: Whether a producer already bound this node's referent
+/// to the empty set.
+///
+/// `SpellContext::forwarded_result_context` is the single vocabulary for
+/// "a producer ran": `None` means none did, and `Some([])` is a completed
+/// producer whose result is no objects — a fact an empty `targets` vec cannot
+/// express, since that is also what an unassigned node looks like. Both the
+/// `forward_result` seam and the zone-choice partition forward record their
+/// empty results this way, so the chain walker can tell a genuinely empty
+/// referent apart from one that was never assigned and must not substitute an
+/// inherited target for it.
+fn bound_result_is_empty(ability: &ResolvedAbility) -> bool {
+    ability
+        .context
+        .forwarded_result_context
+        .as_deref()
+        .is_some_and(|context| context.targets.is_empty())
 }
 
 /// CR 608.2c + CR 603.7c: Detect a dependency on a missing forward-result
