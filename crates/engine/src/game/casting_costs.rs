@@ -4845,7 +4845,7 @@ fn finish_exile_selection_for_cost(
     // CR 400.7 + CR 608.2h: captured HERE, before the exile moves them, so each
     // snapshot carries pre-move characteristics and its binding-time
     // incarnation. `repin_cost_paid_object_recursive` then re-pins to the
-    // post-cost epoch (CR 608.2k), which is what lets
+    // post-cost epoch (CR 400.7j), which is what lets
     // `ZoneChoiceCandidateSource::CostPaidObjects` read these as live referents
     // (Coin of Fate) while still rejecting a card that later left exile and
     // came back as a new object.

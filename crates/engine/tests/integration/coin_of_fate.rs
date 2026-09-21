@@ -478,8 +478,8 @@ fn coin_of_fate_partition_follows_the_opponents_pick_either_way() {
 /// Eternity moving the card to its owner's graveyard, then Scrabbling Claws
 /// re-exiling it) without needing both cards on the board.
 ///
-/// CR 608.2k is deliberately NOT violated by this: that rule keeps the cost's
-/// reference alive across the COST'S OWN move into exile, which
+/// CR 400.7j is what this does NOT violate: that rule lets a spell or ability's
+/// effects find an object its own COST moved into a public zone, which
 /// `repin_cost_paid_object_recursive` accounts for. Only a LATER move — this
 /// one — makes the reference stale.
 ///

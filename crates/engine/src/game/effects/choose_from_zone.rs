@@ -1070,7 +1070,7 @@ fn resolve_candidate_cards(
         //     cannot separate "still the bound object" from "a new object at the
         //     same id" — `CostPaidObjectSnapshot::is_current` compares the
         //     incarnation epoch, which can. That epoch is pinned past the cost's
-        //     OWN move by `repin_cost_paid_object_recursive` (CR 608.2k), so only
+        //     OWN move by `repin_cost_paid_object_recursive` (CR 400.7j), so only
         //     a LATER move reads as stale.
         //   * CR 608.2d — zone. A referent whose object has since left the
         //     requested zone (the sacrificed source, recorded by the same cost

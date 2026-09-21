@@ -9983,7 +9983,7 @@ impl CostPaidObjectRecord {
         }
     }
 
-    /// CR 400.7 + CR 608.2k: Re-pin a captured snapshot past the cost's OWN
+    /// CR 400.7 + CR 400.7j: Re-pin a captured snapshot past the cost's OWN
     /// object moves (see [`CostPaidObjectSnapshot::repin_to_current_incarnation`]).
     /// A legacy membership record is deliberately left alone: re-pinning it
     /// would INVENT the incarnation authority it never had and promote it to a
@@ -31239,7 +31239,7 @@ pub struct ResolvedAbility {
     /// ONE correctly-typed field rather than a second parallel `Vec<ObjectId>`
     /// — two collections recording the same fact would be two sources of truth
     /// that drift. The incarnation pins are kept honest across the cost's OWN
-    /// moves by `repin_cost_paid_object_recursive` (CR 608.2k), so only a
+    /// moves by `repin_cost_paid_object_recursive` (CR 400.7j), so only a
     /// LATER zone change reads as stale.
     ///
     /// WIRE KEY: `cost_paid_object_ids`, the historical name, deliberately
@@ -32323,7 +32323,7 @@ impl ResolvedAbility {
     /// Snapshots must be captured BEFORE the cost moves the objects (CR
     /// 608.2h: the `lki` records their pre-move characteristics); the
     /// subsequent `repin_cost_paid_object_recursive` fixes the incarnation
-    /// epoch so the cost's own move does not read as stale (CR 608.2k).
+    /// epoch so the cost's own move does not read as stale (CR 400.7j).
     ///
     /// Takes `CostPaidObjectSnapshot`s, not [`CostPaidObjectRecord`]s: this is
     /// the only production seam that appends to the collection, so every record

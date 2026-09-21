@@ -4788,7 +4788,8 @@ fn try_parse_choose_cost_paid_exiled_cards(
 ) -> Option<ChooseImperativeAst> {
     type E<'a> = OracleError<'a>;
 
-    // CR 608.2k: no cost-paid exile record on this ability ⇒ no referent.
+    // CR 400.7j + CR 608.2k: no cost-paid exile record on this ability ⇒ no
+    // referent for the anaphor to name.
     ctx.current_ability_exile_cost_zone?;
 
     let (rest, chooser) = alt((

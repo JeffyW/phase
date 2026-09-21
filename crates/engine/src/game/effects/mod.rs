@@ -3310,6 +3310,41 @@ fn bind_forwarded_result_targets_for_legacy_effect(child: &mut ResolvedAbility) 
     }
 }
 
+/// CR 608.2c + CR 609.3: Resume a chain whose forwarded result is COMPLETE but
+/// EMPTY — the producer ran and moved no object, so an instruction anchored to
+/// that object has no referent and must not silently fall back to an inherited
+/// target or to the ability's own source.
+///
+/// Shared by the two seams that reach that state, which keep their own
+/// DETECTION and delegate only this correction:
+///   * a `forward_result` producer whose move yielded nothing, and
+///   * a zone-choice partition whose complement was exhausted — recorded by
+///     `engine_resolution_choices.rs` as `forwarded_result_context = Some([])`,
+///     the same completed-but-empty vocabulary.
+///
+/// Prunes exactly the dependent nodes, re-stamps the completed-but-empty
+/// context so a nested consumer reads the same fact, and resumes at the first
+/// independent sibling rather than terminating the printed instruction. The
+/// stamped result is unconditionally empty: both callers are guarded on the
+/// forwarded set already being empty, so there is nothing to carry.
+fn resolve_sub_with_missing_forward_result(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    sub: &ResolvedAbility,
+    effect_context_object: Option<&CostPaidObjectSnapshot>,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+) -> Result<(), EffectError> {
+    if let Some(mut remaining) = without_missing_forward_result_dependencies(sub) {
+        apply_parent_chain_context(&mut remaining, ability, effect_context_object, state);
+        remaining.context.forwarded_result_context = Some(Box::new(
+            ForwardedResultContext::from_object_ids(state, &[]),
+        ));
+        resolve_ability_chain(state, &remaining, events, depth + 1)?;
+    }
+    Ok(())
+}
+
 fn apply_parent_chain_context(
     child: &mut ResolvedAbility,
     parent: &ResolvedAbility,
@@ -16064,19 +16099,14 @@ fn resolve_chain_body(
             && bound_result_is_empty(sub)
             && ability_chain_depends_on_missing_forward_result(sub)
         {
-            if let Some(mut remaining) = without_missing_forward_result_dependencies(sub) {
-                apply_parent_chain_context(
-                    &mut remaining,
-                    ability,
-                    effect_context_object.as_ref(),
-                    state,
-                );
-                remaining.context.forwarded_result_context = Some(Box::new(
-                    ForwardedResultContext::from_object_ids(state, &[]),
-                ));
-                resolve_ability_chain(state, &remaining, events, depth + 1)?;
-            }
-            return Ok(());
+            return resolve_sub_with_missing_forward_result(
+                state,
+                ability,
+                sub,
+                effect_context_object.as_ref(),
+                events,
+                depth,
+            );
         }
 
         // Apply forward_result: moved object becomes sub's source.
@@ -16148,19 +16178,14 @@ fn resolve_chain_body(
             // dependent sequential siblings and resume at the first independent
             // sibling instead of terminating the entire printed instruction
             // chain.
-            if let Some(mut remaining) = without_missing_forward_result_dependencies(sub) {
-                apply_parent_chain_context(
-                    &mut remaining,
-                    ability,
-                    effect_context_object.as_ref(),
-                    state,
-                );
-                remaining.context.forwarded_result_context = Some(Box::new(
-                    ForwardedResultContext::from_object_ids(state, &forwarded_objects),
-                ));
-                resolve_ability_chain(state, &remaining, events, depth + 1)?;
-            }
-            return Ok(());
+            return resolve_sub_with_missing_forward_result(
+                state,
+                ability,
+                sub,
+                effect_context_object.as_ref(),
+                events,
+                depth,
+            );
         } else if ability.forward_result {
             let mut sub_with_context = sub.as_ref().clone();
             let attachment_candidates = if forwarded_objects.is_empty() {
