@@ -3,10 +3,9 @@ use rand::seq::IndexedRandom; // rand 0.9: `choose_multiple` on `[T]` lives here
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::players;
 use crate::types::ability::{
-    ChooseFromZoneConstraint, CostPaidObjectRecord, Effect, EffectError, EffectKind,
-    ForEachCategoryAction, ParentTargetMissingReason, PerPlayerScope, ReciprocalZoneChoiceRole,
-    ResolvedAbility, TargetFilter, TargetRef, ZoneChoiceCandidateSource, ZoneChoiceChooser,
-    ZoneOwner,
+    ChooseFromZoneConstraint, Effect, EffectError, EffectKind, ForEachCategoryAction,
+    ParentTargetMissingReason, PerPlayerScope, ReciprocalZoneChoiceRole, ResolvedAbility,
+    TargetFilter, TargetRef, ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -1085,25 +1084,16 @@ fn resolve_candidate_cards(
             zones.extend_from_slice(additional_zones);
             let mut candidates: Vec<ObjectId> = Vec::new();
             for record in ability.cost_paid_objects.iter() {
-                // CR 400.7: matched explicitly and exhaustively — a record that
-                // is not a full payment snapshot has no incarnation authority,
-                // so it can never be offered here. A restored pre-migration
-                // save (`MembershipOnly`, a bare id with no recorded epoch)
-                // is exactly that case and fails CLOSED: it stays usable as
-                // target-exclusion membership, but it may not name a live card.
-                // No wildcard, so a future variant is a compile error rather
-                // than a silent candidate.
-                let snapshot = match record {
-                    CostPaidObjectRecord::Captured(snapshot) => snapshot,
-                    CostPaidObjectRecord::MembershipOnly(_) => continue,
+                // CR 400.7: `live_object_id` is the provenance authority: a
+                // membership-only legacy/hidden-discard record, and a stale
+                // captured record, both fail closed rather than rebinding a
+                // reused storage id.
+                let Some(id) = record.live_object_id(state) else {
+                    continue;
                 };
-                let id = snapshot.object_id;
                 // A cost can stamp the same object through more than one recording
                 // site; an object must not be offered twice.
                 if candidates.contains(&id) {
-                    continue;
-                }
-                if !snapshot.is_current(state) {
                     continue;
                 }
                 if state
