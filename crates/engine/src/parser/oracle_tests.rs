@@ -19539,6 +19539,7 @@ fn glamdring_foe_hammer_equipped_power_cost_reduction_and_equip_parse() {
         amount: ManaCost::Cost { generic: 1, .. },
         spell_filter: Some(TargetFilter::Or { ref filters }),
         dynamic_count: Some(QuantityRef::PropertyAggregate(ref aggregate)),
+        ..
     } = &r.statics[0].mode
     else {
         panic!(
@@ -24764,6 +24765,7 @@ fn defiler_single_line_cost_reduction_parses_as_dedicated_static() {
             color,
             life_cost,
             mana_reduction,
+            reach,
         } => {
             assert_eq!(*color, ManaColor::Blue);
             assert_eq!(*life_cost, 2);
@@ -24773,6 +24775,14 @@ fn defiler_single_line_cost_reduction_parses_as_dedicated_static() {
                     shards: vec![ManaCostShard::Blue],
                     generic: 0,
                 }
+            );
+            // CR 118.7b/c/d: the printed rider ("This effect reduces only the
+            // amount of blue mana you pay") must be captured, not dropped —
+            // it is what stops the {U} reduction shaving generic mana off a
+            // blue permanent spell whose cost has no {U} pip.
+            assert_eq!(
+                *reach,
+                crate::types::statics::CostReductionReach::ColoredManaOnly
             );
         }
         other => panic!("expected DefilerCostReduction, got {other:?}"),
@@ -30908,4 +30918,100 @@ fn rose_room_treasurer_otherwise_remains_fallback() {
         "an unparsed antecedent must keep the honest gap marker rather than \
          binding an Otherwise it cannot evaluate: {execute:#?}"
     );
+}
+
+/// CR 611.2 + CR 109.5: full-pipeline routing regression for Promise of
+/// Loyalty. Its second sentence matches the generic "can't attack" arm of
+/// `STATIC_CONTAINS_PATTERNS`, so at BASE_SHA Priority 7 claimed the WHOLE
+/// two-sentence line and emitted one degenerate
+/// `StaticDefinition { mode: CantAttack, affected: SelfRef, modifications: [] }`
+/// whose description was both sentences verbatim, with zero abilities and a
+/// swallowed-clause warning. The line is a resolving SPELL's one-shot chain,
+/// not a static on a permanent.
+///
+/// Revert-discriminating: removing the
+/// `oracle_effect::is_keeper_dispose_head` arm from
+/// `oracle_classifier::should_defer_spell_to_effect` puts `statics` back to one
+/// entry and `abilities` back to zero here.
+#[test]
+fn promise_of_loyalty_routes_to_the_effect_chain_not_a_whole_line_static() {
+    let parsed = parse_oracle_text(
+        "Each player puts a vow counter on a creature they control and sacrifices the rest. Each of those creatures can't attack you or planeswalkers you control for as long as it has a vow counter on it.",
+        "Promise of Loyalty",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert!(
+        parsed.statics.is_empty(),
+        "the two-sentence line must not lower to a whole-line static: {:?}",
+        parsed.statics
+    );
+    assert_eq!(parsed.abilities.len(), 1);
+    assert!(
+        matches!(
+            parsed.abilities[0].effect.as_ref(),
+            Effect::ChooseAndSacrificeRest { .. }
+        ),
+        "the spell must resolve as a keeper-and-sacrifice chain, got {:?}",
+        parsed.abilities[0].effect
+    );
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "the swallowed-clause warning must clear: {:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// The routing predicate is the recognizer's own head combinator INCLUDING its
+/// supported-combination gate, so the two cards the gate refuses keep the
+/// routing they had at BASE_SHA rather than being deferred into a recognizer
+/// that will not claim them.
+///
+/// Covetous Elegy's "up to two" keeper cardinality has no `KeeperConstraint`
+/// range variant (CR 609.3 clamping is not the same instruction), and Divine
+/// Reckoning's tail is CR 701.8a destroy rather than CR 701.21a sacrifice.
+/// Both parse to the same single `Effect::TargetOnly` head they did at
+/// BASE_SHA — regenerate with
+/// `jq -c '.["covetous elegy"] | {ab:(.abilities|length),
+/// st:((.static_abilities//[])|length), e0:.abilities[0].effect.type}'
+/// client/public/card-data.json`.
+///
+/// Both Oracle strings are the FULL printed text, verbatim from
+/// `jq -r '.["divine reckoning"].oracle_text' client/public/card-data.json` —
+/// including Divine Reckoning's flashback line, which is why that row passes
+/// the MTGJSON keyword name the card-data pipeline passes at
+/// `database/synthesis.rs`'s `parse_oracle_text` call.
+#[test]
+fn gate_refused_keeper_cards_keep_their_base_routing() {
+    for (name, oracle, keyword_names) in [
+        (
+            "Covetous Elegy",
+            "Each player chooses up to two creatures they control, then sacrifices the rest. Then you create a tapped Treasure token for each creature your opponents control.",
+            &[][..],
+        ),
+        (
+            "Divine Reckoning",
+            "Each player chooses a creature they control. Destroy the rest.\nFlashback {5}{W}{W} (You may cast this card from your graveyard for its flashback cost. Then exile it.)",
+            &["Flashback".to_string()][..],
+        ),
+    ] {
+        assert!(
+            !crate::parser::oracle_classifier::should_defer_spell_to_effect(
+                &oracle.to_lowercase()
+            ),
+            "{name} must not be deferred by the keeper-dispose arm"
+        );
+        let parsed = parse_oracle_text(oracle, name, keyword_names, &["Sorcery".to_string()], &[]);
+        assert!(parsed.statics.is_empty(), "{name}: {:?}", parsed.statics);
+        assert_eq!(parsed.abilities.len(), 1, "{name}");
+        assert!(
+            matches!(
+                parsed.abilities[0].effect.as_ref(),
+                Effect::TargetOnly { .. }
+            ),
+            "{name} must keep its BASE_SHA head, got {:?}",
+            parsed.abilities[0].effect
+        );
+    }
 }

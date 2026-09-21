@@ -3353,8 +3353,15 @@ pub(super) fn handle_resolution_choice(
                     // (#6410).
                     let mut cost = base_cost.clone();
                     cost.concretize_x(amount);
+                    // CR 605.3b + CR 616.1: `pay_unless_cost` below has no resume
+                    // root, so a mana source that would pause for a replacement
+                    // choice cannot fund this payment.
                     if !casting::can_pay_effect_mana_cost_after_auto_tap(
-                        state, player, source_id, &cost,
+                        state,
+                        player,
+                        source_id,
+                        &cost,
+                        casting::PausedManaPayment::Unresumable,
                     ) {
                         return Err(EngineError::InvalidAction(format!(
                             "Player {:?} cannot pay {}",
@@ -7866,6 +7873,7 @@ pub(super) fn handle_resolution_choice(
                 target_player: _,
                 eligible,
                 required_count,
+                keeper_counter,
                 choose_filter,
                 sacrifice_filter,
                 chooser_scope,
@@ -7911,6 +7919,7 @@ pub(super) fn handle_resolution_choice(
                 &choose_filter,
                 &sacrifice_filter,
                 required_count,
+                keeper_counter.as_ref(),
                 &scoped_players,
                 events,
             )
