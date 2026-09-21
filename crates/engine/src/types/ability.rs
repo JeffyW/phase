@@ -9908,6 +9908,45 @@ impl CostPaidObjectSnapshot {
         }
     }
 
+    /// CR 608.2h: Build a FRESH capture of `object_id` from the LIVE object
+    /// row, or `None` when that row is gone (nothing to read).
+    ///
+    /// The single construction seam for RE-capture, mirroring what
+    /// [`Self::capture`] is for first capture. Both the in-place form
+    /// ([`Self::refresh_capture_from_live`], used by the singular and plural
+    /// ability-side carriers) and the stack object's `cast_cost_paid_object`
+    /// carrier — which lives on `GameObject`, not on `ResolvedAbility`, and so
+    /// cannot be reached by the ability traversal — go through here, so
+    /// "what a re-capture reads" has exactly one implementation.
+    pub fn recapture_from_live(
+        state: &crate::types::game_state::GameState,
+        object_id: ObjectId,
+    ) -> Option<Self> {
+        state
+            .objects
+            .get(&object_id)
+            .map(|object| Self::capture(object, object.snapshot_for_mana_spent()))
+    }
+
+    /// CR 608.2h: RE-CAPTURE this snapshot's characteristics from the LIVE
+    /// object in place, preserving its identity (same `object_id`).
+    ///
+    /// For a payment whose object moves are DEFERRED past the seam that
+    /// published this snapshot: CR 608.2h calls for the object's last known
+    /// information, i.e. its state as it MOST RECENTLY existed, not its state
+    /// at selection time. CR 601.2g puts the mana-ability window between those
+    /// two moments, so a deferred sacrifice selected before that window can be
+    /// tapped for mana inside it and a snapshot frozen at selection would
+    /// report an untapped permanent the game had already tapped.
+    ///
+    /// A no-op for a vanished row: the recorded characteristics are then
+    /// already the last thing the game knew.
+    pub fn refresh_capture_from_live(&mut self, state: &crate::types::game_state::GameState) {
+        if let Some(refreshed) = Self::recapture_from_live(state, self.object_id) {
+            *self = refreshed;
+        }
+    }
+
     /// CR 400.7 + CR 608.2k: The single authority for resolving this snapshot to
     /// a LIVE object id. Yields the id only while the snapshot still names the
     /// object it was bound to; a referent that left (with or without returning
@@ -10196,16 +10235,18 @@ impl CostPaidObjectRecord {
     /// selection would otherwise freeze an untapped `lki` that the game never
     /// observed at the moment of payment.
     ///
+    /// Delegates the actual read to
+    /// [`CostPaidObjectSnapshot::refresh_capture_from_live`], which the
+    /// SINGULAR `cost_paid_object` carrier uses too, so both carriers re-capture
+    /// identically by construction.
+    ///
     /// A no-op for `MembershipOnly` (nothing to refresh, and it must never
     /// acquire a snapshot) and for a vanished row (no live object to read).
     pub fn refresh_capture_from_live(&mut self, state: &crate::types::game_state::GameState) {
         let Self::Captured(snapshot) = self else {
             return;
         };
-        let Some(object) = state.objects.get(&snapshot.object_id) else {
-            return;
-        };
-        *snapshot = CostPaidObjectSnapshot::capture(object, object.snapshot_for_mana_spent());
+        snapshot.refresh_capture_from_live(state);
     }
 }
 
@@ -31482,6 +31523,14 @@ pub struct ResolvedAbility {
     /// Stays singular (the FIRST object chosen) because it backs referent
     /// wording like "the sacrificed creature's toughness", which is
     /// inherently single-object even when the cost consumed several.
+    ///
+    /// CR 601.2g + CR 608.2h: when the cost's own move is DEFERRED past the
+    /// mana-ability window (a spell's sacrifice additional cost, paid at mana
+    /// commit), this snapshot is RE-CAPTURED at the actual payment seam by
+    /// [`ResolvedAbility::refresh_cost_paid_capture_recursive`] — "captured
+    /// before it leaves its zone" means immediately before, not at selection,
+    /// because the selected permanent can be tapped for that very mana in
+    /// between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_paid_object: Option<CostPaidObjectSnapshot>,
     /// CR 106.1b + CR 400.7 + CR 602.2b (issue #6504): The mana type(s) spent
@@ -32791,10 +32840,13 @@ impl ResolvedAbility {
     /// `Captured` for a hidden card) and agrees with this rule by construction.
     ///
     /// The SINGULAR `cost_paid_object` referent keeps a plain, UNCONDITIONAL
-    /// re-pin: unscoped by `moved` and unaffected by `outcome`. Its destination
-    /// policy is owned by its own publication seams and its pre-existing
-    /// behavior is deliberately unchanged here — that field's limitations are
-    /// out of scope for this change.
+    /// re-pin here: unscoped by `moved` and unaffected by `outcome`. That is
+    /// this traversal's whole singular job and it is deliberately narrow — a
+    /// re-pin moves the INCARNATION epoch, never the characteristics. Refreshing
+    /// the singular's CHARACTERISTICS across a deferred payment belongs to the
+    /// pre-move counterpart [`Self::refresh_cost_paid_capture_recursive`],
+    /// which now covers both carriers under one scoping rule; settling is not
+    /// re-capturing, and the two must not be merged.
     ///
     /// This is the SINGLE traversal authority for cost-paid provenance
     /// settlement: it covers the singular `cost_paid_object` referent AND every
@@ -32830,9 +32882,11 @@ impl ResolvedAbility {
         }
     }
 
-    /// CR 608.2h + CR 601.2h: RE-CAPTURE the PLURAL authority's characteristics
+    /// CR 608.2h + CR 601.2h: RE-CAPTURE this ability's cost-paid provenance
     /// for `object_ids` from the live objects, immediately BEFORE the payment
-    /// seam that moves them.
+    /// seam that moves them. Covers BOTH carriers — the singular
+    /// `cost_paid_object` referent and every `Captured` entry of the plural
+    /// `cost_paid_objects` authority.
     ///
     /// The pre-move counterpart of
     /// [`Self::settle_cost_paid_provenance_recursive`], and the only other
@@ -32844,20 +32898,35 @@ impl ResolvedAbility {
     /// Needed because one payment defers its moves past the seam that published
     /// the record: a spell sacrifice selected before the mana window
     /// (`handle_sacrifice_for_cost`'s deferral branch) is paid later, at mana
-    /// commit, and the permanent can be tapped for that very mana in between.
-    /// CR 608.2h calls for the object's last known information — its state as
-    /// it most recently existed — so the record must be re-captured at the
-    /// ACTUAL payment seam rather than frozen at selection.
+    /// commit, and the permanent can be tapped for that very mana in between
+    /// (CR 601.2g puts that window between selection and payment). CR 608.2h
+    /// calls for the object's last known information — its state as it most
+    /// recently existed — so the record must be re-captured at the ACTUAL
+    /// payment seam rather than frozen at selection.
     ///
-    /// Scoped by `object_ids` on purpose: only the objects THIS deferred
-    /// payment is about to move may be re-captured. A record outside that set
-    /// belongs to a cost component that already completed its own move and
-    /// settled, and re-capturing it would overwrite a correct post-move LKI
-    /// with a live read. `MembershipOnly` records are never touched — they have
-    /// no snapshot and must never acquire one (CR 400.7).
+    /// Scoped by `object_ids` on purpose, and IDENTICALLY for both carriers:
+    /// only the objects THIS deferred payment is about to move may be
+    /// re-captured. A referent outside that set belongs to a cost component
+    /// that already completed its own move and settled, and re-capturing it
+    /// would overwrite a correct post-move LKI with a live read.
+    /// `MembershipOnly` records are never touched — they have no snapshot and
+    /// must never acquire one (CR 400.7).
     ///
-    /// The SINGULAR `cost_paid_object` referent is deliberately NOT refreshed:
-    /// its pre-existing capture semantics are out of scope for this traversal.
+    /// The SINGULAR referent is included because the deferral makes its
+    /// selection-time freeze actively WRONG, not merely historical: it is the
+    /// value `ObjectScope::CostPaidObject` quantity resolution reads
+    /// (`game/quantity.rs`) and the value `triggers.rs` copies onto a resolved
+    /// ETB trigger via the spell's `cast_cost_paid_object`, so an unrefreshed
+    /// singular reports selection-time state to effects and triggers that
+    /// CR 608.2h entitles to the state immediately before the actual payment.
+    /// The settlement traversal only RE-PINS the singular (incarnation), which
+    /// cannot fix stale characteristics — capture is this traversal's job.
+    ///
+    /// The spell object's `cast_cost_paid_object` carrier is the one cost-paid
+    /// carrier this traversal cannot reach: it lives on `GameObject`, not on
+    /// `ResolvedAbility`. Its deferred-payment refresh is performed at the two
+    /// finalizer call sites (`game/casting_costs.rs`) under the same scoping,
+    /// through the same [`CostPaidObjectSnapshot::recapture_from_live`] seam.
     pub fn refresh_cost_paid_capture_recursive(
         &mut self,
         state: &crate::types::game_state::GameState,
@@ -32865,6 +32934,11 @@ impl ResolvedAbility {
     ) {
         if object_ids.is_empty() {
             return;
+        }
+        if let Some(snapshot) = self.cost_paid_object.as_mut() {
+            if object_ids.contains(&snapshot.object_id) {
+                snapshot.refresh_capture_from_live(state);
+            }
         }
         for record in self.cost_paid_objects.iter_mut() {
             if object_ids.contains(&record.object_id()) {

@@ -1914,6 +1914,76 @@ fn capture_cost_paid_snapshots(
         .collect()
 }
 
+/// CR 608.2h + CR 601.2g + CR 400.7j: RE-CAPTURE the SPELL object's
+/// `cast_cost_paid_object` carrier from the live object, immediately before a
+/// DEFERRED sacrifice cost actually pays.
+///
+/// The third cost-paid carrier, and the only one
+/// `ResolvedAbility::refresh_cost_paid_capture_recursive` cannot reach: it
+/// lives on the `GameObject` (`game_object.rs`), not on the `ResolvedAbility`,
+/// so the ability traversal structurally cannot see it. This is a call-site
+/// step in the SAME capture job, not a third traversal — the traversal count in
+/// this family stays two (capture before the move, settlement after).
+///
+/// Why it must exist: `handle_sacrifice_for_cost` stamps this carrier from the
+/// SELECTION snapshot, and on the deferred route CR 601.2g's mana-ability
+/// window sits between that selection and the actual payment — the selected
+/// permanent can be tapped for the very mana being paid. CR 608.2h entitles the
+/// spell's effects to the object as it MOST RECENTLY existed, so a carrier
+/// frozen at selection misreports it. The carrier is not inert: `triggers.rs`
+/// copies it onto a resolved ETB trigger's `cost_paid_object` for permanent
+/// spells whose only cost-paid reference lives in that trigger (Adipose
+/// Offspring's "where X is the sacrificed creature's toughness"), which is
+/// precisely the CR 400.7j "that spell's effects can find that object" case.
+///
+/// GATING mirrors the publication site (`handle_sacrifice_for_cost`) exactly,
+/// because a refresh must never reach further than the stamp it refreshes:
+///
+/// * SPELL CASTS ONLY (`activation_ability_index.is_none()`). An activated
+///   ability's `pending.object_id` is the SOURCE PERMANENT, whose own
+///   `cast_cost_paid_object` records how that permanent was cast and must not
+///   be overwritten by an activation's cost. The publication site declines to
+///   stamp in that case, so there is nothing here to refresh either.
+/// * SCOPED to `deferred_ids` — the exact permanents this seam is about to
+///   sacrifice. A carrier naming any other object belongs to a cost component
+///   that already completed and settled its own move, and re-capturing it would
+///   overwrite a correct post-move LKI with a live read. Same rule, same
+///   reason, as the ability traversal's scoping.
+///
+/// Re-captures through [`CostPaidObjectSnapshot::recapture_from_live`], the
+/// single re-capture seam both ability-side carriers use, so all three carriers
+/// read the same thing. A no-op when the spell row, the carrier, or the
+/// sacrificed object's row is absent.
+///
+/// The caller must have already established that the deferred selection is
+/// still live (`validate_deferred_spell_sacrifices_at_commit`) and must call
+/// this BEFORE `pay_deferred_spell_sacrifices_at_commit`, under the same
+/// non-empty `deferred_ids` guard as the ability traversal.
+fn refresh_deferred_cast_cost_paid_object(
+    state: &mut GameState,
+    pending: &PendingCast,
+    deferred_ids: &[ObjectId],
+) {
+    if pending.activation_ability_index.is_some() {
+        return;
+    }
+    let Some(carrier_id) = state
+        .objects
+        .get(&pending.object_id)
+        .and_then(|spell_obj| spell_obj.cast_cost_paid_object.as_ref())
+        .map(|carrier| carrier.object_id)
+        .filter(|carrier_id| deferred_ids.contains(carrier_id))
+    else {
+        return;
+    };
+    let Some(refreshed) = CostPaidObjectSnapshot::recapture_from_live(state, carrier_id) else {
+        return;
+    };
+    if let Some(spell_obj) = state.objects.get_mut(&pending.object_id) {
+        spell_obj.cast_cost_paid_object = Some(refreshed);
+    }
+}
+
 /// Complete the discard-for-cost flow: discard selected cards, then continue casting.
 pub(crate) fn handle_discard_for_cost(
     state: &mut GameState,
@@ -14189,14 +14259,15 @@ fn finalize_mana_payment_with_resume(
             return Ok(state.waiting_for.clone());
         }
         validate_deferred_spell_sacrifices_at_commit(state, player, &pending)?;
-        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's PLURAL
+        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's cost-paid
         // provenance at the ACTUAL payment seam, immediately before the
         // sacrifices happen. `handle_sacrifice_for_cost` published those records
         // when the permanents were SELECTED, which on this route is before the
         // mana window — and the very permanents selected here can be tapped for
-        // that mana in between (issue #5252). CR 608.2h calls for the object's
-        // last known information, i.e. its state as it most recently existed,
-        // not its state at selection, so a record frozen at selection reports an
+        // that mana in between (issue #5252). CR 601.2g is what puts that window
+        // between selection and payment; CR 608.2h calls for the object's last
+        // known information, i.e. its state as it most recently existed, not its
+        // state at selection, so a record frozen at selection reports an
         // untapped permanent the game had already tapped.
         //
         // This is the CAPTURE job and it must run BEFORE the move (the `lki`
@@ -14208,9 +14279,12 @@ fn finalize_mana_payment_with_resume(
         // Scoped to exactly the ids this deferred payment is about to sacrifice:
         // a record belonging to a cost component that already completed its own
         // move must keep the LKI that move settled. `MembershipOnly` records are
-        // never touched (CR 400.7: they have no pin and must not acquire one),
-        // and the SINGULAR `cost_paid_object` referent is deliberately left
-        // alone — its pre-existing capture behavior is out of scope.
+        // never touched (CR 400.7: they have no pin and must not acquire one).
+        // The traversal covers BOTH ability-side carriers under that one scoping
+        // rule — the plural `cost_paid_objects` records AND the singular
+        // `cost_paid_object` referent, which `handle_sacrifice_for_cost` stamps
+        // from the same selection and which `ObjectScope::CostPaidObject`
+        // quantity resolution reads.
         //
         // Placed after `validate_deferred_spell_sacrifices_at_commit`, which has
         // just proven every selected permanent is still on the battlefield under
@@ -14225,6 +14299,7 @@ fn finalize_mana_payment_with_resume(
             pending
                 .ability
                 .refresh_cost_paid_capture_recursive(state, &deferred_ids);
+            refresh_deferred_cast_cost_paid_object(state, &pending, &deferred_ids);
         }
         let deferred_sacrifice_events =
             pay_deferred_spell_sacrifices_at_commit(state, player, &pending, events)?;
@@ -14250,12 +14325,14 @@ fn finalize_mana_payment_with_resume(
         //
         // The non-empty GUARD is still load-bearing even though the plural pass
         // is now scoped: the traversal re-pins the SINGULAR `cost_paid_object`
-        // referent UNCONDITIONALLY (its pre-existing, deliberately unchanged
-        // behavior), and CR 400.7j licenses settling across the COST's own move
-        // and nothing else — so on a cast with no deferred sacrifice an
-        // unguarded call would bless a LATER move, e.g. a mana ability that
-        // returned the singular referent from the graveyard. The
-        // capture-refresh above carries the same guard for the same reason.
+        // referent UNCONDITIONALLY (unscoped by `moved` — that is settlement's
+        // own deliberate shape, unchanged here), and CR 400.7j licenses settling
+        // across the COST's own move and nothing else — so on a cast with no
+        // deferred sacrifice an unguarded call would bless a LATER move, e.g. a
+        // mana ability that returned the singular referent from the graveyard.
+        // The capture-refresh above carries the same guard, though for the
+        // additional reason that it would otherwise read live state for a
+        // payment that never happened.
         //
         // The GUARD itself is not covered by a test.
         // `deferred_spell_sacrifice_repin_does_not_bless_a_later_move` states
@@ -14265,7 +14342,9 @@ fn finalize_mana_payment_with_resume(
         // reached by `manual_payment_defers_selected_artifact_sacrifice_until_
         // mana_payment_commit` (tests/integration/issue_5252_additional_
         // sacrifice_after_mana_abilities.rs), which drives the real deferred
-        // path and asserts both the refreshed tapped LKI and the live referent.
+        // path and asserts the refreshed tapped LKI on all three carriers (the
+        // plural record, the singular referent, and the spell object's
+        // `cast_cost_paid_object`) plus the live referent.
         if !deferred_ids.is_empty() {
             pending.ability.settle_cost_paid_provenance_recursive(
                 state,
@@ -14686,24 +14765,28 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
             return Ok(state.waiting_for.clone());
         }
         validate_deferred_spell_sacrifices_at_commit(state, player, &pending)?;
-        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's PLURAL
+        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's cost-paid
         // provenance at the ACTUAL payment seam — the Phyrexian-choice twin of
         // the same step in `finalize_mana_payment_with_resume`, and required for
         // the same reason: `handle_sacrifice_for_cost` published these records
-        // at SELECTION, before the mana window, and a selected permanent can be
-        // tapped for that mana in between (issue #5252). CR 608.2h calls for the
-        // object's last known information — its state as it most recently
-        // existed — not its state at selection.
+        // at SELECTION, before the mana window (CR 601.2g), and a selected
+        // permanent can be tapped for that mana in between (issue #5252).
+        // CR 608.2h calls for the object's last known information — its state as
+        // it most recently existed — not its state at selection.
         //
         // This is the CAPTURE job and must run BEFORE the move; the settlement
         // call below is the separate post-move job that owns the incarnation pin
         // and the public-destination classification. One traversal per job.
         //
-        // Scoped to exactly the ids this deferred payment is about to sacrifice,
-        // never `MembershipOnly` records (CR 400.7), never the SINGULAR
-        // `cost_paid_object` referent. `validate_deferred_spell_sacrifices_at_
-        // commit` above has just proven each one is still a battlefield
-        // permanent this player controls.
+        // Scoped to exactly the ids this deferred payment is about to sacrifice
+        // and never `MembershipOnly` records (CR 400.7). The traversal covers
+        // BOTH ability-side carriers under that one scoping rule — the plural
+        // `cost_paid_objects` records and the singular `cost_paid_object`
+        // referent — and the spell object's `cast_cost_paid_object` carrier,
+        // which lives on `GameObject` rather than on the ability, is refreshed
+        // alongside it under identical scoping.
+        // `validate_deferred_spell_sacrifices_at_commit` above has just proven
+        // each one is still a battlefield permanent this player controls.
         let deferred_ids: Vec<ObjectId> = pending
             .deferred_sacrificed_permanents
             .iter()
@@ -14713,6 +14796,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
             pending
                 .ability
                 .refresh_cost_paid_capture_recursive(state, &deferred_ids);
+            refresh_deferred_cast_cost_paid_object(state, &pending, &deferred_ids);
         }
         let deferred_sacrifice_events =
             pay_deferred_spell_sacrifices_at_commit(state, player, &pending, events)?;
@@ -14734,11 +14818,13 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
         //
         // The non-empty GUARD remains load-bearing despite the scoping: the
         // traversal re-pins the SINGULAR `cost_paid_object` referent
-        // unconditionally, and mana payment
+        // unconditionally (unscoped by `moved` — settlement's own deliberate
+        // shape, unchanged here), and mana payment
         // (`pay_spell_mana_before_deferred_sacrifice`, above) runs first — so on
         // a cast with no deferred sacrifice an unguarded call would bless a
         // LATER move of that singular referent. The capture-refresh above
-        // carries the same guard for the same reason.
+        // carries the same guard, and additionally would otherwise read live
+        // state for a payment that never happened.
         //
         // The GUARD itself is not covered by a test.
         // `deferred_spell_sacrifice_repin_does_not_bless_a_later_move` states
@@ -26386,12 +26472,16 @@ its replicate cost was paid.)\nDraw a card.";
     /// this was deleted rather than shipped because it passed with the
     /// production fix reverted.
     ///
-    /// The real deferred path IS now driven, for the PLURAL authority, by
+    /// The real deferred path IS now driven end-to-end by
     /// `manual_payment_defers_selected_artifact_sacrifice_until_mana_payment_commit`
     /// in `tests/integration/issue_5252_additional_sacrifice_after_mana_abilities.rs`,
     /// which reaches `finalize_mana_payment_with_resume`'s capture-refresh and
-    /// settlement calls through real `GameAction`s. The singular referent's
-    /// call-site coverage remains the outstanding work this note describes.
+    /// settlement calls through real `GameAction`s and asserts all THREE
+    /// cost-paid carriers — the plural `cost_paid_objects` record, the SINGULAR
+    /// `cost_paid_object` referent, and the spell object's
+    /// `cast_cost_paid_object`. What remains uncovered at the call site is only
+    /// the non-empty `deferred_ids` GUARD itself, as the call-site comments in
+    /// both finalizers state.
     #[test]
     fn deferred_spell_sacrifice_repin_restores_the_cost_referent() {
         use crate::game::zones::create_object;

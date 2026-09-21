@@ -817,12 +817,19 @@ fn deterministic_discard_cost_redirected_to_a_hidden_zone_publishes_membership_o
     );
 
     // SCOPE — the SINGULAR `cost_paid_object` referent is deliberately NOT
-    // asserted here. `handle_discard_for_cost` stamps it at selection time and
-    // its behavior is unchanged by this fix; the maintainer's framing on
-    // PR #9157 is that the singular paths have PRE-EXISTING limitations and the
-    // finding is about the newly introduced PLURAL authority reproducing them.
-    // Asserting either way would either pin a known limitation or claim a fix
-    // this change does not make.
+    // asserted here, and the reason is specific to THIS fixture rather than a
+    // blanket exclusion. `handle_discard_for_cost` stamps the singular at
+    // selection time, and this payment is IMMEDIATE: there is no CR 601.2g
+    // mana-ability window, and nothing else, between that stamp and the cost's
+    // own move, so the singular capture cannot drift from the object's last
+    // known information and there is no capture-refresh behavior to
+    // discriminate. (The DEFERRED spell-sacrifice route is the one where that
+    // gap exists; `refresh_cost_paid_capture_recursive` refreshes the singular
+    // there, and `issue_5252_additional_sacrifice_after_mana_abilities.rs`
+    // asserts it.) What this arm also does not assert is the singular's
+    // DESTINATION policy under CR 701.9c — the plural record is demoted to
+    // membership above, while the singular keeps its own pre-existing
+    // hidden-destination behavior, which this change does not alter.
 
     // Sibling case: the eligible card the player did NOT select is untouched
     // and is not recorded, redirect or no redirect.
