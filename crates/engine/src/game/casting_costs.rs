@@ -4,7 +4,7 @@ use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
     is_chosen_remove_counter_cost_count, AbilityCondition, AbilityCost, AbilityDefinition,
     AbilityKind, AdditionalCost, AdditionalCostInstance, AdditionalCostOrigin, AggregateFunction,
-    BeholdCostAction, CastTimingPermission, Comparator, CostPaidObjectRecord,
+    BeholdCostAction, CastTimingPermission, Comparator, CostMoveOutcome, CostPaidObjectRecord,
     CostPaidObjectSnapshot, CounterCostSelection, Effect, KickerVariant, NotedManaPayment,
     ObjectProperty, QuantityExpr, QuantityRef, ReplacementDefinition, ResolutionCastCleanup,
     ResolvedAbility, SacrificeCost, SacrificeRequirement, SpellCastingOptionKind, SpellContext,
@@ -1881,8 +1881,11 @@ fn next_declared_kicker_cost(pending: &mut PendingCast) -> Option<AbilityCost> {
 /// each entry's `lki` records pre-move characteristics (CR 608.2h). The callers
 /// then hand the result to
 /// `ResolvedAbility::add_cost_paid_objects_recursive`, and the shared
-/// `repin_cost_paid_object_recursive` traversal re-pins every entry once the
-/// cost's moves complete.
+/// `settle_cost_paid_provenance_recursive` traversal settles the entries THIS
+/// seam moved once its moves complete — re-pinning a public delivery
+/// (CR 400.7j), demoting a hidden DISCARD delivery to membership (CR 701.9c),
+/// and leaving a hidden sacrifice/exile/return delivery `Captured` with its
+/// last known information and a stale pin (CR 608.2h).
 ///
 /// A missing object row here is a PROGRAMMER/state invariant violation, not a
 /// player-reachable outcome: every caller has already verified the selection
@@ -1991,17 +1994,37 @@ pub(crate) fn handle_discard_for_cost(
     }
     let cost_event_end = events.len();
 
-    // CR 400.7j + CR 400.7 + CR 608.2k: The discard moves above are this cost's
-    // OWN, and they delivered the cards to a public zone (the graveyard —
-    // CR 701.9a), so CR 400.7j keeps this ability's effects able to find them.
-    // The snapshots were necessarily captured pre-move (their `lki` must record
-    // pre-move characteristics — CR 608.2h), so re-pin every cost-paid referent
-    // to the incarnation the cost's own move produced; only a LATER zone change
-    // reads as stale from here. Mirrors `finish_cost_object_moves` and
-    // `handle_sacrifice_for_cost`, which already do this on their move seams.
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 701.9c: the discard moves above are
+    // this cost's OWN, but they ran through the replacement pipeline, so where
+    // each card actually landed is only knowable NOW. CR 701.9a aims the move at
+    // the graveyard — a public zone — and for a card that got there CR 400.7j
+    // keeps this ability's effects able to find it. The snapshots were
+    // necessarily captured pre-move (their `lki` must record pre-move
+    // characteristics — CR 608.2h), so settlement re-pins those entries to the
+    // incarnation the cost's own move produced; only a LATER zone change reads
+    // as stale from here.
+    //
+    // Settlement — not a bare re-pin — because a replacement (CR 616.1) can
+    // redirect a DETERMINISTIC discard into an unrevealed hidden zone exactly as
+    // it can a random one: how the card was chosen does not change the authority
+    // rule. CR 701.9c leaves such a card's characteristics undefined and
+    // CR 400.7j does not license finding it, so its plural entry is demoted to
+    // membership instead of being re-pinned into a live hidden-zone referent.
+    // Mirrors `finish_cost_object_moves` and `handle_sacrifice_for_cost`, which
+    // already settle on their move seams.
     // The `NeedsReplacementChoice` arm above returns early and its resumed
-    // suffix re-pins in `resume_interrupted_cost_payment`.
-    pending.ability.repin_cost_paid_object_recursive(state);
+    // suffix settles in `resume_interrupted_cost_payment`.
+    //
+    // SCOPED to `chosen` — exactly the cards this discard component moved. A
+    // record published by a DIFFERENT cost component of the same cast (an
+    // earlier exile leg, a deferred sacrifice) already settled against its own
+    // move; re-judging it here would either re-pin it across an unrelated later
+    // zone change (CR 400.7: a new object) or demote a record that legitimately
+    // settled public. TAGGED `Discard` because CR 701.9a is the move these
+    // lines performed, which is what licenses the CR 701.9c demotion.
+    pending
+        .ability
+        .settle_cost_paid_provenance_recursive(state, chosen, CostMoveOutcome::Discard);
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -2093,13 +2116,27 @@ fn commit_random_discard_cost_picks(
         }
     }
 
-    // CR 400.7j + CR 400.7 + CR 608.2k: this commit runs only after the random
-    // discard move(s) it is committing have already completed (CR 701.9a: the
-    // card is in the graveyard), so re-pin every cost-paid referent to the
-    // incarnation the cost's own move produced. Same step as
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 701.9c: this commit runs only after
+    // the random discard move(s) it is committing have already completed
+    // (CR 701.9a: the card is in the graveyard), so settle every cost-paid
+    // referent: re-pin a public delivery to the incarnation the cost's own move
+    // produced, demote a hidden one to membership. Same step as
     // `finish_cost_object_moves` / `handle_sacrifice_for_cost`, through the same
     // single traversal authority.
-    pending.ability.repin_cost_paid_object_recursive(state);
+    //
+    // SCOPED to exactly the picks this commit moved — a record belonging to
+    // another cost component of the same cast settled on its own seam and is
+    // not this one's business. TAGGED `Discard`: CR 701.9b is the move these
+    // picks performed, so CR 701.9c licenses the demotion.
+    //
+    // The per-pick classification above is belt-and-braces with respect to this
+    // call — settlement now enforces the SAME CR 400.7j / CR 701.9c rule on
+    // whatever was published — but it is kept because it prevents even a
+    // transient `Captured` record for a card whose characteristics are undefined.
+    let moved: Vec<ObjectId> = picks.iter().map(|pick| pick.occurrence.object_id).collect();
+    pending
+        .ability
+        .settle_cost_paid_provenance_recursive(state, &moved, CostMoveOutcome::Discard);
 }
 
 fn pay_deferred_random_discard_cost(
@@ -2334,19 +2371,39 @@ fn finish_cost_object_moves(
         }
     }
 
-    // CR 400.7j + CR 400.7 + CR 608.2k: Every cost object move above is now complete, so
-    // re-pin the cost-paid referent to the incarnation the cost's own move
-    // produced. The binding seams capture BEFORE the move (their `lki` must
-    // record pre-move characteristics — CR 608.2h), and without this the
-    // reference would read as stale against the object its own cost just moved
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: Every cost object move above is now
+    // complete, so settle the cost-paid provenance: re-pin the referent to the
+    // incarnation the cost's own move produced. The binding seams capture BEFORE the move
+    // (their `lki` must record pre-move characteristics — CR 608.2h), and without
+    // this the reference would read as stale against the object its own cost just moved
     // (Jhoira of the Ghitu: exile a card as a cost, then put counters on that
     // exiled card). Only a LATER zone change makes it stale from here.
+    //
+    // SCOPED to `chosen`, the exact ids this seam moved: another cost
+    // component's records settled on their own seam and must not be re-judged
+    // against these moves.
+    //
+    // TAGGED `Relocation`, and that is the ONLY correct tag here even though
+    // this function is shared: its `destination` parameter is `Zone::Exile`
+    // (CR 701.13a) or `Zone::Hand` — never a discard (CR 701.9a moves a card
+    // from hand to graveyard; nothing routes that through here). CR 701.9c is
+    // discard-scoped, so it cannot reach either caller. That matters most for
+    // the HAND destination, which is hidden EVERY time: demoting there would
+    // destroy the captured `lki` that CR 608.2h makes the correct reading for a
+    // returned permanent, on every single return-to-hand cost payment. The
+    // `Relocation` arm instead leaves the entry `Captured` with a stale pin, so
+    // the `lki` survives while `live_object_id` still refuses the hidden
+    // referent (CR 400.7j licenses finding only a public-zone delivery).
     //
     // Placed after the loop so it is correct regardless of how many zones the
     // move traversed or whether a replacement effect redirected it; the
     // `NeedsChoice` arm above returns early and re-enters here on resume.
     let mut pending = pending;
-    pending.ability.repin_cost_paid_object_recursive(state);
+    pending.ability.settle_cost_paid_provenance_recursive(
+        state,
+        &chosen,
+        CostMoveOutcome::Relocation,
+    );
 
     let waiting_for = match completion {
         PendingCostMoveCompletion::FinishPending => {
@@ -2645,12 +2702,26 @@ pub(crate) fn resume_interrupted_cost_payment(
                 .take()
                 .and_then(super::casting::remove_selected_discard_cost);
         }
-        // CR 400.7j + CR 400.7 + CR 608.2k: the resumed discard suffix has now
-        // completed this cost's own moves, so re-pin exactly as the unpaused
-        // `handle_discard_for_cost` path does. A replacement-redirected discard
-        // is precisely the case where the post-move incarnation cannot be
-        // predicted from the pre-move capture.
-        pending.ability.repin_cost_paid_object_recursive(state);
+        // CR 400.7j + CR 400.7 + CR 608.2k + CR 701.9c: the resumed discard
+        // suffix has now completed this cost's own moves, so settle exactly as
+        // the unpaused `handle_discard_for_cost` path does. A
+        // replacement-redirected discard is precisely the case where the
+        // post-move incarnation cannot be predicted from the pre-move capture —
+        // and where the redirect's DESTINATION may not be public at all, in
+        // which case CR 701.9c / CR 400.7j require the entry to be demoted to
+        // membership rather than re-pinned into a live hidden-zone referent.
+        //
+        // SCOPED to the whole `chosen` list, not just the resumed suffix: the
+        // pre-pause prefix was discarded by this SAME component and
+        // `handle_discard_for_cost` returned above its settlement call when it
+        // paused, so nothing in `chosen` has settled yet. Records from another
+        // cost component are excluded, as on every other seam. TAGGED
+        // `Discard` — this is the CR 701.9a move, resumed.
+        pending.ability.settle_cost_paid_provenance_recursive(
+            state,
+            &chosen,
+            CostMoveOutcome::Discard,
+        );
         let cost_event_end = events.len();
         let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
         park_cost_payment_triggers_if_paused(
@@ -3348,15 +3419,35 @@ fn finish_sacrifice_for_cost(
             PendingSacrificeCostCompletion::SelectedNonSelf
             | PendingSacrificeCostCompletion::SelfRef,
         ) => {
-            // CR 400.7j + CR 400.7 + CR 608.2k: this is the RESUMED sacrifice path — the
+            // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: this is the RESUMED sacrifice path — the
             // moves above completed after a replacement-effect choice, so
-            // re-pin here exactly as the non-paused paths do. A redirected
+            // settle here exactly as the non-paused paths do. A redirected
             // sacrifice is precisely the case where the referent's incarnation
             // cannot be predicted from the pre-move capture, so omitting this
             // would leave the resumed cost reading as stale against the object
             // its own cost just moved.
+            //
+            // SCOPED to `chosen` — the full selection this sacrifice component
+            // moved, which is exactly what `handle_sacrifice_for_cost`
+            // published records for. `chosen` rather than the `departed`
+            // subset computed above: a permanent a replacement kept ON the
+            // battlefield never moved, is still in a public zone, and re-pins
+            // to the incarnation it already has (a no-op), whereas filtering by
+            // departure would silently skip a record whose object IS public.
+            //
+            // TAGGED `Relocation`: CR 701.21a aims a sacrifice at the owner's
+            // graveyard and a replacement may redirect it, but CR 701.9c is
+            // discard-scoped and does not reach a sacrifice. A redirect into a
+            // hidden zone therefore leaves the entry `Captured` with its
+            // pre-move `lki` — the last known information CR 608.2h makes the
+            // correct reading for "the sacrificed creature's power" — while its
+            // stale pin keeps `live_object_id` refusing the hidden referent.
             let mut pending = pending;
-            pending.ability.repin_cost_paid_object_recursive(state);
+            pending.ability.settle_cost_paid_provenance_recursive(
+                state,
+                chosen,
+                CostMoveOutcome::Relocation,
+            );
             finish_pending_cost_or_cast(state, player, pending, events)?
         }
         (None, PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. }) => {
@@ -3668,12 +3759,28 @@ pub(crate) fn handle_sacrifice_for_cost(
         &crate::game::zones::departed_subset(state, chosen),
     );
 
-    // CR 400.7j + CR 400.7 + CR 608.2k: the sacrifice moves above are the cost's own, so
-    // re-pin the referent to the incarnation they produced (see
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: the sacrifice moves above are the cost's own, so
+    // settle the referent against the incarnation they produced (see
     // `finish_cost_object_moves` for the same step on the shared move seam, and
     // `CostPaidObjectSnapshot::repin_to_current_incarnation` for why the pin
     // must not be assumed to advance by a fixed amount).
-    pending.ability.repin_cost_paid_object_recursive(state);
+    //
+    // SCOPED to `chosen`, the permanents THIS sacrifice component moved — the
+    // exact set `add_cost_paid_objects_recursive` published above. Records from
+    // an earlier discard/exile leg of the same cast settled on their own seam.
+    //
+    // TAGGED `Relocation`: CR 701.21a aims the move at the owner's graveyard
+    // and a replacement can redirect it, but CR 701.9c is discard-scoped, so a
+    // hidden destination does NOT make a sacrificed permanent's characteristics
+    // undefined — CR 608.2h makes the captured pre-move `lki` its last known
+    // information, which is exactly what "the sacrificed creature's power"
+    // reads. The entry keeps that `lki` and its stale pin, so the live
+    // reference stays refused (CR 400.7j).
+    pending.ability.settle_cost_paid_provenance_recursive(
+        state,
+        chosen,
+        CostMoveOutcome::Relocation,
+    );
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -14082,34 +14189,89 @@ fn finalize_mana_payment_with_resume(
             return Ok(state.waiting_for.clone());
         }
         validate_deferred_spell_sacrifices_at_commit(state, player, &pending)?;
+        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's PLURAL
+        // provenance at the ACTUAL payment seam, immediately before the
+        // sacrifices happen. `handle_sacrifice_for_cost` published those records
+        // when the permanents were SELECTED, which on this route is before the
+        // mana window — and the very permanents selected here can be tapped for
+        // that mana in between (issue #5252). CR 608.2h calls for the object's
+        // last known information, i.e. its state as it most recently existed,
+        // not its state at selection, so a record frozen at selection reports an
+        // untapped permanent the game had already tapped.
+        //
+        // This is the CAPTURE job and it must run BEFORE the move (the `lki`
+        // records pre-move characteristics). The settlement call below is the
+        // separate post-move job that owns the incarnation pin and the
+        // public-destination classification, exactly as on every other cost-move
+        // seam — one traversal per job, no parallel append traversal.
+        //
+        // Scoped to exactly the ids this deferred payment is about to sacrifice:
+        // a record belonging to a cost component that already completed its own
+        // move must keep the LKI that move settled. `MembershipOnly` records are
+        // never touched (CR 400.7: they have no pin and must not acquire one),
+        // and the SINGULAR `cost_paid_object` referent is deliberately left
+        // alone — its pre-existing capture behavior is out of scope.
+        //
+        // Placed after `validate_deferred_spell_sacrifices_at_commit`, which has
+        // just proven every selected permanent is still on the battlefield under
+        // this player's control, so the live read is of the object the cost is
+        // about to move.
+        let deferred_ids: Vec<ObjectId> = pending
+            .deferred_sacrificed_permanents
+            .iter()
+            .map(|selection| selection.object_id)
+            .collect();
+        if !deferred_ids.is_empty() {
+            pending
+                .ability
+                .refresh_cost_paid_capture_recursive(state, &deferred_ids);
+        }
         let deferred_sacrifice_events =
             pay_deferred_spell_sacrifices_at_commit(state, player, &pending, events)?;
-        // CR 400.7j + CR 400.7 + CR 608.2k: the fourth cost-completion path. A
+        // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: the fourth cost-completion path. A
         // spell sacrifice deferred until mana payment is captured in
-        // `handle_sacrifice_for_cost` BEFORE the move, then paid here — the
-        // deferral branch returns above the re-pin in that function, so without
+        // `handle_sacrifice_for_cost` BEFORE the move (and re-captured just
+        // above, at the real payment seam), then paid here — the deferral branch
+        // returns above the settlement in that function, so without
         // this the referent stays pinned to the pre-sacrifice incarnation while
         // the live row has already advanced, and every guarded consumer would
         // then resolve it to nothing (Endemic Plague / Fatal Grudge class).
         // CR 400.7j is the rule that mandates the re-pin: a cost that moves an
         // object to a public zone must still let that spell's effects find it.
         //
-        // Guarded on the deferred set being non-empty. CR 400.7j licenses
-        // re-pinning across the COST's own move and nothing else, but mana
-        // payment (`pay_spell_mana_before_deferred_sacrifice`, above) runs
-        // first — so on a cast with no deferred sacrifice an unconditional
-        // re-pin would also bless a LATER move, e.g. a mana ability that
-        // returned the referent from the graveyard.
+        // SCOPED to `deferred_ids` — the exact permanents
+        // `pay_deferred_spell_sacrifices_at_commit` just moved. This seam runs
+        // AFTER `pay_spell_mana_before_deferred_sacrifice`, so an unscoped pass
+        // would judge an earlier discard/exile component's records against a
+        // move that was not theirs (and across the mana window's own zone
+        // changes). TAGGED `Relocation`: this is CR 701.21a sacrifice, which
+        // CR 701.9c does not reach, so a redirected-to-hidden entry keeps the
+        // `lki` CR 608.2h makes its last known information.
         //
-        // NOT covered by a test. `deferred_spell_sacrifice_repin_does_not_bless_a_later_move`
-        // states this rule but cannot constrain this line: it calls
-        // `repin_cost_paid_object_recursive` directly and never enters this
-        // function, so it passes with or without the guard. The guard is latent
-        // for the same reason the re-pin it wraps is (see the SCOPE note on that
-        // test), and the same outstanding work — a test that drives the real
-        // deferred path — would cover both.
-        if !pending.deferred_sacrificed_permanents.is_empty() {
-            pending.ability.repin_cost_paid_object_recursive(state);
+        // The non-empty GUARD is still load-bearing even though the plural pass
+        // is now scoped: the traversal re-pins the SINGULAR `cost_paid_object`
+        // referent UNCONDITIONALLY (its pre-existing, deliberately unchanged
+        // behavior), and CR 400.7j licenses settling across the COST's own move
+        // and nothing else — so on a cast with no deferred sacrifice an
+        // unguarded call would bless a LATER move, e.g. a mana ability that
+        // returned the singular referent from the graveyard. The
+        // capture-refresh above carries the same guard for the same reason.
+        //
+        // The GUARD itself is not covered by a test.
+        // `deferred_spell_sacrifice_repin_does_not_bless_a_later_move` states
+        // this rule but cannot constrain this line: it calls
+        // `settle_cost_paid_provenance_recursive` directly and never enters this
+        // function, so it passes with or without the guard. The guarded CALL is
+        // reached by `manual_payment_defers_selected_artifact_sacrifice_until_
+        // mana_payment_commit` (tests/integration/issue_5252_additional_
+        // sacrifice_after_mana_abilities.rs), which drives the real deferred
+        // path and asserts both the refreshed tapped LKI and the live referent.
+        if !deferred_ids.is_empty() {
+            pending.ability.settle_cost_paid_provenance_recursive(
+                state,
+                &deferred_ids,
+                CostMoveOutcome::Relocation,
+            );
         }
         if pending.deferred_random_discard_cost.is_some() {
             pending.cost = ManaCost::NoCost;
@@ -14524,34 +14686,75 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
             return Ok(state.waiting_for.clone());
         }
         validate_deferred_spell_sacrifices_at_commit(state, player, &pending)?;
+        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's PLURAL
+        // provenance at the ACTUAL payment seam — the Phyrexian-choice twin of
+        // the same step in `finalize_mana_payment_with_resume`, and required for
+        // the same reason: `handle_sacrifice_for_cost` published these records
+        // at SELECTION, before the mana window, and a selected permanent can be
+        // tapped for that mana in between (issue #5252). CR 608.2h calls for the
+        // object's last known information — its state as it most recently
+        // existed — not its state at selection.
+        //
+        // This is the CAPTURE job and must run BEFORE the move; the settlement
+        // call below is the separate post-move job that owns the incarnation pin
+        // and the public-destination classification. One traversal per job.
+        //
+        // Scoped to exactly the ids this deferred payment is about to sacrifice,
+        // never `MembershipOnly` records (CR 400.7), never the SINGULAR
+        // `cost_paid_object` referent. `validate_deferred_spell_sacrifices_at_
+        // commit` above has just proven each one is still a battlefield
+        // permanent this player controls.
+        let deferred_ids: Vec<ObjectId> = pending
+            .deferred_sacrificed_permanents
+            .iter()
+            .map(|selection| selection.object_id)
+            .collect();
+        if !deferred_ids.is_empty() {
+            pending
+                .ability
+                .refresh_cost_paid_capture_recursive(state, &deferred_ids);
+        }
         let deferred_sacrifice_events =
             pay_deferred_spell_sacrifices_at_commit(state, player, &pending, events)?;
-        // CR 400.7j + CR 400.7 + CR 608.2k: the fourth cost-completion path. A
+        // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: the fourth cost-completion path. A
         // spell sacrifice deferred until mana payment is captured in
-        // `handle_sacrifice_for_cost` BEFORE the move, then paid here — the
-        // deferral branch returns above the re-pin in that function, so without
+        // `handle_sacrifice_for_cost` BEFORE the move (and re-captured just
+        // above, at the real payment seam), then paid here — the deferral branch
+        // returns above the settlement in that function, so without
         // this the referent stays pinned to the pre-sacrifice incarnation while
         // the live row has already advanced, and every guarded consumer would
         // then resolve it to nothing (Endemic Plague / Fatal Grudge class).
         // CR 400.7j is the rule that mandates the re-pin: a cost that moves an
         // object to a public zone must still let that spell's effects find it.
         //
-        // Guarded on the deferred set being non-empty. CR 400.7j licenses
-        // re-pinning across the COST's own move and nothing else, but mana
-        // payment (`pay_spell_mana_before_deferred_sacrifice`, above) runs
-        // first — so on a cast with no deferred sacrifice an unconditional
-        // re-pin would also bless a LATER move, e.g. a mana ability that
-        // returned the referent from the graveyard.
+        // SCOPED and TAGGED exactly as the sibling (non-Phyrexian) route:
+        // `deferred_ids` are the permanents this seam just sacrificed, and
+        // `Relocation` is the CR 701.21a cost action CR 701.9c does not reach,
+        // so a hidden redirect keeps the CR 608.2h `lki` instead of losing it.
         //
-        // NOT covered by a test. `deferred_spell_sacrifice_repin_does_not_bless_a_later_move`
-        // states this rule but cannot constrain this line: it calls
-        // `repin_cost_paid_object_recursive` directly and never enters this
-        // function, so it passes with or without the guard. The guard is latent
-        // for the same reason the re-pin it wraps is (see the SCOPE note on that
-        // test), and the same outstanding work — a test that drives the real
-        // deferred path — would cover both.
-        if !pending.deferred_sacrificed_permanents.is_empty() {
-            pending.ability.repin_cost_paid_object_recursive(state);
+        // The non-empty GUARD remains load-bearing despite the scoping: the
+        // traversal re-pins the SINGULAR `cost_paid_object` referent
+        // unconditionally, and mana payment
+        // (`pay_spell_mana_before_deferred_sacrifice`, above) runs first — so on
+        // a cast with no deferred sacrifice an unguarded call would bless a
+        // LATER move of that singular referent. The capture-refresh above
+        // carries the same guard for the same reason.
+        //
+        // The GUARD itself is not covered by a test.
+        // `deferred_spell_sacrifice_repin_does_not_bless_a_later_move` states
+        // this rule but cannot constrain this line: it calls
+        // `settle_cost_paid_provenance_recursive` directly and never enters this
+        // function, so it passes with or without the guard. The guarded CALL is
+        // reached on the sibling (non-Phyrexian) route by `manual_payment_defers_
+        // selected_artifact_sacrifice_until_mana_payment_commit`
+        // (tests/integration/issue_5252_additional_sacrifice_after_mana_
+        // abilities.rs); this Phyrexian twin shares the code shape exactly.
+        if !deferred_ids.is_empty() {
+            pending.ability.settle_cost_paid_provenance_recursive(
+                state,
+                &deferred_ids,
+                CostMoveOutcome::Relocation,
+            );
         }
         if pending.deferred_random_discard_cost.is_some() {
             pending.cost = ManaCost::NoCost;
@@ -26164,14 +26367,16 @@ its replicate cost was paid.)\nDraw a card.";
     /// sacrificed creature").
     ///
     /// SCOPE — read this before trusting the name. This test drives
-    /// `repin_cost_paid_object_recursive` DIRECTLY. It does NOT enter
+    /// `settle_cost_paid_provenance_recursive` DIRECTLY. It does NOT enter
     /// `finalize_mana_payment_with_resume`, so it does **not** pin the
-    /// production call site: deleting the two re-pin calls in that function
-    /// leaves this test green. It pins the re-pin's semantics only — that
-    /// re-pinning after the cost's own move restores the referent.
+    /// production call site: deleting the two settlement calls in that function
+    /// leaves this test green. It pins the settlement's SINGULAR-referent
+    /// semantics only — that re-pinning after the cost's own move restores the
+    /// referent.
     ///
-    /// The call site is deliberately untested because the deferred branch could
-    /// not be reached from a test. `can_defer_spell_sacrifice_until_mana_payment`
+    /// The call site is deliberately untested HERE because the deferred branch
+    /// could not be reached from a unit test.
+    /// `can_defer_spell_sacrifice_until_mana_payment`
     /// requires `cost_has_x || cost.mana_value() > 0` after the cost-floor pass,
     /// and an instrumented probe on that gate printed `can_defer=false ...
     /// cost_mv=0` for an additional-cost sacrifice spell in the scenario
@@ -26181,10 +26386,12 @@ its replicate cost was paid.)\nDraw a card.";
     /// this was deleted rather than shipped because it passed with the
     /// production fix reverted.
     ///
-    /// Treat the guarded call in `finalize_mana_payment_with_resume` as latent:
-    /// correct by construction (a path that moves the referent after capture and
-    /// reaches no re-pin must re-pin) but unprotected by coverage. A test that
-    /// drives the real path is the outstanding work.
+    /// The real deferred path IS now driven, for the PLURAL authority, by
+    /// `manual_payment_defers_selected_artifact_sacrifice_until_mana_payment_commit`
+    /// in `tests/integration/issue_5252_additional_sacrifice_after_mana_abilities.rs`,
+    /// which reaches `finalize_mana_payment_with_resume`'s capture-refresh and
+    /// settlement calls through real `GameAction`s. The singular referent's
+    /// call-site coverage remains the outstanding work this note describes.
     #[test]
     fn deferred_spell_sacrifice_repin_restores_the_cost_referent() {
         use crate::game::zones::create_object;
@@ -26245,7 +26452,17 @@ its replicate cost was paid.)\nDraw a card.";
         );
 
         // What the fix adds after `pay_deferred_spell_sacrifices_at_commit`.
-        ability.repin_cost_paid_object_recursive(&state);
+        // Scoped/tagged exactly as that seam calls it: the deferred sacrifice
+        // moved this one permanent (CR 701.21a ⇒ `Relocation`). Both arguments
+        // are inert for THIS assertion — the SINGULAR referent under test is
+        // re-pinned unconditionally, independent of `moved` and `outcome` — and
+        // they are passed in production form so the fixture cannot drift away
+        // from the seam it stands in for.
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[sacrificed],
+            CostMoveOutcome::Relocation,
+        );
 
         assert!(
             ability
@@ -26300,7 +26517,16 @@ its replicate cost was paid.)\nDraw a card.";
 
         let mut events = Vec::new();
         crate::game::zones::move_to_zone(&mut state, sacrificed, Zone::Graveyard, &mut events);
-        ability.repin_cost_paid_object_recursive(&state);
+        // Same production shape as the sibling test: the deferred sacrifice
+        // seam settles the id it moved with `CostMoveOutcome::Relocation`. The
+        // SINGULAR referent this test asserts on re-pins regardless of either
+        // argument, so the test's intent (the LATER move must not be blessed)
+        // is unchanged.
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[sacrificed],
+            CostMoveOutcome::Relocation,
+        );
         assert!(
             ability
                 .cost_paid_object
@@ -26320,6 +26546,184 @@ its replicate cost was paid.)\nDraw a card.";
                 .expect("bound")
                 .is_current(&state),
             "CR 400.7: a move AFTER the cost completed makes the referent a new              object again; the re-pin must not bless it"
+        );
+    }
+
+    /// CR 601.2h + CR 701.9c + CR 608.2h: the SCOPE half of
+    /// `ResolvedAbility::settle_cost_paid_provenance_recursive` — a settlement
+    /// pass judges ONLY the ids the seam that called it actually moved.
+    ///
+    /// A cost with two non-mana components publishes into ONE plural
+    /// authority, but each component settles on its own seam with its own
+    /// [`CostMoveOutcome`], so the second pass necessarily runs while the first
+    /// component's record is already settled and FINAL. Re-judging that record
+    /// against a move that was never its own is wrong in both directions: a
+    /// hidden-destination RELOCATION record (kept `Captured` with its pre-move
+    /// `lki`, CR 608.2h) would be demoted by a later `Discard` pass under
+    /// CR 701.9c — a rule that is discard-scoped by its own text and does not
+    /// reach a sacrifice (CR 701.21a) at all — and a record that legitimately
+    /// settled public would be re-pinned across a later zone change that
+    /// CR 400.7 makes a NEW object.
+    ///
+    /// UNDER REVERT: delete the `moved.contains(&record.object_id())` guard in
+    /// `settle_cost_paid_provenance_recursive` and the second pass demotes the
+    /// relocation record too — the `matches!(.., Captured(_))` assertion and
+    /// the `lki.name` assertion below both fail, and so does the
+    /// `snapshot().is_some()` guard between them. The discard record's
+    /// `MembershipOnly` assertion is the load-bearing POSITIVE CONTROL: it
+    /// proves the second pass really ran and really applied its CR 701.9c arm,
+    /// so the first record's survival is a SKIP and not a dead traversal.
+    ///
+    /// SCOPE — deliberately TRAVERSAL-level, and NOT claimed as production-path
+    /// coverage. The production ordering it stands in for (a `Relocation`-tagged
+    /// settlement followed by a `Discard`-tagged one on the same ability) is not
+    /// reachable from any printed card today: the single interactive
+    /// activation-cost dispatcher,
+    /// `surface_next_unpaid_interactive_activation_cost`, surfaces its non-self
+    /// DISCARD arm before its SACRIFICE / EXILE / RETURN arms, so a compound
+    /// cost such as Bloodsoaked Altar's `{T}, Pay 2 life, Discard a card,
+    /// Sacrifice a creature` always pays and settles the discard FIRST, when the
+    /// relocation record does not exist yet.
+    ///
+    /// The guard is NOT defensive programming against a hypothetical, though:
+    /// the inverted ordering is already WIRED, in `finalize_mana_payment_with_
+    /// resume`. A deferred spell sacrifice settles `Relocation` at the
+    /// `!deferred_ids.is_empty()` call, and eleven lines later
+    /// `pay_deferred_random_discard_cost` settles the same ability's random
+    /// discard leg as `Discard` — at which point the sacrifice record is still
+    /// `Captured` and, without the scoping guard, would be demoted by a rule
+    /// (CR 701.9c) that never reached it. `finalize_mana_payment_with_
+    /// phyrexian_choices` carries the same pair. Only the absence of a printed
+    /// card pairing a deferred sacrifice with a random discard cost keeps that
+    /// path cold; the seam itself is live. Grep
+    /// `pay_deferred_random_discard_cost` to find it. Promote this to a
+    /// cast-pipeline test the day such a card exists.
+    #[test]
+    fn settlement_skips_records_another_cost_component_already_settled() {
+        use crate::types::ability::{CostPaidObjectSnapshot, ResolvedAbility};
+
+        let mut state = GameState::new_two_player(42);
+        let relocated = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sacrificed Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let discarded = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Discarded Card".to_string(),
+            Zone::Hand,
+        );
+        let relocated_before = state.objects[&relocated].incarnation;
+        let discarded_before = state.objects[&discarded].incarnation;
+
+        // CR 608.2h: both components capture BEFORE their own move, exactly as
+        // `handle_sacrifice_for_cost` and `handle_discard_for_cost` do, and both
+        // land in the same plural authority in payment order.
+        let capture = |state: &GameState, object_id: ObjectId| {
+            let object = state.objects.get(&object_id).expect("cost object exists");
+            CostPaidObjectSnapshot::capture(object, object.snapshot_for_mana_spent())
+        };
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(99),
+            PlayerId(0),
+        );
+        ability.add_cost_paid_objects_recursive(&[
+            capture(&state, relocated),
+            capture(&state, discarded),
+        ]);
+
+        // COMPONENT 1 — a sacrifice (CR 701.21a) whose own graveyard move a
+        // replacement redirected into a hidden zone, settling on its own seam.
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, relocated, Zone::Library, &mut events);
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[relocated],
+            CostMoveOutcome::Relocation,
+        );
+        assert!(
+            !state.objects[&relocated].zone.is_public(),
+            "reach guard: component 1's move must have delivered into a HIDDEN zone"
+        );
+        assert_ne!(
+            state.objects[&relocated].incarnation, relocated_before,
+            "reach guard: CR 400.7 — the move must make a new object, otherwise a \
+             never-re-pinned record could not be told from a re-pinned one"
+        );
+        assert!(
+            matches!(
+                &ability.cost_paid_objects[0],
+                CostPaidObjectRecord::Captured(_)
+            ),
+            "reach guard: CR 608.2h — component 1 settles KEPT, so the second pass \
+             below has something it could wrongly destroy, got {:?}",
+            ability.cost_paid_objects[0]
+        );
+
+        // COMPONENT 2 — a later discard (CR 701.9a) whose own move is redirected
+        // the same way, settling on ITS own seam with its own outcome.
+        crate::game::zones::move_to_zone(&mut state, discarded, Zone::Library, &mut events);
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[discarded],
+            CostMoveOutcome::Discard,
+        );
+
+        // POSITIVE CONTROL: the second pass ran and applied CR 701.9c to the id
+        // it actually moved.
+        assert_ne!(
+            state.objects[&discarded].incarnation, discarded_before,
+            "reach guard: CR 400.7 — component 2's move must have happened"
+        );
+        assert!(
+            matches!(
+                &ability.cost_paid_objects[1],
+                CostPaidObjectRecord::MembershipOnly(id) if *id == discarded
+            ),
+            "CR 701.9c: a discarded card put into an unrevealed hidden zone must be \
+             demoted to membership by its OWN settlement pass, got {:?}",
+            ability.cost_paid_objects[1]
+        );
+
+        // THE DISCRIMINATOR: component 1's record was not this seam's business.
+        let record = &ability.cost_paid_objects[0];
+        assert!(
+            matches!(record, CostPaidObjectRecord::Captured(_)),
+            "CR 701.9c is discard-scoped: a record another component already settled \
+             as a RELOCATION must be skipped, not demoted by this seam's discard, \
+             got {record:?}"
+        );
+        let snapshot = record
+            .snapshot()
+            .expect("a skipped relocation record keeps its captured snapshot");
+        assert_eq!(
+            snapshot.lki.name, "Sacrificed Creature",
+            "CR 608.2h: the pre-move last known information must survive a settlement \
+             pass that did not move this object"
+        );
+        assert_eq!(
+            record.live_object_id(&state),
+            None,
+            "CR 400.7j: the skipped record's pin stays on the pre-move incarnation, so \
+             the hidden-zone referent is still refused"
+        );
+        assert_eq!(
+            ability
+                .cost_paid_objects
+                .iter()
+                .map(CostPaidObjectRecord::object_id)
+                .collect::<Vec<_>>(),
+            vec![relocated, discarded],
+            "CR 601.2c: membership stays EXACT for both components, in payment order"
         );
     }
 }

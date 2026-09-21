@@ -194,6 +194,67 @@ fn manual_payment_defers_selected_artifact_sacrifice_until_mana_payment_commit()
     );
     assert!(runner.state().objects[&lens].tapped);
     assert_eq!(runner.state().objects[&lens].zone, Zone::Graveyard);
+
+    // ── PR #9157 blocker 2: the deferred sacrifice's PLURAL cost-paid record ──
+    //
+    // The assertions above pin the BOARD (tapped, in the graveyard). They say
+    // nothing about the provenance the payment published, and that is exactly
+    // where the deferral bites: `handle_sacrifice_for_cost` captures the
+    // selection and publishes it BEFORE returning through the deferral branch —
+    // i.e. before the mana window — and the very permanent selected here is
+    // then tapped for mana inside that window. CR 608.2h requires the object's
+    // LAST KNOWN INFORMATION, its state as it most recently existed, not its
+    // state at selection, so the record must be re-captured at the actual
+    // payment seam (`finalize_mana_payment_with_resume`'s
+    // `refresh_cost_paid_capture_recursive` call, immediately before
+    // `pay_deferred_spell_sacrifices_at_commit`).
+    //
+    // UNDER REVERT: drop that capture-refresh and the plural snapshot still
+    // holds the selection-time state, so `snapshot.lki.tapped` is `false` and
+    // the tapped assertion below fails. Drop the settlement call that follows
+    // the sacrifice and `live_object_id` yields `None` instead of `Some(lens)`,
+    // because the snapshot stays pinned to the pre-sacrifice incarnation.
+    // The membership assertion holds under both reverts, which is why it is not
+    // the discriminator.
+    //
+    // The SINGULAR `cost_paid_object` referent is deliberately not asserted:
+    // its pre-existing behavior is out of scope for this fix.
+    let spell_entry = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| matches!(entry.kind, StackEntryKind::Spell { .. }))
+        .expect("reach guard: the deferred-sacrifice spell must be on the stack");
+    let spell_ability = spell_entry
+        .ability()
+        .expect("reach guard: the spell carries its ResolvedAbility, which owns the provenance");
+    let record = spell_ability
+        .cost_paid_objects
+        .iter()
+        .find(|record| record.object_id() == lens)
+        .expect(
+            "CR 601.2h: the deferred sacrifice must publish membership for the artifact it paid",
+        );
+    let snapshot = record.snapshot().expect(
+        "CR 400.7j: the sacrifice delivered the artifact to the graveyard — a public zone — \
+         so the record keeps captured provenance",
+    );
+    assert_eq!(
+        snapshot.object_id, lens,
+        "the captured record must name the permanent this cost sacrificed"
+    );
+    assert!(
+        snapshot.lki.tapped,
+        "CR 608.2h: the cost-paid snapshot must record the artifact's LAST KNOWN state — \
+         tapped, as it was when the deferred sacrifice actually paid — not the untapped \
+         state it had when it was SELECTED, before the mana window"
+    );
+    assert_eq!(
+        record.live_object_id(runner.state()),
+        Some(lens),
+        "CR 400.7j: the deferred sacrifice is this spell's OWN cost move to a public zone, \
+         so the referent must still resolve live after it completes"
+    );
 }
 
 #[test]

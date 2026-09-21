@@ -194,8 +194,8 @@ fn captured_snapshot(ability: &ResolvedAbility, object_id: ObjectId) -> &CostPai
 /// the snapshot was RE-PINNED so it still resolves live (CR 400.7j).
 ///
 /// Revert sensitivity lives in the last two assertions: delete the payment
-/// seam's `repin_cost_paid_object_recursive` call and the snapshot keeps its
-/// pre-move epoch, so `snapshot.incarnation == live.incarnation` fails and
+/// seam's `settle_cost_paid_provenance_recursive` call and the snapshot keeps
+/// its pre-move epoch, so `snapshot.incarnation == live.incarnation` fails and
 /// `live_object_id` yields `None` instead of `Some(id)`.
 fn assert_repinned_live(
     state: &GameState,
@@ -632,6 +632,244 @@ fn random_discard_cost_redirected_to_a_hidden_zone_publishes_membership_only() {
 }
 
 // ---------------------------------------------------------------------------
+// DETERMINISTIC discard redirected into a HIDDEN zone — Harnfel + the same
+// graveyard redirect vehicle
+// ---------------------------------------------------------------------------
+
+/// One driven Harnfel deterministic-discard payment, parked on the stack.
+///
+/// Named struct for the same reason as `RandomDiscardFixture`: the values are
+/// all id-shaped and a bare tuple both reads ambiguously and trips
+/// `clippy::type_complexity`.
+struct DeterministicDiscardFixture {
+    runner: GameRunner,
+    /// The hand card the PLAYER deliberately selected to pay the cost.
+    paid: ObjectId,
+    /// An equally eligible hand card that was not selected, so the cost window
+    /// is a genuine choice rather than the "only possible card" branch.
+    kept: ObjectId,
+    /// `paid`'s incarnation epoch BEFORE the payment, so the public control can
+    /// prove the cost's own move advanced it (CR 400.7).
+    before: u64,
+    /// The installed hidden-zone redirect, when this arm installs one.
+    probe: Option<ObjectId>,
+}
+
+/// Pay Harnfel's deterministic discard cost through the engine's own windows,
+/// optionally with `HIDDEN_GRAVEYARD_REDIRECT` on the battlefield so the paid
+/// card's own cost move is redirected into a hidden zone.
+///
+/// Deliberately the SAME redirect vehicle the random-discard fixture installs:
+/// `discard_as_cost` and `discard_at_random` both lower to
+/// `complete_discard_to_graveyard`'s hand → graveyard `ZoneChange` and both run
+/// it through the replacement pipeline (CR 616.1), so one synthetic
+/// shuffle-back replacement reaches both. How the card is CHOSEN is not part of
+/// the authority rule.
+fn pay_harnfel_discard(hidden_redirect: bool) -> DeterministicDiscardFixture {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let harnfel = scenario
+        .add_artifact_from_oracle(P0, "Harnfel, Horn of Bounty", HARNFEL)
+        .id();
+    let probe = hidden_redirect.then(|| {
+        scenario
+            .add_enchantment_from_oracle(P0, "Hidden Redirect Probe", HIDDEN_GRAVEYARD_REDIRECT)
+            .id()
+    });
+    let paid = scenario
+        .add_creature_to_hand(P0, "Discard Fodder", 2, 2)
+        .id();
+    let kept = scenario.add_creature_to_hand(P0, "Kept Card", 3, 3).id();
+    scenario.with_library_top(P0, &["L1", "L2", "L3"]);
+    let mut runner = scenario.build();
+
+    let before = incarnation(&runner, paid);
+    let index = costed_ability_index(&runner, harnfel);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: harnfel,
+            ability_index: index,
+        })
+        .expect("Harnfel's discard ability must be activatable");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Discard,
+                ..
+            }
+        ),
+        "reach guard: the real DETERMINISTIC discard cost window must open — the \
+         player picks the card — got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::SelectCards { cards: vec![paid] })
+        .expect("discarding an eligible hand card must pay the cost");
+    pay_until_on_stack(&mut runner, &[paid]);
+
+    DeterministicDiscardFixture {
+        runner,
+        paid,
+        kept,
+        before,
+        probe,
+    }
+}
+
+/// CR 701.9c + CR 400.7j: the DETERMINISTIC counterpart of
+/// `random_discard_cost_redirected_to_a_hidden_zone_publishes_membership_only`.
+///
+/// `handle_discard_for_cost` captures every chosen card BEFORE the move (it must
+/// — the `lki` records pre-move characteristics, CR 608.2h) and publishes them
+/// as `Captured`, then runs each discard through the replacement pipeline so
+/// Madness (CR 702.35) and friends can intercept. That pipeline is exactly what
+/// can put the card into an unrevealed hidden zone instead, which makes the
+/// pre-move `Captured` classification PROVISIONAL: CR 701.9c then leaves the
+/// card's characteristics undefined and CR 400.7j licenses this ability's
+/// effects finding only an object the cost moved to a PUBLIC zone. Changing how
+/// the card is chosen does not change the authority rule, so the deterministic
+/// path must settle to `MembershipOnly` exactly as the random one does.
+///
+/// UNDER REVERT: restore the plain re-pin at
+/// `handle_discard_for_cost`'s post-move seam (i.e. drop the demotion arm of
+/// `ResolvedAbility::settle_cost_paid_provenance_recursive`) and the hidden
+/// arm's record stays `Captured`. The `matches!(.., MembershipOnly)` assertion
+/// fails, `snapshot().is_none()` fails, and `live_object_id(state).is_none()`
+/// fails hardest of all — the re-pin would have bound that captured record to
+/// the card's post-move incarnation IN THE LIBRARY, which is precisely the live
+/// reference CR 400.7j withholds. The membership assertion holds either way,
+/// which is why it cannot be the discriminator.
+///
+/// Both arms run in ONE test so the pair cannot drift, and the PUBLIC arm is a
+/// load-bearing positive control: without it, the hidden arm's two `None`s could
+/// be satisfied by an authority that publishes nothing at all, or by a redirect
+/// that silently stopped the payment.
+///
+/// CONTRAST — this demotion is DISCARD-scoped, not a general hidden-destination
+/// policy. `sacrifice_cost_redirected_to_a_hidden_zone_keeps_its_captured_lki`
+/// below drives the SAME redirect vehicle on a sacrifice cost and asserts the
+/// opposite record shape, because CR 701.9c's undefined-characteristics rule
+/// reaches only discards and CR 608.2h keeps a sacrificed permanent's last
+/// known information readable. Read the two together before changing either.
+///
+/// The RESUMED deterministic suffix (`resume_interrupted_cost_payment`, reached
+/// when a multi-card discard cost pauses mid-loop on a replacement choice)
+/// settles through the same single traversal, so it classifies identically by
+/// construction rather than by a second rule.
+#[test]
+fn deterministic_discard_cost_redirected_to_a_hidden_zone_publishes_membership_only() {
+    // ── HIDDEN ARM ────────────────────────────────────────────────────────
+    let fixture = pay_harnfel_discard(true);
+    let runner = &fixture.runner;
+    let probe = fixture.probe.expect("the hidden arm installs the redirect");
+
+    // Reach guard: the fixture's printed static really did parse into a
+    // graveyard-destination replacement. Without this, a parser change that
+    // silently dropped the clause would leave the card in the graveyard and the
+    // arm below would be measuring the PUBLIC path while claiming the hidden one.
+    let hosted = &runner.state().objects[&probe].replacement_definitions;
+    assert_eq!(
+        hosted
+            .iter_unchecked()
+            .filter(|def| def.destination_zone == Some(Zone::Graveyard))
+            .count(),
+        1,
+        "reach guard: the redirect must be hosted as exactly one graveyard-destination \
+         replacement, got {hosted:?}"
+    );
+
+    let paid = fixture.paid;
+    assert_eq!(
+        runner.state().objects[&paid].zone,
+        Zone::Library,
+        "reach guard: the deterministic discard cost's own move must have been \
+         redirected into the library"
+    );
+    assert!(
+        !runner.state().objects[&paid].zone.is_public(),
+        "reach guard: CR 701.9c — the cost's own move must have delivered into a \
+         HIDDEN zone, otherwise this arm measures nothing"
+    );
+
+    let ability = ability_on_stack(runner);
+    assert_eq!(
+        paid_ids(ability),
+        vec![paid],
+        "CR 601.2c: membership stays EXACT — the cost really did move this card, \
+         so the target-candidate exclusion must still see it"
+    );
+    let record = paid_record(ability, paid);
+    assert!(
+        matches!(record, CostPaidObjectRecord::MembershipOnly(id) if *id == paid),
+        "CR 701.9c: a deterministically chosen card put into an unrevealed hidden \
+         zone must be recorded as membership only, got {record:?}"
+    );
+    assert!(
+        record.snapshot().is_none(),
+        "CR 701.9c: all values of the card's characteristics are undefined, so no \
+         captured snapshot may be exposed"
+    );
+    assert!(
+        record.live_object_id(runner.state()).is_none(),
+        "CR 400.7j: only a cost move to a PUBLIC zone lets this ability's effects \
+         find the object — the hidden result must refuse to resolve live"
+    );
+
+    // SCOPE — the SINGULAR `cost_paid_object` referent is deliberately NOT
+    // asserted here. `handle_discard_for_cost` stamps it at selection time and
+    // its behavior is unchanged by this fix; the maintainer's framing on
+    // PR #9157 is that the singular paths have PRE-EXISTING limitations and the
+    // finding is about the newly introduced PLURAL authority reproducing them.
+    // Asserting either way would either pin a known limitation or claim a fix
+    // this change does not make.
+
+    // Sibling case: the eligible card the player did NOT select is untouched
+    // and is not recorded, redirect or no redirect.
+    assert_eq!(
+        runner.state().objects[&fixture.kept].zone,
+        Zone::Hand,
+        "the unpaid hand card stays in hand"
+    );
+    assert!(
+        !paid_ids(ability).contains(&fixture.kept),
+        "only objects the cost actually consumed enter the authority"
+    );
+
+    // ── PUBLIC POSITIVE CONTROL ───────────────────────────────────────────
+    // The same card, the same cost, the same driver — only the redirect is gone.
+    let control = pay_harnfel_discard(false);
+    let runner = &control.runner;
+    assert!(
+        control.probe.is_none(),
+        "the control arm installs no redirect"
+    );
+    let paid = control.paid;
+    assert_eq!(
+        runner.state().objects[&paid].zone,
+        Zone::Graveyard,
+        "reach guard: without the redirect the discard cost's own move delivers to \
+         the graveyard (CR 701.9a)"
+    );
+
+    let ability = ability_on_stack(runner);
+    let record = paid_record(ability, paid);
+    assert!(
+        matches!(record, CostPaidObjectRecord::Captured(_)),
+        "CR 400.7j: a payment delivered to the graveyard — a public zone — keeps \
+         full captured provenance, got {record:?}"
+    );
+    assert_repinned_live(
+        runner.state(),
+        captured_snapshot(ability, paid),
+        paid,
+        Zone::Graveyard,
+        control.before,
+        "deterministic discard, public destination",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Sacrifice — Greater Good
 // ---------------------------------------------------------------------------
 
@@ -710,6 +948,260 @@ fn sacrifice_cost_publishes_a_live_snapshot() {
     assert!(
         !paid_ids(ability).contains(&survivor),
         "only objects the cost actually consumed enter the authority"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SACRIFICE redirected into a HIDDEN zone — Greater Good + the same graveyard
+// redirect vehicle. The RELOCATION counterpart of the discard demotion above.
+// ---------------------------------------------------------------------------
+
+/// One driven Greater Good sacrifice payment, parked on the stack.
+///
+/// Named struct for the same reason as the discard fixtures: the values are all
+/// id-shaped and a bare tuple both reads ambiguously and trips
+/// `clippy::type_complexity`.
+struct SacrificeFixture {
+    runner: GameRunner,
+    /// The permanent the PLAYER deliberately selected to pay the cost.
+    victim: ObjectId,
+    /// An equally eligible creature that was not selected, so the cost window
+    /// is a genuine choice rather than the "only possible permanent" branch.
+    survivor: ObjectId,
+    /// `victim`'s incarnation epoch BEFORE the payment, so both arms can prove
+    /// the cost's own move advanced it (CR 400.7).
+    before: u64,
+    /// The installed hidden-zone redirect, when this arm installs one.
+    probe: Option<ObjectId>,
+}
+
+/// Pay Greater Good's sacrifice cost through the engine's own windows,
+/// optionally with `HIDDEN_GRAVEYARD_REDIRECT` on the battlefield so the
+/// sacrificed permanent's own cost move is redirected into a hidden zone.
+///
+/// Deliberately the SAME redirect vehicle the two discard fixtures install, and
+/// it reaches this seam for a reason stated in production code:
+/// `sacrifice::apply_sacrifice_after_replacement` proposes the sacrifice's
+/// battlefield → graveyard move as its own inner `ZoneChange` through the
+/// replacement pipeline precisely so that "a card would be put into a graveyard
+/// from anywhere → redirect instead" replacements apply on sacrifice too
+/// (CR 701.21a + CR 614.1). The probe's parsed filter is owner-scoped
+/// ("your graveyard") and token-excluding ("a card"), and the victim below is a
+/// NONTOKEN permanent owned by the probe's controller, so it matches.
+fn pay_greater_good_sacrifice(hidden_redirect: bool) -> SacrificeFixture {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let good = scenario
+        .add_creature(P0, "Greater Good", 0, 0)
+        .from_oracle_text(GREATER_GOOD)
+        .as_enchantment()
+        .id();
+    let probe = hidden_redirect.then(|| {
+        scenario
+            .add_enchantment_from_oracle(P0, "Hidden Redirect Probe", HIDDEN_GRAVEYARD_REDIRECT)
+            .id()
+    });
+    let victim = scenario.add_creature(P0, "Beast", 5, 5).id();
+    let survivor = scenario.add_creature(P0, "Bystander", 2, 2).id();
+    scenario.with_library_top(P0, &["L1", "L2", "L3", "L4", "L5", "L6"]);
+    scenario.with_cards_in_hand(P0, &["H1", "H2", "H3"]);
+    let mut runner = scenario.build();
+
+    let before = incarnation(&runner, victim);
+    let index = costed_ability_index(&runner, good);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: good,
+            ability_index: index,
+        })
+        .expect("Greater Good's sacrifice ability must be activatable");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                ..
+            }
+        ),
+        "reach guard: the real sacrifice cost window must open, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![victim],
+        })
+        .expect("sacrificing an eligible creature must pay the cost");
+    pay_until_on_stack(&mut runner, &[victim]);
+
+    SacrificeFixture {
+        runner,
+        victim,
+        survivor,
+        before,
+        probe,
+    }
+}
+
+/// CR 608.2h + CR 400.7j: a NON-discard cost move redirected into a hidden zone
+/// must KEEP its captured record — `lki` intact — while refusing to resolve
+/// live. This is the row of the settlement matrix that the discard cases do not
+/// reach, and it is the opposite answer from theirs.
+///
+/// Why the two differ. CR 701.9c — the rule that makes a card's characteristics
+/// UNDEFINED in an unrevealed hidden zone — is discard-scoped by its own text
+/// ("If a card is discarded, but an effect causes it to be put into a hidden
+/// zone instead…"). A SACRIFICE is CR 701.21a, not a discard, so CR 701.9c
+/// never reaches it and nothing makes the permanent's characteristics
+/// undefined. CR 608.2h then supplies the positive rule: an effect that needs
+/// information from an object no longer in the public zone it was expected to
+/// be in uses that object's LAST KNOWN INFORMATION — which for Greater Good's
+/// own "draw cards equal to the sacrificed creature's power" is exactly the
+/// pre-move `lki` this record captured. Demoting the record to
+/// `MembershipOnly` would DESTROY that `lki`, so demotion is not a safe
+/// default: it is wrong in the other direction.
+///
+/// What still fails closed: the record is deliberately NOT re-pinned either.
+/// CR 400.7j licenses this ability's effects finding an object its cost moved
+/// to a PUBLIC zone, and the library is not one, so the pin stays on the
+/// pre-move incarnation and `live_object_id` yields `None` (CR 400.7: the
+/// post-move object is a new object). `Captured`-but-stale is the whole point.
+///
+/// UNDER REVERT, in BOTH directions — this pair is the discriminator:
+///   * revert to the demote-on-any-hidden-destination settlement and the hidden
+///     arm's `matches!(.., Captured(_))` and `lki.power == Some(5)` assertions
+///     fail, because the record becomes `MembershipOnly` and the last known
+///     information is gone;
+///   * revert to the original UNCONDITIONAL re-pin and
+///     `live_object_id(state).is_none()` fails (it yields `Some(victim)`, a live
+///     reference into a hidden zone that CR 400.7j withholds), as does the
+///     paired `snapshot.incarnation != live.incarnation` guard.
+///
+/// Both arms run in ONE test so the pair cannot drift, and the PUBLIC arm is a
+/// load-bearing positive control: without it, the hidden arm could be satisfied
+/// by an authority that published a stale record for some unrelated reason, or
+/// by a redirect that silently stopped the payment.
+#[test]
+fn sacrifice_cost_redirected_to_a_hidden_zone_keeps_its_captured_lki() {
+    // ── HIDDEN ARM ────────────────────────────────────────────────────────
+    let fixture = pay_greater_good_sacrifice(true);
+    let runner = &fixture.runner;
+    let probe = fixture.probe.expect("the hidden arm installs the redirect");
+
+    // Reach guard: the fixture's printed static really did parse into a
+    // graveyard-destination replacement. Without this, a parser change that
+    // silently dropped the clause would leave the permanent in the graveyard
+    // and the arm below would be measuring the PUBLIC path while claiming the
+    // hidden one.
+    let hosted = &runner.state().objects[&probe].replacement_definitions;
+    assert_eq!(
+        hosted
+            .iter_unchecked()
+            .filter(|def| def.destination_zone == Some(Zone::Graveyard))
+            .count(),
+        1,
+        "reach guard: the redirect must be hosted as exactly one graveyard-destination \
+         replacement, got {hosted:?}"
+    );
+
+    let victim = fixture.victim;
+    let live = runner.state().objects.get(&victim).unwrap_or_else(|| {
+        panic!("reach guard: a NONTOKEN sacrificed permanent keeps its row (CR 704.5d)")
+    });
+    assert_eq!(
+        live.zone,
+        Zone::Library,
+        "reach guard: CR 701.21a + CR 614.1 — the sacrifice's own graveyard move must \
+         have been redirected into the library by the hosted replacement"
+    );
+    assert!(
+        !live.zone.is_public(),
+        "reach guard: the cost's own move must have delivered into a HIDDEN zone, \
+         otherwise this arm measures nothing"
+    );
+    assert_ne!(
+        live.incarnation, fixture.before,
+        "reach guard: CR 400.7 — the cost's own move must make a new object, otherwise \
+         a never-re-pinned snapshot could not be told from a re-pinned one"
+    );
+
+    let ability = ability_on_stack(runner);
+    assert_eq!(
+        paid_ids(ability),
+        vec![victim],
+        "CR 601.2c: membership stays EXACT — the cost really did move this permanent, \
+         so the target-candidate exclusion must still see it"
+    );
+    let record = paid_record(ability, victim);
+    assert!(
+        matches!(record, CostPaidObjectRecord::Captured(_)),
+        "CR 608.2h: a SACRIFICE is not a discard, so CR 701.9c's undefined-characteristics \
+         rule does not reach it — the captured record must survive the hidden \
+         destination, got {record:?}"
+    );
+    let snapshot = captured_snapshot(ability, victim);
+    assert_eq!(
+        snapshot.lki.power,
+        Some(5),
+        "CR 608.2h: the pre-move last known information is what 'the sacrificed \
+         creature's power' reads; demoting this record would destroy it"
+    );
+    assert_eq!(
+        snapshot.lki.name, "Beast",
+        "CR 608.2h: the captured record still names the permanent as it last existed"
+    );
+    assert_ne!(
+        snapshot.incarnation, live.incarnation,
+        "CR 400.7j: the pin must NOT be refreshed across a move into a hidden zone — \
+         only a public-zone delivery earns a live reference"
+    );
+    assert!(
+        record.live_object_id(runner.state()).is_none(),
+        "CR 400.7j: the record must still refuse to resolve LIVE — the stale pin is \
+         what fails it closed, not the loss of the snapshot"
+    );
+
+    // Sibling case: the equally eligible permanent the player did NOT select is
+    // untouched and is not recorded, redirect or no redirect.
+    assert_eq!(
+        runner.state().objects[&fixture.survivor].zone,
+        Zone::Battlefield,
+        "the unchosen creature stays on the battlefield"
+    );
+    assert!(
+        !paid_ids(ability).contains(&fixture.survivor),
+        "only objects the cost actually consumed enter the authority"
+    );
+
+    // ── PUBLIC POSITIVE CONTROL ───────────────────────────────────────────
+    // The same permanent, the same cost, the same driver — only the redirect is
+    // gone, and the record must then be re-pinned and resolve live.
+    let control = pay_greater_good_sacrifice(false);
+    let runner = &control.runner;
+    assert!(
+        control.probe.is_none(),
+        "the control arm installs no redirect"
+    );
+    assert_eq!(
+        runner.state().objects[&control.victim].zone,
+        Zone::Graveyard,
+        "reach guard: without the redirect the sacrifice's own move delivers to the \
+         owner's graveyard (CR 701.21a)"
+    );
+
+    let ability = ability_on_stack(runner);
+    let record = paid_record(ability, control.victim);
+    assert!(
+        matches!(record, CostPaidObjectRecord::Captured(_)),
+        "CR 400.7j: a sacrifice delivered to the graveyard — a public zone — keeps full \
+         captured provenance, got {record:?}"
+    );
+    assert_repinned_live(
+        runner.state(),
+        captured_snapshot(ability, control.victim),
+        control.victim,
+        Zone::Graveyard,
+        control.before,
+        "sacrifice, public destination",
     );
 }
 

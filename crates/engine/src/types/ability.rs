@@ -9931,13 +9931,29 @@ impl CostPaidObjectSnapshot {
 /// invent an [`LKISnapshot`] that CR 608.2h readers would then report as if it
 /// were the departed object's real recorded state).
 ///
-/// CR 701.9c: a LIVE payment reaches the same shape when a random discard cost's
-/// card is redirected into a hidden zone without being revealed — the cost
+/// CR 701.9c: a LIVE payment reaches the same shape when a DISCARD cost's card
+/// is redirected into a hidden zone without being revealed — the cost
 /// really did move that card (membership is exact), but its characteristics are
 /// undefined and CR 400.7j licenses finding only an object a cost moved to a
-/// PUBLIC zone. So `MembershipOnly` has two producers, the persisted migration
-/// and that one hidden-destination payment classification; it never means "this
-/// object was not paid".
+/// PUBLIC zone. Two code paths produce that classification: the random-discard
+/// seam (`commit_random_discard_cost_picks`) classifies per pick at publication
+/// time, and `ResolvedAbility::settle_cost_paid_provenance_recursive` demotes a
+/// provisionally-`Captured` record whose object did not reach a public zone,
+/// but ONLY when the settling seam passes
+/// [`CostMoveOutcome::Discard`] — which is what covers the deterministic
+/// discard paths, whose moves run through the replacement pipeline AFTER
+/// publication. So `MembershipOnly` has three producers, the persisted
+/// migration plus those two; it never means "this object was not paid".
+///
+/// CR 608.2h: demotion is deliberately NOT the general hidden-destination
+/// answer, because it is LOSSY — it throws away the pre-move `lki` that CR
+/// 608.2h names as the correct reading for an object no longer in the public
+/// zone it was expected to be in ("Sacrifice a creature: … equal to its
+/// power"). CR 701.9c, the rule that makes the characteristics *undefined*
+/// rather than last-known, is DISCARD-scoped by its own text. A sacrifice,
+/// exile, or return-to-hand cost move into a hidden zone therefore keeps its
+/// `Captured` record with the pre-move `lki` intact and its pin left stale, so
+/// [`Self::live_object_id`] still fails closed per CR 400.7j.
 ///
 /// `MembershipOnly` is deliberately NOT boxed away behind the captured variant:
 /// the enum's whole job is that a migrated record carries NOTHING but an id, and
@@ -9957,12 +9973,57 @@ pub enum CostPaidObjectRecord {
     /// incapable of resolving live: it holds no snapshot to resolve through.
     ///
     /// CR 701.9c + CR 400.7j: also written by a live payment whose own move
-    /// delivered the object into a HIDDEN zone (a random discard cost
-    /// redirected to a library or hand without being revealed). There the
-    /// refusal is a rules requirement rather than a missing record: the
-    /// characteristics are undefined, and only a move to a public zone lets
-    /// the cost's own effects find the object.
+    /// delivered the object into a HIDDEN zone (a discard cost — random or
+    /// deterministic — redirected to a library or hand without being
+    /// revealed). There the refusal is a rules requirement rather than a
+    /// missing record: the characteristics are undefined, and only a move to a
+    /// public zone lets the cost's own effects find the object.
+    ///
+    /// CR 608.2h: a NON-discard cost move (sacrifice, exile, return to hand)
+    /// that ends in a hidden zone is NOT written here. CR 701.9c does not reach
+    /// it, its last known information is exactly what the ability's own effects
+    /// must read, and demoting would destroy that `lki`.
     MembershipOnly(ObjectId),
+}
+
+/// CR 701.9c + CR 608.2h: WHICH cost action produced the moves a settlement
+/// pass is settling. The axis decides one thing and only one: whether a
+/// `Captured` record whose object ended in a HIDDEN zone loses its captured
+/// characteristics.
+///
+/// Typed rather than a bool: the two arms are different RULES, not two states
+/// of one switch (`Discard` is licensed by CR 701.9c's discard-scoped
+/// undefined-characteristics rule; `Relocation` is governed by CR 608.2h's
+/// last-known-information rule), and a `settle(.., true)` at a call site would
+/// say nothing about which rule the seam is claiming.
+///
+/// This axis is expected to GROW (a future cost action whose hidden-destination
+/// rule is neither CR 701.9c's nor CR 608.2h's gets its own variant), so every
+/// dispatch on it is an EXHAUSTIVE `match` with no wildcard arm — see
+/// [`CostPaidObjectRecord::settle_after_cost_move`], the only such dispatch.
+/// A `_ =>` fallback would silently hand each new variant whichever arm it
+/// happened to share, and the demoting arm is LOSSY.
+///
+/// Why the settlement traversal is SCOPED to the ids its seam moved rather than
+/// settling every record: one ability can settle twice with DIFFERENT outcomes.
+/// `finalize_mana_payment_with_resume` settles a deferred spell sacrifice as
+/// `Relocation`, then eleven lines later `pay_deferred_random_discard_cost`
+/// settles the same ability's random discard leg as `Discard`
+/// (`finalize_mana_payment_with_phyrexian_choices` carries the same pair). An
+/// unscoped second pass would apply CR 701.9c to the sacrifice record — a rule
+/// discard-scoped by its own text that never reached it — and destroy the LKI
+/// CR 608.2h preserves. That seam is live in code today and cold only because
+/// no printed card pairs a deferred sacrifice with a random discard cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostMoveOutcome {
+    /// CR 701.9a / CR 701.9b: the cost DISCARDED these objects, so CR 701.9c's
+    /// undefined-characteristics rule applies if one of them landed in an
+    /// unrevealed hidden zone.
+    Discard,
+    /// Any other cost move — sacrifice (CR 701.21a), exile (CR 701.13a),
+    /// return to hand. CR 701.9c does not reach these; CR 608.2h keeps the
+    /// pre-move LKI the correct answer for a hidden destination.
+    Relocation,
 }
 
 impl CostPaidObjectRecord {
@@ -9988,8 +10049,8 @@ impl CostPaidObjectRecord {
     }
 
     /// Mutable twin of [`Self::snapshot`]. The single seam through which the
-    /// repin traversal reaches a captured record, so `MembershipOnly` cannot be
-    /// upgraded into a live referent by any caller.
+    /// settlement traversal reaches a captured record, so `MembershipOnly`
+    /// cannot be upgraded into a live referent by any caller.
     pub fn snapshot_mut(&mut self) -> Option<&mut CostPaidObjectSnapshot> {
         match self {
             Self::Captured(snapshot) => Some(snapshot),
@@ -10021,6 +10082,107 @@ impl CostPaidObjectRecord {
         if let Some(snapshot) = self.snapshot_mut() {
             snapshot.repin_to_current_incarnation(state);
         }
+    }
+
+    /// CR 400.7j + CR 701.9c + CR 608.2h: SETTLE this record against where THIS
+    /// seam's own move ACTUALLY delivered the object, once those moves are
+    /// complete. The caller has already established that this record's object
+    /// is one the seam moved (see
+    /// [`ResolvedAbility::settle_cost_paid_provenance_recursive`], which owns
+    /// the scoping) and which cost action performed the move (`outcome`).
+    ///
+    /// Three outcomes, and which one applies is a per-object fact that cannot
+    /// be known at publication time — capture must stay PRE-move so the `lki`
+    /// records pre-move characteristics (CR 608.2h), while the destination is
+    /// only decided afterwards by the replacement pipeline (CR 616.1):
+    ///
+    /// * delivered to a PUBLIC zone (either outcome) → re-pin. CR 400.7j is the
+    ///   rule that keeps the reference alive across the cost's own move.
+    /// * NOT public, [`CostMoveOutcome::Discard`] → DEMOTE to
+    ///   [`Self::MembershipOnly`]. CR 701.9c leaves a discarded card put into an
+    ///   unrevealed hidden zone with ALL values of its characteristics
+    ///   undefined, so the captured snapshot may not be exposed at all; the
+    ///   demotion preserves the exact CR 601.2c / CR 602.2b membership the
+    ///   target-candidate exclusion reads, while withholding the snapshot and
+    ///   any live reference.
+    /// * NOT public, [`CostMoveOutcome::Relocation`] → LEAVE UNTOUCHED. CR
+    ///   701.9c is discard-scoped and does not reach a sacrifice (CR 701.21a),
+    ///   an exile (CR 701.13a), or a return to hand, so those characteristics
+    ///   are not undefined — they are last known information, which CR 608.2h
+    ///   makes the CORRECT answer for an object that is no longer in the public
+    ///   zone it was expected to be in ("Sacrifice a creature: … equal to its
+    ///   power"). Demoting here would destroy exactly the `lki` the ability's
+    ///   own effects must read. Not re-pinning is equally deliberate: the pin
+    ///   stays on the pre-move incarnation, so [`Self::live_object_id`] and
+    ///   [`Self::is_current`] fail CLOSED (CR 400.7j licenses finding only a
+    ///   PUBLIC-zone delivery) while the captured characteristics survive.
+    ///
+    /// A missing object row reads as NOT public, fail-closed: the destination
+    /// cannot be proven public. That arm is deliberately NOT the
+    /// sacrificed-token case (CR 704.5d) — a token's row is purged by the
+    /// state-based-action sweep, which runs long after this settlement, so a
+    /// token sacrificed to a cost still settles through the public-graveyard
+    /// arm with its provenance intact.
+    ///
+    /// A `MembershipOnly` record is already settled and is never upgraded.
+    pub fn settle_after_cost_move(
+        &mut self,
+        state: &crate::types::game_state::GameState,
+        outcome: CostMoveOutcome,
+    ) {
+        let Some(object_id) = self.snapshot().map(|snapshot| snapshot.object_id) else {
+            return;
+        };
+        let delivered_to_public_zone = state
+            .objects
+            .get(&object_id)
+            .is_some_and(|object| object.zone.is_public());
+        if delivered_to_public_zone {
+            self.repin_to_current_incarnation(state);
+            return;
+        }
+        // The destination is hidden. WHICH rule applies is decided entirely by
+        // which cost action performed the move, so this dispatch is an
+        // EXHAUSTIVE match with no wildcard arm: a future `CostMoveOutcome`
+        // variant must state its own hidden-destination rule here and be
+        // rejected by the compiler until it does. A `_ =>` fallback would hand
+        // every new cost action the LOSSY demotion arm by default, which is
+        // wrong for every non-discard move (it destroys the CR 608.2h `lki`).
+        match outcome {
+            // CR 701.9c: a DISCARDED card put into an unrevealed hidden zone has
+            // all values of its characteristics undefined, so the snapshot may
+            // not be exposed at all; membership (CR 601.2c) is all that
+            // survives.
+            CostMoveOutcome::Discard => *self = Self::MembershipOnly(object_id),
+            // CR 608.2h: a non-discard cost move into a hidden zone leaves the
+            // captured LAST KNOWN INFORMATION as the correct answer, so the
+            // record is left exactly as it is — snapshot kept, pin deliberately
+            // NOT refreshed, so the live reference stays refused (CR 400.7j).
+            CostMoveOutcome::Relocation => {}
+        }
+    }
+
+    /// CR 608.2h: RE-CAPTURE a captured record's characteristics from the LIVE
+    /// object, preserving the record's identity (same `object_id`).
+    ///
+    /// For a payment whose object moves are DEFERRED past the seam that
+    /// published this record: CR 608.2h calls for the object's last known
+    /// information, i.e. its state as it most recently existed, not its state
+    /// at selection time. A deferred sacrifice selected before the mana window
+    /// can be tapped for mana inside that window, so the record published at
+    /// selection would otherwise freeze an untapped `lki` that the game never
+    /// observed at the moment of payment.
+    ///
+    /// A no-op for `MembershipOnly` (nothing to refresh, and it must never
+    /// acquire a snapshot) and for a vanished row (no live object to read).
+    pub fn refresh_capture_from_live(&mut self, state: &crate::types::game_state::GameState) {
+        let Self::Captured(snapshot) = self else {
+            return;
+        };
+        let Some(object) = state.objects.get(&snapshot.object_id) else {
+            return;
+        };
+        *snapshot = CostPaidObjectSnapshot::capture(object, object.snapshot_for_mana_spent());
     }
 }
 
@@ -31330,15 +31492,19 @@ pub struct ResolvedAbility {
     /// this ability's cost moved". Each entry is a
     /// [`CostPaidObjectRecord`], which carries either a full payment-time
     /// snapshot (post-cost INCARNATION plus characteristics) or — for a
-    /// pre-migration persisted payload, and for a payment whose own move
-    /// delivered into a hidden zone (CR 701.9c) — MEMBERSHIP only. The engine
+    /// pre-migration persisted payload, and for a DISCARD payment whose own
+    /// move delivered into an unrevealed hidden zone (CR 701.9c) — MEMBERSHIP
+    /// only. The engine
     /// reuses `ObjectId`, so an id alone cannot tell "still the object the cost
     /// moved" from "a new object that later took the same id" (CR 400.7).
     /// Readers that only need membership (target-candidate exclusion) project
     /// [`CostPaidObjectRecord::object_id`], which is exact for BOTH variants;
     /// readers that act on the LIVE object must resolve through
     /// [`CostPaidObjectRecord::live_object_id`], which yields `None` for a
-    /// membership-only record (fail closed) rather than rebinding a reused id.
+    /// membership-only record (fail closed) rather than rebinding a reused id —
+    /// and equally for a `Captured` record whose non-discard cost move ended in
+    /// a hidden zone, where CR 608.2h keeps the captured `lki` readable while
+    /// the stale pin refuses the live reference.
     ///
     /// CR 601.2c: `alias = "cost_paid_object_ids"` migrates the pre-snapshot
     /// save shape (a raw id array) into `MembershipOnly` entries. Dropping
@@ -32558,38 +32724,135 @@ impl ResolvedAbility {
         }
     }
 
-    /// CR 400.7 + CR 608.2k: Re-pin this ability's (and every sub/else branch's)
-    /// cost-paid referents to their current incarnation, once the cost's own
-    /// object moves are complete. Mirrors `set_cost_paid_object_recursive`'s
+    /// CR 400.7 + CR 400.7j + CR 608.2k + CR 701.9c: SETTLE this ability's (and
+    /// every sub/else branch's) cost-paid provenance once ONE cost-move seam's
+    /// own object moves are complete. Mirrors `set_cost_paid_object_recursive`'s
     /// traversal.
     ///
+    /// Named for the job it actually does — it is not a bare re-pin. Settlement
+    /// is SCOPED and TYPED, and both parameters are load-bearing:
+    ///
+    /// * `moved` — the ids THIS seam just moved. A cast can pay several
+    ///   non-mana components (discard a card, exile a card, then sacrifice a
+    ///   permanent at mana commit); every one of them calls this traversal, and
+    ///   the plural authority accumulates ALL of their records. A record whose
+    ///   object is not in `moved` belongs to a DIFFERENT component that already
+    ///   completed and settled its own move, so it is skipped entirely: settling
+    ///   it again would judge it against a move that was never its own — either
+    ///   re-pinning across a later, unrelated zone change (CR 400.7 says that is
+    ///   a new object) or demoting a record that legitimately settled public.
+    ///   Mirrors the pre-move counterpart
+    ///   [`Self::refresh_cost_paid_capture_recursive`], which is scoped the same
+    ///   way for the same reason.
+    /// * `outcome` — WHICH cost action performed those moves, because that
+    ///   decides the hidden-destination rule. See
+    ///   [`CostPaidObjectRecord::settle_after_cost_move`] for the per-record
+    ///   matrix; in short, a public delivery re-pins under CR 400.7j either way,
+    ///   a hidden [`CostMoveOutcome::Discard`] demotes to
+    ///   `CostPaidObjectRecord::MembershipOnly` under CR 701.9c, and a hidden
+    ///   [`CostMoveOutcome::Relocation`] is left alone — CR 701.9c is
+    ///   discard-scoped, and CR 608.2h makes the captured pre-move `lki` the
+    ///   correct reading for a sacrificed/exiled/returned object, so demoting
+    ///   would destroy the very information the ability's effects need. Its pin
+    ///   stays stale, so the LIVE reference still fails closed.
+    ///
+    /// The demotion has to live HERE, post-move, because capture has to stay
+    /// pre-move (the `lki` must record pre-move characteristics — CR 608.2h)
+    /// and the destination is not known until the replacement pipeline
+    /// (CR 616.1) has run. Routing it through the traversal every cost-move
+    /// seam already calls is what makes deterministic discard (immediate and
+    /// resumed) and random discard classify IDENTICALLY: changing how the
+    /// discarded card is chosen does not change the authority rule.
+    /// `commit_random_discard_cost_picks` additionally classifies at
+    /// publication time; that is belt-and-braces (it prevents even a transient
+    /// `Captured` for a hidden card) and agrees with this rule by construction.
+    ///
+    /// The SINGULAR `cost_paid_object` referent keeps a plain, UNCONDITIONAL
+    /// re-pin: unscoped by `moved` and unaffected by `outcome`. Its destination
+    /// policy is owned by its own publication seams and its pre-existing
+    /// behavior is deliberately unchanged here — that field's limitations are
+    /// out of scope for this change.
+    ///
     /// This is the SINGLE traversal authority for cost-paid provenance
-    /// repinning: it covers the singular `cost_paid_object` referent AND every
+    /// settlement: it covers the singular `cost_paid_object` referent AND every
     /// entry of the plural `cost_paid_objects` authority, so a cost-payment
     /// seam that already calls it cannot forget one of the two. Do not add a
-    /// parallel traversal.
-    ///
-    /// See `CostPaidObjectSnapshot::repin_to_current_incarnation`: the cost's own
-    /// move must not make the reference stale, only a later one.
+    /// parallel traversal. Its pre-move counterpart — the only other traversal
+    /// in this family — is
+    /// [`Self::refresh_cost_paid_capture_recursive`], whose job is capture, not
+    /// settlement.
     ///
     /// CR 400.7: a migrated `CostPaidObjectRecord::MembershipOnly` entry has no
     /// pin to refresh and must never acquire one, so the per-record method
     /// no-ops for it. The traversal stays the single authority either way.
-    pub fn repin_cost_paid_object_recursive(
+    pub fn settle_cost_paid_provenance_recursive(
         &mut self,
         state: &crate::types::game_state::GameState,
+        moved: &[ObjectId],
+        outcome: CostMoveOutcome,
     ) {
         if let Some(snapshot) = self.cost_paid_object.as_mut() {
             snapshot.repin_to_current_incarnation(state);
         }
         for record in self.cost_paid_objects.iter_mut() {
-            record.repin_to_current_incarnation(state);
+            if moved.contains(&record.object_id()) {
+                record.settle_after_cost_move(state, outcome);
+            }
         }
         if let Some(sub) = self.sub_ability.as_mut() {
-            sub.repin_cost_paid_object_recursive(state);
+            sub.settle_cost_paid_provenance_recursive(state, moved, outcome);
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
-            else_branch.repin_cost_paid_object_recursive(state);
+            else_branch.settle_cost_paid_provenance_recursive(state, moved, outcome);
+        }
+    }
+
+    /// CR 608.2h + CR 601.2h: RE-CAPTURE the PLURAL authority's characteristics
+    /// for `object_ids` from the live objects, immediately BEFORE the payment
+    /// seam that moves them.
+    ///
+    /// The pre-move counterpart of
+    /// [`Self::settle_cost_paid_provenance_recursive`], and the only other
+    /// traversal in this family. Their jobs are disjoint and both are needed:
+    /// this one is CAPTURE (run before the move, it decides WHAT the record
+    /// says); that one is SETTLEMENT (run after the move, it decides whether
+    /// the record may still say it and which incarnation it names).
+    ///
+    /// Needed because one payment defers its moves past the seam that published
+    /// the record: a spell sacrifice selected before the mana window
+    /// (`handle_sacrifice_for_cost`'s deferral branch) is paid later, at mana
+    /// commit, and the permanent can be tapped for that very mana in between.
+    /// CR 608.2h calls for the object's last known information — its state as
+    /// it most recently existed — so the record must be re-captured at the
+    /// ACTUAL payment seam rather than frozen at selection.
+    ///
+    /// Scoped by `object_ids` on purpose: only the objects THIS deferred
+    /// payment is about to move may be re-captured. A record outside that set
+    /// belongs to a cost component that already completed its own move and
+    /// settled, and re-capturing it would overwrite a correct post-move LKI
+    /// with a live read. `MembershipOnly` records are never touched — they have
+    /// no snapshot and must never acquire one (CR 400.7).
+    ///
+    /// The SINGULAR `cost_paid_object` referent is deliberately NOT refreshed:
+    /// its pre-existing capture semantics are out of scope for this traversal.
+    pub fn refresh_cost_paid_capture_recursive(
+        &mut self,
+        state: &crate::types::game_state::GameState,
+        object_ids: &[ObjectId],
+    ) {
+        if object_ids.is_empty() {
+            return;
+        }
+        for record in self.cost_paid_objects.iter_mut() {
+            if object_ids.contains(&record.object_id()) {
+                record.refresh_capture_from_live(state);
+            }
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.refresh_cost_paid_capture_recursive(state, object_ids);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.refresh_cost_paid_capture_recursive(state, object_ids);
         }
     }
 
@@ -32641,18 +32904,26 @@ impl ResolvedAbility {
     /// its own resolution-time referent semantics.
     ///
     /// CR 400.7: the appended entries are full snapshots captured BEFORE the
-    /// cost's own move, so `repin_cost_paid_object_recursive` must run once the
-    /// cost's moves complete — it repins these entries through the same single
-    /// traversal that repins `cost_paid_object`.
+    /// cost's own move, so [`Self::settle_cost_paid_provenance_recursive`] must
+    /// run once that seam's moves complete, scoped to the ids this seam moved
+    /// and tagged with its [`CostMoveOutcome`] — it settles these entries
+    /// through the same single traversal that repins `cost_paid_object`.
     ///
-    /// CR 400.7j: this snapshot-taking form is the PUBLIC-DESTINATION front
-    /// door — every one of its callers pays a cost whose own move delivers to a
-    /// public zone (discard → graveyard, sacrifice → graveyard, exile → exile),
-    /// so `Captured` is the right record for all of them. A payment that can
-    /// deliver into a HIDDEN zone must classify per object and call
-    /// [`Self::add_cost_paid_records_recursive`] directly (CR 701.9c:
-    /// a discarded card put into a hidden zone without being revealed has
-    /// undefined characteristics). Both forms share one traversal.
+    /// CR 400.7j: this snapshot-taking form is the INTENDED-public-destination
+    /// front door — every one of its callers pays a cost whose own move AIMS at
+    /// a public zone (discard → graveyard, sacrifice → graveyard, exile →
+    /// exile). It is NOT a promise that the move lands there: a replacement
+    /// effect (CR 616.1) can redirect any of them into a hidden zone. What
+    /// happens then depends on the cost action, not on the destination alone:
+    /// CR 701.9c makes a DISCARDED card's characteristics undefined, so that
+    /// `Captured` entry is PROVISIONAL and the post-move settlement demotes it;
+    /// a sacrificed, exiled, or returned object keeps its captured entry,
+    /// because CR 608.2h makes the captured pre-move `lki` its last known
+    /// information and the stale pin already refuses the live reference.
+    /// A payment that already KNOWS the per-object outcome at publication time
+    /// may classify up front and call [`Self::add_cost_paid_records_recursive`]
+    /// directly (`commit_random_discard_cost_picks` does, so a hidden result is
+    /// never even transiently `Captured`); settlement then agrees with it.
     pub fn add_cost_paid_objects_recursive(&mut self, snapshots: &[CostPaidObjectSnapshot]) {
         let records = snapshots
             .iter()
@@ -32666,16 +32937,26 @@ impl ResolvedAbility {
     /// [`Self::add_cost_paid_objects_recursive`] and the SINGLE traversal
     /// authority for appending to the plural cost-paid provenance.
     ///
-    /// Exists because the record VARIANT is a per-object question at exactly one
-    /// payment seam: a random discard cost (CR 701.9b) whose card a replacement
-    /// effect redirected into a hidden zone is still a card this cost moved
-    /// (exact membership, CR 601.2c), but CR 701.9c leaves its characteristics
-    /// undefined and CR 400.7j licenses finding only an object the cost moved to
-    /// a PUBLIC zone — so that entry must be `CostPaidObjectRecord::MembershipOnly`
+    /// Exists because the record VARIANT is a per-object question that ONE
+    /// payment seam can already answer at publication time: a random discard
+    /// cost (CR 701.9b) whose card a replacement effect redirected into a
+    /// hidden zone is still a card this cost moved (exact membership,
+    /// CR 601.2c), but CR 701.9c leaves its characteristics undefined and
+    /// CR 400.7j licenses finding only an object the cost moved to a PUBLIC
+    /// zone — so that entry must be `CostPaidObjectRecord::MembershipOnly`
     /// and must never acquire a snapshot or a live reference. Classifying at the
     /// call site and appending through here keeps that decision out of the
     /// traversal, so there is still only one recursion for a future sub/else
     /// branch to be forgotten by.
+    ///
+    /// This is belt-and-braces, not the only enforcement: a DISCARD seam's
+    /// post-move [`Self::settle_cost_paid_provenance_recursive`] call
+    /// ([`CostMoveOutcome::Discard`]) applies the SAME CR 701.9c rule to
+    /// whatever was published, so a discard seam that cannot classify up front
+    /// (the deterministic discard paths, which run their moves through the
+    /// replacement pipeline after publishing) is covered too. Classifying
+    /// here additionally prevents even a TRANSIENT `Captured` record for a card
+    /// whose characteristics are undefined.
     pub fn add_cost_paid_records_recursive(&mut self, records: &[CostPaidObjectRecord]) {
         self.cost_paid_objects.extend_from_slice(records);
         if let Some(sub) = self.sub_ability.as_mut() {
