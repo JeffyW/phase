@@ -1918,6 +1918,20 @@ pub(super) fn change_zone_target_choice_timing(
 }
 
 pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetChoiceTiming {
+    // CR 115.10a + CR 701.41a: a producer that expanded a keyword-action
+    // SHORTHAND into a targeted effect already knows the answer the ladder below
+    // is trying to infer, so its declaration wins outright. The ladder decides by
+    // scanning this clause's PRINTED fragment for the literal word "target";
+    // that scan is correct for printed prose and structurally blind to a
+    // shorthand, whose printed fragment is not the ability's rules text
+    // ("support 2" has no "target"; CR 701.41a defines it to mean "… up to two
+    // other target creatures"). Checked FIRST rather than as a fallback: every
+    // arm below can return early, so a later check would be unreachable for
+    // exactly the shapes that need it — and ahead of the shared `lower` binding,
+    // which this path never reads.
+    if let Some(timing) = clause_ir.declared_target_choice_timing {
+        return timing;
+    }
     // CR 115.1d: the "is this a target?" decisions below read the clause's
     // printed text, so its lowercased fragment is computed once and shared.
     let lower = clause_ir
