@@ -11088,19 +11088,37 @@ fn finalize_cast_with_phyrexian_choices_inner(
     };
     // CR 601.2a + CR 603.7 + CR 611.2a: Capture the tracked-set group of a
     // single-use `PlayFromExile` grant authorizing this cast BEFORE the object
-    // leaves exile for the stack.
+    // leaves its source zone for the stack.
     // Consumed after the move (see below) so the grant's one allowed cast is
-    // spent and every sibling exiled card becomes uncastable (Chandra, Hope's
+    // spent and every sibling card in the set becomes uncastable (Chandra, Hope's
     // Beacon +1).
-    let single_use_exile_play_group = if source_zone == Zone::Exile {
-        casting_permission_index.and_then(|index| {
-            state.objects.get(&object_id).and_then(|obj| {
-                super::casting::single_use_play_from_exile_group(state, obj, player, index)
-            })
+    //
+    // DELIBERATELY NOT ZONE-GATED, unlike the three exile-scoped captures above.
+    // This gate used to read `source_zone == Zone::Exile`, which made the cap
+    // unenforceable for any grant whose pool is not the exile zone: the group was
+    // never captured, `consume_single_use_play_from_exile` was never called, the
+    // `exile_play_single_use_consumed` ledger was never written, and the
+    // eligibility gate in `play_from_exile_permission_source_at_index` — which is
+    // itself zone-agnostic — therefore kept passing. A SECOND card was castable
+    // from a grant that prints a cap of one.
+    //
+    // The zone test was also redundant with the permission test it guarded:
+    // `single_use_play_from_exile_group` already requires the elected permission
+    // at `casting_permission_index` to be a `single_use` `PlayFromExile` granted
+    // to this player, so a cast that is not authorized by such a grant returns
+    // `None` here regardless of where the card was. Removing the zone test is
+    // therefore behaviour-preserving for every exile-pooled card and closes the
+    // leak for the rest.
+    //
+    // No shipped card paired a non-exile pool with a serialized `single_use`
+    // before Locke, Treasure Hunter ("each player mills a card … Until end of
+    // turn, you may cast a spell from among those cards" — the pool is the
+    // GRAVEYARD), which is why the gap survived unnoticed.
+    let single_use_play_group = casting_permission_index.and_then(|index| {
+        state.objects.get(&object_id).and_then(|obj| {
+            super::casting::single_use_play_from_exile_group(state, obj, player, index)
         })
-    } else {
-        None
-    };
+    });
 
     // CR 614.1a + CR 608.2n + CR 400.7 / CR 113.6e: Capture the `CastFromZone`
     // grant's graveyard-redirect destination BEFORE the Exile→Stack move. For an
@@ -11111,7 +11129,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // never install, wrongly sending the spell to the graveyard instead of the
     // library bottom. Mirrors the sibling exile-scoped captures above
     // (`exile_play_permission_source`, `top_of_library_permission_source`,
-    // `single_use_exile_play_group`), all read pre-move for the same reason. The
+    // `single_use_play_group`), all read pre-move for the same reason. The
     // destination is read from the selected-permission authority (the permission
     // that actually supports THIS cast) so a non-consumed sibling `ExileWithAltCost`
     // permission's redirect cannot leak onto this cast (CR 608.2c). The rider is
@@ -11458,7 +11476,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // every other card still in the tracked set so the remaining exiled cards
     // can no longer be cast (Chandra, Hope's Beacon +1: "an instant or sorcery
     // spell" — one total).
-    if let Some(group) = single_use_exile_play_group {
+    if let Some(group) = single_use_play_group {
         super::casting::consume_single_use_play_from_exile(state, group);
     }
 

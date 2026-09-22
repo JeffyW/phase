@@ -4460,12 +4460,37 @@ pub(crate) fn single_use_play_from_exile_group(
 /// CR 601.2a + CR 611.2a: Spend a single-use `PlayFromExile` grant. Records the
 /// `group` in `exile_play_single_use_consumed` and strips the now-void
 /// `PlayFromExile { single_use_group == group, single_use: true }` permission
-/// from every object still in exile, so the remaining cards in that tracked set
-/// are no longer castable (Chandra, Hope's Beacon +1 grants one cast total
+/// from every object still carrying it, so the remaining cards in that tracked
+/// set are no longer castable (Chandra, Hope's Beacon +1 grants one cast total
 /// across its until-end-of-next-turn window).
+///
+/// THE SWEEP IS ZONE-BLIND, and that is the fix rather than a detail. It used to
+/// iterate `state.exile` alone, which silently did nothing for a grant whose pool
+/// is any other zone: Locke, Treasure Hunter's batch is MILLED, so its siblings
+/// sit in graveyards and kept a permission this call had just declared spent.
+/// Membership in the set is what the permission is scoped by — `single_use_group`
+/// is a `TrackedSetId`, not a zone — so the tracked set is the authority here.
+/// The exile zone is still swept as well, because a grant whose set is absent
+/// from `tracked_object_sets` (a deserialized state, a legacy grant) would
+/// otherwise lose the sweep it has today; the union can only strip permissions
+/// carrying this exact group, so the extra leg cannot over-reach.
+///
+/// `exile_play_single_use_consumed` is the belt to this sweep's braces — the
+/// eligibility gate in `play_from_exile_permission_source_at_index` consults it
+/// independently and is itself zone-agnostic. Both are kept because a stale
+/// permission is visible to anything reading `casting_permissions` directly,
+/// including the AI's legal-action surface.
 pub(crate) fn consume_single_use_play_from_exile(state: &mut GameState, group: TrackedSetId) {
     state.exile_play_single_use_consumed.insert(group);
-    for obj_id in state.exile.clone() {
+    let scoped: Vec<ObjectId> = state
+        .tracked_object_sets
+        .get(&group)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(state.exile.iter().cloned())
+        .collect();
+    for obj_id in scoped {
         if let Some(obj) = state.objects.get_mut(&obj_id) {
             obj.casting_permissions.retain(|p| {
                 !matches!(
