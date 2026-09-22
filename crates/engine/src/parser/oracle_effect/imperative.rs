@@ -6230,6 +6230,28 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
         } => {
             let mut zones = zones.into_iter();
             let zone = zones.next().unwrap_or(Zone::Hand);
+            // CR 608.2c + CR 608.2d: this clause NAMES its own zone ("a creature
+            // card in your graveyard"), so its candidate pool is that zone — not
+            // whatever set an earlier instruction in the same chain happened to
+            // publish. `Legacy` prefers the chain's tracked set whenever one
+            // exists, which silently substituted the preceding clause's output
+            // for the named zone: Rejoin the Fight offered only the three cards
+            // it had just milled and never the rest of the graveyard.
+            //
+            // EXCEPT when the filter carries `TargetFilter::ExiledBySource` —
+            // the "exiled this way" anaphor (CR 607.2a linked ability). Those
+            // clauses name a zone AND refer back to the set this same ability
+            // just put there, so the prior tracked set IS their printed pool.
+            // Author of Shadows and Plargg and Nassari are the class: with a
+            // direct scan they would offer every unrelated card sitting in the
+            // shared exile zone (CR 400.1). The `FromTrackedSet` sibling arm
+            // above covers the anaphors that name no zone ("choose one of
+            // them"); `ExiledBySource` covers the ones that do.
+            let candidate_source = if super::lower::filter_mentions_exiled_by_source(&filter) {
+                crate::types::ability::ZoneChoiceCandidateSource::Legacy
+            } else {
+                crate::types::ability::ZoneChoiceCandidateSource::Direct
+            };
             Effect::ChooseFromZone {
                 count,
                 zone,
@@ -6237,21 +6259,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 zone_owner,
                 filter: Some(filter),
                 chooser: chooser.into(),
-                // CR 608.2c + CR 608.2d: this clause NAMES its own zone ("a
-                // creature card in your graveyard"), so its candidate pool is
-                // that zone — not whatever set an earlier instruction in the
-                // same chain happened to publish. `Legacy` prefers the chain's
-                // tracked set whenever one exists, which silently substituted
-                // the preceding clause's output for the named zone: Rejoin the
-                // Fight offered only the three cards it had just milled and
-                // never the rest of the graveyard.
-                //
-                // The anaphoric sibling — `FromTrackedSet` above, "choose one of
-                // them" / "a nonland card exiled this way" — keeps `Legacy`
-                // precisely because for those clauses the prior tracked set IS
-                // the printed pool. The AST already draws that distinction, so
-                // the discrimination is structural and needs no phrase matching.
-                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Direct,
+                candidate_source,
                 reciprocal_role: None,
                 up_to,
                 selection,
