@@ -146,21 +146,61 @@ fn banon_pool_qualifier_lowers_to_arrival_plus_origin_exclusion() {
     );
 }
 
-/// CR 400.7: Kagha's affirmative sibling — same anchor, positive origin.
+/// CR 400.7 + CR 608.2c: Kagha's affirmative sibling — same anchor, positive
+/// origin — with the qualifier attached to EACH branch rather than ANDed onto
+/// the union.
+///
+/// Kagha's pool phrase is the shared trailing complement of both verbs ("play a
+/// land **or** cast a permanent spell from among cards in your graveyard that
+/// were put there from your library this turn"), so it governs the land branch
+/// and the spell branch alike. Asserting per branch, not over a flattened
+/// property set, is what distinguishes that from ANDing both branches'
+/// qualifiers onto the union — which would require a card satisfying either
+/// printed alternative to satisfy both.
 #[test]
-fn kagha_pool_qualifier_lowers_to_library_origin() {
+fn kagha_pool_qualifier_scopes_each_branch_of_the_disjunction() {
     let parsed = parse(KAGHA_ORACLE, "Kagha, Shadow Archdruid");
     let def = graveyard_permission(&parsed);
     let affected = def.affected.as_ref().expect("permission must scope a pool");
 
+    let expected = FilterProp::ZoneChangedThisTurn {
+        from: Some(Zone::Library),
+        to: Some(Zone::Graveyard),
+    };
+    let TargetFilter::Or { filters } = affected else {
+        panic!("Kagha prints a land/spell disjunction, so its pool is a union; got {affected:?}");
+    };
+    assert_eq!(filters.len(), 2, "one branch per printed verb");
+    for branch in filters {
+        assert!(
+            properties_of(branch).contains(&expected),
+            "every branch must carry the pool qualifier; branch {branch:?} did not"
+        );
+    }
+}
+
+/// CR 400.7 + CR 608.2c: an affirmative pool qualifier with NO time phrase is
+/// refused rather than silently narrowed to a this-turn pool.
+///
+/// The shared `parse_zone_changed_this_turn_suffix` keeps `opt(" this turn")`
+/// for its existing callers, but it always yields a `ZoneChangedThisTurn`
+/// result — so the pool path requires the time phrase instead of inheriting a
+/// predicate the card did not print.
+#[test]
+fn pool_qualifier_without_a_time_phrase_declines() {
+    let line = "Once during each of your turns, you may cast a creature spell from among \
+                cards in your graveyard that were put there from your library.";
+    let parsed = parse(line, "Synthetic Timeless Pool");
+
     assert!(
-        properties_of(affected).contains(&FilterProp::ZoneChangedThisTurn {
-            from: Some(Zone::Library),
-            to: Some(Zone::Graveyard),
-        }),
-        "Kagha's pool is cards put into the graveyard from the LIBRARY this turn; got {:?}",
-        properties_of(affected)
+        !parsed
+            .statics
+            .iter()
+            .any(|def| matches!(def.mode, StaticMode::GraveyardCastPermission { .. })),
+        "an unlimited pool must not be narrowed to \"this turn\"; got {:?}",
+        parsed.statics
     );
+    assert_refused_by_the_static_parser(&parsed, line);
 }
 
 /// Positive reach guard for a DECLINE row: prove the line actually reached the
@@ -413,6 +453,59 @@ fn kagha_composite_filter_pool_is_enforced_at_runtime() {
         !castable.contains(&stale),
         "a card that did not arrive from the library this turn is excluded — the \
          And-wrapped pool props must constrain the Or[Land, Permanent] union"
+    );
+}
+
+/// CR 400.7: the multi-hop row — the shared `ZoneChangedThisTurn` reading is
+/// CURRENT-INCARNATION, not any-record.
+///
+/// `bounced` reaches the graveyard from the battlefield, leaves for the hand,
+/// and is discarded back into the graveyard, all in one turn. Its current
+/// residency came from the HAND, so Banon must offer it. The engine keeps one
+/// `ObjectId` across zone changes (measured: graveyard→hand→graveyard leaves
+/// two records under one id), so an any-record reading still sees the stale
+/// battlefield→graveyard row and wrongly excludes it.
+///
+/// The same stale row is wrong in the opposite direction for the affirmative
+/// form, which is why the reading was fixed for the whole family rather than
+/// only for the negated one: Faith's Reward would RETURN this card.
+#[test]
+fn banon_reads_the_current_incarnation_not_a_stale_earlier_hop() {
+    let mut scenario = GameScenario::new();
+    scenario
+        .add_creature_from_oracle(P0, "Banon, the Returners' Leader", 1, 3, BANON_ORACLE)
+        .id();
+    let bounced = scenario
+        .add_creature_to_graveyard(P0, "Recurring Bear", 2, 2)
+        .id();
+    let mut runner = scenario.build();
+
+    // Hop 1: died. Hop 2: returned to hand. Hop 3: discarded.
+    record_arrival(runner.state_mut(), bounced, Zone::Battlefield);
+    let mut hop = runner.state().objects[&bounced].snapshot_for_zone_change(
+        bounced,
+        Some(Zone::Graveyard),
+        Zone::Hand,
+    );
+    engine::game::restrictions::record_zone_change(runner.state_mut(), &mut hop);
+    record_arrival(runner.state_mut(), bounced, Zone::Hand);
+
+    // Reach guard: the stale battlefield→graveyard row really is still present,
+    // so this row measures the READING and not a missing record.
+    assert!(
+        runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .any(|r| r.object_id == bounced && r.from_zone == Some(Zone::Battlefield)),
+        "the stale battlefield hop must still be on the ledger for this row to mean anything"
+    );
+
+    assert!(
+        spell_objects_available_to_cast(runner.state(), P0).contains(&bounced),
+        "the card's CURRENT graveyard residency came from the hand, so Banon offers \
+         it — an any-record reading would see the earlier battlefield hop and \
+         wrongly exclude it (CR 400.7)"
     );
 }
 

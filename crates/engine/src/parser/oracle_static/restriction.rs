@@ -2260,23 +2260,32 @@ const GRAVEYARD_POOL_ANCHOR: &str = " from among cards in your graveyard";
 /// The pool anchor is tried FIRST and kept explicit so a future widening of
 /// either literal cannot make the bare anchor shadow the qualified one.
 ///
-/// `None` is a REFUSAL, not "some other shape": it is returned when a
-/// provenance qualifier is printed but unmodeled. Leaving such a qualifier in
-/// `trailing` for the downstream strict-consumption checks is NOT sufficient —
-/// measured on Raul, Trouble Shooter, whose "that were milled this turn" tail
-/// was consumed by the permission-condition fallback and produced a permission
-/// over the WHOLE graveyard (CR 608.2c: strictly more permissive than printed).
+/// `None` is a REFUSAL, not "some other shape". Two causes:
+///   * a provenance qualifier is printed but unmodeled. Leaving it in `trailing`
+///     is NOT sufficient — measured on Raul, Trouble Shooter, whose "that were
+///     milled this turn" tail was consumed by the permission-condition fallback
+///     and produced a permission over the WHOLE graveyard (CR 608.2c).
+///   * the pool phrase is followed by rules-bearing text. The only
+///     strict-consumption gate downstream fires when a destination rider is
+///     present (`graveyard_destination_replacement.is_some()`), so a
+///     pool-anchored line carrying a cost or other rider would emit a permission
+///     with that rider dropped. No printed card in this class carries one, so
+///     requiring a punctuation-only tail costs no coverage and closes the hole
+///     for BOTH callers — including the disjunctive one, which discards its
+///     branch remainder entirely.
 fn split_graveyard_permission_anchor(rest: &str) -> Option<(&str, &str, Vec<FilterProp>)> {
     if let Ok((_, (filter_text, after))) =
         nom_primitives::split_once_on(rest, GRAVEYARD_POOL_ANCHOR)
     {
-        return match read_graveyard_pool_qualifier(after) {
-            GraveyardPoolQualifier::Unmodeled => None,
-            GraveyardPoolQualifier::Absent => Some((filter_text, after, Vec::new())),
-            GraveyardPoolQualifier::Parsed(props, consumed) => {
-                Some((filter_text, &after[consumed..], props))
-            }
+        let (trailing, props) = match read_graveyard_pool_qualifier(after) {
+            GraveyardPoolQualifier::Unmodeled => return None,
+            GraveyardPoolQualifier::Absent => (after, Vec::new()),
+            GraveyardPoolQualifier::Parsed(props, consumed) => (&after[consumed..], props),
         };
+        if !is_punctuation_only(trailing) {
+            return None;
+        }
+        return Some((filter_text, trailing, props));
     }
     nom_primitives::split_once_on(rest, " from your graveyard")
         .ok()
@@ -2636,25 +2645,59 @@ fn try_parse_disjunctive_graveyard_cast_permission(
     // ("from among cards in your graveyard that were put there from your library
     // this turn" — Kagha, Shadow Archdruid) also yields the provenance
     // properties that narrow the pool.
-    let (spell_branch, pool_props) = strip_graveyard_zone_anchor(spell_branch)?;
+    let (spell_branch, spell_trailing, spell_props) =
+        split_graveyard_permission_anchor(spell_branch)?;
+    // CR 608.2c: a branch remainder carrying rules-bearing text would be
+    // discarded here (this helper keeps no rider machinery, unlike the direct
+    // caller), so refuse rather than drop it.
+    if !is_punctuation_only(spell_trailing) {
+        return None;
+    }
+    let spell_branch = spell_branch.trim();
 
     // The land branch optionally carries its own zone anchor (Serra form); strip
     // it when present so the bare filter phrase reaches the filter parser. A
     // branch with NO anchor keeps its text unchanged; a branch whose anchor
     // carries an unmodeled qualifier declines the whole permission rather than
     // dropping it (CR 608.2c).
-    let (land_branch, land_pool_props) = match strip_graveyard_zone_anchor(land_branch) {
-        Some(stripped) => stripped,
-        None if branch_states_a_graveyard_anchor(land_branch) => return None,
-        None => (land_branch, Vec::new()),
-    };
+    let (land_branch, land_props, land_states_its_own_anchor) =
+        match split_graveyard_permission_anchor(land_branch) {
+            Some((before, trailing, props)) => {
+                if !is_punctuation_only(trailing) {
+                    return None;
+                }
+                (before.trim(), props, true)
+            }
+            None if branch_states_a_graveyard_anchor(land_branch) => return None,
+            None => (land_branch, Vec::new(), false),
+        };
 
     let land_filter = parse_graveyard_branch_filter(land_branch)?;
     let spell_filter = parse_graveyard_branch_filter(spell_branch)?;
 
+    // CR 608.2c: a qualifier printed on ONE branch scopes THAT branch. ANDing
+    // both branches' qualifiers onto the union would require a card satisfying
+    // either printed alternative to satisfy BOTH — narrower than the card.
+    //
+    // The one case where the spell branch's qualifier legitimately governs the
+    // land branch too is when the land branch states no anchor of its own, i.e.
+    // the pool phrase is the shared trailing complement of both verbs: Kagha's
+    // "you may play a land or cast a permanent spell from among cards in your
+    // graveyard that were put there from your library this turn" reads with the
+    // pool qualifying the whole disjunction, not the cast half alone.
+    let land_props = if land_states_its_own_anchor {
+        land_props
+    } else {
+        spell_props.clone()
+    };
+    let land_filter = inject_filter_props(land_filter, land_props);
+    let spell_filter = inject_filter_props(spell_filter, spell_props);
+
     // CR 700.6: a land is itself a permanent, so when both branches resolve to
     // the same typed filter (historic land ⊆ historic permanent), collapse the
     // union to that single filter rather than emitting a redundant `Or`.
+    // Compared AFTER each branch's qualifier is attached — collapsing first
+    // would fuse two branches that differ only in their pool.
     let affected = if land_filter == spell_filter {
         land_filter
     } else {
@@ -2662,15 +2705,6 @@ fn try_parse_disjunctive_graveyard_cast_permission(
             filters: vec![land_filter, spell_filter],
         }
     };
-    // CR 400.7: the printed pool provenance applies to the whole permission —
-    // Kagha's "cards in your graveyard that were put there from your library
-    // this turn" governs the land branch and the spell branch alike, because the
-    // qualifier sits on the shared trailing pool phrase, not on either verb.
-    // A per-branch anchor (Serra form) contributes its own properties the same
-    // way; the two sets are AND-combined onto the union.
-    let mut props = pool_props;
-    props.extend(land_pool_props);
-    let affected = inject_filter_props(affected, props);
 
     Some(
         StaticDefinition::new(StaticMode::GraveyardCastPermission {
@@ -2727,14 +2761,6 @@ fn try_parse_unlimited_combined_graveyard_permission(
         .affected(affected)
         .description(text.to_string()),
     )
-}
-
-/// Strip the trailing " from your graveyard" source-zone anchor (plus any
-/// leading whitespace) from a branch phrase, returning the bare filter text.
-/// Returns `None` when the anchor is absent.
-fn strip_graveyard_zone_anchor(branch: &str) -> Option<(&str, Vec<FilterProp>)> {
-    split_graveyard_permission_anchor(branch)
-        .map(|(before, _trailing, props)| (before.trim(), props))
 }
 
 /// CR 601.2a: true when a disjunctive branch names a graveyard source zone at
