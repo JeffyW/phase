@@ -1,15 +1,24 @@
-//! CR 607.2a — the "exiled this way" anaphor keeps its tracked-set pool.
+//! CR 608.2c — the "exiled this way" anaphor keeps its tracked-set pool.
 //!
 //! A `ChooseFromZone` clause that NAMES its own zone reads that zone
 //! (`ZoneChoiceCandidateSource::Direct`). But some clauses name a zone *and*
-//! refer back to the set the same ability just put there — "Choose a nonland
-//! card **exiled this way**". Those are linked-ability references (CR 607.2a):
-//! their printed pool IS the prior tracked set, and a direct scan would offer
-//! every unrelated card sitting in the shared exile zone (CR 400.1).
+//! refer back to the set an earlier instruction of the SAME ability put there —
+//! "Choose a nonland card **exiled this way**". CR 608.2c: a spell's
+//! instructions are followed in the order written, and that second instruction
+//! refers to the first one's result, so its printed pool is the chain's tracked
+//! set.
+//!
+//! Deliberately NOT CR 607.2a. That rule links two SEPARATE abilities printed
+//! on one object (CR 607.1); Author of Shadows and Plargg and Nassari each
+//! carry a single triggered ability whose second sentence refers to its own
+//! first sentence.
 //!
 //! The discriminator is structural, not phrasal: the anaphor lowers to
 //! `TargetFilter::ExiledBySource`, so the lowering keeps `Legacy` whenever the
-//! filter mentions it and emits `Direct` otherwise.
+//! filter mentions it and emits `Direct` otherwise. `ExiledBySource` would
+//! independently reject cards this source never exiled, so what this preserves
+//! is pool PROVENANCE — a pool defined by the instruction rather than
+//! re-derived from the zone.
 //!
 //! This guard exists because the candidate-source change initially flipped
 //! these two cards to `Direct` — caught by reading the card-data parse delta,
@@ -58,7 +67,8 @@ fn candidate_sources(oracle: &str, name: &str, types: &[&str]) -> Vec<ZoneChoice
     found
 }
 
-/// CR 607.2a: "exiled this way" is a linked reference — pool stays the tracked set.
+/// CR 608.2c: "exiled this way" refers to an earlier instruction of the same
+/// ability — pool stays the tracked set.
 #[test]
 fn exiled_this_way_anaphor_keeps_the_tracked_set_pool() {
     for (name, oracle, types) in [
@@ -76,8 +86,9 @@ fn exiled_this_way_anaphor_keeps_the_tracked_set_pool() {
             sources
                 .iter()
                 .all(|s| matches!(s, ZoneChoiceCandidateSource::Legacy)),
-            "{name} chooses from cards exiled THIS WAY (CR 607.2a) — a direct zone \
-             scan would offer every unrelated card in the shared exile zone; got {sources:?}"
+            "{name} chooses from cards exiled THIS WAY — the result of an \
+             earlier instruction of this same ability (CR 608.2c), so the pool \
+             is that instruction's set, not one re-derived from the zone; got {sources:?}"
         );
     }
 }

@@ -6239,14 +6239,25 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             // it had just milled and never the rest of the graveyard.
             //
             // EXCEPT when the filter carries `TargetFilter::ExiledBySource` —
-            // the "exiled this way" anaphor (CR 607.2a linked ability). Those
-            // clauses name a zone AND refer back to the set this same ability
-            // just put there, so the prior tracked set IS their printed pool.
-            // Author of Shadows and Plargg and Nassari are the class: with a
-            // direct scan they would offer every unrelated card sitting in the
-            // shared exile zone (CR 400.1). The `FromTrackedSet` sibling arm
-            // above covers the anaphors that name no zone ("choose one of
-            // them"); `ExiledBySource` covers the ones that do.
+            // the "exiled this way" anaphor. Those clauses name a zone AND
+            // refer back to the set an EARLIER INSTRUCTION OF THIS SAME ABILITY
+            // put there, which is still CR 608.2c (the instructions are
+            // followed in the order written, and the later one refers to the
+            // earlier one's result). Deliberately NOT CR 607.2a: that rule
+            // links two SEPARATE abilities printed on one object (CR 607.1),
+            // whereas Author of Shadows and Plargg and Nassari each carry a
+            // single triggered ability whose second sentence refers to its own
+            // first sentence.
+            //
+            // Keeping `Legacy` here preserves pool PROVENANCE: the printed pool
+            // is "what this instruction exiled", which is exactly the chain's
+            // tracked set. `ExiledBySource` would independently reject cards
+            // this source never exiled, so this is not the difference between
+            // offering unrelated exile and not — it is the difference between a
+            // pool defined by the instruction and one re-derived from the zone.
+            // The `FromTrackedSet` sibling arm above covers the anaphors that
+            // name no zone ("choose one of them"); `ExiledBySource` covers the
+            // ones that do.
             let candidate_source = if super::lower::filter_mentions_exiled_by_source(&filter) {
                 crate::types::ability::ZoneChoiceCandidateSource::Legacy
             } else {
