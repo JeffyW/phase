@@ -8287,6 +8287,105 @@ fn parse_cost_paid_object_reference<'a>(
     Ok((rest, TargetFilter::CostPaidObject))
 }
 
+/// CR 400.7: The origin zone named by a "put there from <zone>" provenance
+/// clause. Factored out of [`parse_zone_changed_this_turn_suffix`] so the
+/// affirmative form and the "anywhere other than" negated form below read the
+/// same zone vocabulary through one production instead of two lists that can
+/// drift apart.
+fn parse_zone_change_origin_zone(input: &str) -> nom::IResult<&str, Zone, OracleError<'_>> {
+    alt((
+        value(Zone::Battlefield, tag("the battlefield")),
+        value(Zone::Graveyard, tag("a graveyard")),
+        value(Zone::Graveyard, tag("your graveyard")),
+        value(Zone::Graveyard, tag("graveyard")),
+        value(Zone::Exile, tag("exile")),
+        value(Zone::Hand, tag("a hand")),
+        value(Zone::Hand, tag("your hand")),
+        value(Zone::Hand, tag("hand")),
+        value(Zone::Library, tag("a library")),
+        value(Zone::Library, tag("your library")),
+        value(Zone::Library, tag("library")),
+    ))
+    .parse(input)
+}
+
+/// CR 400.7 + CR 608.2c: The "that (were|was) put there from …" provenance
+/// clause shared by the affirmative form ("… from your library this turn" —
+/// Kagha, Shadow Archdruid; The Fourteenth Doctor) and the negated form
+/// ("… from anywhere other than the battlefield this turn" — Banon, the
+/// Returners' Leader).
+///
+/// Returns the AND-combined properties the clause states, plus the number of
+/// bytes consumed. The negated form yields TWO properties rather than a lone
+/// `Not`, and both are load-bearing:
+///
+///   * `ZoneChangedThisTurn { from: None, to }` — the card must have arrived in
+///     `to` THIS TURN at all. Without it a card that has sat in the graveyard
+///     since an earlier turn satisfies the `Not` vacuously (it has no
+///     battlefield→graveyard record either), which would widen the printed
+///     "this turn" pool to the whole graveyard.
+///   * `Not(ZoneChangedThisTurn { from: Some(excluded), to })` — the origin
+///     exclusion itself, expressed through the existing general
+///     [`FilterProp::Not`] combinator rather than a negated-origin sibling.
+///
+/// KNOWN LIMITATION, pre-existing and family-wide rather than introduced here:
+/// `FilterProp::ZoneChangedThisTurn` matches if ANY of this turn's records for
+/// the object fits, and this engine keeps one `ObjectId` across zone changes
+/// (CR 400.7's "new object" is modeled by resetting per-zone state, not by
+/// reminting the id). A card that reached the graveyard from the battlefield
+/// EARLIER this turn, left, and returned from another zone therefore still
+/// carries the battlefield record and is excluded. The affirmative form already
+/// ships with the same any-record reading (The Fourteenth Doctor), so both
+/// readings here match the established semantics of the family; making the
+/// reading current-residency-exact is a change to that whole family and belongs
+/// in its own change, not in a card-scoped one.
+pub(crate) fn parse_graveyard_pool_provenance_suffix(
+    input: &str,
+    to: Option<Zone>,
+) -> Option<(Vec<FilterProp>, usize)> {
+    let trimmed = input.trim_start();
+    let offset = input.len() - trimmed.len();
+
+    // CR 608.2c: the negated form is tried first — its "from anywhere other
+    // than " head strictly extends the affirmative "from " head, so the
+    // affirmative production would otherwise match the shorter prefix and leave
+    // "anywhere other than …" as an unconsumed residual.
+    let negated = (
+        tag::<_, _, OracleError<'_>>("that "),
+        alt((tag("were "), tag("was "))),
+        alt((tag("put "), tag("placed "), tag("moved "))),
+        tag("there from anywhere other than "),
+        parse_zone_change_origin_zone,
+        // REQUIRED here, unlike the affirmative production below, which keeps
+        // `opt` for compatibility with the shapes already shipping. Without a
+        // time limiter this production would narrow an unlimited exclusion
+        // ("put there from anywhere other than the battlefield", no "this
+        // turn") to a this-turn pool — under-permissive, and silently so. No
+        // printed card prints the unlimited form; requiring the limiter costs
+        // nothing today and refuses rather than guesses if one appears.
+        tag(" this turn"),
+    )
+        .map(|(_, _, _, _, excluded, _)| excluded)
+        .parse(trimmed);
+
+    if let Ok((rest, excluded)) = negated {
+        return Some((
+            vec![
+                FilterProp::ZoneChangedThisTurn { from: None, to },
+                FilterProp::Not {
+                    prop: Box::new(FilterProp::ZoneChangedThisTurn {
+                        from: Some(excluded),
+                        to,
+                    }),
+                },
+            ],
+            offset + trimmed.len() - rest.len(),
+        ));
+    }
+
+    parse_zone_changed_this_turn_suffix(input, to).map(|(prop, consumed)| (vec![prop], consumed))
+}
+
 pub(crate) fn parse_zone_changed_this_turn_suffix(
     input: &str,
     to: Option<Zone>,
@@ -8298,19 +8397,7 @@ pub(crate) fn parse_zone_changed_this_turn_suffix(
         alt((tag("were "), tag("was "))),
         alt((tag("put "), tag("placed "), tag("moved "))),
         tag("there from "),
-        alt((
-            value(Zone::Battlefield, tag("the battlefield")),
-            value(Zone::Graveyard, tag("a graveyard")),
-            value(Zone::Graveyard, tag("your graveyard")),
-            value(Zone::Graveyard, tag("graveyard")),
-            value(Zone::Exile, tag("exile")),
-            value(Zone::Hand, tag("a hand")),
-            value(Zone::Hand, tag("your hand")),
-            value(Zone::Hand, tag("hand")),
-            value(Zone::Library, tag("a library")),
-            value(Zone::Library, tag("your library")),
-            value(Zone::Library, tag("library")),
-        )),
+        parse_zone_change_origin_zone,
         opt(tag(" this turn")),
     )
         .map(|(_, _, _, _, from, _)| from)
