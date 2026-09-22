@@ -6237,7 +6237,21 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 zone_owner,
                 filter: Some(filter),
                 chooser: chooser.into(),
-                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                // CR 608.2c + CR 608.2d: this clause NAMES its own zone ("a
+                // creature card in your graveyard"), so its candidate pool is
+                // that zone — not whatever set an earlier instruction in the
+                // same chain happened to publish. `Legacy` prefers the chain's
+                // tracked set whenever one exists, which silently substituted
+                // the preceding clause's output for the named zone: Rejoin the
+                // Fight offered only the three cards it had just milled and
+                // never the rest of the graveyard.
+                //
+                // The anaphoric sibling — `FromTrackedSet` above, "choose one of
+                // them" / "a nonland card exiled this way" — keeps `Legacy`
+                // precisely because for those clauses the prior tracked set IS
+                // the printed pool. The AST already draws that distinction, so
+                // the discrimination is structural and needs no phrase matching.
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Direct,
                 reciprocal_role: None,
                 up_to,
                 selection,
