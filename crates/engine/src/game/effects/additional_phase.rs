@@ -321,6 +321,8 @@ mod tests {
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            ability_cost_discount_static_sources: Vec::new(),
         }
     }
 

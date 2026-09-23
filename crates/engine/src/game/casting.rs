@@ -3,10 +3,10 @@ use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, ActivationManaPaymentRestriction,
     AdditionalCost, BoardWideCostModifier, CardPlayMode, CardSelectionMode, CardTypeSetSource,
     CastCostModifier, CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification,
-    CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, EffectKind,
-    FilterProp, GameRestriction, ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope,
-    ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
-    RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
+    CostObjectCount, CostPaidObjectSnapshot, CostReduction, CounterCostSelection, Duration, Effect,
+    EffectKind, FilterProp, GameRestriction, ModalSelectionCondition, ObjectScope, ParsedCondition,
+    PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility,
+    RestrictionExpiry, RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
     TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
 };
 use crate::types::actions::{AlternativeCastDecision, GameAction};
@@ -47,7 +47,8 @@ use super::ability_utils::{
     ability_target_legality_needs_chosen_x, additional_cost_instead_spell_has_legal_targets,
     assign_targets_in_chain, auto_select_targets, auto_select_targets_for_ability,
     begin_target_selection, begin_target_selection_for_ability, build_resolved_from_def,
-    build_target_slots, build_target_slots_for_announcement, compute_unavailable_modes,
+    build_target_assignments_for_ability_with_limit, build_target_slots,
+    build_target_slots_for_announcement, compute_unavailable_modes,
     filter_references_target_player, flatten_targets_in_chain,
     has_legal_target_assignment_for_ability, modal_choice_for_player,
     simple_legal_target_assignment_exists_for_ability, target_constraints_from_modal,
@@ -687,7 +688,11 @@ pub(crate) fn begin_variable_speed_payment(
     let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
     pending.activation_cost = Some(cost);
     pending.activation_ability_index = Some(ability_index);
-    pending.activation_target_selection = target_selection;
+    if matches!(target_selection, ActivationTargetSelection::Settled) {
+        settle_activation_targets(state, &mut pending);
+    } else {
+        pending.activation_target_selection = target_selection;
+    }
     state.pending_cast = Some(Box::new(pending));
     WaitingFor::NamedChoice {
         player,
@@ -22898,7 +22903,13 @@ pub(crate) fn activation_verdict(
         }
     }
     // CR 601.2f: Apply self-referential cost reduction before affordability check.
-    apply_cost_reduction(state, &mut ability_def, player, source_id);
+    apply_cost_reduction_with_pass(
+        state,
+        &mut ability_def,
+        player,
+        source_id,
+        TargetDependentCostPass::Feasibility,
+    );
     let affordability_cost = ability_def
         .cost
         .clone()
@@ -23141,7 +23152,11 @@ pub(super) fn try_finalize_activation_mana_payment(
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
     let mut pending = PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
-    pending.activation_target_selection = target_selection;
+    if matches!(target_selection, ActivationTargetSelection::Settled) {
+        settle_activation_targets(state, &mut pending);
+    } else {
+        pending.activation_target_selection = target_selection;
+    }
     try_finalize_activation_mana_payment_from_root(
         state,
         player,
@@ -23357,7 +23372,13 @@ pub fn handle_activate_ability(
     }
 
     // CR 601.2f: Apply self-referential cost reduction before any cost payment.
-    apply_cost_reduction(state, &mut ability_def, player, source_id);
+    let consumed_discount_sources = apply_cost_reduction_with_pass(
+        state,
+        &mut ability_def,
+        player,
+        source_id,
+        TargetDependentCostPass::Deferred,
+    );
 
     // CR 118.12a: Normalize legacy card-data equip disjunctions before any
     // affordability or detour checks so EffectCost(ChooseOneOf) exports match
@@ -23428,7 +23449,8 @@ pub fn handle_activate_ability(
         let mut unavailable_modes = compute_unavailable_modes(state, source_id, &modal);
         let x_dependent_modal_targets = ability_def.cost.as_ref().is_some_and(|cost| {
             ability_def.mode_abilities.iter().any(|mode| {
-                let resolved = build_resolved_from_def(mode, source_id, player);
+                let mut resolved = build_resolved_from_def(mode, source_id, player);
+                resolved.ability_cost_discount_static_sources = consumed_discount_sources.clone();
                 (casting_costs::extract_x_mana_cost(cost).is_some()
                     || casting_costs::activation_cost_needs_x_choice(&resolved, cost))
                     && ability_target_legality_needs_chosen_x(&resolved, mode.distribute.as_ref())
@@ -23503,6 +23525,7 @@ pub fn handle_activate_ability(
     // `else_ability`, and other typed fields survive into resolution
     // (issue #310 — same root cause as the spell-cast path).
     let mut resolved = build_resolved_from_def(&ability_def, source_id, player);
+    resolved.ability_cost_discount_static_sources = consumed_discount_sources;
     // CR 602.2b -> CR 601.2b: activating an ability follows the spell-announcement rules
     // 601.2b-i identically, so a text-defined, announce-locked X ("where X is <count> as
     // you activate this ability") is measured HERE — at announcement, before targets are
@@ -24601,26 +24624,79 @@ pub(crate) fn loyalty_ability_gains_mana_tax(
         return false;
     }
     let mut probe = ability_def.clone();
-    apply_cost_reduction(state, &mut probe, player, source_id);
+    apply_cost_reduction_with_pass(
+        state,
+        &mut probe,
+        player,
+        source_id,
+        TargetDependentCostPass::Feasibility,
+    );
     !matches!(probe.cost, Some(AbilityCost::Loyalty { .. }))
+}
+
+/// CR 602.2b: Which target-dependent activation-cost pass is evaluating a
+/// rider whose condition reads the activation's targets.
+#[derive(Clone, Copy)]
+pub(crate) enum TargetDependentCostPass<'a> {
+    /// Pre-target feasibility: apply a target-gated rider only if a complete
+    /// legal target assignment exists that includes a qualifying target.
+    Feasibility,
+    /// Announcement: defer target-gated riders until targets are committed.
+    Deferred,
+    /// Post-target authoritative pass against committed targets.
+    Committed(&'a ResolvedAbility),
 }
 
 /// CR 601.2f: Apply self-referential cost reduction/increase to an ability definition's cost.
 /// Mutates `ability_def.cost` in place by `amount_per * count` in `cost_reduction.mode`'s
 /// direction (`Reduce` floors at {0}; `Raise` adds generic mana).
+#[cfg(test)]
 fn apply_cost_reduction(
     state: &GameState,
     ability_def: &mut AbilityDefinition,
     player: PlayerId,
     source_id: ObjectId,
-) {
+) -> Vec<ObjectId> {
+    apply_cost_reduction_with_pass(
+        state,
+        ability_def,
+        player,
+        source_id,
+        TargetDependentCostPass::Deferred,
+    )
+}
+
+fn apply_cost_reduction_with_pass(
+    state: &GameState,
+    ability_def: &mut AbilityDefinition,
+    player: PlayerId,
+    source_id: ObjectId,
+    pass: TargetDependentCostPass<'_>,
+) -> Vec<ObjectId> {
+    let mut consumed_discount_sources = Vec::new();
+    // CR 601.2f + CR 602.2b: the `Committed` pass is a SECOND visit to a cost the
+    // announcement pass already reduced — it exists only to fold in the riders
+    // that `Deferred` had to skip because targets were not yet chosen. Applying a
+    // target-INDEPENDENT modifier here would apply it twice (measured: a targeted
+    // `{4}` ability under Training Grounds paid {0} instead of {2}). So this pass
+    // is restricted to target-dependent riders on BOTH authorities: the self
+    // `CostReduction` below and the `ReduceAbilityCost` statics further down.
+    let only_target_dependent = matches!(pass, TargetDependentCostPass::Committed(_));
     if let Some(ref reduction) = ability_def.cost_reduction {
         // CR 602.2b + CR 601.2f: A conditional flat modification ("costs {N} less/more … if [cond]")
         // applies only when its gate holds at cost-determination time. `None` =
         // unconditional (the "for each" scaling form and all legacy reductions).
-        let condition_met = reduction.condition.as_ref().is_none_or(|cond| {
-            crate::game::restrictions::evaluate_condition(state, player, source_id, cond)
-        });
+        let target_dependent = ability_cost_reduction_is_target_dependent(reduction);
+        let condition_met = if target_dependent {
+            self_cost_reduction_target_gate_satisfied(state, ability_def, player, source_id, pass)
+        } else if only_target_dependent {
+            // Already folded in at announcement; re-applying would double it.
+            false
+        } else {
+            reduction.condition.as_ref().is_none_or(|cond| {
+                crate::game::restrictions::evaluate_condition(state, player, source_id, cond)
+            })
+        };
         if condition_met {
             let count =
                 super::quantity::resolve_quantity(state, &reduction.count, player, source_id);
@@ -24650,7 +24726,15 @@ fn apply_cost_reduction(
     // (active_keyword == None) — so skipping the whole function is equivalent to
     // skipping just the "activated" arm, and clearer.
     if !is_plot_special_action(ability_def) {
-        apply_static_activated_ability_cost_reduction(state, ability_def, player, source_id);
+        apply_static_activated_ability_cost_reduction(
+            state,
+            ability_def,
+            player,
+            source_id,
+            pass,
+            &mut consumed_discount_sources,
+            only_target_dependent,
+        );
     }
 
     // CR 116.2k + CR 702.170: Plot is taken as a special action via a synthesized
@@ -24665,6 +24749,241 @@ fn apply_cost_reduction(
             reduce_special_action_in_ability_cost(state, player, SpecialAction::Plot, cost);
         }
     }
+    consumed_discount_sources
+}
+
+fn ability_cost_reduction_is_target_dependent(reduction: &CostReduction) -> bool {
+    reduction
+        .condition
+        .as_ref()
+        .is_some_and(parsed_condition_reads_targets)
+        || quantity_expr_reads_target_object(&reduction.count)
+}
+
+fn parsed_condition_reads_targets(condition: &ParsedCondition) -> bool {
+    match condition {
+        ParsedCondition::SpellTargetsFilter { .. } => true,
+        ParsedCondition::QuantityComparison { lhs, rhs, .. } => {
+            quantity_expr_reads_target_object(lhs) || quantity_expr_reads_target_object(rhs)
+        }
+        ParsedCondition::And { conditions } | ParsedCondition::Or { conditions } => {
+            conditions.iter().any(parsed_condition_reads_targets)
+        }
+        ParsedCondition::Not { condition } => parsed_condition_reads_targets(condition),
+        _ => false,
+    }
+}
+
+fn quantity_expr_reads_target_object(expr: &QuantityExpr) -> bool {
+    match expr {
+        QuantityExpr::Ref { qty } => quantity_ref_reads_target_object(qty),
+        QuantityExpr::Fixed { .. } => false,
+        QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::UpTo { max: inner }
+        | QuantityExpr::Power {
+            exponent: inner, ..
+        } => quantity_expr_reads_target_object(inner),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
+            exprs.iter().any(quantity_expr_reads_target_object)
+        }
+        QuantityExpr::Difference { left, right } => {
+            quantity_expr_reads_target_object(left) || quantity_expr_reads_target_object(right)
+        }
+    }
+}
+
+fn quantity_ref_reads_target_object(qty: &QuantityRef) -> bool {
+    matches!(
+        qty,
+        QuantityRef::CountersOn {
+            scope: ObjectScope::Target,
+            ..
+        } | QuantityRef::Power {
+            scope: ObjectScope::Target,
+        } | QuantityRef::BasePower {
+            scope: ObjectScope::Target,
+        } | QuantityRef::Intensity {
+            scope: ObjectScope::Target,
+        } | QuantityRef::Toughness {
+            scope: ObjectScope::Target,
+        } | QuantityRef::ObjectManaValue {
+            scope: ObjectScope::Target,
+        } | QuantityRef::ObjectColorCount {
+            scope: ObjectScope::Target,
+        } | QuantityRef::ObjectNameWordCount {
+            scope: ObjectScope::Target,
+        } | QuantityRef::ObjectTypelineComponentCount {
+            scope: ObjectScope::Target,
+        } | QuantityRef::ManaSymbolsInManaCost {
+            scope: ObjectScope::Target,
+            ..
+        }
+    )
+}
+
+fn self_cost_reduction_target_gate_satisfied(
+    state: &GameState,
+    ability_def: &AbilityDefinition,
+    player: PlayerId,
+    source_id: ObjectId,
+    pass: TargetDependentCostPass<'_>,
+) -> bool {
+    match pass {
+        TargetDependentCostPass::Deferred => false,
+        TargetDependentCostPass::Committed(ability) => ability_def
+            .cost_reduction
+            .as_ref()
+            .and_then(|reduction| reduction.condition.as_ref())
+            .is_none_or(|cond| {
+                parsed_condition_satisfied_with_committed_targets(
+                    state, player, source_id, ability, cond,
+                )
+            }),
+        TargetDependentCostPass::Feasibility => {
+            let resolved = build_resolved_from_def(ability_def, source_id, player);
+            target_dependent_modifier_has_legal_qualifying_assignment(
+                state,
+                source_id,
+                player,
+                &resolved,
+                ability_def.cost_reduction.as_ref().and_then(|reduction| {
+                    match &reduction.condition {
+                        Some(ParsedCondition::SpellTargetsFilter { filter }) => Some(filter),
+                        _ => None,
+                    }
+                }),
+            )
+        }
+    }
+}
+
+fn parsed_condition_satisfied_with_committed_targets(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability: &ResolvedAbility,
+    condition: &ParsedCondition,
+) -> bool {
+    match condition {
+        ParsedCondition::SpellTargetsFilter { filter } => {
+            let Some(source_controller) = state.objects.get(&source_id).map(|obj| obj.controller)
+            else {
+                return false;
+            };
+            selected_targets_match_filter(
+                state,
+                source_id,
+                source_controller,
+                ability,
+                filter,
+                false,
+            )
+        }
+        ParsedCondition::And { conditions } => conditions.iter().all(|inner| {
+            parsed_condition_satisfied_with_committed_targets(
+                state, player, source_id, ability, inner,
+            )
+        }),
+        ParsedCondition::Or { conditions } => conditions.iter().any(|inner| {
+            parsed_condition_satisfied_with_committed_targets(
+                state, player, source_id, ability, inner,
+            )
+        }),
+        ParsedCondition::Not { condition } => !parsed_condition_satisfied_with_committed_targets(
+            state, player, source_id, ability, condition,
+        ),
+        _ => restrictions::evaluate_condition(state, player, source_id, condition),
+    }
+}
+
+fn target_dependent_modifier_has_legal_qualifying_assignment(
+    state: &GameState,
+    static_source_id: ObjectId,
+    source_controller: PlayerId,
+    ability: &ResolvedAbility,
+    required_target_filter: Option<&TargetFilter>,
+) -> bool {
+    let Ok(target_slots) = build_target_slots(state, ability) else {
+        return false;
+    };
+    let assignments =
+        build_target_assignments_for_ability_with_limit(state, ability, &target_slots, &[], None);
+    assignments.into_iter().any(|targets| {
+        let mut candidate = ability.clone();
+        assign_targets_in_chain(state, &mut candidate, &targets).is_ok()
+            && required_target_filter.is_none_or(|filter| {
+                selected_targets_match_filter(
+                    state,
+                    static_source_id,
+                    source_controller,
+                    &candidate,
+                    filter,
+                    false,
+                )
+            })
+    })
+}
+
+/// CR 601.2c + CR 602.2b: single authority for the transition from target
+/// selection in progress to settled for activated abilities. Once targets are
+/// committed, target-dependent activation cost modifiers become determinable
+/// and must be folded in before any interactive cost is surfaced.
+pub(crate) fn settle_activation_targets(state: &GameState, pending: &mut PendingCast) {
+    if matches!(
+        pending.activation_target_selection,
+        ActivationTargetSelection::Settled
+    ) {
+        return;
+    }
+    pending.activation_target_selection = ActivationTargetSelection::Settled;
+    apply_deferred_target_dependent_activation_cost_modifiers(state, pending);
+}
+
+fn apply_deferred_target_dependent_activation_cost_modifiers(
+    state: &GameState,
+    pending: &mut PendingCast,
+) {
+    let Some(cost) = pending.activation_cost.clone() else {
+        return;
+    };
+    if pending.activation_ability_index.is_none() {
+        return;
+    }
+    if cost_has_x_in_ability_cost(&cost) {
+        // CR 602.2b: this engine's {X} activation path locks and pays mana before
+        // targets are selected. No corpus card has a target-restricted static
+        // reducer on that shape; fail closed rather than repricing after payment.
+        return;
+    }
+    let mut def = AbilityDefinition::new(pending.ability.kind, pending.ability.effect.clone());
+    def.cost = Some(cost);
+    def.ability_tag = pending.ability.context.ability_tag;
+    def.cost_reduction = pending.ability.activation_cost_reduction.clone();
+    let mut consumed = apply_cost_reduction_with_pass(
+        state,
+        &mut def,
+        pending.ability.controller,
+        pending.object_id,
+        TargetDependentCostPass::Committed(&pending.ability),
+    );
+    if let Some(new_cost) = def.cost {
+        pending.activation_cost = Some(new_cost);
+    }
+    pending
+        .ability
+        .ability_cost_discount_static_sources
+        .append(&mut consumed);
+}
+
+fn cost_has_x_in_ability_cost(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::Mana { cost } => casting_costs::cost_has_x(cost),
+        AbilityCost::Composite { costs } => costs.iter().any(cost_has_x_in_ability_cost),
+        _ => false,
+    }
 }
 
 fn apply_static_activated_ability_cost_reduction(
@@ -24672,6 +24991,9 @@ fn apply_static_activated_ability_cost_reduction(
     ability_def: &mut AbilityDefinition,
     player: PlayerId,
     source_id: ObjectId,
+    pass: TargetDependentCostPass<'_>,
+    consumed_discount_sources: &mut Vec<ObjectId>,
+    only_target_dependent: bool,
 ) {
     // CR 604.1: presence gate — nothing to do unless a printed ReduceAbilityCost
     // static (CR 611.3) OR a duration-scoped continuous ReduceAbilityCost effect
@@ -24698,6 +25020,7 @@ fn apply_static_activated_ability_cost_reduction(
     // abilities" / "that aren't mana abilities" — Suppression Field, Zirda) can
     // skip a mana ability's cost.
     let ability_is_mana = super::mana_abilities::is_mana_ability(ability_def);
+    let ability_def_snapshot = ability_def.clone();
 
     let Some(cost) = ability_def.cost.as_mut() else {
         return;
@@ -24719,12 +25042,24 @@ fn apply_static_activated_ability_cost_reduction(
             if !matches!(def.mode, StaticMode::ReduceAbilityCost { .. }) {
                 continue;
             }
+            if only_target_dependent
+                && !matches!(
+                    def.mode,
+                    StaticMode::ReduceAbilityCost {
+                        targets: Some(_),
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
             // CR 604.1 + CR 109.5: "you control" in the affected filter anchors on the
             // static's current controller, read live from the battlefield object.
             let ctx = super::filter::FilterContext::from_source(state, static_source.id);
             apply_one_reduce_ability_cost(
                 state,
                 cost,
+                &ability_def_snapshot,
                 source_id,
                 player,
                 active_keyword,
@@ -24735,6 +25070,9 @@ fn apply_static_activated_ability_cost_reduction(
                 static_source.id,
                 static_source.controller,
                 &ctx,
+                pass,
+                consumed_discount_sources,
+                None,
             );
         }
     }
@@ -24755,6 +25093,17 @@ fn apply_static_activated_ability_cost_reduction(
             else {
                 continue;
             };
+            if only_target_dependent
+                && !matches!(
+                    reduce_mode,
+                    StaticMode::ReduceAbilityCost {
+                        targets: Some(_),
+                        ..
+                    }
+                )
+            {
+                continue;
+            }
             // CR 608.2c + CR 109.5: "you control" is latched to the installing
             // player captured on the TCE, not the source's current controller.
             let ctx = super::filter::FilterContext::from_source_with_controller(
@@ -24764,6 +25113,7 @@ fn apply_static_activated_ability_cost_reduction(
             apply_one_reduce_ability_cost(
                 state,
                 cost,
+                &ability_def_snapshot,
                 source_id,
                 player,
                 active_keyword,
@@ -24774,6 +25124,9 @@ fn apply_static_activated_ability_cost_reduction(
                 tce.source_id,
                 tce.controller,
                 &ctx,
+                pass,
+                consumed_discount_sources,
+                None,
             );
         }
     }
@@ -24811,6 +25164,7 @@ fn transient_reduce_ability_cost_present(state: &GameState) -> bool {
 fn apply_one_reduce_ability_cost(
     state: &GameState,
     cost: &mut AbilityCost,
+    ability_def: &AbilityDefinition,
     ability_source_id: ObjectId,
     player: PlayerId,
     active_keyword: Option<&'static str>,
@@ -24821,6 +25175,9 @@ fn apply_one_reduce_ability_cost(
     static_source_id: ObjectId,
     static_controller: PlayerId,
     filter_ctx: &super::filter::FilterContext,
+    pass: TargetDependentCostPass<'_>,
+    consumed_discount_sources: &mut Vec<ObjectId>,
+    forced_target_filter: Option<&TargetFilter>,
 ) {
     let StaticMode::ReduceAbilityCost {
         mode,
@@ -24830,6 +25187,8 @@ fn apply_one_reduce_ability_cost(
         dynamic_count,
         exemption,
         activator,
+        targets,
+        frequency,
     } = reduce_mode
     else {
         return;
@@ -24864,6 +25223,42 @@ fn apply_one_reduce_ability_cost(
     }) {
         return;
     }
+    let target_filter = forced_target_filter.or(targets.as_ref());
+    match (target_filter, pass) {
+        (Some(_filter), TargetDependentCostPass::Deferred) => {
+            return;
+        }
+        (Some(filter), TargetDependentCostPass::Committed(ability)) => {
+            if !selected_targets_match_filter(
+                state,
+                static_source_id,
+                static_controller,
+                ability,
+                filter,
+                false,
+            ) {
+                return;
+            }
+        }
+        (Some(filter), TargetDependentCostPass::Feasibility) => {
+            let probe = build_resolved_from_def(ability_def, ability_source_id, player);
+            if !target_dependent_modifier_has_legal_qualifying_assignment(
+                state,
+                static_source_id,
+                static_controller,
+                &probe,
+                Some(filter),
+            ) {
+                return;
+            }
+        }
+        (None, _) => {}
+    }
+    if matches!(frequency, Some(CastFrequency::OncePerTurn))
+        && state.ability_cost_discount_used.contains(&static_source_id)
+    {
+        return;
+    }
     // CR 601.2f + CR 208.1 + CR 113.7: When `dynamic_count` is present the per-unit
     // `amount` is multiplied by the resolved quantity (Agatha of the Vile Cauldron:
     // amount 1 × ~'s power). Resolve against the static's own source so "~'s power"
@@ -24887,6 +25282,15 @@ fn apply_one_reduce_ability_cost(
         }
         CostModifyMode::Raise => increase_generic_in_cost(cost, effective),
         CostModifyMode::Minimum => {}
+    }
+    if matches!(frequency, Some(CastFrequency::OncePerTurn))
+        && matches!(
+            pass,
+            TargetDependentCostPass::Committed(_) | TargetDependentCostPass::Deferred
+        )
+        && !consumed_discount_sources.contains(&static_source_id)
+    {
+        consumed_discount_sources.push(static_source_id);
     }
 }
 

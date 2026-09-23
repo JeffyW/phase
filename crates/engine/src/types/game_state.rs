@@ -19283,6 +19283,18 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub alt_cost_grant_permissions_used: HashSet<ObjectId>,
+    /// CR 118.7 + CR 602.2b: Tracks which once-per-turn activated-ability cost
+    /// discount sources have been used this turn (Professor Hojo, Tezzeret).
+    /// Keyed by the granting source ObjectId and consumed only when the ability
+    /// reaches the stack.
+    ///
+    /// Boxed to preserve the `GameState` stack budget (see
+    /// `types/game_state_size.rs`): this ledger is empty on almost every board,
+    /// and inline it measured `GameState` at 13,840 B against a 13,824 B
+    /// ceiling. Same shape as `public_revealed_cards` / `enduring_story`.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub ability_cost_discount_used: Box<HashSet<ObjectId>>,
     /// CR 601.2a: Tracks once-per-turn `PlayFromExile` permission sources
     /// consumed this turn. Keyed by the granting source's ObjectId.
     #[serde(default)]
@@ -25155,6 +25167,7 @@ impl GameState {
             pending_permanent_type_slot: None,
             hand_cast_free_permissions_used: HashSet::new(),
             alt_cost_grant_permissions_used: HashSet::new(),
+            ability_cost_discount_used: Box::new(HashSet::new()),
             exile_play_permissions_used: HashSet::new(),
             exile_play_single_use_consumed: HashSet::new(),
             exile_cast_permissions_used: HashSet::new(),
@@ -27417,6 +27430,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_permanent_type_slot: _,
         hand_cast_free_permissions_used: _,
         alt_cost_grant_permissions_used: _,
+        ability_cost_discount_used: _,
         exile_play_permissions_used: _,
         exile_play_single_use_consumed: _,
         exile_cast_permissions_used: _,
@@ -27754,6 +27768,7 @@ impl PartialEq for GameState {
             && self.pending_permanent_type_slot == other.pending_permanent_type_slot
             && self.hand_cast_free_permissions_used == other.hand_cast_free_permissions_used
             && self.alt_cost_grant_permissions_used == other.alt_cost_grant_permissions_used
+            && self.ability_cost_discount_used == other.ability_cost_discount_used
             && self.exile_play_permissions_used == other.exile_play_permissions_used
             && self.exile_play_single_use_consumed == other.exile_play_single_use_consumed
             && self.exile_cast_permissions_used == other.exile_cast_permissions_used

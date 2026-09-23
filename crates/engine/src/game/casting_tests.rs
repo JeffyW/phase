@@ -12668,6 +12668,8 @@ fn activated_ability_cost_reduction_applies_to_matching_permanent_type() {
                 dynamic_count: None,
                 exemption: crate::types::statics::ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(TypedFilter {
                 type_filters: vec![TypeFilter::Subtype("Food".to_string())],
@@ -12824,6 +12826,9 @@ fn transient_activation_cost_reduction_hits_only_controlled_artifact_tokens() {
         dynamic_count: None,
         exemption: crate::types::statics::ActivationExemption::None,
         activator: None,
+
+        targets: None,
+        frequency: None,
     };
     let source_filter = TargetFilter::Typed(TypedFilter {
         type_filters: vec![TypeFilter::Artifact],
@@ -12924,6 +12929,9 @@ fn activated_ability_cost_reduction_mana_exemption_skips_mana_abilities() {
                 dynamic_count: None,
                 exemption: crate::types::statics::ActivationExemption::ManaAbilities,
                 activator: Some(crate::types::ability::PlayerFilter::Controller),
+
+                targets: None,
+                frequency: None,
             }),
         );
 
@@ -13026,6 +13034,9 @@ fn activated_ability_cost_reduction_you_activate_keys_off_activator_not_source_c
             // CR 602.2: activator-scoped to the static's controller ("you"),
             // with no `affected` source filter.
             activator: Some(crate::types::ability::PlayerFilter::Controller),
+
+            targets: None,
+            frequency: None,
         }));
 
     // A permanent P0 controls, carrying an activated ability that ANY player may
@@ -13201,6 +13212,8 @@ fn activated_ability_cost_reduction_respects_minimum_mana_floor() {
                 dynamic_count: None,
                 exemption: crate::types::statics::ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::You),
@@ -40574,6 +40587,8 @@ mod loyalty_gate {
                 dynamic_count: None,
                 exemption: ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::new(TypeFilter::Planeswalker).controller(ControllerRef::Opponent),
@@ -40641,6 +40656,9 @@ mod loyalty_gate {
                         dynamic_count: None,
                         exemption: ActivationExemption::None,
                         activator: None,
+
+                        targets: None,
+                        frequency: None,
                     })
                     .affected(TargetFilter::Typed(
                         TypedFilter::new(TypeFilter::Planeswalker)
@@ -40783,6 +40801,8 @@ mod loyalty_gate {
                 dynamic_count: None,
                 exemption: ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::new(TypeFilter::Planeswalker).controller(ControllerRef::Opponent),
@@ -49844,6 +49864,9 @@ fn boom_scholar_reduces_other_permanents_exhaust_ability_cost() {
             dynamic_count: None,
             exemption: crate::types::statics::ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         })
         .affected(TargetFilter::Typed(
             TypedFilter::permanent()
@@ -49970,6 +49993,9 @@ fn skyseer_increases_chosen_name_activated_ability_cost() {
             dynamic_count: None,
             exemption: crate::types::statics::ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         })
         .affected(TargetFilter::HasChosenName)]
         .into();
@@ -50096,6 +50122,9 @@ fn eidolon_of_obstruction_taxes_opponent_loyalty_ability() {
             dynamic_count: None,
             exemption: crate::types::statics::ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         })
         .affected(TargetFilter::Typed(
             TypedFilter::new(TypeFilter::Planeswalker).controller(ControllerRef::Opponent),
@@ -50258,6 +50287,9 @@ fn agatha_dynamic_power_reduces_controlled_creature_ability_cost() {
             }),
             exemption: crate::types::statics::ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         })
         .affected(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::You),
@@ -50528,6 +50560,8 @@ fn agatha_reduced_creature_ability_activates_via_production_path() {
                 }),
                 exemption: crate::types::statics::ActivationExemption::None,
                 activator: None,
+                targets: None,
+                frequency: None,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::You),
@@ -51072,6 +51106,9 @@ fn plot_special_action_ignores_generic_activated_ability_cost_modifiers() {
             dynamic_count: None,
             exemption: crate::types::statics::ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         })
     };
     let doc_axis = || {
@@ -51298,6 +51335,9 @@ fn firion_reduces_self_equip_ability_cost() {
             dynamic_count: None,
             exemption: crate::types::statics::ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         })
         .affected(TargetFilter::SelfRef)]
         .into();

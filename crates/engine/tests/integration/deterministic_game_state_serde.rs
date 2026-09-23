@@ -231,6 +231,15 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         game_state,
         "GameState",
         None,
+        "ability_cost_discount_used",
+        "Box<HashSet>",
+        Classification::Canonical(HASH_SET),
+    );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
         "public_revealed_cards",
         "Box<HashSet>",
         Classification::Canonical(HASH_SET),

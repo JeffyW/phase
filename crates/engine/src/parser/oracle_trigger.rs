@@ -14284,6 +14284,10 @@ fn try_parse_event(
                 SimpleEvent::BecomesTargetAbility,
                 tag("becomes the target of an ability"),
             ),
+            value(
+                SimpleEvent::BecomesTargetAbility,
+                tag("become the target of an activated ability"),
+            ),
             // CR 702.26c: "phases in" / "phase in" — phasing trigger.
             value(SimpleEvent::PhasesIn, tag("phases in")),
             value(SimpleEvent::PhasesIn, tag("phase in")),

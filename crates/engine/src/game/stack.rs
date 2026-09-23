@@ -3720,6 +3720,8 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        activation_cost_reduction: _,
+        ability_cost_discount_static_sources: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller,
@@ -3951,6 +3953,8 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        activation_cost_reduction: _,
+        ability_cost_discount_static_sources: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
@@ -4162,6 +4166,8 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        activation_cost_reduction: _,
+        ability_cost_discount_static_sources: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
@@ -4695,6 +4701,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         mode_abilities: a_mode_abilities,
         parent_target_missing_reason: a_parent_target_missing_reason,
         selected_target_incarnations: a_selected_target_incarnations,
+        activation_cost_reduction: a_activation_cost_reduction,
+        ability_cost_discount_static_sources: a_ability_cost_discount_static_sources,
         illegal_target_slots: a_illegal_target_slots,
     } = a;
     let ResolvedAbility {
@@ -4769,6 +4777,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         mode_abilities: b_mode_abilities,
         parent_target_missing_reason: b_parent_target_missing_reason,
         selected_target_incarnations: b_selected_target_incarnations,
+        activation_cost_reduction: b_activation_cost_reduction,
+        ability_cost_discount_static_sources: b_ability_cost_discount_static_sources,
         illegal_target_slots: b_illegal_target_slots,
     } = b;
 
@@ -4783,6 +4793,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         && a_selected_target_incarnations == b_selected_target_incarnations
         // CR 608.2b: the resolution legality stamp participates for the same
         // reason — agreement with the derived `PartialEq`.
+        && a_activation_cost_reduction == b_activation_cost_reduction
+        && a_ability_cost_discount_static_sources == b_ability_cost_discount_static_sources
         && a_illegal_target_slots == b_illegal_target_slots
         && a_controller == b_controller
         && a_scoped_player == b_scoped_player

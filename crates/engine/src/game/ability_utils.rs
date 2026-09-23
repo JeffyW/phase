@@ -152,6 +152,7 @@ pub fn build_resolved_from_def_with_targets(
     let mut resolved =
         ResolvedAbility::new(*def.effect.clone(), targets, source_id, controller).kind(def.kind);
     resolved.context.ability_tag = def.ability_tag;
+    resolved.activation_cost_reduction = def.cost_reduction.clone();
     if let Some(sub) = &def.sub_ability {
         resolved = resolved.sub_ability(build_resolved_from_def(sub, source_id, controller));
     }
@@ -7319,7 +7320,7 @@ fn build_target_assignments(
     }
 }
 
-fn build_target_assignments_for_ability_with_limit(
+pub(crate) fn build_target_assignments_for_ability_with_limit(
     state: &GameState,
     ability: &ResolvedAbility,
     target_slots: &[TargetSelectionSlot],

@@ -17575,6 +17575,9 @@ fn static_reduce_ability_cost_ninjutsu() {
                 exemption: _,
                 // CR 602.2: "abilities you activate" is activator-scoped.
                 activator: Some(PlayerFilter::Controller),
+
+                targets: None,
+                frequency: None,
             } if keyword == "ninjutsu"
         ),
         "Expected ReduceAbilityCost {{ keyword: ninjutsu, amount: 1 }}, got {:?}",
@@ -17599,6 +17602,9 @@ fn static_reduce_equip_abilities_with_object_qualifier() {
             exemption: ActivationExemption::None,
             // CR 602.2: "abilities you activate" is activator-scoped.
             activator: Some(PlayerFilter::Controller),
+
+            targets: None,
+            frequency: None,
         }
     );
 }
@@ -24159,6 +24165,9 @@ fn static_reduce_activated_ability_cost_generic() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
 }
@@ -24179,6 +24188,9 @@ fn static_reduce_activated_ability_cost_generic_with_minimum() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
 }
@@ -24199,6 +24211,9 @@ fn static_reduce_activated_ability_cost_enchanted_artifact_with_minimum() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     assert!(matches!(
@@ -24223,6 +24238,9 @@ fn static_reduce_activated_ability_cost_equipped_artifact_with_minimum() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     assert!(matches!(
@@ -24252,6 +24270,9 @@ fn static_reduce_exhaust_ability_cost_other_permanents() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     // "other ... you control" must exclude the source permanent (CR 109.5).
@@ -24305,6 +24326,9 @@ fn static_activated_ability_cost_increase_chosen_name() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     assert_eq!(
@@ -24335,6 +24359,9 @@ fn static_loyalty_ability_cost_increase_eidolon_of_obstruction() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     assert!(
@@ -24387,6 +24414,9 @@ fn static_activated_ability_cost_opponent_activator_scope() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: Some(PlayerFilter::Opponent),
+
+            targets: None,
+            frequency: None,
         },
     );
 
@@ -24407,6 +24437,9 @@ fn static_activated_ability_cost_opponent_activator_scope() {
             dynamic_count: None,
             exemption: ActivationExemption::ManaAbilities,
             activator: Some(PlayerFilter::Opponent),
+
+            targets: None,
+            frequency: None,
         },
     );
 
@@ -24474,6 +24507,9 @@ fn static_possessive_equip_ability_cost_reduction_self_ref() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     assert_eq!(
@@ -24496,6 +24532,9 @@ fn static_reduce_ability_cost_registry_round_trip_preserves_direction() {
             dynamic_count: None,
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         };
         let encoded = original.to_string();
         let decoded = encoded
@@ -24538,6 +24577,9 @@ fn static_reduce_activated_ability_cost_dynamic_power() {
             }),
             exemption: ActivationExemption::None,
             activator: None,
+
+            targets: None,
+            frequency: None,
         }
     );
     match &def.affected {

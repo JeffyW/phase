@@ -5424,8 +5424,7 @@ pub(crate) fn finish_target_selected_activated_ability_at_payment_boundary(
     mut pending: PendingCast,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    pending.activation_target_selection =
-        crate::types::game_state::ActivationTargetSelection::Settled;
+    super::casting::settle_activation_targets(state, &mut pending);
     finish_activated_ability_at_payment_boundary(state, player, pending, events)
 }
 
@@ -6338,7 +6337,11 @@ pub(super) fn push_activated_ability_to_stack(
         pending_interactive.activation_cost = Some(cost.clone());
         pending_interactive.activation_ability_index = Some(ability_index);
         pending_interactive.pending_loyalty_activation_player = pending_loyalty_activation_player;
-        pending_interactive.activation_target_selection = target_selection;
+        if matches!(target_selection, ActivationTargetSelection::Settled) {
+            super::casting::settle_activation_targets(state, &mut pending_interactive);
+        } else {
+            pending_interactive.activation_target_selection = target_selection;
+        }
         pending_interactive.activation_trigger_collection = activation_trigger_collection.clone();
         if let Some(waiting_for) = surface_next_unpaid_interactive_activation_cost(
             state,
@@ -6422,7 +6425,11 @@ pub(super) fn push_activated_ability_to_stack(
             pending.pending_loyalty_activation_player = should_record_loyalty
                 .then_some(player)
                 .or(pending_loyalty_activation_player);
-            pending.activation_target_selection = target_selection;
+            if matches!(target_selection, ActivationTargetSelection::Settled) {
+                super::casting::settle_activation_targets(state, &mut pending);
+            } else {
+                pending.activation_target_selection = target_selection;
+            }
             pending.activation_trigger_collection = activation_trigger_collection.clone();
             if let Some(pending) = attach_pending_cast_to_cost_move(state, Box::new(pending)) {
                 state.pending_cast = Some(pending);
@@ -6566,6 +6573,7 @@ pub(super) fn push_ability_entry(
 
     // CR 603.4: Stamp the printed-ability index for per-turn resolution tracking.
     resolved.ability_index = Some(ability_index);
+    let consumed_discount_sources = resolved.ability_cost_discount_static_sources.clone();
     stack::push_to_stack(
         state,
         StackEntry {
@@ -6585,6 +6593,9 @@ pub(super) fn push_ability_entry(
     }
 
     restrictions::record_ability_activation(state, source_id, ability_index);
+    for discount_source in consumed_discount_sources {
+        state.ability_cost_discount_used.insert(discount_source);
+    }
     // CR 117.1b: Priority permits unbounded activation. `pending_activations`
     // is a per-priority-window AI-guard — see `GameState::pending_activations`.
     state.pending_activations.push((source_id, ability_index));

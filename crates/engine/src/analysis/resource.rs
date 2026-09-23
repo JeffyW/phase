@@ -13244,6 +13244,9 @@ mod tests {
             dynamic_count,
             exemption: Default::default(),
             activator: None,
+
+            targets: None,
+            frequency: None,
         };
         assert!(
             !cover_with_static_on_stable(reduce(Some(object_count_ref()))),

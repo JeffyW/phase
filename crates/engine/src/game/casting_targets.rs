@@ -408,7 +408,7 @@ pub(crate) fn handle_select_targets(
 
     if pending.activation_ability_index.is_some() {
         pending.ability = ability;
-        pending.activation_target_selection = ActivationTargetSelection::Settled;
+        super::casting::settle_activation_targets(state, &mut pending);
         if !target_first_activation_defers_interactive_costs_to_payment_boundary(
             &pending,
             TargetFirstPaymentHandoff::BeforeManaPayment,
@@ -524,7 +524,7 @@ pub(crate) fn handle_choose_target(
 
             if pending.activation_ability_index.is_some() {
                 pending.ability = ability;
-                pending.activation_target_selection = ActivationTargetSelection::Settled;
+                super::casting::settle_activation_targets(state, &mut pending);
                 if !target_first_activation_defers_interactive_costs_to_payment_boundary(
                     &pending,
                     TargetFirstPaymentHandoff::BeforeManaPayment,
