@@ -16398,14 +16398,23 @@ fn handle_play_land(
     let in_hand = player_data.hand.contains(&object_id);
     // CR 305.1 + CR 604.2: Check graveyard for play-from-graveyard permission
     // CR 604.2: Find graveyard play permission source (if any) for once-per-turn tracking.
-    let gy_permission_source = if player_data.graveyard.contains(&object_id) {
+    //
+    // DELIBERATELY NOT PRE-GATED on the acting player's OWN graveyard. CR 601.2a:
+    // a `PlayFromExile` grant names the player it authorizes, not the card's
+    // owner, so a land milled from an opponent's library can be inside the
+    // printed permission. `graveyard_lands_playable_by_permission` is the single
+    // authority for that question and already answers it across every graveyard
+    // (see `non_owner_graveyard_play_from_exile_grants`), so an owner test here
+    // is redundant with the lookup it guards and only makes the two DISAGREE:
+    // discovery would offer the land and this gate would reject the submitted
+    // action. That mismatch is the same defect the cast surface had in the
+    // opposite direction, where the gate admitted what discovery never offered.
+    // `an_opponent_owned_milled_land_is_offered_and_playable` pins the pair.
+    let gy_permission_source =
         super::casting::graveyard_lands_playable_by_permission(state, player)
             .iter()
             .find(|(obj_id, _)| *obj_id == object_id)
-            .map(|(_, source_id)| *source_id)
-    } else {
-        None
-    };
+            .map(|(_, source_id)| *source_id);
     let in_graveyard_with_permission = gy_permission_source.is_some();
 
     // CR 401.5 + CR 305.1: Check top of library for

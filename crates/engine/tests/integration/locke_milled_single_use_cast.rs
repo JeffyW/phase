@@ -1,4 +1,4 @@
-//! CR 601.2a + CR 608.2g + CR 611.2a: Locke, Treasure Hunter — a
+//! CR 601.2a + CR 611.2a: Locke, Treasure Hunter — a
 //! duration-scoped cast permission over a MILLED batch, capped at one.
 //!
 //! Locke is the first shipped card to pair a non-exile pool with a serialized
@@ -499,6 +499,91 @@ fn locke_grants_a_single_use_cast_until_end_of_turn() {
 /// been installed, which is exactly how this class of test goes green against a
 /// broken engine.
 ///
+/// CR 305.1 + CR 601.2a: a land milled from an OPPONENT's library is offered by
+/// the land-play surface and the submitted action succeeds.
+///
+/// The cast fix's land companion had the same defect in the opposite direction.
+/// Discovery (`graveyard_lands_playable_by_permission`) was widened to see
+/// cross-owner grants, but the admission gate in `engine.rs` pre-checked
+/// `player_data.graveyard.contains(&object_id)` — the ACTING player's own
+/// graveyard — before consulting that authority. So the land appeared in legal
+/// actions and was rejected when submitted: an offer the engine would not honor,
+/// which is the mirror image of the cast bug where the engine would have honored
+/// an action it never offered. The owner test was redundant with the lookup it
+/// guarded, because that lookup already answers the permission question for every
+/// graveyard.
+///
+/// BOTH HALVES ARE ASSERTED, and that pairing is the point — either one alone
+/// passes while the two disagree.
+///
+/// Uses a `mode: Play` grant over a cross-owner mill, which is the general shape:
+/// CR 701.17a puts each milled card into ITS OWNER'S graveyard, so a grant over
+/// "those cards" necessarily spans graveyards as soon as more than one player
+/// mills. Locke's own grant is `mode: Cast` and so can never reach the land path,
+/// which is why the land half needs its own carrier.
+#[test]
+fn an_opponent_owned_milled_land_is_offered_and_playable() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Cross-Owner Mill Source",
+            1,
+            1,
+            "Whenever this creature attacks, each player mills a card. You may play \
+             a land from among those cards this turn.",
+        )
+        .id();
+    let their_land = scenario
+        .add_spell_to_library_top(P1, "Their Milled Land", false)
+        .as_land()
+        .id();
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(source, AttackTarget::Player(P1))])
+        .expect("the source must be able to attack");
+    runner.advance_until_stack_empty();
+    advance_past_combat(&mut runner);
+
+    // Reach guards: the land really is in the OPPONENT's graveyard carrying a
+    // live `mode: Play` grant. Without these the assertions below could pass over
+    // an empty set or over a card the acting player already owns.
+    assert_eq!(
+        (
+            zone_of(&runner, their_land),
+            runner.state().objects[&their_land].owner
+        ),
+        (Zone::Graveyard, P1),
+        "reach guard: the land under test must be opponent-OWNED and in the \
+         opponent's graveyard"
+    );
+
+    // Half 1 — discovery offers it.
+    assert!(
+        engine::game::casting::graveyard_lands_playable_by_permission(runner.state(), P0)
+            .iter()
+            .any(|(id, _)| *id == their_land),
+        "CR 601.2a: a `mode: Play` grant naming this player authorizes the land \
+         wherever it sits, so the land-play sweep must surface it"
+    );
+
+    // Half 2 — the production action gate honors what discovery offered.
+    let card_id = runner.state().objects[&their_land].card_id;
+    runner
+        .act(GameAction::PlayLand {
+            object_id: their_land,
+            card_id,
+        })
+        .expect("an offered land play must be accepted by the action gate");
+    assert_eq!(
+        zone_of(&runner, their_land),
+        Zone::Battlefield,
+        "playing the opponent's milled land must actually move it to the battlefield"
+    );
+}
+
 /// CR 601.2a: the OPPONENT's milled card is a member of the batch and must be
 /// castable through the production pipeline, not merely carry the permission.
 ///

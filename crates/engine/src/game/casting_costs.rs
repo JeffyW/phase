@@ -11086,7 +11086,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     } else {
         None
     };
-    // CR 601.2a + CR 603.7 + CR 611.2a: Capture the tracked-set group of a
+    // CR 601.2a + CR 611.2a: Capture the tracked-set group of a
     // single-use `PlayFromExile` grant authorizing this cast BEFORE the object
     // leaves its source zone for the stack.
     // Consumed after the move (see below) so the grant's one allowed cast is
@@ -11471,7 +11471,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
         )
         .expect("top-of-library cast permission must have an unused ledger slot");
     }
-    // CR 601.2a + CR 603.7 + CR 611.2a: A single-use exile-cast grant is spent
+    // CR 601.2a + CR 611.2a: A single-use exile-cast grant is spent
     // on this cast. Record the group and strip the now-void `PlayFromExile` grant from
     // every other card still in the tracked set so the remaining exiled cards
     // can no longer be cast (Chandra, Hope's Beacon +1: "an instant or sorcery
