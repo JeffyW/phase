@@ -1407,6 +1407,16 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
         &player_data.graveyard,
     ));
 
+    // CR 601.2a: the same object-tagged `PlayFromExile` grant, on a card in
+    // SOMEONE ELSE'S graveyard. Kept as its own pass rather than folded into the
+    // walk above, which is owner-scoped for everything else it discovers; see
+    // `non_owner_graveyard_play_from_exile_grants`.
+    objects.extend(
+        non_owner_graveyard_play_from_exile_grants(state, player, CardPlayMode::Cast)
+            .into_iter()
+            .map(|(obj_id, _source)| obj_id),
+    );
+
     // CR 601.2a + CR 113.6b + CR 118.9: Cards in exile castable via a
     // `StaticMode::ExileCastPermission` static from a battlefield permanent
     // (Maralen, Fae Ascendant). Restricted to cards exiled "with" the source
@@ -1453,6 +1463,61 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
             })
         })
         .collect()
+}
+
+/// CR 601.2a: object-tagged `PlayFromExile` grants on cards sitting in
+/// ANOTHER player's graveyard.
+///
+/// A `PlayFromExile` permission names the player it was granted to
+/// (`granted_to`), and nothing in CR 601.2a ties that player to the card's owner
+/// or to which graveyard the card is in — "you may cast a spell from among those
+/// cards" covers every member of the batch, including cards milled from an
+/// opponent's library (Locke, Treasure Hunter: "each player mills a card").
+///
+/// This exists because the owner-scoped walk in
+/// `graveyard_spell_objects_available_to_cast` is correct for everything ELSE it
+/// discovers — flashback, escape, retrace, and the battlefield-static permission
+/// sources are all properties of the caster's own graveyard — so widening that
+/// walk would change all of them. A separate, permission-gated pass mirrors what
+/// the exile surface already does one screen up in
+/// `spell_objects_available_to_cast`, where an owner-scoped block is followed by
+/// a second block gated on `obj.owner != player` admitting only objects whose
+/// permission authorizes this player.
+///
+/// The admission gate (`castable_from_current_zone`) already had no owner test on
+/// this disjunct, so before this pass existed the two halves disagreed: the
+/// engine would have accepted the cast it never offered.
+fn non_owner_graveyard_play_from_exile_grants(
+    state: &GameState,
+    player: PlayerId,
+    mode: CardPlayMode,
+) -> Vec<(ObjectId, ObjectId)> {
+    let mut results = Vec::new();
+    for other in state.players.iter().filter(|p| p.id != player) {
+        for &obj_id in &other.graveyard {
+            let Some(obj) = state.objects.get(&obj_id) else {
+                continue;
+            };
+            // CR 305.1: a land is played and a spell is cast; the caller's `mode`
+            // decides which surface this is, and the object has to match it.
+            let admitted = match mode {
+                CardPlayMode::Cast => play_from_exile_object_in_cast_path(obj),
+                CardPlayMode::Play => obj
+                    .card_types
+                    .core_types
+                    .contains(&crate::types::card_type::CoreType::Land),
+            };
+            if !admitted {
+                continue;
+            }
+            if let Some((source, _)) =
+                play_from_exile_permission_source(state, obj, player, state.turn_number, Some(mode))
+            {
+                results.push((obj_id, source));
+            }
+        }
+    }
+    results
 }
 
 fn graveyard_spell_objects_available_to_cast(
@@ -5777,6 +5842,18 @@ pub fn graveyard_lands_playable_by_permission(
             results.push((gy_obj_id, source));
         }
     }
+
+    // CR 305.1 + CR 601.2a: the land companion of the cross-owner cast pass. Same
+    // grant, same reason — a `mode: Play` `PlayFromExile` naming this player
+    // authorizes the land wherever it sits, and scanning only this player's own
+    // graveyard hid it. Measured as the same shape as the cast surface rather
+    // than assumed symmetric: the loop above is the identical object-tagged
+    // branch, restricted the identical way.
+    results.extend(non_owner_graveyard_play_from_exile_grants(
+        state,
+        player,
+        CardPlayMode::Play,
+    ));
 
     let sources = graveyard_permission_sources(state, player, Some(CardPlayMode::Play));
     for source in &sources {

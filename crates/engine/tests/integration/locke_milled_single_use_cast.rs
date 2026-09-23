@@ -1,4 +1,4 @@
-//! CR 601.2a + CR 603.7 + CR 608.2g + CR 611.2a: Locke, Treasure Hunter — a
+//! CR 601.2a + CR 608.2g + CR 611.2a: Locke, Treasure Hunter — a
 //! duration-scoped cast permission over a MILLED batch, capped at one.
 //!
 //! Locke is the first shipped card to pair a non-exile pool with a serialized
@@ -154,8 +154,8 @@ fn has_single_use_grant(parsed: &engine::parser::oracle::ParsedAbilities) -> boo
 /// Walk from the declare-attackers step to the postcombat main phase.
 ///
 /// The scenario driver's `advance_to_phase` passes priority in pairs and stops
-/// the moment the engine surfaces something that is not a priority window; CR
-/// 509.1 makes declare-blockers a turn-based action rather than a priority
+/// the moment the engine surfaces something that is not a priority window.
+/// CR 509.1 makes declare-blockers a turn-based action rather than a priority
 /// window, so the walk has to answer it explicitly. No blocks are declared —
 /// this test is about the cast permission, not about combat.
 fn advance_past_combat(runner: &mut GameRunner) {
@@ -181,7 +181,7 @@ fn advance_past_combat(runner: &mut GameRunner) {
     panic!("combat did not reach the postcombat main phase");
 }
 
-/// CR 603.7 + CR 608.2c: the published set is the MILLED batch and nothing else,
+/// The published set is the MILLED batch and nothing else,
 /// and it is published *because* the grant references it.
 ///
 /// Two guarantees in one test, because they share a setup and each is the other's
@@ -262,7 +262,7 @@ fn the_published_set_is_exactly_the_milled_cards_and_excludes_the_treasure() {
     expected.sort();
     assert_eq!(
         members, expected,
-        "CR 608.2c: \"those cards\" is the milled batch — the Treasure created \
+        "\"those cards\" is the milled batch — the Treasure created \
          between the mill and the cast clause is not one of them"
     );
     for treasure in treasures {
@@ -336,7 +336,7 @@ fn a_stated_duration_does_not_leak_into_the_next_clause() {
     );
 }
 
-/// CR 603.7: Locke's grant binds the set THIS resolution published, never an
+/// Locke's grant binds the set THIS resolution published, never an
 /// unrelated earlier one.
 ///
 /// `resolve_tracked_set_sentinel` (`game/targeting.rs`) resolves the
@@ -421,7 +421,7 @@ fn lockes_grant_binds_this_resolutions_set_not_a_stale_published_one() {
     // grant reached the card. Rung 3 would put Locke's grant on the stale card.
     assert!(
         !single_use_grant_durations(&runner, stale).contains(&Duration::UntilEndOfTurn),
-        "CR 603.7: Locke's grant must bind the set its own resolution published — \
+        "Locke's grant must bind the set its own resolution published — \
          finding it on a member of an unrelated earlier set means the sentinel fell \
          through to `latest_tracked_set_id`"
     );
@@ -499,14 +499,78 @@ fn locke_grants_a_single_use_cast_until_end_of_turn() {
 /// been installed, which is exactly how this class of test goes green against a
 /// broken engine.
 ///
-/// NOT PROVEN HERE, and deliberately: that the opponent's milled card is
-/// *offered* at the legal-action surface. It is not, and that is a distinct
-/// pre-existing gap this change does not touch —
-/// `graveyard_spell_objects_available_to_cast` (`game/casting.rs`) scans only
-/// `player_data.graveyard` and then skips `obj.owner != player`, so an
-/// owner-scoped graveyard surface hides every non-owner grant, not just Locke's.
-/// The exile surface has no such restriction. The grant IS correctly installed on
-/// that card (asserted in the sibling test above); only its surfacing is missing.
+/// CR 601.2a: the OPPONENT's milled card is a member of the batch and must be
+/// castable through the production pipeline, not merely carry the permission.
+///
+/// Locke prints "each player mills a card" and then "you may cast a spell from
+/// among **those** cards". Nothing in CR 601.2a ties a granted cast permission to
+/// the card's owner or to which graveyard the card sits in, so the opponent's
+/// milled card is inside the printed permission. Before the discovery fix the
+/// grant was installed on it correctly and never offered:
+/// `graveyard_spell_objects_available_to_cast` scanned only the caster's own
+/// graveyard and then skipped `obj.owner != player`, while the admission gate
+/// `castable_from_current_zone` had no owner test at all — the two halves
+/// disagreed, and the engine would have accepted a cast it never offered.
+///
+/// DISCRIMINATING, and the whole point of the test: it drives the cast through
+/// `runner.cast(...)` off `legal_actions`, so it cannot pass by some other route
+/// that happens to make the card castable. Reverting
+/// `non_owner_graveyard_play_from_exile_grants` fails it at the reach guard with
+/// the card still holding a valid grant.
+#[test]
+fn locke_casts_the_opponents_milled_card_through_the_production_pipeline() {
+    let Milled {
+        mut runner,
+        mine,
+        theirs,
+        ..
+    } = locke_attacks();
+    advance_past_combat(&mut runner);
+
+    // Reach guard: the opponent-owned card is genuinely in the OPPONENT's
+    // graveyard, not somewhere the owner-scoped walk would have found anyway.
+    assert_eq!(
+        (
+            zone_of(&runner, theirs),
+            runner.state().objects[&theirs].owner
+        ),
+        (Zone::Graveyard, P1),
+        "reach guard: the card under test must be an opponent-OWNED card in the \
+         opponent's graveyard, or this proves nothing about the owner boundary"
+    );
+    assert!(
+        can_cast(&runner, theirs),
+        "CR 601.2a: a card milled from the opponent's library is a member of \
+         \"those cards\" and must be offered — the permission names the player, \
+         not the owner"
+    );
+
+    runner.cast(theirs).commit();
+    // CR 601.2a: the card is on the stack as a spell — this is what proves the
+    // production cast pipeline actually moved it, and it has to be checked BEFORE
+    // resolution. CR 608.2n puts a resolved instant/sorcery into its owner's
+    // graveyard, so the post-resolution zone is `Graveyard` again and asserting on
+    // that would be indistinguishable from the card never having been cast.
+    assert_eq!(
+        zone_of(&runner, theirs),
+        Zone::Stack,
+        "the opponent's milled card must reach the stack when cast through the \
+         production pipeline"
+    );
+    runner.advance_until_stack_empty();
+
+    // CR 601.2a: the cap is grant-scoped, not owner-scoped. Spending it on the
+    // opponent's card must close the controller's own card out too.
+    assert!(
+        !can_cast(&runner, mine) && single_use_grant_durations(&runner, mine).is_empty(),
+        "spending the single-use grant on the opponent's milled card must strip \
+         it from the controller's own milled card as well"
+    );
+}
+
+/// NOT PROVEN HERE: that the cap holds across the OWNER boundary at the action
+/// surface as well as in the permission state. That is
+/// `locke_casts_the_opponents_milled_card_through_the_production_pipeline`.
 #[test]
 fn locke_authorizes_exactly_one_cast_from_the_milled_batch() {
     let Milled {

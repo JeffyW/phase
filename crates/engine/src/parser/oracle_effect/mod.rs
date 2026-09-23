@@ -26869,7 +26869,7 @@ fn exiled_cast_target_with_type_gate(rest: &str) -> TargetFilter {
     }
 }
 
-/// CR 608.2c + CR 608.2g + CR 611.2a: what a `from among …` batch anaphor lowers
+/// CR 608.2g + CR 611.2a: what a `from among …` batch anaphor lowers
 /// to, once its printed bound has been paired with the mechanism its grammar
 /// implies.
 ///
@@ -26893,7 +26893,7 @@ enum FromAmongBatchLowering {
     /// reached from the batch-anaphor surfaces (Locke, Treasure Hunter;
     /// Chiss-Goria, Forge Tyrant).
     SingleUseGrant,
-    /// CR 608.2c: no representation carries the printed bound. The caller emits
+    /// No representation carries the printed bound. The caller emits
     /// the honest gap and must NOT substitute a mechanism, because every
     /// substitution available is strictly more permissive than the instruction.
     Refused,
@@ -27121,7 +27121,7 @@ fn from_among_batch_cast_effect(
     }
 }
 
-/// CR 601.2a + CR 603.7 + CR 611.2a: the duration-scoped, capped-at-one grant over
+/// CR 601.2a + CR 611.2a: the duration-scoped, capped-at-one grant over
 /// a chain-published batch.
 ///
 /// Identical in shape to what `try_parse_cast_from_tracked_exile_grant` builds for
@@ -27179,7 +27179,7 @@ fn single_use_tracked_set_cast_grant(
             exiled_by_ability_controller: None,
             mana_spend_permission: None,
             card_filter: parse_cast_type_gate(fragment),
-            // CR 603.7: stamped with the resolving set's id at grant time
+            // Stamped with the resolving set's id at grant time
             // (`grant_permission::resolve`), which is what makes the one-cast
             // budget shared across exactly this batch and no other.
             single_use_group: None,

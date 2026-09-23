@@ -3442,7 +3442,7 @@ fn all_gap_names(oracle: &str, name: &str, types: &[&str]) -> Vec<String> {
     names
 }
 
-/// CR 608.2c + CR 611.2a: every `from among` route whose selected mechanism
+/// CR 611.2a: every `from among` route whose selected mechanism
 /// cannot carry the printed bound refuses the clause, on REAL cards — and the
 /// duration-bearing members of the same family now have a mechanism that can.
 ///
@@ -3493,7 +3493,7 @@ fn real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused() {
             gaps.iter().any(|gap| gap == "unrepresentable_cast_cap"),
             "{name} ({axis}): the printed cap must refuse the clause outright — \
              granting an uncapped permission over the whole batch is strictly \
-             more permissive than the printed instruction (CR 608.2c). gaps = {gaps:?}"
+             more permissive than the printed instruction. gaps = {gaps:?}"
         );
     }
 

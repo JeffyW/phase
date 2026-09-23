@@ -49265,7 +49265,7 @@ fn from_among_batch_cast_driver_refuses_an_unrepresentable_cap_on_every_axis() {
             "{label}: an unrepresentable printed cap must refuse, never downgrade \
              to a driver with no count channel"
         );
-        // CR 608.2c: and a STATED duration does not buy an unrepresentable cap a
+        // And a STATED duration does not buy an unrepresentable cap a
         // promotion either — `single_use` is a budget of ONE, not of `N`.
         assert_eq!(
             lowering_with_stated_duration(mode, without_paying, rest),
@@ -49571,7 +49571,7 @@ fn a_stated_duration_promotes_a_paid_cap_of_one_to_a_single_use_grant() {
          cannot express 'without paying its mana cost'"
     );
 
-    // CR 608.2c: a cap of TWO has no single-use form either — `single_use` is a
+    // A cap of TWO has no single-use form either — `single_use` is a
     // budget of one. March of Reckless Joy and Ashiok keep refusing until the
     // bool becomes a count.
     assert_eq!(
