@@ -323,3 +323,71 @@ fn target_independent_static_is_not_double_applied_after_targets_settle() {
         "control: the untargeted path was already correct and must stay {{2}}"
     );
 }
+
+/// CR 118.7 + CR 115.9b + CR 601.2c: the `Raise` direction of a target-gated
+/// activation-cost static, at RUNTIME rather than in the parsed shape.
+///
+/// Kopala, Warden of Waves taxes an OPPONENT's activated ability that targets a
+/// Merfolk its controller controls. Two legs, because they exercise different
+/// cost carriers:
+///   * a fixed `{2}` cost, which rides `PendingCast::activation_cost`;
+///   * an `{X}` cost, whose mana leg is extracted into `PendingCast::cost` and
+///     has X concretized BEFORE targets settle — still unpaid at that point, so
+///     it is repriceable.
+///
+/// The `{X}` leg is a regression guard for a fail-OPEN defect: an earlier
+/// revision skipped every `{X}` activation in the post-target pass, on the
+/// premise that its mana was already paid. The premise was false, and the skip
+/// was direction-blind, so the opponent dodged the tax outright (CR 118.7
+/// underpayment) instead of merely forgoing a discount.
+///
+/// The non-Merfolk leg is the discriminating control: it proves the tax is
+/// gated on the target clause and not applied blanket.
+#[test]
+fn kopala_taxes_opponent_activation_that_targets_a_protected_merfolk() {
+    const KOPALA_ACTIVATE_HALF: &str = "Abilities your opponents activate that target a Merfolk you control cost {2} more to activate.";
+    const FIXED_TAP: &str = "{2}: Tap target creature.";
+    const X_TAP: &str = "{X}: Tap target creature.";
+
+    /// Mana P0 (the taxed opponent) actually spent.
+    fn paid(ability: &str, x: Option<u32>, target_is_merfolk: bool) -> usize {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        // P1 controls both Kopala and the Merfolk the tax protects.
+        s.add_creature_from_oracle(P1, "Kopala, Warden of Waves", 2, 2, KOPALA_ACTIVATE_HALF);
+        let mut victim = s.add_creature(P1, "Merfolk Trickster", 2, 2);
+        if target_is_merfolk {
+            victim.with_subtypes(vec!["Merfolk"]);
+        }
+        let victim = victim.id();
+        // P0 is the opponent whose activation is taxed.
+        let src = s.add_artifact_from_oracle(P0, "Tapper", ability).id();
+        add_white_mana(&mut s, 8);
+        let mut runner = s.build();
+        let before = mana_pool(&runner);
+        let activation = runner.activate(src, 0);
+        let activation = match x {
+            Some(value) => activation.x(value),
+            None => activation,
+        };
+        activation.target_object(victim).resolve();
+        before - mana_pool(&runner)
+    }
+
+    assert_eq!(
+        paid(FIXED_TAP, None, true),
+        4,
+        "positive guard: a fixed {{2}} activation targeting the protected Merfolk pays {{2}} + the {{2}} tax"
+    );
+    assert_eq!(
+        paid(X_TAP, Some(2), true),
+        4,
+        "an {{X=2}} activation targeting the protected Merfolk pays X + the {{2}} tax - \
+         skipping {{X}} here let the opponent dodge the tax entirely"
+    );
+    assert_eq!(
+        paid(FIXED_TAP, None, false),
+        2,
+        "control: the same activation targeting a NON-Merfolk is untaxed, so the gate discriminates"
+    );
+}

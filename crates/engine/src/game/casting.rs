@@ -24946,20 +24946,45 @@ fn apply_deferred_target_dependent_activation_cost_modifiers(
     state: &GameState,
     pending: &mut PendingCast,
 ) {
-    let Some(cost) = pending.activation_cost.clone() else {
-        return;
-    };
     if pending.activation_ability_index.is_none() {
         return;
     }
-    if cost_has_x_in_ability_cost(&cost) {
-        // CR 602.2b: this engine's {X} activation path locks and pays mana before
-        // targets are selected. No corpus card has a target-restricted static
-        // reducer on that shape; fail closed rather than repricing after payment.
-        return;
-    }
+    // CR 601.2c + CR 601.2f + CR 602.2b: the activation's still-unpaid mana lives
+    // in exactly ONE of two carriers when targets settle, and the Committed
+    // adjustment has to land on whichever one holds it:
+    //
+    //   * `pending.cost` (a `ManaCost`) — the `{X}` path and the hoisted mana-leg
+    //     path extract the mana leg here, leaving `activation_cost` holding only
+    //     the non-mana residual (or nothing at all).
+    //   * `pending.activation_cost` — the ordinary target-first path
+    //     (`{2}: Tap target creature`) keeps the whole cost here with
+    //     `pending.cost == NoCost`.
+    //
+    // So `pending.cost` takes precedence whenever it carries mana: that is the
+    // live leg, and adjusting `activation_cost` instead would silently no-op.
+    //
+    // MEASURED, and the reason this is not an `{X}` carve-out: for `{X}: Tap
+    // target creature` this function is reached with `activation_cost == None`
+    // and `pending.cost == {2}` — X is already concretized but the leg is still
+    // UNPAID, so it can be repriced here. An earlier revision skipped every
+    // `{X}` cost on the stated premise that mana was already paid. That premise
+    // was false, and because the skip was direction-blind it made a cost RAISE
+    // fail OPEN: an opponent activating an `{X}` ability targeting a Merfolk
+    // dodged Kopala's `{2}` tax entirely (CR 118.7 underpayment) rather than
+    // merely forgoing a discount.
+    let mana_leg_is_live = !pending.cost.is_without_paying_mana();
+    let carrier_cost = if mana_leg_is_live {
+        AbilityCost::Mana {
+            cost: pending.cost.clone(),
+        }
+    } else {
+        let Some(cost) = pending.activation_cost.clone() else {
+            return;
+        };
+        cost
+    };
     let mut def = AbilityDefinition::new(pending.ability.kind, pending.ability.effect.clone());
-    def.cost = Some(cost);
+    def.cost = Some(carrier_cost);
     def.ability_tag = pending.ability.context.ability_tag;
     def.cost_reduction = pending.ability.activation_cost_reduction.clone();
     let mut consumed = apply_cost_reduction_with_pass(
@@ -24969,21 +24994,17 @@ fn apply_deferred_target_dependent_activation_cost_modifiers(
         pending.object_id,
         TargetDependentCostPass::Committed(&pending.ability),
     );
-    if let Some(new_cost) = def.cost {
-        pending.activation_cost = Some(new_cost);
+    match def.cost {
+        // CR 118.7: the adjustment is generic mana only, so a `Mana` carrier
+        // stays a `Mana` carrier and is written back to the leg it came from.
+        Some(AbilityCost::Mana { cost }) if mana_leg_is_live => pending.cost = cost,
+        Some(new_cost) if !mana_leg_is_live => pending.activation_cost = Some(new_cost),
+        _ => {}
     }
     pending
         .ability
         .ability_cost_discount_static_sources
         .append(&mut consumed);
-}
-
-fn cost_has_x_in_ability_cost(cost: &AbilityCost) -> bool {
-    match cost {
-        AbilityCost::Mana { cost } => casting_costs::cost_has_x(cost),
-        AbilityCost::Composite { costs } => costs.iter().any(cost_has_x_in_ability_cost),
-        _ => false,
-    }
 }
 
 fn apply_static_activated_ability_cost_reduction(
@@ -25072,7 +25093,6 @@ fn apply_static_activated_ability_cost_reduction(
                 &ctx,
                 pass,
                 consumed_discount_sources,
-                None,
             );
         }
     }
@@ -25126,7 +25146,6 @@ fn apply_static_activated_ability_cost_reduction(
                 &ctx,
                 pass,
                 consumed_discount_sources,
-                None,
             );
         }
     }
@@ -25177,7 +25196,6 @@ fn apply_one_reduce_ability_cost(
     filter_ctx: &super::filter::FilterContext,
     pass: TargetDependentCostPass<'_>,
     consumed_discount_sources: &mut Vec<ObjectId>,
-    forced_target_filter: Option<&TargetFilter>,
 ) {
     let StaticMode::ReduceAbilityCost {
         mode,
@@ -25223,7 +25241,7 @@ fn apply_one_reduce_ability_cost(
     }) {
         return;
     }
-    let target_filter = forced_target_filter.or(targets.as_ref());
+    let target_filter = targets.as_ref();
     match (target_filter, pass) {
         (Some(_filter), TargetDependentCostPass::Deferred) => {
             return;
