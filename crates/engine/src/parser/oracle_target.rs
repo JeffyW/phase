@@ -8309,7 +8309,7 @@ fn parse_zone_change_origin_zone(input: &str) -> nom::IResult<&str, Zone, Oracle
     .parse(input)
 }
 
-/// CR 400.7 + CR 608.2c: The "that (were|was) put there from …" provenance
+/// CR 400.7: The "that (were|was) put there from …" provenance
 /// clause shared by the affirmative form ("… from your library this turn" —
 /// Kagha, Shadow Archdruid; The Fourteenth Doctor) and the negated form
 /// ("… from anywhere other than the battlefield this turn" — Banon, the
@@ -8328,17 +8328,8 @@ fn parse_zone_change_origin_zone(input: &str) -> nom::IResult<&str, Zone, Oracle
 ///     exclusion itself, expressed through the existing general
 ///     [`FilterProp::Not`] combinator rather than a negated-origin sibling.
 ///
-/// KNOWN LIMITATION, pre-existing and family-wide rather than introduced here:
-/// `FilterProp::ZoneChangedThisTurn` matches if ANY of this turn's records for
-/// the object fits, and this engine keeps one `ObjectId` across zone changes
-/// (CR 400.7's "new object" is modeled by resetting per-zone state, not by
-/// reminting the id). A card that reached the graveyard from the battlefield
-/// EARLIER this turn, left, and returned from another zone therefore still
-/// carries the battlefield record and is excluded. The affirmative form already
-/// ships with the same any-record reading (The Fourteenth Doctor), so both
-/// readings here match the established semantics of the family; making the
-/// reading current-residency-exact is a change to that whole family and belongs
-/// in its own change, not in a card-scoped one.
+/// `FilterProp::ZoneChangedThisTurn` reads the object's most recent zone-change
+/// record, so an earlier graveyard visit cannot qualify its current residency.
 pub(crate) fn parse_graveyard_pool_provenance_suffix(
     input: &str,
     to: Option<Zone>,
@@ -8346,7 +8337,7 @@ pub(crate) fn parse_graveyard_pool_provenance_suffix(
     let trimmed = input.trim_start();
     let offset = input.len() - trimmed.len();
 
-    // CR 608.2c: the negated form is tried first — its "from anywhere other
+    // The negated form is tried first — its "from anywhere other
     // than " head strictly extends the affirmative "from " head, so the
     // affirmative production would otherwise match the shorter prefix and leave
     // "anywhere other than …" as an unconsumed residual.

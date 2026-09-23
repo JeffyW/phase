@@ -2217,7 +2217,7 @@ pub(crate) fn try_parse_graveyard_cast_permission(
     Some(def)
 }
 
-/// CR 604.2 + CR 400.7 + CR 608.2c: Outcome of reading the provenance
+/// CR 604.2 + CR 400.7: Outcome of reading the provenance
 /// qualifier that may follow the pool anchor.
 ///
 /// Three states rather than `Option<Vec<_>>` for the same reason the sibling
@@ -2264,7 +2264,7 @@ const GRAVEYARD_POOL_ANCHOR: &str = " from among cards in your graveyard";
 ///   * a provenance qualifier is printed but unmodeled. Leaving it in `trailing`
 ///     is NOT sufficient — measured on Raul, Trouble Shooter, whose "that were
 ///     milled this turn" tail was consumed by the permission-condition fallback
-///     and produced a permission over the WHOLE graveyard (CR 608.2c).
+///     and produced a permission over the WHOLE graveyard.
 ///   * the pool phrase is followed by rules-bearing text. The only
 ///     strict-consumption gate downstream fires when a destination rider is
 ///     present (`graveyard_destination_replacement.is_some()`), so a
@@ -2292,7 +2292,7 @@ fn split_graveyard_permission_anchor(rest: &str) -> Option<(&str, &str, Vec<Filt
         .map(|(_, (filter_text, trailing))| (filter_text, trailing, Vec::new()))
 }
 
-/// CR 400.7 + CR 608.2c: Classify the text following the pool anchor.
+/// CR 400.7: Classify the text following the pool anchor.
 ///
 /// The rule is deliberately inverted from "recognise the qualifiers I know":
 /// anything that is NOT a recognised provenance qualifier and NOT an immediate
@@ -2647,7 +2647,7 @@ fn try_parse_disjunctive_graveyard_cast_permission(
     // properties that narrow the pool.
     let (spell_branch, spell_trailing, spell_props) =
         split_graveyard_permission_anchor(spell_branch)?;
-    // CR 608.2c: a branch remainder carrying rules-bearing text would be
+    // A branch remainder carrying rules-bearing text would be
     // discarded here (this helper keeps no rider machinery, unlike the direct
     // caller), so refuse rather than drop it.
     if !is_punctuation_only(spell_trailing) {
@@ -2659,7 +2659,7 @@ fn try_parse_disjunctive_graveyard_cast_permission(
     // it when present so the bare filter phrase reaches the filter parser. A
     // branch with NO anchor keeps its text unchanged; a branch whose anchor
     // carries an unmodeled qualifier declines the whole permission rather than
-    // dropping it (CR 608.2c).
+    // dropping it.
     let (land_branch, land_props, land_states_its_own_anchor) =
         match split_graveyard_permission_anchor(land_branch) {
             Some((before, trailing, props)) => {
@@ -2675,7 +2675,7 @@ fn try_parse_disjunctive_graveyard_cast_permission(
     let land_filter = parse_graveyard_branch_filter(land_branch)?;
     let spell_filter = parse_graveyard_branch_filter(spell_branch)?;
 
-    // CR 608.2c: a qualifier printed on ONE branch scopes THAT branch. ANDing
+    // A qualifier printed on ONE branch scopes THAT branch. ANDing
     // both branches' qualifiers onto the union would require a card satisfying
     // either printed alternative to satisfy BOTH — narrower than the card.
     //

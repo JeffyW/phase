@@ -17,7 +17,7 @@
 //! CR 400.7: "put there from <zone>" is a zone-change provenance predicate,
 //! carried by `FilterProp::ZoneChangedThisTurn` on the permission's `affected`
 //! filter rather than by a pool axis on the static mode.
-//! CR 608.2c: a printed pool qualifier the parser cannot model must DECLINE the
+//! A printed pool qualifier the parser cannot model must DECLINE the
 //! whole permission — dropping it would offer the entire graveyard, which is
 //! strictly more permissive than the printed instruction.
 //! CR 701.17a: milling is specifically from the TOP of a library, so "milled
@@ -152,7 +152,7 @@ fn banon_pool_qualifier_lowers_to_arrival_plus_origin_exclusion() {
     );
 }
 
-/// CR 400.7 + CR 608.2c: Kagha's affirmative sibling — same anchor, positive
+/// CR 400.7: Kagha's affirmative sibling — same anchor, positive
 /// origin — with the qualifier attached to EACH branch rather than ANDed onto
 /// the union.
 ///
@@ -185,7 +185,7 @@ fn kagha_pool_qualifier_scopes_each_branch_of_the_disjunction() {
     }
 }
 
-/// CR 400.7 + CR 608.2c: an affirmative pool qualifier with NO time phrase is
+/// CR 400.7: an affirmative pool qualifier with NO time phrase is
 /// refused rather than silently narrowed to a this-turn pool.
 ///
 /// The shared `parse_zone_changed_this_turn_suffix` keeps `opt(" this turn")`
@@ -247,7 +247,7 @@ fn assert_refused_by_the_static_parser(parsed: &ParsedAbilities, line: &str) {
     );
 }
 
-/// CR 608.2c + CR 701.17a: the silent-drop guard.
+/// CR 701.17a: the silent-drop guard.
 ///
 /// Raul's pool qualifier ("that were milled this turn") is printed but not
 /// modeled. It must leave the permission UNPARSED. The failure this pins is not
@@ -274,7 +274,7 @@ fn raul_unmodeled_pool_qualifier_declines_instead_of_offering_the_whole_graveyar
     );
 }
 
-/// CR 608.2c + CR 118.9: the second silent-drop guard, on a qualifier shape the
+/// CR 118.9: the second silent-drop guard, on a qualifier shape the
 /// first cut did not even recognise as a qualifier.
 ///
 /// Eye of Duskmantle must stay unsupported. Two clauses would be dropped if it
@@ -303,7 +303,7 @@ fn eye_of_duskmantle_unrecognized_qualifier_shape_declines() {
     );
 }
 
-/// CR 608.2c: the qualifier slot's boundary is a FULL STOP, not any punctuation.
+/// The qualifier slot's boundary is a FULL STOP, not any punctuation.
 ///
 /// An earlier cut also treated `,` and `;` as "the pool phrase ends here", which
 /// is a door that opens the over-permissive way: a qualifier introduced after a
