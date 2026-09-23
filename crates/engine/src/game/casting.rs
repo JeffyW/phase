@@ -24994,12 +24994,38 @@ fn apply_deferred_target_dependent_activation_cost_modifiers(
         pending.object_id,
         TargetDependentCostPass::Committed(&pending.ability),
     );
-    match def.cost {
-        // CR 118.7: the adjustment is generic mana only, so a `Mana` carrier
-        // stays a `Mana` carrier and is written back to the leg it came from.
-        Some(AbilityCost::Mana { cost }) if mana_leg_is_live => pending.cost = cost,
-        Some(new_cost) if !mana_leg_is_live => pending.activation_cost = Some(new_cost),
-        _ => {}
+    // CR 118.7: write the adjustment back to the carrier it was taken from. The
+    // arms are exhaustive on purpose: a catch-all here would be the same
+    // silently-drop-in-one-carrier shape this function exists to remove.
+    if mana_leg_is_live {
+        match def.cost {
+            // The carrier went in as `AbilityCost::Mana`, and every generic-mana
+            // adjuster preserves that wrapper — `increase_generic_in_cost` and
+            // `reduce_generic_in_cost*` mutate `generic` through `&mut` and never
+            // replace the variant, and the `Composite`-building arm of the former
+            // is reachable only for a non-`Mana` input. So the leg comes back out
+            // the shape it went in.
+            Some(AbilityCost::Mana { cost }) => pending.cost = cost,
+            // Not reachable today, and deliberately NOT `unreachable!()`: that
+            // would trade a quiet misprice for a panic in a live game if the
+            // invariant above ever stopped holding. Handle it instead — the
+            // adjusted cost still CONTAINS the original leg, so move the whole
+            // thing to `activation_cost` (the carrier that can express a non-mana
+            // shape), preserving any residual already there, and retire the mana
+            // leg so the price is neither lost nor charged twice.
+            Some(other) => {
+                pending.activation_cost = Some(match pending.activation_cost.take() {
+                    Some(residual) => AbilityCost::Composite {
+                        costs: vec![other, residual],
+                    },
+                    None => other,
+                });
+                pending.cost = ManaCost::NoCost;
+            }
+            None => {}
+        }
+    } else if let Some(new_cost) = def.cost {
+        pending.activation_cost = Some(new_cost);
     }
     pending
         .ability

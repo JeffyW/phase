@@ -348,6 +348,9 @@ fn kopala_taxes_opponent_activation_that_targets_a_protected_merfolk() {
     const KOPALA_ACTIVATE_HALF: &str = "Abilities your opponents activate that target a Merfolk you control cost {2} more to activate.";
     const FIXED_TAP: &str = "{2}: Tap target creature.";
     const X_TAP: &str = "{X}: Tap target creature.";
+    // Both carriers populated at once: the mana leg is extracted into
+    // `PendingCast::cost` while the `{T}` residual stays in `activation_cost`.
+    const X_TAP_AND_TAP: &str = "{X}, {T}: Tap target creature.";
 
     /// Mana P0 (the taxed opponent) actually spent.
     fn paid(ability: &str, x: Option<u32>, target_is_merfolk: bool) -> usize {
@@ -389,5 +392,26 @@ fn kopala_taxes_opponent_activation_that_targets_a_protected_merfolk() {
         paid(FIXED_TAP, None, false),
         2,
         "control: the same activation targeting a NON-Merfolk is untaxed, so the gate discriminates"
+    );
+    // CR 115.9b: the `{X}` carrier needs its OWN negative control. Without it a
+    // regression that made the `pending.cost` path tax blanket - ignoring the
+    // target clause entirely - would still satisfy every assertion above, because
+    // the only other control rides the `activation_cost` carrier. The repaired
+    // carrier is exactly the one whose predecessor failed silently through a full
+    // green suite, so it does not get to be the unpinned one.
+    assert_eq!(
+        paid(X_TAP, Some(2), false),
+        2,
+        "control: an {{X}} activation targeting a NON-Merfolk is untaxed on the pending.cost carrier too"
+    );
+    assert_eq!(
+        paid(X_TAP_AND_TAP, Some(2), true),
+        4,
+        "both carriers populated ({{X}} mana leg + {{T}} residual): the protected Merfolk is still taxed"
+    );
+    assert_eq!(
+        paid(X_TAP_AND_TAP, Some(2), false),
+        2,
+        "control: both carriers populated, NON-Merfolk target, so no tax"
     );
 }
