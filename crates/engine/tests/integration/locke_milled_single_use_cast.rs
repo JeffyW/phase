@@ -499,6 +499,102 @@ fn locke_grants_a_single_use_cast_until_end_of_turn() {
 /// been installed, which is exactly how this class of test goes green against a
 /// broken engine.
 ///
+/// CR 601.3: a printed type restriction stated as a SUFFIX is refused rather
+/// than silently dropped.
+///
+/// The promotion reads the type gate off the cast HEAD (`parse_cast_type_gate`)
+/// and discards the caller's target, which it must — that target carries an
+/// exile-zone leg that is wrong for a milled pool. But
+/// `parse_from_among_exiled_this_way` lifts a SUFFIX gate ("cast a spell from
+/// among the **instant or sorcery** cards exiled this way") into exactly that
+/// discarded target, so the head is bare and the restriction would vanish.
+///
+/// Measured before the guard: that clause promoted to a grant with
+/// `card_filter: None`, authorizing every member of the tracked set regardless
+/// of type — a spell the card does not permit.
+///
+/// ASSERTS THE ABSENCE OF THE GRANT, not a gap name, and the paired row is why.
+/// The identical sentence with a cap of TWO has always taken the long-standing
+/// `Refused` path, and both land on the same generic `effect_structure` gap —
+/// that is a pre-existing property of this sentence shape (the refusing cast
+/// clause takes the whole line down with it), NOT something this guard
+/// introduced. Pinning the gap name would therefore pin unrelated behaviour;
+/// pinning "no grant is installed" pins the widening this guard prevents.
+#[test]
+fn a_suffix_only_type_gate_refuses_instead_of_widening_the_grant() {
+    let suffix_gated = parse_oracle_text(
+        "Exile the top five cards of your library. Until end of turn, you may cast \
+         a spell from among the instant or sorcery cards exiled this way.",
+        "Suffix Gate",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        !has_single_use_grant(&suffix_gated),
+        "CR 601.3: a type restriction the promotion cannot carry must refuse the \
+         clause, never produce an unfiltered grant over the whole tracked set"
+    );
+
+    // The cap-of-two sibling refuses through the pre-existing path. Identical
+    // outcome, which is what establishes that the guard above lands the clause
+    // where this family already lands rather than inventing a failure mode.
+    let cap_two = parse_oracle_text(
+        "Exile the top five cards of your library. Until end of turn, you may cast \
+         up to two spells from among the instant or sorcery cards exiled this way.",
+        "Suffix Gate Cap Two",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        !has_single_use_grant(&cap_two),
+        "the pre-existing refusal path must also install no grant"
+    );
+
+    // DISCRIMINATING CONTROLS. Without these the assertions above would pass if
+    // the promotion had simply stopped working.
+    //
+    // (1) The same clause with NO type restriction still promotes: the guard
+    //     fires on the dropped restriction, not on the `exiled this way` surface.
+    let ungated = parse_oracle_text(
+        "Exile the top five cards of your library. Until end of turn, you may cast \
+         a spell from among the cards exiled this way.",
+        "Ungated",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        has_single_use_grant(&ungated),
+        "control: with no printed type restriction there is nothing to lose, so \
+         the same surface must still promote"
+    );
+
+    // (2) The same restriction stated on the HEAD is recovered by
+    //     `parse_cast_type_gate` and rides on `card_filter`.
+    let head_gated = parse_oracle_text(
+        "Exile the top five cards of your library. Until end of turn, you may cast \
+         an instant or sorcery spell from among them.",
+        "Head Gate",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        has_single_use_grant(&head_gated),
+        "control: a HEAD-stated type restriction must still promote"
+    );
+    assert!(
+        serde_json::to_string(&head_gated)
+            .expect("serializes")
+            .contains("\"Instant\""),
+        "control: the promoted grant must actually CARRY the printed type filter, \
+         or this row would pass on exactly the unfiltered grant the guard exists \
+         to prevent"
+    );
+}
+
 /// CR 305.1 + CR 601.2a: a land milled from an OPPONENT's library is offered by
 /// the land-play surface and the submitted action succeeds.
 ///

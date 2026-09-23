@@ -27103,7 +27103,7 @@ fn from_among_batch_cast_effect(
             return Effect::unimplemented(UNREPRESENTABLE_CAST_CAP_GAP, fragment);
         }
         FromAmongBatchLowering::SingleUseGrant => {
-            return single_use_tracked_set_cast_grant(mode, constraint, fragment);
+            return single_use_tracked_set_cast_grant(mode, constraint, &target, fragment);
         }
     };
     Effect::CastFromZone {
@@ -27148,6 +27148,7 @@ fn from_among_batch_cast_effect(
 fn single_use_tracked_set_cast_grant(
     mode: CardPlayMode,
     constraint: Option<CastPermissionConstraint>,
+    target: &TargetFilter,
     fragment: &str,
 ) -> Effect {
     // CR 601.2a: `CastingPermission::PlayFromExile` has no cast-constraint
@@ -27155,6 +27156,32 @@ fn single_use_tracked_set_cast_grant(
     // into a grant that would silently drop it. Same strict-lowering rule the
     // counted free-cast arm applies for `Effect::FreeCastFromZones`.
     if constraint.is_some() {
+        return Effect::unimplemented(UNREPRESENTABLE_CAST_CAP_GAP, fragment);
+    }
+    // CR 601.3: the printed type restriction can be stated in EITHER of two
+    // places, and this seam reads only one of them. A HEAD gate ("cast an
+    // artifact spell from among them" — Chiss-Goria) is recovered from the
+    // fragment by `parse_cast_type_gate` and becomes `card_filter` below. A
+    // SUFFIX gate ("cast a spell from among the instant or sorcery cards exiled
+    // this way") is lifted by `parse_from_among_exiled_this_way` into the
+    // caller's `target` instead — and the promotion DISCARDS that target,
+    // because it must (the target carries an exile-zone leg that is wrong for a
+    // milled pool; see below).
+    //
+    // Measured: such a clause promoted to a grant with `card_filter: None`,
+    // authorizing every member of the tracked set regardless of type — a spell
+    // the card does not permit. Refuse instead. The gate is stated as "the
+    // discarded target carried a restriction the head did not", not as a list of
+    // shapes, so a new suffix-gate producer inherits the refusal rather than
+    // slipping past it.
+    //
+    // This is a REFUSAL, not a fix: carrying the suffix gate across would mean
+    // stripping its zone leg and re-hosting the rest on `card_filter`, which is
+    // a real capability this seam does not yet have. An honest gap is the
+    // correct landing until it does. No card in the corpus prints this shape
+    // today, so the refusal costs no coverage now and closes the widening.
+    let head_gate = parse_cast_type_gate(fragment);
+    if head_gate.is_none() && !matches!(target, TargetFilter::ExiledBySource) {
         return Effect::unimplemented(UNREPRESENTABLE_CAST_CAP_GAP, fragment);
     }
     Effect::GrantCastingPermission {
@@ -27178,7 +27205,7 @@ fn single_use_tracked_set_cast_grant(
             source_id: None,
             exiled_by_ability_controller: None,
             mana_spend_permission: None,
-            card_filter: parse_cast_type_gate(fragment),
+            card_filter: head_gate,
             // Stamped with the resolving set's id at grant time
             // (`grant_permission::resolve`), which is what makes the one-cast
             // budget shared across exactly this batch and no other.

@@ -3521,10 +3521,12 @@ fn real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused() {
              faithful home in `PlayFromExile {{ single_use: true }}`, so the clause \
              must no longer refuse. gaps = {gaps:?}"
         );
-        assert!(
-            single_use_cast_grant_durations(oracle, name, types).len() == 1,
+        assert_eq!(
+            single_use_cast_grant_durations(oracle, name, types),
+            vec![Duration::UntilEndOfTurn],
             "{name} ({axis}): exactly one single-use cast grant must be installed, \
-             carrying the printed window"
+             carrying the PRINTED window — a `Duration::Permanent` here means the \
+             placeholder was never patched and the grant outlives the card's text"
         );
     }
 }
