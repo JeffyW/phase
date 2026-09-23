@@ -24,11 +24,17 @@
 //! this turn" is not the same predicate as a library→graveyard zone change and
 //! is deliberately NOT approximated by one (Raul, Trouble Shooter stays a gap).
 
-use engine::game::casting::spell_objects_available_to_cast;
+use engine::game::casting::{
+    graveyard_lands_playable_by_permission, spell_objects_available_to_cast,
+};
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::{parse_oracle_text, ParsedAbilities};
 use engine::types::ability::{FilterProp, TargetFilter};
+use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::ManaColor;
+use engine::types::phase::Phase;
 use engine::types::statics::{CastFrequency, StaticMode};
 use engine::types::zones::Zone;
 use engine::types::StaticDefinition;
@@ -360,16 +366,17 @@ fn banon_offers_only_this_turn_non_battlefield_arrivals() {
     let banon = scenario
         .add_creature_from_oracle(P0, "Banon, the Returners' Leader", 1, 3, BANON_ORACLE)
         .id();
-    let milled = scenario
-        .add_creature_to_graveyard(P0, "Milled Bear", 2, 2)
-        .id();
-    let died = scenario
-        .add_creature_to_graveyard(P0, "Fallen Bear", 2, 2)
-        .id();
+    let milled = scenario.add_card_to_library_top(P0, "Milled Bear");
+    let died = scenario.add_creature(P0, "Fallen Bear", 2, 2).id();
     let stale = scenario
         .add_creature_to_graveyard(P0, "Old Bear", 2, 2)
         .id();
     let mut runner = scenario.build();
+    // `add_card_to_library_top` creates an untyped object; Banon's pool is
+    // scoped to creature spells.
+    if let Some(obj) = runner.state_mut().objects.get_mut(&milled) {
+        obj.card_types.core_types = vec![CoreType::Creature];
+    }
 
     // Reach guard: the permission actually exists and FUNCTIONS on the
     // battlefield source (CR 113.6 zone-of-function), which is what the runtime
@@ -384,10 +391,13 @@ fn banon_offers_only_this_turn_non_battlefield_arrivals() {
          rows below are vacuous without it"
     );
 
-    // CR 400.7: stage the provenance each graveyard card is supposed to have.
-    // `stale` is deliberately given NO record.
-    record_arrival(runner.state_mut(), milled, Zone::Library);
-    record_arrival(runner.state_mut(), died, Zone::Battlefield);
+    // CR 400.7: drive the REAL moves that establish each card's provenance.
+    // `stale` is deliberately left untouched, so it has no arrival this turn.
+    let mut events = Vec::new();
+    move_through(runner.state_mut(), milled, Zone::Graveyard, &mut events);
+    move_through(runner.state_mut(), died, Zone::Graveyard, &mut events);
+    assert_eq!(runner.state().objects[&milled].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&died].zone, Zone::Graveyard);
 
     let castable = spell_objects_available_to_cast(runner.state(), P0);
 
@@ -425,13 +435,14 @@ fn kagha_composite_filter_pool_is_enforced_at_runtime() {
     let kagha = scenario
         .add_creature_from_oracle(P0, "Kagha, Shadow Archdruid", 4, 4, KAGHA_ORACLE)
         .id();
-    let milled = scenario
-        .add_creature_to_graveyard(P0, "Milled Bear", 2, 2)
-        .id();
+    let milled = scenario.add_card_to_library_top(P0, "Milled Bear");
     let stale = scenario
         .add_creature_to_graveyard(P0, "Old Bear", 2, 2)
         .id();
     let mut runner = scenario.build();
+    if let Some(obj) = runner.state_mut().objects.get_mut(&milled) {
+        obj.card_types.core_types = vec![CoreType::Creature];
+    }
 
     assert!(
         engine::game::functioning_abilities::active_static_definitions(
@@ -442,7 +453,9 @@ fn kagha_composite_filter_pool_is_enforced_at_runtime() {
         "Kagha must carry a functioning GraveyardCastPermission static"
     );
 
-    record_arrival(runner.state_mut(), milled, Zone::Library);
+    let mut events = Vec::new();
+    move_through(runner.state_mut(), milled, Zone::Graveyard, &mut events);
+    assert_eq!(runner.state().objects[&milled].zone, Zone::Graveyard);
 
     let castable = spell_objects_available_to_cast(runner.state(), P0);
     assert!(
@@ -457,67 +470,162 @@ fn kagha_composite_filter_pool_is_enforced_at_runtime() {
 }
 
 /// CR 400.7: the multi-hop row — the shared `ZoneChangedThisTurn` reading is
-/// CURRENT-INCARNATION, not any-record.
+/// CURRENT-INCARNATION, not any-record — driven through the REAL zone-change
+/// pipeline.
 ///
-/// `bounced` reaches the graveyard from the battlefield, leaves for the hand,
-/// and is discarded back into the graveyard, all in one turn. Its current
+/// `bounced` starts on the battlefield, dies, is returned to hand, and is
+/// discarded back into the graveyard, all in one turn, each hop performed by
+/// `zones::move_to_zone` (which routes through `resolve_and_apply_zone_change`,
+/// validating the source zone and bumping the incarnation). Its current
 /// residency came from the HAND, so Banon must offer it. The engine keeps one
-/// `ObjectId` across zone changes (measured: graveyard→hand→graveyard leaves
-/// two records under one id), so an any-record reading still sees the stale
-/// battlefield→graveyard row and wrongly excludes it.
+/// `ObjectId` across zone changes, so an any-record reading still sees the
+/// stale battlefield→graveyard row and wrongly excludes it.
 ///
-/// The same stale row is wrong in the opposite direction for the affirmative
-/// form, which is why the reading was fixed for the whole family rather than
-/// only for the negated one: Faith's Reward would RETURN this card.
+/// Driving the production mover rather than appending snapshots is the point:
+/// it demonstrates that the move pipeline and `FilterProp::ZoneChangedThisTurn`
+/// agree on which occurrence is final. A hand-built ledger could agree with the
+/// filter while disagreeing with production.
+///
+/// `died` is the paired negative: same number of hops is irrelevant — what
+/// matters is that its FINAL arrival is from the battlefield, so it stays
+/// excluded. Without it, a reading that admitted everything would pass.
 #[test]
-fn banon_reads_the_current_incarnation_not_a_stale_earlier_hop() {
+fn banon_reads_the_current_incarnation_through_the_real_move_pipeline() {
     let mut scenario = GameScenario::new();
     scenario
         .add_creature_from_oracle(P0, "Banon, the Returners' Leader", 1, 3, BANON_ORACLE)
         .id();
-    let bounced = scenario
-        .add_creature_to_graveyard(P0, "Recurring Bear", 2, 2)
-        .id();
+    let bounced = scenario.add_creature(P0, "Recurring Bear", 2, 2).id();
+    let died = scenario.add_creature(P0, "Fallen Bear", 2, 2).id();
     let mut runner = scenario.build();
 
-    // Hop 1: died. Hop 2: returned to hand. Hop 3: discarded.
-    record_arrival(runner.state_mut(), bounced, Zone::Battlefield);
-    let mut hop = runner.state().objects[&bounced].snapshot_for_zone_change(
-        bounced,
-        Some(Zone::Graveyard),
-        Zone::Hand,
-    );
-    engine::game::restrictions::record_zone_change(runner.state_mut(), &mut hop);
-    record_arrival(runner.state_mut(), bounced, Zone::Hand);
+    let mut events = Vec::new();
+    // `bounced`: battlefield → graveyard → hand → graveyard. Final arrival: HAND.
+    move_through(runner.state_mut(), bounced, Zone::Graveyard, &mut events);
+    move_through(runner.state_mut(), bounced, Zone::Hand, &mut events);
+    move_through(runner.state_mut(), bounced, Zone::Graveyard, &mut events);
+    // `died`: battlefield → graveyard. Final arrival: BATTLEFIELD.
+    move_through(runner.state_mut(), died, Zone::Graveyard, &mut events);
 
-    // Reach guard: the stale battlefield→graveyard row really is still present,
-    // so this row measures the READING and not a missing record.
+    // Reach guard 1: both really are in the graveyard, so the rows below are
+    // about the READING and not about a move that silently failed.
+    assert_eq!(runner.state().objects[&bounced].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&died].zone, Zone::Graveyard);
+    // Reach guard 2: the stale battlefield→graveyard row for `bounced` is still
+    // on the ledger, which is what makes this a current-incarnation test rather
+    // than a test that the earlier hop was forgotten.
     assert!(
         runner
             .state()
             .zone_changes_this_turn
             .iter()
-            .any(|r| r.object_id == bounced && r.from_zone == Some(Zone::Battlefield)),
+            .any(|r| r.object_id == bounced
+                && r.from_zone == Some(Zone::Battlefield)
+                && r.to_zone == Zone::Graveyard),
         "the stale battlefield hop must still be on the ledger for this row to mean anything"
     );
 
+    let castable = spell_objects_available_to_cast(runner.state(), P0);
     assert!(
-        spell_objects_available_to_cast(runner.state(), P0).contains(&bounced),
+        castable.contains(&bounced),
         "the card's CURRENT graveyard residency came from the hand, so Banon offers \
          it — an any-record reading would see the earlier battlefield hop and \
          wrongly exclude it (CR 400.7)"
     );
+    assert!(
+        !castable.contains(&died),
+        "a card whose FINAL arrival is from the battlefield stays excluded"
+    );
 }
 
-/// CR 400.7: append the zone-change record that `FilterProp::ZoneChangedThisTurn`
-/// reads, for a card already staged in the graveyard.
-fn record_arrival(
+/// CR 305.1 + CR 601.2a: Kagha's `Play` half at the land-play action boundary.
+///
+/// Kagha's permission is `play_mode: Play`, so a qualifying LAND must be offered
+/// by `graveyard_lands_playable_by_permission` — a different authority from the
+/// `spell_objects_available_to_cast` path every other runtime row here uses —
+/// and must be accepted by `GameAction::PlayLand`. Without this row the newly
+/// parsed `Play` branch could be absent or miswired while every other assertion
+/// stayed green.
+///
+/// CR 305.1 also requires the land NOT to appear on the cast path.
+///
+/// `from_battlefield` is the paired negative: a land whose graveyard arrival was
+/// from the battlefield fails Kagha's printed library-origin pool.
+#[test]
+fn kagha_play_half_authorizes_a_library_origin_land_at_the_play_action() {
+    let mut scenario = GameScenario::new();
+    scenario
+        .add_creature_from_oracle(P0, "Kagha, Shadow Archdruid", 4, 4, KAGHA_ORACLE)
+        .id();
+    let milled_land = scenario.add_card_to_library_top(P0, "Milled Forest");
+    let from_battlefield = scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    // `add_card_to_library_top` creates an untyped object; the land-play path
+    // requires the Land core type.
+    if let Some(obj) = runner.state_mut().objects.get_mut(&milled_land) {
+        obj.card_types.core_types = vec![CoreType::Land];
+    }
+
+    let mut events = Vec::new();
+    move_through(
+        runner.state_mut(),
+        milled_land,
+        Zone::Graveyard,
+        &mut events,
+    );
+    move_through(
+        runner.state_mut(),
+        from_battlefield,
+        Zone::Graveyard,
+        &mut events,
+    );
+
+    runner.state_mut().phase = Phase::PreCombatMain;
+    runner.state_mut().active_player = P0;
+    runner.state_mut().priority_player = P0;
+
+    let playable = graveyard_lands_playable_by_permission(runner.state(), P0);
+    assert!(
+        playable.iter().any(|(id, _)| *id == milled_land),
+        "a land put into the graveyard from the LIBRARY this turn is in Kagha's \
+         Play pool; got {playable:?}"
+    );
+    assert!(
+        !playable.iter().any(|(id, _)| *id == from_battlefield),
+        "a land that reached the graveyard from the BATTLEFIELD fails Kagha's \
+         printed library-origin pool"
+    );
+    // CR 305.1: a land is played, never cast.
+    assert!(
+        !spell_objects_available_to_cast(runner.state(), P0).contains(&milled_land),
+        "a land must not surface on the spell-cast path (CR 305.1)"
+    );
+
+    // Drive the real action, not just the authority query.
+    let card_id = runner.state().objects[&milled_land].card_id;
+    runner
+        .act(GameAction::PlayLand {
+            object_id: milled_land,
+            card_id,
+        })
+        .expect("Kagha's Play half must authorize the land-play special action");
+    assert_eq!(
+        runner.state().objects[&milled_land].zone,
+        Zone::Battlefield,
+        "playing the land via Kagha's permission must move it to the battlefield"
+    );
+}
+
+/// CR 400.7: perform one real zone change through the production mover, so the
+/// occurrence bookkeeping and the zone-change ledger are written exactly as they
+/// are in a game. Deliberately NOT a hand-built `record_zone_change`: a
+/// manufactured ledger can agree with the filter while disagreeing with the
+/// pipeline that actually produces it.
+fn move_through(
     state: &mut engine::types::game_state::GameState,
     object_id: ObjectId,
-    from: Zone,
+    to: Zone,
+    events: &mut Vec<engine::types::events::GameEvent>,
 ) {
-    let record =
-        state.objects[&object_id].snapshot_for_zone_change(object_id, Some(from), Zone::Graveyard);
-    let mut record = record;
-    engine::game::restrictions::record_zone_change(state, &mut record);
+    engine::game::zones::move_to_zone(state, object_id, to, events);
 }
