@@ -12,8 +12,9 @@ use crate::types::ability::{
 use crate::types::actions::{AlternativeCastDecision, GameAction};
 use crate::types::card::LayoutKind;
 use crate::types::casting_costs::{
-    amount_is_order_relevant, CostReductionAnalysis, CostReductionCoverage, CostReductionElection,
-    CostReductionEntry, CostReductionOutcome, ReductionProvenance,
+    amount_is_order_relevant, ActivationCostLock, ActivationCostLockPoint, ActivationCostSnapshot,
+    CostReductionAnalysis, CostReductionCoverage, CostReductionElection, CostReductionEntry,
+    CostReductionOutcome, ReductionProvenance,
 };
 use crate::types::events::{ActivatedAbilityKind, GameEvent};
 use crate::types::game_state::{
@@ -673,6 +674,7 @@ pub(crate) fn variable_speed_payment_range(cost: &AbilityCost, max_speed: u8) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn begin_variable_speed_payment(
     state: &mut GameState,
     player: PlayerId,
@@ -681,12 +683,18 @@ pub(crate) fn begin_variable_speed_payment(
     cost: AbilityCost,
     ability_index: usize,
     target_selection: ActivationTargetSelection,
+    activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
 ) -> WaitingFor {
     let max_speed = effective_speed(state, player);
     let (min, max) = variable_speed_payment_range(&cost, max_speed).unwrap_or((0, max_speed));
-    let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+    let mut pending = PendingCast::for_activation(
+        source_id,
+        resolved,
+        ManaCost::NoCost,
+        ability_index,
+        activation_cost_snapshot,
+    );
     pending.activation_cost = Some(cost);
-    pending.activation_ability_index = Some(ability_index);
     pending.activation_target_selection = target_selection;
     state.pending_cast = Some(Box::new(pending));
     WaitingFor::NamedChoice {
@@ -21348,10 +21356,16 @@ fn pending_activation_after_cost_pause(
     resolved: ResolvedAbility,
     ability_index: usize,
     remaining_cost: Option<AbilityCost>,
+    activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
 ) -> PendingCast {
-    let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+    let mut pending = PendingCast::for_activation(
+        source_id,
+        resolved,
+        ManaCost::NoCost,
+        ability_index,
+        activation_cost_snapshot,
+    );
     pending.activation_cost = remaining_cost;
-    pending.activation_ability_index = Some(ability_index);
     pending
 }
 
@@ -23176,9 +23190,16 @@ pub(super) fn try_finalize_activation_mana_payment(
     resolved: &ResolvedAbility,
     cost: &AbilityCost,
     target_selection: ActivationTargetSelection,
+    activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
-    let mut pending = PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+    let mut pending = PendingCast::for_activation(
+        source_id,
+        resolved.clone(),
+        ManaCost::NoCost,
+        ability_index,
+        activation_cost_snapshot,
+    );
     pending.activation_target_selection = target_selection;
     try_finalize_activation_mana_payment_from_root(
         state,
@@ -23332,6 +23353,89 @@ pub fn handle_activate_ability(
     ability_index: usize,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    activate_with_cost_carrier(state, player, source_id, ability_index, None, events)
+}
+
+/// The resolution of a `WaitingFor::OrderCostReductions` answer for an
+/// activation (CR 601.2f + CR 602.2b).
+pub(crate) enum ActivationElectionResume {
+    /// The activation continued under the elected order.
+    Continued(WaitingFor),
+    /// CR 601.2h: the elected total could not be paid, so the activation is
+    /// reversed. The action boundary restores the pre-action state; nothing here
+    /// undoes anything.
+    Reversed,
+}
+
+/// CR 601.2f + CR 602.2b: continue an activation after the caster elected its
+/// reduction order. Re-enters the announcement with the prompt's snapshot,
+/// locked under that order — never re-collected (CR 601.2h). Re-running the
+/// announcement is sound because the lock precedes every mutation: nothing
+/// changed between the prompt and this answer.
+pub(crate) fn resume_activation_after_cost_election(
+    state: &mut GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    order: Vec<ReductionProvenance>,
+    events: &mut Vec<GameEvent>,
+) -> Result<ActivationElectionResume, EngineError> {
+    let (Some(snapshot), Some(ability_index)) = (
+        pending.activation_cost_snapshot.as_ref(),
+        pending.activation_ability_index,
+    ) else {
+        return Err(EngineError::InvalidAction(
+            "an activation election must carry its cost snapshot and ability index".to_string(),
+        ));
+    };
+    let mut snapshot = snapshot.clone();
+    match snapshot.lock {
+        ActivationCostLock::Open => {}
+        ActivationCostLock::Locked { .. } => {
+            return Err(EngineError::InvalidAction(
+                "this activation's cost is already locked".to_string(),
+            ));
+        }
+    }
+    snapshot.lock = ActivationCostLock::Locked {
+        point: ActivationCostLockPoint::Announcement,
+        order: Some(order),
+    };
+    Ok(
+        match activate_with_cost_carrier(
+            state,
+            player,
+            pending.object_id,
+            ability_index,
+            Some(snapshot),
+            events,
+        ) {
+            Ok(waiting_for) => ActivationElectionResume::Continued(waiting_for),
+            Err(_) => ActivationElectionResume::Reversed,
+        },
+    )
+}
+
+/// CR 601.2f + CR 602.2b: the elected order a locked snapshot carries, if any.
+fn locked_activation_order(snapshot: &ActivationCostSnapshot) -> Option<&[ReductionProvenance]> {
+    match &snapshot.lock {
+        ActivationCostLock::Locked {
+            order: Some(order), ..
+        } => Some(order),
+        ActivationCostLock::Locked { order: None, .. } | ActivationCostLock::Open => None,
+    }
+}
+
+/// CR 602.2: the one activation path. `carrier` is `None` for a fresh
+/// activation (the modifiers are collected here) and a `Locked` snapshot when
+/// the caster's CR 601.2f election resumes it, or for the lock's own dry run.
+fn activate_with_cost_carrier(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    carrier: Option<Box<ActivationCostSnapshot>>,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
     if !state.objects.contains_key(&source_id) {
         return Err(EngineError::InvalidAction("Object not found".to_string()));
     }
@@ -23394,14 +23498,49 @@ pub fn handle_activate_ability(
         }
     }
 
-    // CR 601.2f: Apply self-referential cost reduction before any cost payment.
-    apply_cost_reduction(state, &mut ability_def, player, source_id);
+    // CR 601.2f + CR 602.2b: collect this activation's cost modifiers exactly
+    // once (or, resuming the caster's election, take the snapshot its prompt
+    // carried) and fold the PREVIEW the gates below read. The ability's cost
+    // itself is written only by the lock, further down.
+    let mut carrier = match carrier {
+        Some(snapshot) => {
+            if matches!(snapshot.lock, ActivationCostLock::Open) {
+                debug_assert!(false, "an activation re-entered with an unlocked cost");
+                return Err(EngineError::InvalidAction(
+                    "an activation re-entered with its cost still unlocked".to_string(),
+                ));
+            }
+            Some(snapshot)
+        }
+        None => ability_def.cost.clone().map(|base_cost| {
+            let modifiers =
+                collect_activation_cost_modifiers(state, &ability_def, player, source_id);
+            Box::new(ActivationCostSnapshot {
+                base_cost,
+                raise_total: modifiers.raise_total,
+                reductions: modifiers.reductions,
+                lock: ActivationCostLock::Open,
+            })
+        }),
+    };
+    let preview_cost = carrier.as_ref().map(|snapshot| {
+        finish_activation_fold(
+            state,
+            player,
+            &ability_def,
+            fold_activation_cost(
+                &snapshot.base_cost,
+                snapshot.raise_total,
+                &snapshot.reductions,
+                locked_activation_order(snapshot),
+            ),
+        )
+    });
 
     // CR 118.12a: Normalize legacy card-data equip disjunctions before any
     // affordability or detour checks so EffectCost(ChooseOneOf) exports match
     // oracle-parsed OneOf at runtime.
-    let activation_cost = ability_def
-        .cost
+    let activation_cost = preview_cost
         .clone()
         .map(|cost| activation_cost_for_affordability(cost, ability_def.ability_tag));
 
@@ -23443,6 +23582,70 @@ pub fn handle_activate_ability(
             ));
         }
     }
+
+    // CR 601.2f + CR 602.2b: the cost lock. It runs exactly once per activation,
+    // after the final fold (on this engine the announcement fold above, which is
+    // where every modelled activation cost modifier is determined) and before the
+    // first mutation or payment, so every continuation below — modes, X, targets,
+    // interactive costs and the `{0}` direct push — sees the locked total.
+    let election = match carrier.as_deref() {
+        Some(snapshot) if matches!(snapshot.lock, ActivationCostLock::Open) => {
+            analyze_activation_cost_election(snapshot)
+        }
+        _ => None,
+    };
+    if let Some(outcomes) = election {
+        let snapshot = carrier
+            .take()
+            .expect("an election is only analyzed over a present snapshot");
+        // CR 602.2 + CR 602.2b -> CR 601.2: only a LEGAL activation may raise the
+        // election, because an illegal one is reversed as though it never began.
+        // The pre-check is the real continuation itself, dry-run under the
+        // default (cheapest) order: every non-cost check is order-independent,
+        // so legal under the default is legal under some order. It runs on an
+        // OWNED CLONE that is then discarded with everything it recorded —
+        // including a stack placement if the default reaches the stack — so it
+        // must never share state with the real game.
+        let mut dry_run = snapshot.as_ref().clone();
+        dry_run.lock = ActivationCostLock::Locked {
+            point: ActivationCostLockPoint::Announcement,
+            order: None,
+        };
+        let mut probe = state.clone();
+        activate_with_cost_carrier(
+            &mut probe,
+            player,
+            source_id,
+            ability_index,
+            Some(Box::new(dry_run)),
+            &mut Vec::new(),
+        )?;
+        let reductions = snapshot.reductions.clone();
+        let pending = PendingCast::for_activation(
+            source_id,
+            build_resolved_from_def(&ability_def, source_id, player),
+            ManaCost::NoCost,
+            ability_index,
+            Some(snapshot),
+        );
+        return Ok(WaitingFor::OrderCostReductions {
+            player,
+            reductions,
+            hybrid_symbols: Vec::new(),
+            outcomes,
+            pending_cast: Box::new(pending),
+        });
+    }
+    if let Some(snapshot) = carrier.as_mut() {
+        if matches!(snapshot.lock, ActivationCostLock::Open) {
+            snapshot.lock = ActivationCostLock::Locked {
+                point: ActivationCostLockPoint::Announcement,
+                order: None,
+            };
+        }
+    }
+    // The lock is the only writer of the ability's cost.
+    ability_def.cost = preview_cost;
 
     // CR 602.2b: Announce → choose modes → choose targets → pay costs.
     // Modal detection must happen BEFORE cost payment.
@@ -23531,7 +23734,7 @@ pub fn handle_activate_ability(
             is_activated: true,
             ability_index: Some(ability_index),
             ability_cost: ability_def.cost.clone(),
-            activation_cost_snapshot: None,
+            activation_cost_snapshot: carrier.clone(),
             unavailable_modes,
         });
     }
@@ -23602,14 +23805,14 @@ pub fn handle_activate_ability(
             // happens. Split fixed mana out so it flows through ManaPayment,
             // then pay the concretized residual cost.
             let (mana_cost, remaining) = split_alt_cost_components(cost);
-            let mut pending_x = PendingCast::new(
+            let mut pending_x = PendingCast::for_activation(
                 source_id,
-                CardId(0),
                 resolved,
                 mana_cost.unwrap_or(ManaCost::NoCost),
+                ability_index,
+                carrier.clone(),
             );
             pending_x.activation_cost = remaining;
-            pending_x.activation_ability_index = Some(ability_index);
             pending_x.deferred_target_selection = has_effect_targets;
             // CR 601.2g + CR 601.2h: if a non-self battlefield-removal sub-cost
             // (Sacrifice / battlefield Exile / ReturnToHand) is still
@@ -23644,9 +23847,14 @@ pub fn handle_activate_ability(
         // the residual-cost handler (`finish_pending_cost_or_cast`), which already
         // surfaces a `PayCost::Discard` / `Sacrifice` / `Composite` for them.
         if let Some((mana_cost, remaining)) = casting_costs::extract_x_mana_cost(cost) {
-            let mut pending_x = PendingCast::new(source_id, CardId(0), resolved, mana_cost);
+            let mut pending_x = PendingCast::for_activation(
+                source_id,
+                resolved,
+                mana_cost,
+                ability_index,
+                carrier.clone(),
+            );
             pending_x.activation_cost = remaining;
-            pending_x.activation_ability_index = Some(ability_index);
             pending_x.deferred_target_selection = has_effect_targets;
             // CR 601.2f + CR 601.2h: POSITIVE signal — the residual non-mana tail
             // in `activation_cost` is still OUTSTANDING after mana payment, so
@@ -23691,9 +23899,14 @@ pub fn handle_activate_ability(
             && (find_non_self_battlefield_removal_cost(cost).is_some() || loyalty_no_targets)
         {
             if let Some((mana_cost, remaining)) = casting_costs::extract_mana_leg(cost) {
-                let mut pending_leg = PendingCast::new(source_id, CardId(0), resolved, mana_cost);
+                let mut pending_leg = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    mana_cost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_leg.activation_cost = remaining;
-                pending_leg.activation_ability_index = Some(ability_index);
                 pending_leg.activation_residual = ActivationResidual::ManaLeg;
                 state.pending_cast = Some(Box::new(pending_leg));
                 return casting_costs::enter_payment_step(state, player, None, events);
@@ -23706,10 +23919,14 @@ pub fn handle_activate_ability(
             // activation after target declaration. In particular, its handlers
             // remove the paid cost leg before resuming, so a completed exile,
             // craft, or collect-evidence cost cannot be prompted a second time.
-            let mut pending_interactive =
-                PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+            let mut pending_interactive = PendingCast::for_activation(
+                source_id,
+                resolved.clone(),
+                ManaCost::NoCost,
+                ability_index,
+                carrier.clone(),
+            );
             pending_interactive.activation_cost = Some(cost.clone());
-            pending_interactive.activation_ability_index = Some(ability_index);
             let initial_activation_cost = pending_interactive.activation_cost.clone();
             if let Some(waiting_for) =
                 casting_costs::surface_next_unpaid_interactive_activation_cost(
@@ -23741,10 +23958,14 @@ pub fn handle_activate_ability(
                 cost,
                 Some(&resolved),
             )? {
-                let mut pending_discard =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_discard = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_discard.activation_cost = Some(cost.clone());
-                pending_discard.activation_ability_index = Some(ability_index);
                 return Ok(WaitingFor::PayCost {
                     player,
                     kind: PayCostKind::Discard,
@@ -23773,10 +23994,14 @@ pub fn handle_activate_ability(
             // This is the SINGLE-AUTHORITY interactive-cost dispatch: the call site
             // never inspects cost components beyond routing to the resolver.
             if let Some(amount) = find_collect_evidence_activation_cost(cost) {
-                let mut pending =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending.activation_cost = Some(cost.clone());
-                pending.activation_ability_index = Some(ability_index);
                 return super::effects::collect_evidence::begin_cost_payment(
                     state,
                     player,
@@ -23810,10 +24035,14 @@ pub fn handle_activate_ability(
                         "Not enough eligible cards to reach the exile threshold".into(),
                     ));
                 }
-                let mut pending_agg =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_agg = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_agg.activation_cost = Some(cost.clone());
-                pending_agg.activation_ability_index = Some(ability_index);
                 let max_count = eligible.len();
                 return Ok(WaitingFor::PayCost {
                     player,
@@ -23858,10 +24087,14 @@ pub fn handle_activate_ability(
                         "Not enough eligible cards to exile".into(),
                     ));
                 }
-                let mut pending_exile =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_exile = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_exile.activation_cost = Some(cost.clone());
-                pending_exile.activation_ability_index = Some(ability_index);
                 return Ok(WaitingFor::PayCost {
                     player,
                     kind: PayCostKind::ExileFromZone { zone: narrow_zone },
@@ -23893,10 +24126,14 @@ pub fn handle_activate_ability(
                         "Not enough eligible materials to craft".into(),
                     ));
                 }
-                let mut pending_craft =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_craft = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_craft.activation_cost = Some(cost.clone());
-                pending_craft.activation_ability_index = Some(ability_index);
                 return Ok(WaitingFor::PayCost {
                     player,
                     kind: PayCostKind::ExileMaterials {
@@ -23928,10 +24165,14 @@ pub fn handle_activate_ability(
                         "Cannot pay activation cost".to_string(),
                     ));
                 }
-                let mut pending_one_of =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_one_of = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_one_of.activation_cost = Some(cost.clone());
-                pending_one_of.activation_ability_index = Some(ability_index);
                 return Ok(WaitingFor::ActivationCostOneOfChoice {
                     player,
                     costs: payable,
@@ -23950,10 +24191,14 @@ pub fn handle_activate_ability(
                         "No eligible permanents to return".into(),
                     ));
                 }
-                let mut pending_return =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_return = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_return.activation_cost = Some(cost.clone());
-                pending_return.activation_ability_index = Some(ability_index);
                 return Ok(WaitingFor::PayCost {
                     player,
                     kind: PayCostKind::ReturnToHand,
@@ -24004,10 +24249,14 @@ pub fn handle_activate_ability(
                         ));
                     }
                 }
-                let mut pending_counter =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_counter = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_counter.activation_cost = Some(cost.clone());
-                pending_counter.activation_ability_index = Some(ability_index);
                 let max_count = match selection {
                     CounterCostSelection::SingleObject => 1,
                     CounterCostSelection::AmongObjects => eligible.len(),
@@ -24064,10 +24313,14 @@ pub fn handle_activate_ability(
                         "Not enough eligible creatures to tap".into(),
                     ));
                 }
-                let mut pending_tap =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending_tap = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_tap.activation_cost = Some(cost.clone());
-                pending_tap.activation_ability_index = Some(ability_index);
                 return Ok(WaitingFor::PayCost {
                     player,
                     kind: PayCostKind::TapCreatures { mode },
@@ -24086,10 +24339,14 @@ pub fn handle_activate_ability(
             // handlers remove exactly one leg before re-entering the payment
             // boundary, including repeated and chosen-OneOf costs.
             {
-                let mut pending_interactive =
-                    PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+                let mut pending_interactive = PendingCast::for_activation(
+                    source_id,
+                    resolved.clone(),
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_interactive.activation_cost = Some(cost.clone());
-                pending_interactive.activation_ability_index = Some(ability_index);
                 if let Some(waiting_for) =
                     casting_costs::surface_next_unpaid_interactive_activation_cost(
                         state,
@@ -24112,10 +24369,14 @@ pub fn handle_activate_ability(
 
             // Waterbend cost: detour to ManaPayment with Waterbend mode.
             if let Some(wb_cost) = find_waterbend_cost(cost) {
-                let mut pending_wb =
-                    PendingCast::new(source_id, CardId(0), resolved, wb_cost.clone());
+                let mut pending_wb = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    wb_cost.clone(),
+                    ability_index,
+                    carrier.clone(),
+                );
                 pending_wb.activation_cost = Some(cost.clone());
-                pending_wb.activation_ability_index = Some(ability_index);
                 state.pending_cast = Some(Box::new(pending_wb));
                 return casting_costs::enter_payment_step(
                     state,
@@ -24144,9 +24405,14 @@ pub fn handle_activate_ability(
                 player,
                 events,
             );
-            let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+            let mut pending = PendingCast::for_activation(
+                source_id,
+                resolved,
+                ManaCost::NoCost,
+                ability_index,
+                carrier.clone(),
+            );
             pending.activation_cost = ability_def.cost.clone();
-            pending.activation_ability_index = Some(ability_index);
             pending.target_constraints = target_constraints;
             pending.distribute = ability_def.distribute.clone();
             pending.begin_activation_trigger_collection();
@@ -24155,14 +24421,14 @@ pub fn handle_activate_ability(
             );
         }
 
-        let mut pending_target = PendingCast::new(
+        let mut pending_target = PendingCast::for_activation(
             source_id,
-            CardId(0),
             resolved,
             crate::types::mana::ManaCost::NoCost,
+            ability_index,
+            carrier.clone(),
         );
         pending_target.activation_cost = ability_def.cost.clone();
-        pending_target.activation_ability_index = Some(ability_index);
         pending_target.target_constraints = target_constraints;
         // CR 601.2d: propagate the divided-effect flag so a targeted activated
         // ability that divides damage/counters among its targets (Captain
@@ -24188,6 +24454,7 @@ pub fn handle_activate_ability(
                 cost.clone(),
                 ability_index,
                 ActivationTargetSelection::Pending,
+                carrier.clone(),
             ));
         }
         stamp_self_ref_discard_cost_paid_object(state, source_id, &mut resolved, cost);
@@ -24199,6 +24466,7 @@ pub fn handle_activate_ability(
             &resolved,
             cost,
             ActivationTargetSelection::Pending,
+            carrier.clone(),
             events,
         )? {
             return Ok(waiting);
@@ -24216,6 +24484,7 @@ pub fn handle_activate_ability(
                 resolved.clone(),
                 ability_index,
                 remaining_cost,
+                carrier.clone(),
             );
             if let Some(pending) =
                 casting_costs::attach_pending_cast_to_cost_move(state, Box::new(pending))
@@ -24266,6 +24535,50 @@ pub fn handle_activate_ability(
     );
     commit_crime_after_stack_placement(state, crime_candidate, player, events);
 
+    record_activated_ability_placed(state, player, source_id, ability_index, entry_id, events);
+
+    priority::clear_priority_passes(state);
+
+    Ok(WaitingFor::Priority { player })
+}
+
+/// CR 602.2 + CR 117.1b: the bookkeeping every placement of a player-activated
+/// ability on the stack performs once the entry is pushed — the per-turn
+/// activation record, the priority-window activation guard, the
+/// `AbilityActivated` event (CR 606.2 classifies loyalty vs. normal), and the
+/// CR 702.142b boast event. The single authority for the three placements: the
+/// direct push, [`casting_costs::push_activated_ability_to_stack`]'s entry, and
+/// the loyalty tail — three explicit call sites. Steps whose position differs
+/// per site (crime commitment, the CR 606.3 loyalty record, trigger collection)
+/// stay at their sites.
+///
+/// `placed_entry` is the id of the `StackEntry` the caller just pushed. The
+/// placed ability is read from THAT entry by id — never from the top of the
+/// stack, which cannot tell two activations of one permanent's same ability
+/// apart.
+pub(crate) fn record_activated_ability_placed(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    placed_entry: ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    // The caller just pushed this entry, and `stack::push_to_stack` always
+    // `push_back`s, so it is the stack's back entry — an id naming an EARLIER
+    // activation of the same ability (which matches source and index) fails.
+    debug_assert!(
+        state
+            .stack
+            .back()
+            .is_some_and(|entry| entry.id == placed_entry
+                && matches!(
+                    &entry.kind,
+                    StackEntryKind::ActivatedAbility { source_id: placed, ability }
+                        if *placed == source_id && ability.ability_index == Some(ability_index)
+                )),
+        "record_activated_ability_placed must name the entry its caller just pushed"
+    );
     restrictions::record_ability_activation(state, source_id, ability_index);
     // CR 117.1b: Priority permits unbounded activation. `pending_activations`
     // is a per-priority-window AI-guard — see `GameState::pending_activations`.
@@ -24284,10 +24597,6 @@ pub fn handle_activate_ability(
         player,
         events,
     );
-
-    priority::clear_priority_passes(state);
-
-    Ok(WaitingFor::Priority { player })
 }
 
 /// CR 601.2i: If the player is unable or unwilling to complete a cast, the
@@ -24659,22 +24968,30 @@ fn apply_cost_reduction(
     source_id: ObjectId,
 ) {
     let modifiers = collect_activation_cost_modifiers(state, ability_def, player, source_id);
-    if let Some(cost) = ability_def.cost.as_mut() {
-        *cost = fold_activation_cost(cost, modifiers.raise_total, &modifiers.reductions, None);
+    if let Some(cost) = ability_def.cost.take() {
+        let folded =
+            fold_activation_cost(&cost, modifiers.raise_total, &modifiers.reductions, None);
+        ability_def.cost = Some(finish_activation_fold(state, player, ability_def, folded));
     }
+}
 
-    // CR 116.2k + CR 702.170: Plot is taken as a special action via a synthesized
-    // hand activation whose effect grants the `Plotted` casting permission. Its mana
-    // cost is adjusted ONLY by `ReduceActionCost { action: Plot }` statics (Doc
-    // Aurlock) — the dedicated special-action axis. The generic activated-ability
-    // reducer is skipped by the collector for plot: its `keyword == "activated"`
-    // blanket arm would otherwise match (and adjust) a plot cost even though plot is
-    // not the activation of an ability (CR 702.170b).
+/// CR 116.2k + CR 702.170: Plot is taken as a special action via a synthesized
+/// hand activation whose effect grants the `Plotted` casting permission. Its mana
+/// cost is adjusted ONLY by `ReduceActionCost { action: Plot }` statics (Doc
+/// Aurlock) — the dedicated special-action axis, applied after the fold. The
+/// generic activated-ability reducer is skipped by the collector for plot: its
+/// `keyword == "activated"` blanket arm would otherwise match (and adjust) a plot
+/// cost even though plot is not the activation of an ability (CR 702.170b).
+fn finish_activation_fold(
+    state: &GameState,
+    player: PlayerId,
+    ability_def: &AbilityDefinition,
+    mut cost: AbilityCost,
+) -> AbilityCost {
     if is_plot_special_action(ability_def) {
-        if let Some(cost) = ability_def.cost.as_mut() {
-            reduce_special_action_in_ability_cost(state, player, SpecialAction::Plot, cost);
-        }
+        reduce_special_action_in_ability_cost(state, player, SpecialAction::Plot, &mut cost);
     }
+    cost
 }
 
 /// CR 601.2f + CR 602.2b: every cost modifier that applies to one activation,
@@ -24850,6 +25167,76 @@ pub(crate) fn fold_activation_cost(
         );
     }
     cost
+}
+
+/// The mana an activation cost demands: the sum of its mana legs, for the
+/// prompt's engine-authored locked totals.
+fn activation_mana_component(cost: &AbilityCost) -> ManaCost {
+    match cost {
+        AbilityCost::Mana { cost } => cost.clone(),
+        AbilityCost::Composite { costs } => costs
+            .iter()
+            .map(activation_mana_component)
+            .fold(ManaCost::zero(), |total, leg| {
+                super::restrictions::add_mana_cost(&total, &leg)
+            }),
+        _ => ManaCost::zero(),
+    }
+}
+
+/// CR 601.2f + CR 602.2b: the distinct totals an activation's reduction orders
+/// lock in, when — and only when — the caster has a real choice.
+///
+/// Activation reductions are generic-only (CR 118.7a), so the only thing an
+/// order can change is which floor binds. Reductions with equal effective floors
+/// commute ([`fold_activation_cost`]), so a set whose effective floors are all
+/// equal is never enumerated: that is exact, not a heuristic, and it keeps every
+/// ordinary activation (no reducer, one reducer, or only unfloored ones) silent.
+/// Otherwise every order is folded through the same arithmetic the lock applies,
+/// the results are deduped by the mana they demand, and the cheapest — the
+/// default — comes first. When agreement cannot be proven the caster is asked;
+/// the engine never picks. A budget-narrowed plan still prompts.
+pub(crate) fn analyze_activation_cost_election(
+    snapshot: &ActivationCostSnapshot,
+) -> Option<Vec<CostReductionOutcome>> {
+    let reductions = &snapshot.reductions;
+    let mut raised = snapshot.base_cost.clone();
+    increase_generic_in_cost(&mut raised, snapshot.raise_total);
+    let positive = reductions
+        .iter()
+        .filter(|entry| activation_reduction_amount(entry) > 0)
+        .count();
+    let mut floors = reductions
+        .iter()
+        .map(|entry| activation_effective_floor(&raised, entry));
+    let first = floors.next()?;
+    if positive < 2 || floors.all(|floor| floor == first) {
+        return None;
+    }
+
+    let plan = CandidatePlan::bounded(reductions.len(), 0);
+    let mut outcomes: Vec<CostReductionOutcome> = Vec::new();
+    for order in plan.order_iter(reductions.len()) {
+        let provenances: Vec<ReductionProvenance> = order
+            .iter()
+            .map(|&index| reductions[index].provenance)
+            .collect();
+        let locked_cost = activation_mana_component(&fold_activation_cost(
+            &snapshot.base_cost,
+            snapshot.raise_total,
+            reductions,
+            Some(&provenances),
+        ));
+        if outcomes.iter().all(|o| o.locked_cost != locked_cost) {
+            outcomes.push(CostReductionOutcome {
+                order,
+                hybrid_announcement: Vec::new(),
+                locked_cost,
+            });
+        }
+    }
+    outcomes.sort_by_key(|o| o.locked_cost.mana_value());
+    (outcomes.len() > 1).then_some(outcomes)
 }
 
 fn collect_static_activated_ability_cost_modifiers(

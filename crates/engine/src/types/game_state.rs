@@ -16598,6 +16598,62 @@ pub struct ActionResult {
     pub waiting_for: WaitingFor,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log_entries: Vec<super::log::GameLogEntry>,
+    /// Whether the action happened or ended an in-progress activation that
+    /// could not be completed. Omitted when `Applied`, so every ordinary result
+    /// serializes exactly as it did before the field existed.
+    #[serde(default, skip_serializing_if = "ActionDisposition::is_applied")]
+    pub disposition: ActionDisposition,
+}
+
+impl ActionResult {
+    /// An ordinary result: the action happened. Every ordinary path builds its
+    /// result here, so none can end up `Reversed` by accident.
+    pub fn applied(events: Vec<GameEvent>, waiting_for: WaitingFor) -> Self {
+        Self {
+            events,
+            waiting_for,
+            log_entries: Vec::new(),
+            disposition: ActionDisposition::Applied,
+        }
+    }
+
+    pub fn with_log_entries(mut self, log_entries: Vec<super::log::GameLogEntry>) -> Self {
+        self.log_entries = log_entries;
+        self
+    }
+
+    /// CR 602.2b + CR 601.2h: the action ended an in-progress activation that
+    /// could not be completed. The action boundary restores the state from
+    /// before the action and applies only `waiting_for`; the result carries no
+    /// events and is not a history entry.
+    pub fn reversed(waiting_for: WaitingFor) -> Self {
+        Self {
+            events: Vec::new(),
+            waiting_for,
+            log_entries: Vec::new(),
+            disposition: ActionDisposition::Reversed,
+        }
+    }
+}
+
+/// Whether an action happened (the ordinary case) or reversed an activation
+/// that could not be completed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActionDisposition {
+    #[default]
+    Applied,
+    /// CR 602.2b + CR 601.2h: "Unpayable costs can't be paid." An activation
+    /// whose elected total cannot be paid is reversed to the state before it
+    /// began. The action boundary restored its pre-action snapshot, applied only
+    /// the reversal, ran no auto-pass, and committed no lifecycle facts; it is
+    /// not recorded as a takeback point.
+    Reversed,
+}
+
+impl ActionDisposition {
+    pub fn is_applied(&self) -> bool {
+        matches!(self, Self::Applied)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36971,13 +37027,12 @@ mod tests {
 
     #[test]
     fn action_result_contains_events_and_waiting_for() {
-        let result = ActionResult {
-            events: vec![GameEvent::GameStarted],
-            waiting_for: WaitingFor::Priority {
+        let result = ActionResult::applied(
+            vec![GameEvent::GameStarted],
+            WaitingFor::Priority {
                 player: PlayerId(0),
             },
-            log_entries: vec![],
-        };
+        );
         assert_eq!(result.events.len(), 1);
     }
 

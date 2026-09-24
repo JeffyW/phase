@@ -40,15 +40,16 @@ fn is_zero_u32(value: &u32) -> bool {
 /// `player` / `amount` / `spell_filter`. A sentinel id for those would be a lie
 /// the UI and the AI would both have to decode.
 ///
-/// RESERVED VARIANTS: only [`ReductionProvenance::Static`] and
-/// [`ReductionProvenance::Defiler`] are constructed today.
-/// `PendingOneShot` / `Affinity` / `Undaunted` name the three channels that are
-/// structurally generic-only — they reduce generic mana and nothing else — so
-/// [`CostReductionEntry::is_order_relevant`] excludes them from the permutation
-/// set by construction and they never reach a snapshot. They are kept (and
-/// wire-tested) because the taxonomy is the honest one: the day a printed
-/// Affinity-shaped or one-shot reduction carries a shard, the entry needs a
-/// name that is not a fabricated `ObjectId`.
+/// RESERVED VARIANTS: `PendingOneShot` / `Affinity` / `Undaunted` name the three
+/// spell channels that are structurally generic-only — they reduce generic mana
+/// and nothing else — so [`CostReductionEntry::is_order_relevant`] excludes them
+/// from the spell permutation set by construction and they never reach a
+/// snapshot. They are kept (and wire-tested) because the taxonomy is the honest
+/// one: the day a printed Affinity-shaped or one-shot reduction carries a shard,
+/// the entry needs a name that is not a fabricated `ObjectId`. Every other
+/// variant is constructed: `Static`, `Defiler` and `CastingPermission` by the
+/// spell election, `Static`, `AbilityCostRider` and `TransientEffect` by the
+/// activation election.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ReductionProvenance {
