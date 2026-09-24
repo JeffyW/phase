@@ -5374,17 +5374,29 @@ fn graveyard_permission_source(
     player: PlayerId,
     object_id: ObjectId,
 ) -> Option<GraveyardPermissionSource<'_>> {
+    graveyard_permission_candidates(state, player, object_id)
+        .into_iter()
+        .next()
+}
+
+/// CR 601.2a: Every permission source that could authorize casting `object_id`
+/// from the graveyard right now, in source order.
+fn graveyard_permission_candidates(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Vec<GraveyardPermissionSource<'_>> {
     // CR 305.9: a land is played, never cast, whatever the permission says.
     if state
         .objects
         .get(&object_id)
         .is_some_and(|obj| !object_may_enter_cast_path(obj))
     {
-        return None;
+        return Vec::new();
     }
     graveyard_permission_sources(state, player, Some(CardPlayMode::Cast))
         .into_iter()
-        .find(|source| {
+        .filter(|source| {
             // CR 604.2 + CR 110.4: Skip if this source's slot has already been used.
             if !frequency_slot_available(state, source.source_id, object_id, source.frequency) {
                 return false;
@@ -5408,6 +5420,66 @@ fn graveyard_permission_source(
                 ),
             )
         })
+        .collect()
+}
+
+/// CR 601.2a + CR 110.4: The `GraveyardPermission` casting variant for a cast
+/// authorized by `source`. For a `OncePerTurnPerPermanentType` permission the
+/// slot is auto-picked when exactly one is available; with several (a
+/// multi-type card) it is left `None` so the player chooses it via
+/// `ChoosePermanentTypeSlot`.
+fn graveyard_permission_variant(
+    state: &GameState,
+    object_id: ObjectId,
+    source: &GraveyardPermissionSource<'_>,
+) -> CastingVariant {
+    let slot_type = if source.frequency == CastFrequency::OncePerTurnPerPermanentType {
+        let slots = available_permanent_type_slots(state, source.source_id, object_id);
+        if slots.len() == 1 {
+            Some(slots[0])
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    CastingVariant::GraveyardPermission {
+        source: source.source_id,
+        frequency: source.frequency,
+        slot_type,
+        graveyard_destination_replacement: source.graveyard_destination_replacement,
+    }
+}
+
+/// CR 601.2a + CR 118.9a: The graveyard permission that admits a cast whose
+/// casting variant is the card's OWN alternative cost (Blitz, Bestow — see
+/// `CastingVariant::is_independent_alternative_cost_rider`).
+///
+/// Such a cast carries the rider in `casting_variant`, so the permission that
+/// let the card be cast from the graveyard is not recorded there — yet it is
+/// still the authority for the cast, and a frequency-limited one (Muldrotha,
+/// Lurrus) must spend its slot exactly as it would for a printed-cost cast.
+/// This is the graveyard counterpart of the exile rider path, whose authority
+/// travels separately in `casting_permission_index`.
+///
+/// CR 601.2a: when several permissions admit the cast, an `Unlimited` one is
+/// preferred, so a bounded slot is not spent when a permission that needs no
+/// slot also authorizes this cast (Sabin, Master Monk's own "using its blitz
+/// ability" rider beside Muldrotha). Mirrors `top_of_library_selected_permission`.
+///
+/// Read while the card is still in the graveyard — `finalize_cast` calls this
+/// before the Graveyard→Stack move, alongside its sibling pre-move captures.
+pub(super) fn graveyard_rider_permission_authority(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Option<CastingVariant> {
+    let candidates = graveyard_permission_candidates(state, player, object_id);
+    let selected = candidates
+        .iter()
+        .find(|source| source.frequency == CastFrequency::Unlimited)
+        .or_else(|| candidates.first())?;
+    Some(graveyard_permission_variant(state, object_id, selected))
 }
 
 /// CR 601.2f: When `object_id` is castable from the graveyard via a
@@ -7974,26 +8046,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         } else if disturb_cost.is_some() {
             CastingVariant::Disturb
         } else if let Some(source) = graveyard_permission_src {
-            // CR 110.4: For OncePerTurnPerPermanentType permissions, auto-pick
-            // the slot when only one is available. When multiple slots are
-            // available (multi-type card), leave `None` — the engine will
-            // prompt the player to choose via `ChoosePermanentTypeSlot`.
-            let slot_type = if source.frequency == CastFrequency::OncePerTurnPerPermanentType {
-                let slots = available_permanent_type_slots(state, source.source_id, object_id);
-                if slots.len() == 1 {
-                    Some(slots[0])
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            CastingVariant::GraveyardPermission {
-                source: source.source_id,
-                frequency: source.frequency,
-                slot_type,
-                graveyard_destination_replacement: source.graveyard_destination_replacement,
-            }
+            graveyard_permission_variant(state, object_id, &source)
         } else if warp_cost.is_some() {
             CastingVariant::Warp
         } else {

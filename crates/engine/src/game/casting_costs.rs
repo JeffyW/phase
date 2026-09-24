@@ -11119,6 +11119,23 @@ fn finalize_cast_with_phyrexian_choices_inner(
     } else {
         None
     };
+    // CR 601.2a + CR 118.9a: A card cast from the graveyard for its OWN
+    // alternative cost (Blitz, Bestow) carries that rider in `casting_variant`,
+    // so the graveyard permission that admitted the cast is not recorded there.
+    // Capture it BEFORE the Graveyard→Stack move, like the sibling captures
+    // above, so a frequency-limited permission (Muldrotha, Lurrus) still spends
+    // its slot and its "enters with a counter" rider still applies. Every other
+    // graveyard cast already names its authority in `casting_variant`, either
+    // as `GraveyardPermission` or as a keyword route that is its own authority
+    // (flashback, escape, …), so it is left alone.
+    let permission_authority = if source_zone == Zone::Graveyard
+        && casting_variant.is_independent_alternative_cost_rider()
+    {
+        super::casting::graveyard_rider_permission_authority(state, player, object_id)
+            .unwrap_or(casting_variant)
+    } else {
+        casting_variant
+    };
     // CR 601.2a + CR 603.7 + CR 611.2a: Capture the tracked-set group of a
     // single-use `PlayFromExile` grant authorizing this cast BEFORE the object
     // leaves exile for the stack.
@@ -11212,8 +11229,10 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // Samurai) is carried on the static's `enters_with_counter` field. The
     // authorizing source is embedded in `casting_variant`; register the pending
     // ETB counter on the same object so it enters carrying the counter.
-    let static_perm_etb_counter =
-        super::casting::selected_static_permission_enters_with_counter(state, &casting_variant);
+    let static_perm_etb_counter = super::casting::selected_static_permission_enters_with_counter(
+        state,
+        &permission_authority,
+    );
     if let Some(counter_type) = static_perm_etb_counter {
         state
             .pending_etb_counters
@@ -11373,7 +11392,11 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // same source/slot before the first resolves. Only frequency-bounded
     // variants (`OncePerTurn`, `OncePerTurnPerPermanentType`) need tracking;
     // `Unlimited` permissions (Conduit of Worlds, Omniscience) skip.
-    match casting_variant {
+    //
+    // Matched on `permission_authority`, not `casting_variant`: for a graveyard
+    // cast made for the card's own alternative cost (Blitz), the permission that
+    // admitted it is recorded there instead (see its capture above).
+    match permission_authority {
         CastingVariant::GraveyardPermission {
             source,
             frequency: crate::types::statics::CastFrequency::OncePerTurn,

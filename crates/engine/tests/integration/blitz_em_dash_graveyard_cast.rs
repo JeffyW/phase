@@ -17,12 +17,15 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::actions::GameAction;
+use engine::types::actions::{AlternativeCastDecision, GameAction};
+use engine::types::card_type::CoreType;
+use engine::types::counter::CounterType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::zones::Zone;
 
 const SABIN: &str = "Double strike\nBlitz\u{2014}{2}{R}{R}, Discard a card. (If you cast this spell for its blitz cost, it gains haste and \"When this creature dies, draw a card.\" Sacrifice it at the beginning of the next end step.)\nYou may cast this card from your graveyard using its blitz ability.";
 
@@ -327,7 +330,7 @@ fn space_form_blitz_alone_does_not_allow_graveyard_cast() {
         "Caldaia Guardian",
         &["Blitz".into()],
         &["Creature".into()],
-        &["Human".into(), "Citizen".into()],
+        &["Human".into(), "Soldier".into()],
     );
     let kw = blitz_keyword(&parsed);
     assert!(
@@ -366,5 +369,294 @@ fn space_form_blitz_alone_does_not_allow_graveyard_cast() {
         runner.state().stack.len(),
         0,
         "no spell may reach the stack from this illegal cast"
+    );
+}
+
+const MULDROTHA: &str = "During each of your turns, you may play a land and cast a permanent spell of each permanent type from your graveyard. (If a card has multiple permanent types, choose one as you play it.)";
+
+const LEONARDO: &str = "Sneak {2}{W}{W}\nDouble strike\nDuring your turn, you may cast creature spells with power or toughness 1 or less from your graveyard. If you cast a spell this way, that creature enters with a finality counter on it. (If a creature with a finality counter on it would die, exile it instead.)";
+
+/// Put a permanent on P0's battlefield carrying every static its Oracle text
+/// parses to, so the graveyard permission under test is the parser's own.
+fn add_permission_source(
+    scenario: &mut GameScenario,
+    name: &str,
+    oracle: &str,
+    subtypes: &[&str],
+) -> ObjectId {
+    let parsed = parse_oracle_text(
+        oracle,
+        name,
+        &[],
+        &["Legendary".into(), "Creature".into()],
+        &subtypes
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        parsed
+            .statics
+            .iter()
+            .any(|s| format!("{s:?}").contains("GraveyardCastPermission")),
+        "{name} must parse to a GraveyardCastPermission, got {:?}",
+        parsed.statics
+    );
+    let mut source = scenario.add_creature(P0, name, 4, 4);
+    for s in parsed.statics {
+        source.with_static_definition(s);
+    }
+    source.id()
+}
+
+fn caldaia_blitz() -> Keyword {
+    blitz_keyword(&parse_oracle_text(
+        CALDAIA,
+        "Caldaia Guardian",
+        &["Blitz".into()],
+        &["Creature".into()],
+        &["Human".into(), "Soldier".into()],
+    ))
+}
+
+fn cast_from_graveyard(runner: &mut GameRunner, id: ObjectId) -> Result<WaitingFor, String> {
+    let card_id = runner.state().objects[&id].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: id,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .map(|r| r.waiting_for)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// CR 601.2a + CR 118.9a: a card cast from the graveyard for its own
+/// alternative cost is still cast under the permission that let it leave the
+/// graveyard. Muldrotha allows one permanent spell of each permanent type per
+/// turn, so a creature blitzed from the graveyard spends Muldrotha's creature
+/// slot, and a second creature can't follow it that turn.
+///
+/// Before the fix, choosing blitz replaced the `GraveyardPermission` casting
+/// variant, so finalization never spent the slot and Muldrotha allowed one
+/// graveyard creature after another.
+#[test]
+fn blitz_from_graveyard_under_muldrotha_spends_its_creature_slot() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let guardian = scenario
+        .add_creature_to_graveyard(P0, "Caldaia Guardian", 4, 3)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Green],
+        })
+        .with_keyword(caldaia_blitz())
+        .id();
+    let bears = scenario
+        .add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Green],
+        })
+        .id();
+    let mut runner = scenario.build();
+    fill_mana(&mut runner, ManaType::Green);
+
+    // Muldrotha is unconstrained, so the printed cost is also on offer and
+    // blitz must be chosen (CR 118.9b).
+    let waiting = cast_from_graveyard(&mut runner, guardian).expect("graveyard cast must be legal");
+    assert!(
+        matches!(
+            waiting,
+            WaitingFor::AlternativeCastChoice {
+                keyword: engine::types::game_state::AlternativeCastKeyword::Blitz,
+                ..
+            }
+        ),
+        "expected the blitz choice, got {waiting:?}"
+    );
+    runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Alternative,
+        })
+        .expect("choosing blitz must complete the cast");
+
+    // Positive reach guard: the blitz cast completed and charged blitz's
+    // {2}{G} = 3 mana rather than the printed {3}{G} = 4.
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "Caldaia must be on the stack"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        5,
+        "blitz {{2}}{{G}} = 3 of the 8 mana must be spent, not the printed 4"
+    );
+
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "the blitz cast must spend Muldrotha's creature slot, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+
+    runner.resolve_top();
+    assert_eq!(
+        runner.state().objects[&guardian].zone,
+        Zone::Battlefield,
+        "Caldaia must resolve, so the stack is empty for the next sorcery-speed cast"
+    );
+    assert!(runner.state().stack.is_empty());
+
+    let second = cast_from_graveyard(&mut runner, bears);
+    assert!(
+        second.is_err(),
+        "Muldrotha's creature slot is spent, so a second graveyard creature \
+         must be refused this turn, but the cast was accepted: {second:?}"
+    );
+    assert!(
+        runner.state().stack.is_empty(),
+        "the refused cast must not reach the stack"
+    );
+}
+
+/// CR 601.2a: when an unlimited permission also admits the blitz cast, the
+/// bounded one is not spent. Sabin's own rider ("You may cast this card from
+/// your graveyard using its blitz ability.") needs no slot, so blitzing Sabin
+/// beside Muldrotha leaves Muldrotha's creature slot for another creature.
+#[test]
+fn blitz_prefers_the_cards_own_rider_over_a_bounded_graveyard_permission() {
+    let parsed = parse_oracle_text(
+        SABIN,
+        "Sabin, Master Monk",
+        &[],
+        &["Legendary".into(), "Creature".into()],
+        &["Human".into(), "Noble".into(), "Monk".into()],
+    );
+    let own_rider = parsed
+        .statics
+        .first()
+        .expect("graveyard-cast permission static must parse")
+        .clone();
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let sabin = scenario
+        .add_creature_to_graveyard(P0, "Sabin, Master Monk", 4, 3)
+        .with_static_definition(own_rider)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 4,
+            shards: vec![ManaCostShard::Red],
+        })
+        .with_keyword(blitz_keyword(&parsed))
+        .id();
+    let bears = scenario
+        .add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Red],
+        })
+        .id();
+    scenario.add_card_to_hand(P0, "Filler Card");
+    let mut runner = scenario.build();
+    fill_mana(&mut runner, ManaType::Red);
+
+    cast_from_graveyard(&mut runner, sabin).expect("graveyard cast must be legal");
+    runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Alternative,
+        })
+        .expect("choosing blitz must be legal");
+    let filler = runner.state().players[0].hand[0];
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![filler],
+        })
+        .expect("paying the blitz discard must complete the cast");
+
+    // Positive reach guard: the blitz cast completed for {2}{R}{R} = 4.
+    assert_eq!(runner.state().stack.len(), 1, "Sabin must be on the stack");
+    assert_eq!(runner.state().players[0].mana_pool.total(), 4);
+
+    assert!(
+        !runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "Sabin's own unlimited rider authorizes this cast, so Muldrotha's \
+         creature slot must stay unspent, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+
+    runner.resolve_top();
+    assert!(runner.state().stack.is_empty());
+    cast_from_graveyard(&mut runner, bears)
+        .expect("Muldrotha's creature slot is still free, so this cast must be legal");
+}
+
+/// CR 601.2a + CR 122.1: a permission's "if you cast a spell this way, that
+/// creature enters with a counter on it" rider applies to a blitz cast it
+/// admits, because blitz changes the cost, not the permission. Leonardo admits
+/// creature spells with power or toughness 1 or less from the graveyard, so the
+/// fixture is a 1/1 blitz creature.
+#[test]
+fn blitz_from_graveyard_keeps_the_permissions_enters_with_counter_rider() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_source(
+        &mut scenario,
+        "Leonardo, Sewer Samurai",
+        LEONARDO,
+        &["Mutant", "Ninja", "Turtle", "Samurai"],
+    );
+    let blitzer = scenario
+        .add_creature_to_graveyard(P0, "Blitz Test Creature", 1, 1)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Green],
+        })
+        .with_keyword(caldaia_blitz())
+        .id();
+    let mut runner = scenario.build();
+    fill_mana(&mut runner, ManaType::Green);
+
+    let waiting = cast_from_graveyard(&mut runner, blitzer).expect("graveyard cast must be legal");
+    assert!(
+        matches!(waiting, WaitingFor::AlternativeCastChoice { .. }),
+        "expected the blitz choice, got {waiting:?}"
+    );
+    runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Alternative,
+        })
+        .expect("choosing blitz must complete the cast");
+    // Positive reach guard: blitz's {2}{G} = 3 was charged, not the printed 4.
+    assert_eq!(runner.state().players[0].mana_pool.total(), 5);
+
+    runner.resolve_top();
+    let entered = &runner.state().objects[&blitzer];
+    assert_eq!(entered.zone, Zone::Battlefield);
+    assert_eq!(
+        entered.counters.get(&CounterType::Finality).copied(),
+        Some(1),
+        "Leonardo's finality-counter rider must apply to a blitz cast it admits, \
+         counters: {:?}",
+        entered.counters
     );
 }
