@@ -59393,3 +59393,133 @@ mod unreadable_additional_cost_is_refused_not_free {
         );
     }
 }
+
+/// CR 601.2f + CR 602.2b: the activation fold's default order is the MINIMUM over
+/// every order the caster could elect — the proof `fold_activation_cost` states,
+/// checked exhaustively as a building block over generic-only reductions with
+/// mixed floors, colored and colorless symbol counts, and raises.
+#[test]
+fn activation_fold_default_order_is_the_minimum_over_every_order() {
+    fn entry(index: u8, amount: u32, minimum_mana: u32) -> CostReductionEntry {
+        CostReductionEntry {
+            amount: ManaCost::generic(amount),
+            multiplier: 1,
+            reach: CostReductionReach::SpillsToGeneric,
+            provenance: ReductionProvenance::Static {
+                source: ObjectId(900),
+                ordinal: index,
+            },
+            display_name: format!("reducer {index}"),
+            minimum_mana,
+        }
+    }
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for rest in permutations(n - 1) {
+            for slot in 0..=rest.len() {
+                let mut order = rest.clone();
+                order.insert(slot, n - 1);
+                out.push(order);
+            }
+        }
+        out
+    }
+    fn total_mana(cost: &AbilityCost) -> u32 {
+        match cost {
+            AbilityCost::Mana {
+                cost: ManaCost::Cost { generic, shards },
+            } => *generic + shards.len() as u32,
+            _ => unreachable!("the fixture only builds bare mana costs"),
+        }
+    }
+
+    let shapes: [&[(u32, u32)]; 5] = [
+        &[(2, 1), (2, 0)],
+        &[(1, 0), (3, 1)],
+        &[(2, 2), (2, 0), (1, 1)],
+        &[(3, 1), (1, 2), (2, 0)],
+        &[(1, 1), (1, 1), (2, 0)],
+    ];
+    let mut observable = 0;
+    for generic in 0..=6u32 {
+        for shards in [Vec::new(), vec![ManaCostShard::Red]] {
+            for raise_total in [0u32, 2] {
+                for shape in shapes {
+                    let base = AbilityCost::Mana {
+                        cost: ManaCost::Cost {
+                            shards: shards.clone(),
+                            generic,
+                        },
+                    };
+                    let reductions: Vec<CostReductionEntry> = shape
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(amount, floor))| entry(i as u8, amount, floor))
+                        .collect();
+                    let default =
+                        total_mana(&fold_activation_cost(&base, raise_total, &reductions, None));
+                    let totals: Vec<u32> = permutations(reductions.len())
+                        .into_iter()
+                        .map(|order| {
+                            let order: Vec<ReductionProvenance> =
+                                order.iter().map(|&i| reductions[i].provenance).collect();
+                            total_mana(&fold_activation_cost(
+                                &base,
+                                raise_total,
+                                &reductions,
+                                Some(&order),
+                            ))
+                        })
+                        .collect();
+                    let minimum = *totals.iter().min().unwrap();
+                    assert_eq!(
+                        default, minimum,
+                        "default must be the cheapest order: base {generic}+{shards:?}, \
+                         raise {raise_total}, reductions {shape:?}, orders gave {totals:?}"
+                    );
+                    if totals.iter().any(|&t| t != minimum) {
+                        observable += 1;
+                    }
+                }
+            }
+        }
+    }
+    // Reach guard: the sweep must contain boards where the order is observable,
+    // or "default == minimum" would hold vacuously.
+    assert!(
+        observable > 0,
+        "the sweep must include order-observable boards"
+    );
+}
+
+/// CR 601.2f: "plus all additional costs and cost increases, and minus all cost
+/// reductions" — every raise is applied BEFORE any reduction, so a floored
+/// reduction sees the raised total. `{1}` + a `{2}` raise + a `-2` reduction that
+/// can't go below one mana locks `{1}`; reducing first would lock `{3}`, a total
+/// no legal order produces.
+#[test]
+fn activation_fold_applies_raises_before_reductions() {
+    let base = AbilityCost::Mana {
+        cost: ManaCost::generic(1),
+    };
+    let floored = CostReductionEntry {
+        amount: ManaCost::generic(2),
+        multiplier: 1,
+        reach: CostReductionReach::SpillsToGeneric,
+        provenance: ReductionProvenance::Static {
+            source: ObjectId(901),
+            ordinal: 0,
+        },
+        display_name: "Training Grounds".to_string(),
+        minimum_mana: 1,
+    };
+    assert_eq!(
+        fold_activation_cost(&base, 2, &[floored], None),
+        AbilityCost::Mana {
+            cost: ManaCost::generic(1)
+        }
+    );
+}

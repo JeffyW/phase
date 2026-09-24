@@ -24547,6 +24547,10 @@ fn reduce_generic_in_cost_with_minimum_mana(
     reduce_generic_in_cost_by(cost, &mut remaining);
 }
 
+/// The unfloored case of [`reduce_generic_in_cost_with_minimum_mana`], kept for
+/// the building-block tests; production reductions go through
+/// [`fold_activation_cost`].
+#[cfg(test)]
 fn reduce_generic_in_cost(cost: &mut AbilityCost, amount: u32) {
     reduce_generic_in_cost_with_minimum_mana(cost, amount, 0);
 }
@@ -24644,61 +24648,28 @@ pub(crate) fn loyalty_ability_gains_mana_tax(
     !matches!(probe.cost, Some(AbilityCost::Loyalty { .. }))
 }
 
-/// CR 601.2f: Apply self-referential cost reduction/increase to an ability definition's cost.
-/// Mutates `ability_def.cost` in place by `amount_per * count` in `cost_reduction.mode`'s
-/// direction (`Reduce` floors at {0}; `Raise` adds generic mana).
+/// CR 601.2f + CR 602.2b: Determine an activation's cost under the caster-optimal
+/// default reduction order — the single preview/default authority. Collects every
+/// modifier once ([`collect_activation_cost_modifiers`]) and folds it with
+/// [`fold_activation_cost`]; never prompts.
 fn apply_cost_reduction(
     state: &GameState,
     ability_def: &mut AbilityDefinition,
     player: PlayerId,
     source_id: ObjectId,
 ) {
-    if let Some(ref reduction) = ability_def.cost_reduction {
-        // CR 602.2b + CR 601.2f: A conditional flat modification ("costs {N} less/more … if [cond]")
-        // applies only when its gate holds at cost-determination time. `None` =
-        // unconditional (the "for each" scaling form and all legacy reductions).
-        let condition_met = reduction.condition.as_ref().is_none_or(|cond| {
-            crate::game::restrictions::evaluate_condition(state, player, source_id, cond)
-        });
-        if condition_met {
-            let count =
-                super::quantity::resolve_quantity(state, &reduction.count, player, source_id);
-            let delta = (reduction.amount_per as i32 * count).max(0) as u32;
-            if delta > 0 {
-                if let Some(ref mut cost) = ability_def.cost {
-                    // CR 601.2f + CR 118.7: self-referential text uses the same
-                    // Reduce/Raise axis as external ability-cost statics.
-                    // `Minimum` is not emitted for self `CostReduction`.
-                    match reduction.mode {
-                        CostModifyMode::Reduce => reduce_generic_in_cost(cost, delta),
-                        CostModifyMode::Raise => increase_generic_in_cost(cost, delta),
-                        CostModifyMode::Minimum => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // CR 702.170b + CR 116.2k: Plot is a SPECIAL ACTION, not the activation of an
-    // ability. The activated-ability reducer's `keyword == "activated"` blanket arm
-    // matches ANY ability regardless of tag and adjusts in BOTH directions, so it
-    // would wrongly change a plot cost. Skip it for the synthesized plot shape; plot's
-    // only cost adjustment is its dedicated special-action axis below
-    // (ReduceActionCost { action: Plot }). A tag-keyed reducer can never match plot
-    // anyway — the synthesized plot ability carries no `ability_tag`
-    // (active_keyword == None) — so skipping the whole function is equivalent to
-    // skipping just the "activated" arm, and clearer.
-    if !is_plot_special_action(ability_def) {
-        apply_static_activated_ability_cost_reduction(state, ability_def, player, source_id);
+    let modifiers = collect_activation_cost_modifiers(state, ability_def, player, source_id);
+    if let Some(cost) = ability_def.cost.as_mut() {
+        *cost = fold_activation_cost(cost, modifiers.raise_total, &modifiers.reductions, None);
     }
 
     // CR 116.2k + CR 702.170: Plot is taken as a special action via a synthesized
     // hand activation whose effect grants the `Plotted` casting permission. Its mana
     // cost is adjusted ONLY by `ReduceActionCost { action: Plot }` statics (Doc
     // Aurlock) — the dedicated special-action axis. The generic activated-ability
-    // reducer is skipped above for plot: its `keyword == "activated"` blanket arm
-    // would otherwise match (and adjust) a plot cost even though plot is not the
-    // activation of an ability (CR 702.170b).
+    // reducer is skipped by the collector for plot: its `keyword == "activated"`
+    // blanket arm would otherwise match (and adjust) a plot cost even though plot is
+    // not the activation of an ability (CR 702.170b).
     if is_plot_special_action(ability_def) {
         if let Some(cost) = ability_def.cost.as_mut() {
             reduce_special_action_in_ability_cost(state, player, SpecialAction::Plot, cost);
@@ -24706,11 +24677,187 @@ fn apply_cost_reduction(
     }
 }
 
-fn apply_static_activated_ability_cost_reduction(
+/// CR 601.2f + CR 602.2b: every cost modifier that applies to one activation,
+/// collected once and not yet applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ActivationCostModifiers {
+    /// The sum of every applying raise. CR 601.2f adds all cost increases before
+    /// any reduction, and raises only ever grow the generic component, so only
+    /// their sum is observable.
+    pub(crate) raise_total: u32,
+    /// Every applying reduction, in canonical collection order: the ability's own
+    /// rider, then battlefield statics, then duration-scoped continuous effects.
+    pub(crate) reductions: Vec<CostReductionEntry>,
+}
+
+impl ActivationCostModifiers {
+    /// CR 118.7: route one resolved modification in its static's direction.
+    fn push(
+        &mut self,
+        mode: CostModifyMode,
+        amount: u32,
+        minimum_mana: u32,
+        provenance: ReductionProvenance,
+        display_name: &str,
+    ) {
+        if amount == 0 {
+            return;
+        }
+        match mode {
+            CostModifyMode::Raise => self.raise_total = self.raise_total.saturating_add(amount),
+            CostModifyMode::Reduce => self.reductions.push(CostReductionEntry {
+                // CR 118.7a: activation reductions reduce generic mana only.
+                amount: ManaCost::generic(amount),
+                multiplier: 1,
+                reach: CostReductionReach::SpillsToGeneric,
+                provenance,
+                display_name: display_name.to_string(),
+                minimum_mana,
+            }),
+            // `Minimum` is not emitted for activated-ability modifiers.
+            CostModifyMode::Minimum => {}
+        }
+    }
+}
+
+/// CR 601.2f + CR 602.2b: collect every modifier that applies to activating
+/// `ability_def` — the ability's own "costs {N} less/more" rider, printed
+/// `ReduceAbilityCost` statics, and duration-scoped continuous ones — without
+/// applying any of them. The single collection authority for activation costs.
+pub(crate) fn collect_activation_cost_modifiers(
     state: &GameState,
-    ability_def: &mut AbilityDefinition,
+    ability_def: &AbilityDefinition,
     player: PlayerId,
     source_id: ObjectId,
+) -> ActivationCostModifiers {
+    let mut modifiers = ActivationCostModifiers::default();
+    let source_name = state
+        .objects
+        .get(&source_id)
+        .map(|obj| obj.name.as_str())
+        .unwrap_or_default();
+
+    if let Some(ref rider) = ability_def.cost_reduction {
+        // CR 602.2b + CR 601.2f: A conditional flat modification ("costs {N} less/more … if [cond]")
+        // applies only when its gate holds at cost-determination time. `None` =
+        // unconditional (the "for each" scaling form and all legacy reductions).
+        let condition_met = rider.condition.as_ref().is_none_or(|cond| {
+            crate::game::restrictions::evaluate_condition(state, player, source_id, cond)
+        });
+        if condition_met {
+            let count = super::quantity::resolve_quantity(state, &rider.count, player, source_id);
+            let delta = (rider.amount_per as i32 * count).max(0) as u32;
+            // CR 601.2f + CR 118.7: self-referential text uses the same
+            // Reduce/Raise axis as external ability-cost statics, and is unfloored.
+            modifiers.push(
+                rider.mode,
+                delta,
+                0,
+                ReductionProvenance::AbilityCostRider,
+                source_name,
+            );
+        }
+    }
+
+    // CR 702.170b + CR 116.2k: Plot is a SPECIAL ACTION, not the activation of an
+    // ability. The activated-ability reducer's `keyword == "activated"` blanket arm
+    // matches ANY ability regardless of tag and adjusts in BOTH directions, so it
+    // would wrongly change a plot cost. Skip it for the synthesized plot shape; plot's
+    // only cost adjustment is its dedicated special-action axis (ReduceActionCost
+    // { action: Plot }), applied after the fold. A tag-keyed reducer can never match
+    // plot anyway — the synthesized plot ability carries no `ability_tag`
+    // (active_keyword == None) — so skipping the whole collection is equivalent to
+    // skipping just the "activated" arm, and clearer.
+    if !is_plot_special_action(ability_def) {
+        collect_static_activated_ability_cost_modifiers(
+            state,
+            ability_def,
+            player,
+            source_id,
+            &mut modifiers,
+        );
+    }
+    modifiers
+}
+
+/// CR 601.2f: the generic reduction one activation entry applies.
+fn activation_reduction_amount(entry: &CostReductionEntry) -> u32 {
+    debug_assert!(
+        !entry.is_order_relevant(),
+        "activation reductions are generic-only (CR 118.7a)"
+    );
+    let per = match &entry.amount {
+        ManaCost::Cost { generic, .. } => *generic,
+        _ => 0,
+    };
+    per.saturating_mul(entry.multiplier)
+}
+
+/// CR 601.2f: the generic mana below which `entry` cannot reduce `cost` — its
+/// floor, less the non-generic mana symbols that already count toward it.
+/// Reductions whose effective floors are equal commute; that is the whole basis
+/// for the default order and for the election's observability test.
+pub(crate) fn activation_effective_floor(cost: &AbilityCost, entry: &CostReductionEntry) -> u32 {
+    let non_generic = total_mana_in_cost(cost).saturating_sub(generic_mana_in_cost(cost));
+    entry.minimum_mana.saturating_sub(non_generic)
+}
+
+/// CR 601.2f + CR 602.2b: apply collected activation modifiers to `base`.
+///
+/// CR 601.2f: "The total cost is the mana cost or alternative cost ..., plus all
+/// additional costs and cost increases, and minus all cost reductions. If
+/// multiple cost reductions apply, the player may apply them in any order." So
+/// every raise is applied first, then the reductions — in the caster's elected
+/// `order` when one exists, otherwise in DESCENDING effective floor.
+///
+/// That default is the minimum over all orders, not merely a deterministic pick.
+/// A reduction with effective floor φ maps the generic amount `x` to `x` when
+/// `x ≤ φ` and to `max(x − a, φ)` otherwise. Each such map never increases `x`
+/// and is monotone, and for φ_A ≥ φ_B applying A then B never yields more than
+/// B then A (equal floors commute). Any order therefore sorts to descending φ by
+/// adjacent swaps that never raise the result. Previews, affordability and the
+/// AI read this default, which is exact for them: payable under the default is
+/// payable under some electable order and vice versa.
+///
+/// Pure: no board reads, so a caller may fold once per candidate order.
+pub(crate) fn fold_activation_cost(
+    base: &AbilityCost,
+    raise_total: u32,
+    reductions: &[CostReductionEntry],
+    order: Option<&[ReductionProvenance]>,
+) -> AbilityCost {
+    let mut cost = base.clone();
+    increase_generic_in_cost(&mut cost, raise_total);
+    let mut ordered: Vec<&CostReductionEntry> = reductions.iter().collect();
+    match order {
+        // Stable, so an entry absent from the election keeps collection order
+        // behind the elected ones.
+        Some(order) => ordered.sort_by_key(|entry| {
+            order
+                .iter()
+                .position(|p| *p == entry.provenance)
+                .unwrap_or(usize::MAX)
+        }),
+        None => {
+            ordered.sort_by_key(|entry| std::cmp::Reverse(activation_effective_floor(&cost, entry)))
+        }
+    }
+    for entry in ordered {
+        reduce_generic_in_cost_with_minimum_mana(
+            &mut cost,
+            activation_reduction_amount(entry),
+            entry.minimum_mana,
+        );
+    }
+    cost
+}
+
+fn collect_static_activated_ability_cost_modifiers(
+    state: &GameState,
+    ability_def: &AbilityDefinition,
+    player: PlayerId,
+    source_id: ObjectId,
+    modifiers: &mut ActivationCostModifiers,
 ) {
     // CR 604.1: presence gate — nothing to do unless a printed ReduceAbilityCost
     // static (CR 611.3) OR a duration-scoped continuous ReduceAbilityCost effect
@@ -24727,54 +24874,64 @@ fn apply_static_activated_ability_cost_reduction(
     crate::game::perf_counters::record_static_full_scan();
     // CR 601.2f: A `ReduceAbilityCost` static keyed on a keyword (e.g. "power-up")
     // also reduces a tagged activated ability whose tag matches that keyword
-    // (Hulk reduces other creatures' power-up abilities). Read the activating
-    // ability's tag keyword before the mutable borrow of its cost below.
+    // (Hulk reduces other creatures' power-up abilities).
     let active_keyword = ability_def
         .ability_tag
         .map(crate::types::ability::AbilityTag::keyword_str);
-    // CR 605.1a: Classify the activating ability BEFORE the mutable cost borrow so
-    // an `ActivationExemption::ManaAbilities` static ("unless they're mana
-    // abilities" / "that aren't mana abilities" — Suppression Field, Zirda) can
-    // skip a mana ability's cost.
+    // CR 605.1a: an `ActivationExemption::ManaAbilities` static ("unless they're
+    // mana abilities" / "that aren't mana abilities" — Suppression Field, Zirda)
+    // skips a mana ability's cost.
     let ability_is_mana = super::mana_abilities::is_mana_ability(ability_def);
 
-    let Some(cost) = ability_def.cost.as_mut() else {
+    let Some(cost) = ability_def.cost.as_ref() else {
         return;
     };
     // CR 606.1: Loyalty abilities are activated abilities identified by their
     // `AbilityCost::Loyalty` cost, not by an `AbilityTag`. A `ReduceAbilityCost`
     // static keyed on `keyword == "loyalty"` (Eidolon of Obstruction) matches
-    // exactly this class. Classified on the unwrapped cost (a `&mut` reborrows to
-    // `&`) before the loop mutates it.
+    // exactly this class.
     let ability_is_loyalty = crate::types::ability::is_loyalty_ability_cost(cost);
+    let scope = ActivationCostScope {
+        ability_source_id: source_id,
+        player,
+        active_keyword,
+        ability_is_mana,
+        ability_is_loyalty,
+    };
 
     // CR 611.3 + CR 601.2f: printed battlefield/command-zone `ReduceAbilityCost`
     // statics (Training Grounds, Suppression Field, Zirda, Agatha, …). The
     // presence index avoids scanning all static sources when this activation is
     // affected only by a duration-scoped continuous reduction.
     if has_static {
+        // CR 601.2f: an ordinal per source disambiguates several reducing statics
+        // printed on one permanent, so each is a distinct electable reduction.
+        let mut ordinals: HashMap<ObjectId, u8> = HashMap::new();
         for (static_source, def) in super::functioning_abilities::battlefield_active_statics(state)
         {
             if !matches!(def.mode, StaticMode::ReduceAbilityCost { .. }) {
                 continue;
             }
+            let ordinal = ordinals.entry(static_source.id).or_insert(0);
+            let provenance = ReductionProvenance::Static {
+                source: static_source.id,
+                ordinal: *ordinal,
+            };
+            *ordinal = ordinal.saturating_add(1);
             // CR 604.1 + CR 109.5: "you control" in the affected filter anchors on the
             // static's current controller, read live from the battlefield object.
             let ctx = super::filter::FilterContext::from_source(state, static_source.id);
-            apply_one_reduce_ability_cost(
+            if let Some((mode, amount, minimum_mana)) = resolve_one_reduce_ability_cost(
                 state,
-                cost,
-                source_id,
-                player,
-                active_keyword,
-                ability_is_mana,
-                ability_is_loyalty,
+                &scope,
                 &def.mode,
                 def.affected.as_ref(),
                 static_source.id,
                 static_source.controller,
                 &ctx,
-            );
+            ) {
+                modifiers.push(mode, amount, minimum_mana, provenance, &static_source.name);
+            }
         }
     }
 
@@ -24787,35 +24944,59 @@ fn apply_static_activated_ability_cost_reduction(
     // the affected set is dynamic (re-evaluated each activation), so a token
     // created later this turn is still discounted.
     for tce in &state.transient_continuous_effects {
-        for modification in &tce.modifications {
-            let ContinuousModification::AddStaticMode {
-                mode: reduce_mode @ StaticMode::ReduceAbilityCost { .. },
-            } = modification
-            else {
-                continue;
-            };
+        let reducers = tce
+            .modifications
+            .iter()
+            .filter_map(|modification| match modification {
+                ContinuousModification::AddStaticMode {
+                    mode: reduce_mode @ StaticMode::ReduceAbilityCost { .. },
+                } => Some(reduce_mode),
+                _ => None,
+            });
+        for (ordinal, reduce_mode) in reducers.enumerate() {
             // CR 608.2c + CR 109.5: "you control" is latched to the installing
             // player captured on the TCE, not the source's current controller.
             let ctx = super::filter::FilterContext::from_source_with_controller(
                 tce.source_id,
                 tce.controller,
             );
-            apply_one_reduce_ability_cost(
+            if let Some((mode, amount, minimum_mana)) = resolve_one_reduce_ability_cost(
                 state,
-                cost,
-                source_id,
-                player,
-                active_keyword,
-                ability_is_mana,
-                ability_is_loyalty,
+                &scope,
                 reduce_mode,
                 Some(&tce.affected),
                 tce.source_id,
                 tce.controller,
                 &ctx,
-            );
+            ) {
+                let display_name = state
+                    .objects
+                    .get(&tce.source_id)
+                    .map(|obj| obj.name.as_str())
+                    .unwrap_or_default();
+                modifiers.push(
+                    mode,
+                    amount,
+                    minimum_mana,
+                    ReductionProvenance::TransientEffect {
+                        effect: tce.id,
+                        ordinal: ordinal.min(u8::MAX as usize) as u8,
+                    },
+                    display_name,
+                );
+            }
         }
     }
+}
+
+/// The activating ability's side of every `ReduceAbilityCost` applicability check.
+#[derive(Clone, Copy)]
+struct ActivationCostScope {
+    ability_source_id: ObjectId,
+    player: PlayerId,
+    active_keyword: Option<&'static str>,
+    ability_is_mana: bool,
+    ability_is_loyalty: bool,
 }
 
 /// CR 604.1: presence gate for the transient (duration-scoped) `ReduceAbilityCost`
@@ -24837,30 +25018,33 @@ fn transient_reduce_ability_cost_present(state: &GameState) -> bool {
     })
 }
 
-/// CR 601.2f + CR 118.7 + CR 605.1a + CR 606.1: Apply ONE `ReduceAbilityCost`
-/// static to the activating ability's `cost`. The single authority for both a
-/// printed battlefield static (Training Grounds) and a duration-scoped continuous
-/// effect (The Dining Car's transient chaos discount), so both apply through
-/// identical keyword-match, mana-exemption, activator-scope, source-filter, and
+/// CR 601.2f + CR 118.7 + CR 605.1a + CR 606.1: Resolve ONE `ReduceAbilityCost`
+/// static against the activating ability: `Some((direction, effective amount,
+/// floor))` when it applies. The single authority for both a printed
+/// battlefield static (Training Grounds) and a duration-scoped continuous effect
+/// (The Dining Car's transient chaos discount), so both apply through identical
+/// keyword-match, mana-exemption, activator-scope, source-filter, and
 /// dynamic-count logic. `reduce_mode` must be a `StaticMode::ReduceAbilityCost`;
 /// `affected` is its source-scope filter (evaluated against the ability's SOURCE
 /// permanent via `filter_ctx`); `static_source_id`/`static_controller` anchor the
-/// dynamic-count resolution and the activator-permission check.
-#[allow(clippy::too_many_arguments)]
-fn apply_one_reduce_ability_cost(
+/// dynamic-count resolution and the activator-permission check. It applies
+/// nothing: [`fold_activation_cost`] owns the arithmetic and its order.
+fn resolve_one_reduce_ability_cost(
     state: &GameState,
-    cost: &mut AbilityCost,
-    ability_source_id: ObjectId,
-    player: PlayerId,
-    active_keyword: Option<&'static str>,
-    ability_is_mana: bool,
-    ability_is_loyalty: bool,
+    scope: &ActivationCostScope,
     reduce_mode: &StaticMode,
     affected: Option<&TargetFilter>,
     static_source_id: ObjectId,
     static_controller: PlayerId,
     filter_ctx: &super::filter::FilterContext,
-) {
+) -> Option<(CostModifyMode, u32, u32)> {
+    let ActivationCostScope {
+        ability_source_id,
+        player,
+        active_keyword,
+        ability_is_mana,
+        ability_is_loyalty,
+    } = *scope;
     let StaticMode::ReduceAbilityCost {
         mode,
         keyword,
@@ -24871,7 +25055,7 @@ fn apply_one_reduce_ability_cost(
         activator,
     } = reduce_mode
     else {
-        return;
+        return None;
     };
     // CR 601.2f + CR 606.1: match the "activated" blanket arm, a tag-keyed keyword
     // (power-up, exhaust, …), or the "loyalty" arm against a loyalty ability's cost.
@@ -24879,12 +25063,12 @@ fn apply_one_reduce_ability_cost(
         || Some(keyword.as_str()) == active_keyword
         || (keyword == "loyalty" && ability_is_loyalty);
     if !keyword_matches || *amount == 0 {
-        return;
+        return None;
     }
     // CR 605.1a: a mana ability bypasses a "unless they're mana abilities"
     // adjustment (Suppression Field's tax, Zirda's discount).
     if *exemption == ActivationExemption::ManaAbilities && ability_is_mana {
-        return;
+        return None;
     }
     // CR 602.2: an activator-scoped static ("abilities you activate" — Zirda, the
     // Dawnwaker; Fluctuator) keys off WHO is activating the ability, evaluated
@@ -24894,14 +25078,14 @@ fn apply_one_reduce_ability_cost(
     // source/global scope untouched.
     if let Some(activator) = activator {
         if !player_may_begin_activating(state, player, static_controller, Some(activator)) {
-            return;
+            return None;
         }
     }
     // CR 602.2: scope by the source filter against the ability's SOURCE permanent.
     if affected.is_some_and(|filter| {
         !super::filter::matches_target_filter(state, ability_source_id, filter, filter_ctx)
     }) {
-        return;
+        return None;
     }
     // CR 601.2f + CR 208.1 + CR 113.7: When `dynamic_count` is present the per-unit
     // `amount` is multiplied by the resolved quantity (Agatha of the Vile Cauldron:
@@ -24916,17 +25100,11 @@ fn apply_one_reduce_ability_cost(
             as u32
     });
     let effective = amount.saturating_mul(multiplier);
-    // CR 118.7: Apply the adjustment in the static's direction. `Reduce` subtracts
-    // generic mana (honoring the optional one-mana floor); `Raise` adds generic
-    // mana (Skyseer's Chariot). `Minimum` is not emitted for activated-ability
-    // statics and is treated as a no-op.
-    match mode {
-        CostModifyMode::Reduce => {
-            reduce_generic_in_cost_with_minimum_mana(cost, effective, minimum_mana.unwrap_or(0));
-        }
-        CostModifyMode::Raise => increase_generic_in_cost(cost, effective),
-        CostModifyMode::Minimum => {}
-    }
+    // CR 118.7: the adjustment's direction. `Reduce` subtracts generic mana
+    // (honoring the optional one-mana floor); `Raise` adds generic mana
+    // (Skyseer's Chariot). `Minimum` is not emitted for activated-ability
+    // statics, and the collector ignores it.
+    Some((*mode, effective, minimum_mana.unwrap_or(0)))
 }
 
 /// CR 116.2 + CR 118.7a: Reduce (or raise) the generic mana of a special
