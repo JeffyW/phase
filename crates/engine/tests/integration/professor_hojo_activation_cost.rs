@@ -514,3 +514,123 @@ fn professor_hojo_trigger_fires_only_for_activated_abilities() {
         "a TRIGGERED ability targeting a creature you control must not fire Hojo"
     );
 }
+
+/// M3, CR 107.4d + CR 601.2f: a concrete `{0}` mana leg is a real cost, not an
+/// absent one. An opponent's `{X}` activation with X=0, targeting a Merfolk
+/// Kopala protects, still pays Kopala's `{2}` tax.
+///
+/// The `{X}` route extracts its mana leg into `PendingCast::cost` before targets
+/// settle. At X=0 that leg is `{0}`. The settlement write-back used to test it with
+/// `is_without_paying_mana()`, which is true for a concrete `{0}`, so it read the
+/// leg as absent, returned early, and skipped every target-gated modifier.
+#[test]
+fn x_zero_activation_still_pays_a_target_gated_tax() {
+    const KOPALA_ACTIVATE_HALF: &str = "Abilities your opponents activate that target a Merfolk you control cost {2} more to activate.";
+    const X_TAP: &str = "{X}: Tap target creature.";
+
+    fn paid_at_x_zero(target_is_merfolk: bool) -> usize {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        s.add_creature_from_oracle(P1, "Kopala, Warden of Waves", 2, 2, KOPALA_ACTIVATE_HALF);
+        let mut victim = s.add_creature(P1, "Merfolk Trickster", 2, 2);
+        if target_is_merfolk {
+            victim.with_subtypes(vec!["Merfolk"]);
+        }
+        let victim = victim.id();
+        let src = s.add_artifact_from_oracle(P0, "Tapper", X_TAP).id();
+        add_white_mana(&mut s, 8);
+        let mut runner = s.build();
+        let before = mana_pool(&runner);
+        runner.activate(src, 0).x(0).target_object(victim).resolve();
+        before - mana_pool(&runner)
+    }
+
+    assert_eq!(
+        paid_at_x_zero(true),
+        2,
+        "X=0 targeting the protected Merfolk pays the {{2}} tax: {{0}} is a real mana leg"
+    );
+    assert_eq!(
+        paid_at_x_zero(false),
+        0,
+        "control: X=0 targeting a non-Merfolk is untaxed and costs nothing"
+    );
+}
+
+/// M3 route separation. Deciding WHERE a target-first activation's price is
+/// written (the settlement write-back) and deciding WHETHER payment is skipped
+/// (the mana-leg finalizer's zero-leg check) are two different sites. M3 changed
+/// only the first. This pins that each kind of activation takes its own site and
+/// never the other's, so a later change to one can't silently move into the
+/// other.
+///
+/// Each row is the other's reach guard: the targeted row proves the write-back
+/// counter is live, and the untargeted row proves the skip counter is live. So
+/// neither row's zero is vacuous.
+#[test]
+fn settlement_writeback_and_zero_leg_skip_are_distinct_sites() {
+    use engine::game::perf_counters;
+    const TRAINING_GROUNDS_FLOOR: &str = "Activated abilities of creatures you control cost {2} less to activate. This effect can't reduce the mana in that cost to less than one mana.";
+
+    // Target-first, folds to {0}: Training Grounds (-2, floor 1) plus Hojo (-2) on
+    // {3}, targeting your own creature, with no mana. Priced at settlement.
+    {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        s.add_artifact_from_oracle(P0, "Training Grounds", TRAINING_GROUNDS_FLOOR);
+        s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+        let own = s.add_creature(P0, "Own", 1, 1).id();
+        // Hojo's trigger draws a card when your creature is targeted, so the
+        // library must be non-empty or the draw ends the game before the
+        // activation resolves.
+        for name in ["L1", "L2"] {
+            s.add_card_to_library_top(P0, name);
+        }
+        let src = s
+            .add_creature_from_oracle(P0, "Tapper", 2, 2, "{3}: Tap target creature.")
+            .id();
+        let mut runner = s.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&src)
+            .unwrap()
+            .has_summoning_sickness = false;
+        perf_counters::reset();
+        runner.activate(src, 0).target_object(own).resolve();
+        let routes = perf_counters::activation_cost_route_snapshot();
+        assert!(
+            routes.settlement_writebacks >= 1,
+            "a target-first activation is priced at the settlement write-back: {routes:?}"
+        );
+        assert_eq!(
+            routes.zero_mana_leg_skips, 0,
+            "and never through the payment-skip check: {routes:?}"
+        );
+        assert!(
+            runner.state().objects[&own].tapped,
+            "positive guard: the {{0}} activation resolved and tapped its target"
+        );
+    }
+
+    // Untargeted, a concrete {0}: nothing to settle, payment skipped.
+    {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let src = s
+            .add_artifact_from_oracle(P0, "Free Relic", "{0}: You gain 1 life.")
+            .id();
+        let mut runner = s.build();
+        perf_counters::reset();
+        runner.activate(src, 0).resolve();
+        let routes = perf_counters::activation_cost_route_snapshot();
+        assert_eq!(
+            routes.zero_mana_leg_skips, 1,
+            "an untargeted {{0}} activation takes the payment-skip check: {routes:?}"
+        );
+        assert_eq!(
+            routes.settlement_writebacks, 0,
+            "and never the settlement write-back (it has no targets): {routes:?}"
+        );
+    }
+}

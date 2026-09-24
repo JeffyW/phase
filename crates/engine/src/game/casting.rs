@@ -23214,6 +23214,11 @@ pub(super) fn try_finalize_pending_activation_mana_leg(
         return Ok(None);
     };
     if mana_cost.is_without_paying_mana() {
+        // CR 601.2h: nothing left to pay, so payment is skipped. This is the
+        // payment-skip decision, deliberately distinct from the settlement
+        // write-back's carrier choice (M3), which keys on `NoCost` instead.
+        #[cfg(feature = "test-support")]
+        super::perf_counters::record_activation_zero_mana_leg_skip();
         return Ok(None);
     }
     let excluded_sources = remaining
@@ -25002,7 +25007,22 @@ fn apply_deferred_target_dependent_activation_cost_modifiers(
     // fail OPEN: an opponent activating an `{X}` ability targeting a Merfolk
     // dodged Kopala's `{2}` tax entirely (CR 118.7 underpayment) rather than
     // merely forgoing a discount.
-    let mana_leg_is_live = !pending.cost.is_without_paying_mana();
+    // M3, CR 107.4d + CR 601.2f: which carrier holds the unpaid mana is keyed on
+    // `NoCost` ("no mana leg lives here"), NOT on `is_without_paying_mana()`. That
+    // predicate is also true for a CONCRETE `{0}` (`types/mana.rs`), and "{0}
+    // represents zero mana" is a real cost, not an absent one (CR 107.4d). An `{X}`
+    // activation with X=0 leaves `pending.cost == {0}` while `activation_cost` may
+    // be `None`, so the old predicate returned early and skipped every target-gated
+    // modifier: an opponent's X=0 activation dodged Kopala's `{2}` tax outright.
+    //
+    // This decides only WHERE the adjustment is written. Whether payment is skipped
+    // is a separate decision, made at `try_finalize_pending_activation_mana_leg`'s
+    // zero-leg check, which this does not touch. The two sites are counted apart
+    // (`perf_counters::ActivationCostRouteCounters`) so neither can drift into the
+    // other.
+    #[cfg(feature = "test-support")]
+    super::perf_counters::record_activation_settlement_writeback();
+    let mana_leg_is_live = !matches!(pending.cost, ManaCost::NoCost);
     let carrier_cost = if mana_leg_is_live {
         AbilityCost::Mana {
             cost: pending.cost.clone(),
