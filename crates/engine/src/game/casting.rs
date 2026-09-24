@@ -4731,6 +4731,25 @@ struct GraveyardPermissionSource<'a> {
     /// static (Festival of Embers: additional pay-life). Borrowed from the static
     /// definition (kept `Copy` so the source struct stays `Copy`).
     extra_cost: &'a Option<crate::types::statics::CastExtraCost>,
+    /// CR 122.1 + CR 607.1: Optional "if you cast a spell this way, that creature
+    /// enters with a [counter] counter on it" rider (Leonardo, Noctis). Applied at
+    /// the `finalize_cast` seam by `selected_static_permission_enters_with_counter`;
+    /// carried here so permission selection can see every rider a choice brings.
+    enters_with_counter: &'a Option<crate::types::counter::CounterType>,
+}
+
+impl GraveyardPermissionSource<'_> {
+    /// CR 601.2a: true when using this permission is a choice no player would
+    /// make differently. It is `Unlimited`, so it spends no per-turn slot, and it
+    /// carries no rider: no enters-with counter, no graveyard redirect and no
+    /// extra cost. Any other permission can only spend a slot or add a rider, so
+    /// this one is strictly dominant.
+    fn is_strictly_dominant(&self) -> bool {
+        self.frequency == CastFrequency::Unlimited
+            && self.enters_with_counter.is_none()
+            && self.graveyard_destination_replacement.is_none()
+            && self.extra_cost.is_none()
+    }
 }
 
 /// CR 601.2a + CR 113.6b + CR 118.9: An active battlefield permanent carrying
@@ -5260,9 +5279,10 @@ fn graveyard_permission_sources(
                     play_mode,
                     graveyard_destination_replacement,
                     ref extra_cost,
-                    // enters-with counter is read at the finalize_cast seam via
-                    // `selected_static_permission_enters_with_counter`, not here.
-                    ..
+                    // Applied at the finalize_cast seam via
+                    // `selected_static_permission_enters_with_counter`; carried
+                    // here so permission selection can see the rider.
+                    ref enters_with_counter,
                 } if graveyard_permission_play_mode_matches(play_mode, play_mode_filter) => {
                     definition
                         .affected
@@ -5273,6 +5293,7 @@ fn graveyard_permission_sources(
                             frequency,
                             graveyard_destination_replacement,
                             extra_cost,
+                            enters_with_counter,
                         })
                 }
                 _ => None,
@@ -5462,10 +5483,17 @@ fn graveyard_permission_variant(
 /// This is the graveyard counterpart of the exile rider path, whose authority
 /// travels separately in `casting_permission_index`.
 ///
-/// CR 601.2a: when several permissions admit the cast, an `Unlimited` one is
-/// preferred, so a bounded slot is not spent when a permission that needs no
-/// slot also authorizes this cast (Sabin, Master Monk's own "using its blitz
-/// ability" rider beside Muldrotha). Mirrors `top_of_library_selected_permission`.
+/// CR 601.2a: the player announces which permission they are using when
+/// several admit the cast (Muldrotha, 2020-11-10 ruling). The engine does not
+/// model that announcement yet, so it chooses only where the choice is
+/// strictly dominant: an `Unlimited` permission with no rider (see
+/// `GraveyardPermissionSource::is_strictly_dominant`) spends no slot and adds
+/// nothing, so a bounded slot is not spent when such a permission also admits
+/// the cast (Sabin, Master Monk's own "using its blitz ability" rider beside
+/// Muldrotha). Otherwise it falls back to source order, the same first match
+/// `graveyard_permission_source` gives a printed-cost cast. An unlimited
+/// permission WITH a rider is a real trade-off: Leonardo's finality counter
+/// against Muldrotha's slot is the player's call, not the engine's.
 ///
 /// Read while the card is still in the graveyard — `finalize_cast` calls this
 /// before the Graveyard→Stack move, alongside its sibling pre-move captures.
@@ -5477,7 +5505,7 @@ pub(super) fn graveyard_rider_permission_authority(
     let candidates = graveyard_permission_candidates(state, player, object_id);
     let selected = candidates
         .iter()
-        .find(|source| source.frequency == CastFrequency::Unlimited)
+        .find(|source| source.is_strictly_dominant())
         .or_else(|| candidates.first())?;
     Some(graveyard_permission_variant(state, object_id, selected))
 }

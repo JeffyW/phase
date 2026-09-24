@@ -660,3 +660,81 @@ fn blitz_from_graveyard_keeps_the_permissions_enters_with_counter_rider() {
         entered.counters
     );
 }
+
+const RIVETEERS_DECOY: &str = "This creature must be blocked if able.\nBlitz {3}{G} (If you cast this spell for its blitz cost, it gains haste and \"When this creature dies, draw a card.\" Sacrifice it at the beginning of the next end step.)";
+
+/// CR 601.2a: when several permissions admit a graveyard cast, the player
+/// announces which one they use (Muldrotha, 2020-11-10 ruling). The engine
+/// picks only when the choice is strictly dominant, so an unlimited permission
+/// that brings a rider is NOT preferred over a bounded one.
+///
+/// Leonardo is unlimited but gives the creature a finality counter, so blitz's
+/// end-step sacrifice would exile Riveteers Decoy instead of returning it to the
+/// graveyard. Spending Muldrotha's slot instead is a real alternative, so the
+/// engine keeps the same source-order first match a printed-cost cast gets.
+/// Muldrotha is added first, so that first match is Muldrotha.
+#[test]
+fn blitz_does_not_prefer_an_unlimited_permission_that_brings_a_rider() {
+    let decoy_blitz = blitz_keyword(&parse_oracle_text(
+        RIVETEERS_DECOY,
+        "Riveteers Decoy",
+        &["Blitz".into()],
+        &["Creature".into()],
+        &["Human".into(), "Warrior".into()],
+    ));
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    add_permission_source(
+        &mut scenario,
+        "Leonardo, Sewer Samurai",
+        LEONARDO,
+        &["Mutant", "Ninja", "Turtle", "Samurai"],
+    );
+    let decoy = scenario
+        .add_creature_to_graveyard(P0, "Riveteers Decoy", 3, 1)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Green],
+        })
+        .with_keyword(decoy_blitz)
+        .id();
+    let mut runner = scenario.build();
+    fill_mana(&mut runner, ManaType::Green);
+
+    cast_from_graveyard(&mut runner, decoy).expect("graveyard cast must be legal");
+    runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Alternative,
+        })
+        .expect("choosing blitz must complete the cast");
+    // Positive reach guard: blitz's {3}{G} = 4 was charged, not the printed 2.
+    assert_eq!(runner.state().players[0].mana_pool.total(), 4);
+
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "with no strictly dominant permission, the source-order first match \
+         (Muldrotha) authorizes the cast and spends its slot, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+
+    runner.resolve_top();
+    let entered = &runner.state().objects[&decoy];
+    assert_eq!(entered.zone, Zone::Battlefield);
+    assert_eq!(
+        entered.counters.get(&CounterType::Finality).copied(),
+        None,
+        "Leonardo's permission was not the one used, so its finality rider must \
+         not apply, counters: {:?}",
+        entered.counters
+    );
+}
