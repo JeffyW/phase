@@ -415,3 +415,102 @@ fn kopala_taxes_opponent_activation_that_targets_a_protected_merfolk() {
         "control: both carriers populated, NON-Merfolk target, so no tax"
     );
 }
+
+/// Hojo's trigger as parsed, isolated from his cost static.
+const HOJO_TRIGGER: &str = "Whenever one or more creatures you control become the target of an activated ability, draw a card. This ability triggers only once each turn.";
+
+/// Number of cards in P0's library.
+fn library_size(runner: &GameRunner) -> usize {
+    runner
+        .state()
+        .objects
+        .values()
+        .filter(|o| o.zone == engine::types::zones::Zone::Library && o.owner == P0)
+        .count()
+}
+
+/// CR 113.3b + CR 113.3c + CR 115.1a: Professor Hojo's trigger reads "become the
+/// target of an ACTIVATED ability", so a TRIGGERED ability targeting a creature
+/// Hojo's controller controls must not fire it.
+///
+/// Parse shape first, then runtime: the parse pins that the printed kind survives
+/// into `valid_source`, and the runtime legs prove the kind gates at match time.
+/// That includes the activated leg, whose ability is not yet physically on the
+/// stack when its targets are declared: the engine matches it through the virtual
+/// targeting-source projection.
+#[test]
+fn professor_hojo_trigger_fires_only_for_activated_abilities() {
+    use engine::types::ability::StackAbilityKind;
+
+    // Parse: the kind is carried, not dropped to "any ability".
+    let parsed = parse_oracle_text(
+        HOJO_TRIGGER,
+        "Professor Hojo",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::BecomesTarget)
+        .expect("Hojo's trigger parses to BecomesTarget, not Unknown");
+    assert!(
+        matches!(
+            trigger.valid_source,
+            Some(TargetFilter::StackAbility {
+                kind: Some(StackAbilityKind::Activated),
+                ..
+            })
+        ),
+        "the printed 'activated' qualifier must narrow the source, got {:?}",
+        trigger.valid_source
+    );
+
+    /// P0 controls Hojo plus `own`; the probe card targets `own`.
+    /// Returns the number of cards P0 drew.
+    fn drawn_after(targeting_card_is_triggered: bool) -> usize {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+        let own = s.add_creature(P0, "Own", 1, 1).id();
+        for name in ["L1", "L2", "L3", "L4"] {
+            s.add_card_to_library_top(P0, name);
+        }
+        add_white_mana(&mut s, 8);
+        let source = if targeting_card_is_triggered {
+            s.add_creature_to_hand_from_oracle(
+                P0,
+                "Tap Herald",
+                1,
+                1,
+                "When this creature enters, tap target creature.",
+            )
+            .id()
+        } else {
+            s.add_artifact_from_oracle(P0, "Tapper", "{4}: Tap target creature.")
+                .id()
+        };
+        let mut runner = s.build();
+        let before = library_size(&runner);
+        if targeting_card_is_triggered {
+            runner.cast(source).target_object(own).resolve();
+        } else {
+            runner.activate(source, 0).target_object(own).resolve();
+        }
+        before - library_size(&runner)
+    }
+
+    // Positive reach guard: the activated case DOES draw, so the negative below
+    // cannot pass because the trigger never fires at all.
+    assert_eq!(
+        drawn_after(false),
+        1,
+        "an activated ability targeting a creature you control draws a card"
+    );
+    assert_eq!(
+        drawn_after(true),
+        0,
+        "a TRIGGERED ability targeting a creature you control must not fire Hojo"
+    );
+}
