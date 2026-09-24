@@ -707,7 +707,26 @@ fn bestow_from_graveyard_under_muldrotha_spends_its_enchantment_slot() {
     }
     fill_mana(&mut runner, ManaType::Green);
 
-    cast_from_graveyard(&mut runner, satyr).expect("graveyard bestow cast must be legal");
+    // CR 118.9b + CR 702.103a: Muldrotha also authorizes the printed creature
+    // cast, so bestow is offered as a CHOICE, not forced.
+    let waiting =
+        cast_from_graveyard(&mut runner, satyr).expect("graveyard bestow cast must be legal");
+    assert!(
+        matches!(
+            waiting,
+            WaitingFor::AlternativeCastChoice {
+                keyword: engine::types::game_state::AlternativeCastKeyword::Bestow,
+                ..
+            }
+        ),
+        "with Muldrotha authorizing the printed cast too, bestow must be offered \
+         as a choice, got {waiting:?}"
+    );
+    runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Alternative,
+        })
+        .expect("choosing bestow must be legal");
     if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
         runner
             .choose_first_legal_target()
@@ -974,14 +993,15 @@ fn mycosynth_muldrotha_board(scenario: &mut GameScenario) -> ObjectId {
     builder.id()
 }
 
-/// CR 110.4 + CR 702.103b: under Encroaching Mycosynth a bestowed Boon Satyr is
-/// an artifact AND an enchantment spell, so Muldrotha offers two slots and the
-/// player would have to choose one. That choice has no prompt on the
-/// alternative-cost path yet, so Muldrotha can't be used for the bestow cast,
-/// and the cast is refused before any cost is paid, rather than finalizing a
-/// cast that spends no slot (or tripping the finalize-time slot assertion).
+/// CR 110.4 + CR 702.103b + CR 118.9b: under Encroaching Mycosynth a bestowed
+/// Boon Satyr is an artifact AND an enchantment spell, so Muldrotha offers two
+/// slots and the player would have to choose one. That choice has no prompt on
+/// the alternative-cost path yet, so bestow is not offered through Muldrotha,
+/// rather than finalizing a cast that spends no slot (or tripping the
+/// finalize-time slot assertion). Bestow is optional, though, so Muldrotha's
+/// ordinary creature cast is still legal and goes to the existing slot prompt.
 #[test]
-fn bestow_needing_a_permanent_type_choice_is_refused_not_finalized() {
+fn bestow_needing_a_permanent_type_choice_leaves_the_printed_cast() {
     let mut scenario = GameScenario::new();
     let satyr = mycosynth_muldrotha_board(&mut scenario);
     let mut runner = scenario.build();
@@ -1012,26 +1032,232 @@ fn bestow_needing_a_permanent_type_choice_is_refused_not_finalized() {
         runner.state().objects[&satyr].card_types.core_types
     );
 
-    let result = cast_from_graveyard(&mut runner, satyr);
-    assert!(
-        result.is_err(),
-        "the bestow cast must be refused while its slot choice has no prompt, got {result:?}"
-    );
+    let waiting = cast_from_graveyard(&mut runner, satyr)
+        .expect("Muldrotha's printed creature cast is legal, so the cast must go ahead");
+    match &waiting {
+        WaitingFor::ChoosePermanentTypeSlot {
+            available_slots, ..
+        } => {
+            for slot in [
+                CoreType::Artifact,
+                CoreType::Creature,
+                CoreType::Enchantment,
+            ] {
+                assert!(
+                    available_slots.contains(&slot),
+                    "the printed Artifact Enchantment Creature cast offers every slot, \
+                     missing {slot:?} in {available_slots:?}"
+                );
+            }
+        }
+        other => panic!(
+            "bestow can't be used through Muldrotha here, so the printed cast must go \
+             to the existing slot prompt, not {other:?}"
+        ),
+    }
     assert!(
         runner.state().stack.is_empty(),
-        "nothing may reach the stack"
+        "nothing is on the stack yet"
     );
     let obj = &runner.state().objects[&satyr];
     assert_eq!(obj.zone, Zone::Graveyard);
     assert!(
         obj.card_types.core_types.contains(&CoreType::Creature),
-        "the refused bestow must leave the card in its printed creature form, types: {:?}",
+        "no bestow form was applied, so the card keeps its creature type, types: {:?}",
         obj.card_types.core_types
     );
-    assert!(runner
-        .state()
+}
+
+/// CR 110.4 + CR 118.9b: choosing the printed cast over bestow, from the
+/// graveyard under Muldrotha, still takes the permanent-type slot choice. Boon
+/// Satyr's printed cast is an enchantment creature spell, so there are two
+/// slots to choose between.
+#[test]
+fn bestow_declined_from_graveyard_takes_the_slot_prompt() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Boon Satyr", 4, 2);
+    builder.with_mana_cost(ManaCost::Cost {
+        generic: 1,
+        shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+    });
+    builder.with_subtypes(vec!["Satyr"]);
+    builder.from_oracle_text_with_keywords(&["Flash", "Bestow"], BOON_SATYR);
+    let satyr = builder.id();
+    let mut runner = scenario.build();
+    {
+        let obj = runner.state_mut().objects.get_mut(&satyr).unwrap();
+        for types in [
+            &mut obj.card_types.core_types,
+            &mut obj.base_card_types.core_types,
+        ] {
+            if !types.contains(&CoreType::Enchantment) {
+                types.push(CoreType::Enchantment);
+            }
+        }
+    }
+    fill_mana(&mut runner, ManaType::Green);
+
+    let waiting = cast_from_graveyard(&mut runner, satyr).expect("graveyard cast must be legal");
+    assert!(
+        matches!(waiting, WaitingFor::AlternativeCastChoice { .. }),
+        "expected the bestow choice, got {waiting:?}"
+    );
+    let waiting = runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Normal,
+        })
+        .expect("choosing the printed cast must be legal")
+        .waiting_for;
+    assert!(
+        matches!(
+            &waiting,
+            WaitingFor::ChoosePermanentTypeSlot { available_slots, .. }
+                if available_slots.contains(&CoreType::Creature)
+                    && available_slots.contains(&CoreType::Enchantment)
+        ),
+        "the printed enchantment creature cast must go to the slot prompt, got {waiting:?}"
+    );
+}
+
+/// CR 110.4 + CR 702.103d + CR 118.9b: with Muldrotha's ENCHANTMENT slot already
+/// spent this turn, a bestowed Boon Satyr (an enchantment spell) can't use
+/// Muldrotha, but the printed creature cast can still take the free creature
+/// slot. Bestow is optional, so that printed cast must go ahead instead of the
+/// whole cast being refused.
+#[test]
+fn bestow_blocked_by_a_spent_slot_still_leaves_the_printed_cast() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Boon Satyr", 4, 2);
+    builder.with_mana_cost(ManaCost::Cost {
+        generic: 1,
+        shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+    });
+    builder.with_subtypes(vec!["Satyr"]);
+    builder.from_oracle_text_with_keywords(&["Flash", "Bestow"], BOON_SATYR);
+    let satyr = builder.id();
+    let mut runner = scenario.build();
+    {
+        let obj = runner.state_mut().objects.get_mut(&satyr).unwrap();
+        for types in [
+            &mut obj.card_types.core_types,
+            &mut obj.base_card_types.core_types,
+        ] {
+            if !types.contains(&CoreType::Enchantment) {
+                types.push(CoreType::Enchantment);
+            }
+        }
+    }
+    runner
+        .state_mut()
         .graveyard_cast_permissions_used_per_type
-        .is_empty());
+        .insert((muldrotha, CoreType::Enchantment));
+    fill_mana(&mut runner, ManaType::Green);
+
+    let waiting = cast_from_graveyard(&mut runner, satyr)
+        .expect("the printed creature cast through the free creature slot is legal");
+    assert!(
+        !matches!(waiting, WaitingFor::AlternativeCastChoice { .. }),
+        "bestow can't use Muldrotha's spent enchantment slot, so it must not be offered, \
+         got {waiting:?}"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the printed cast must reach the stack"
+    );
+    assert!(
+        runner.state().objects[&satyr]
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature),
+        "this must be the printed creature cast, not a bestowed Aura"
+    );
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "the printed cast must spend Muldrotha's creature slot, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+}
+
+/// CR 110.4 + CR 118.9b: the Blitz counterpart of the test above. Under
+/// Encroaching Mycosynth Sabin is an artifact creature card, so its printed cast
+/// through Muldrotha has two slots. Sabin's own rider still admits blitz, so the
+/// choice is offered, and declining blitz goes to the slot prompt.
+#[test]
+fn blitz_declined_from_graveyard_takes_the_slot_prompt() {
+    let parsed = parse_oracle_text(
+        SABIN,
+        "Sabin, Master Monk",
+        &[],
+        &["Legendary".into(), "Creature".into()],
+        &["Human".into(), "Noble".into(), "Monk".into()],
+    );
+    let own_rider = parsed
+        .statics
+        .first()
+        .expect("graveyard-cast permission static must parse")
+        .clone();
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    scenario.add_artifact_from_oracle(P0, "Encroaching Mycosynth", ENCROACHING_MYCOSYNTH);
+    let sabin = scenario
+        .add_creature_to_graveyard(P0, "Sabin, Master Monk", 4, 3)
+        .with_static_definition(own_rider)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 4,
+            shards: vec![ManaCostShard::Red],
+        })
+        .with_keyword(blitz_keyword(&parsed))
+        .id();
+    scenario.add_card_to_hand(P0, "Filler Card");
+    let mut runner = scenario.build();
+    engine::game::layers::flush_layers(runner.state_mut());
+    fill_mana(&mut runner, ManaType::Red);
+
+    let waiting = cast_from_graveyard(&mut runner, sabin).expect("graveyard cast must be legal");
+    assert!(
+        matches!(waiting, WaitingFor::AlternativeCastChoice { .. }),
+        "expected the blitz choice, got {waiting:?}"
+    );
+    let waiting = runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Normal,
+        })
+        .expect("choosing the printed cast must be legal")
+        .waiting_for;
+    assert!(
+        matches!(
+            &waiting,
+            WaitingFor::ChoosePermanentTypeSlot { available_slots, .. }
+                if available_slots.contains(&CoreType::Artifact)
+                    && available_slots.contains(&CoreType::Creature)
+        ),
+        "the printed artifact creature cast must go to the slot prompt, got {waiting:?}"
+    );
 }
 
 /// CR 110.4: the Blitz counterpart. Under Encroaching Mycosynth, Caldaia Guardian

@@ -13522,7 +13522,7 @@ pub fn handle_bestow_cost_choice_with_payment_mode(
     state: &mut GameState,
     player: PlayerId,
     object_id: ObjectId,
-    _card_id: CardId,
+    card_id: CardId,
     decision: crate::types::actions::AlternativeCastDecision,
     payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
@@ -13565,7 +13565,17 @@ pub fn handle_bestow_cost_choice_with_payment_mode(
         prepared.payment_mode = payment_mode;
         return continue_with_prepared(state, player, prepared, events);
     }
-    continue_cast_from_prepared(state, player, object_id, payment_mode, events)
+    // CR 110.4: the printed creature cast may come from the graveyard (Muldrotha
+    // beside a bestow card), so it takes the same permanent-type slot choice as
+    // any other printed graveyard cast — an enchantment creature has two.
+    continue_graveyard_cast_with_slot_choice(
+        state,
+        player,
+        object_id,
+        card_id,
+        payment_mode,
+        events,
+    )
 }
 
 /// CR 702.140a: Public entry-point for the Mutate cost choice (auto payment mode).
@@ -13955,7 +13965,7 @@ pub fn handle_blitz_cost_choice_with_payment_mode(
     state: &mut GameState,
     player: PlayerId,
     object_id: ObjectId,
-    _card_id: CardId,
+    card_id: CardId,
     decision: crate::types::actions::AlternativeCastDecision,
     payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
@@ -13975,7 +13985,17 @@ pub fn handle_blitz_cost_choice_with_payment_mode(
         prepared.payment_mode = payment_mode;
         return continue_with_prepared(state, player, prepared, events);
     }
-    continue_cast_from_prepared(state, player, object_id, payment_mode, events)
+    // CR 110.4: the printed-cost cast may come from the graveyard (an
+    // unconstrained permission beside a blitz card), so it takes the same
+    // permanent-type slot choice as any other printed graveyard cast.
+    continue_graveyard_cast_with_slot_choice(
+        state,
+        player,
+        object_id,
+        card_id,
+        payment_mode,
+        events,
+    )
 }
 
 /// CR 702.137a: Resolve the player's Spectacle cost choice. Mirrors
@@ -16305,20 +16325,32 @@ pub fn handle_cast_spell_with_payment_mode(
                     None => true,
                 };
                 let bestow_affordable = bestow_mana_affordable && bestow_non_mana_affordable;
-                // CR 601.2a: from the graveyard the "normal" creature cast is the
-                // graveyard-permission cast (handled by the variant pipeline). From
-                // the hand it's the printed creature cost. Compute the printed-cost
-                // affordability only when casting from hand — a graveyard bestow
-                // always routes through the bestow path (the permission grants the
-                // cast; there is no separate hand-cost branch to compare against).
+                // CR 601.2a: whether the PRINTED creature cast is on offer at all.
+                // From hand it always is. From the graveyard only when some
+                // permission authorizes an unconstrained cast (Muldrotha). Detective's
+                // Phoenix's own "using its bestow ability" rider grants the bestow
+                // cast only. Bestow twin of the Blitz block's gate.
                 let from_hand = obj.zone == Zone::Hand;
-                let (normal_cost, normal_affordable) = if from_hand {
-                    normal_cast_choice_cost_and_affordability(state, player, object_id, obj)
-                } else {
-                    (obj.mana_cost.clone(), false)
-                };
-                if from_hand && has_legal_creature_target && normal_affordable && bestow_affordable
-                {
+                let printed_cost_cast_allowed = from_hand
+                    || has_graveyard_cast_permission_without_keyword_constraint(
+                        state,
+                        player,
+                        object_id,
+                        KeywordKind::Bestow,
+                    );
+                let (normal_cost, normal_cost_affordable) =
+                    normal_cast_choice_cost_and_affordability(state, player, object_id, obj);
+                let normal_affordable = printed_cost_cast_allowed && normal_cost_affordable;
+                // CR 601.2a + CR 110.4: from the graveyard, bestow needs a
+                // permission it can commit to, judged on the bestowed form (see
+                // `graveyard_bestow_authority_usable`).
+                let bestow_offerable = has_legal_creature_target
+                    && bestow_affordable
+                    && (from_hand || graveyard_bestow_authority_usable(state, player, object_id));
+                // CR 118.9b + CR 702.103a: bestow is an optional alternative cost,
+                // so whenever both the printed and bestow casts are legal and
+                // affordable the player gets the choice — from the graveyard too.
+                if normal_affordable && bestow_offerable {
                     return Ok(WaitingFor::AlternativeCastChoice {
                         player,
                         object_id,
@@ -16331,10 +16363,10 @@ pub fn handle_cast_spell_with_payment_mode(
                         alternative_additional_cost_description: None,
                     });
                 }
-                if has_legal_creature_target && bestow_affordable {
+                if bestow_offerable {
                     // Bestow is the only viable path here: from hand the printed
-                    // cost is unaffordable; from the graveyard the permission only
-                    // grants the bestow cast. Proceed via the bestow path.
+                    // cost is unaffordable; from the graveyard no permission
+                    // authorizes the printed cast. Proceed via the bestow path.
                     return handle_bestow_cost_choice_with_payment_mode(
                         state,
                         player,
@@ -16345,22 +16377,19 @@ pub fn handle_cast_spell_with_payment_mode(
                         events,
                     );
                 }
-                if !from_hand
-                    && !has_graveyard_cast_permission_without_keyword_constraint(
-                        state,
-                        player,
-                        object_id,
-                        KeywordKind::Bestow,
-                    )
-                {
+                // CR 601.2a + CR 118.9b: a "using its bestow ability" permission
+                // authorizes ONLY the bestow cast. When bestow can't be cast and no
+                // separate permission grants an unconstrained graveyard cast,
+                // refuse rather than fall through to a printed cast the permission
+                // never granted.
+                if !printed_cost_cast_allowed {
                     return Err(EngineError::InvalidAction(
                         "No legal bestow cast from graveyard".to_string(),
                     ));
                 }
-                // Otherwise (no legal target / unaffordable bestow): fall through
-                // to the normal / graveyard-permission cast path. The graveyard
-                // case is only legal when a separate permission grants a normal
-                // cast, not merely a "using bestow" rider.
+                // Otherwise (no legal target / bestow unaffordable / no usable
+                // permission for bestow): fall through to the printed cast and its
+                // permanent-type slot choice.
             }
         }
     }
@@ -16660,6 +16689,32 @@ pub fn handle_cast_spell_with_payment_mode(
         }
     }
 
+    continue_graveyard_cast_with_slot_choice(
+        state,
+        player,
+        object_id,
+        card_id,
+        payment_mode,
+        events,
+    )
+}
+
+/// CR 110.4 + CR 601.2a: continue a cast at its ordinary (printed-cost) path,
+/// first prompting for the permanent-type slot when the card is cast from the
+/// graveyard through a `OncePerTurnPerPermanentType` permission (Muldrotha) and
+/// has more than one available slot (an artifact creature, an enchantment
+/// creature). Shared by the end of the cast-offer flow and by the "Normal"
+/// branch of the Blitz and Bestow choices, which also cast for the printed cost
+/// from the graveyard and so need the same slot choice. From any other zone it
+/// just continues the cast.
+fn continue_graveyard_cast_with_slot_choice(
+    state: &mut GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    card_id: CardId,
+    payment_mode: CastPaymentMode,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
     // CR 110.4: For graveyard spells via OncePerTurnPerPermanentType, prompt
     // the player to choose which permanent type slot to consume when the card
     // has multiple available slots (multi-type permanents like Artifact Creature).
@@ -22754,6 +22809,31 @@ fn blitz_castable_zone(
                 CastingVariant::Blitz,
             )
             .is_some())
+}
+
+/// CR 702.103b + CR 601.2a + CR 110.4: can a graveyard bestow cast commit to a
+/// permission it can actually use (see `elected_graveyard_permission_source`)?
+///
+/// Judged on the BESTOWED form, because that is the spell as it will be cast:
+/// an Aura enchantment, not a creature. Under Muldrotha a bestowed Boon Satyr
+/// is an enchantment spell with one slot, so bestow is usable, while under
+/// Encroaching Mycosynth it is an artifact and an enchantment spell with two,
+/// which needs a slot prompt this path does not have. The form is applied to a
+/// scratch copy through the same `apply_bestow_aura_form` the bestow handler
+/// uses, so this agrees with the check `prepare_spell_cast` makes after that
+/// handler has applied it for real.
+fn graveyard_bestow_authority_usable(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> bool {
+    let mut bestowed = state.clone();
+    let Some(obj) = bestowed.objects.get_mut(&object_id) else {
+        return false;
+    };
+    apply_bestow_aura_form(obj);
+    elected_graveyard_permission_source(&bestowed, player, object_id, CastingVariant::Bestow)
+        .is_some()
 }
 
 /// CR 702.152a + CR 601.2f-h: Blitz twin of `split_bestow_cost_components`.
