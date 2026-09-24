@@ -38,12 +38,15 @@ use engine::ai_support::legal_actions;
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{CastingPermission, Duration};
+use engine::types::ability::{
+    AbilityDefinition, CastingPermission, Duration, Effect, TargetFilter, TypeFilter, TypedFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
+use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
 /// Verbatim Oracle text (Scryfall `cards/named?exact=Locke, Treasure Hunter`).
@@ -149,6 +152,44 @@ fn has_unrepresentable_cast_cap_gap(parsed: &engine::parser::oracle::ParsedAbili
 fn has_single_use_grant(parsed: &engine::parser::oracle::ParsedAbilities) -> bool {
     let json = serde_json::to_string(parsed).expect("a parsed ability tree serializes");
     json.contains("\"PlayFromExile\"") && json.contains("\"single_use\":true")
+}
+
+/// The `card_filter` of every `single_use` `PlayFromExile` grant in a parse.
+///
+/// Returns the filters structurally rather than as serialized text: a substring
+/// check for one type name passes on a filter that kept only that leg, which is
+/// the narrowed-restriction defect in miniature.
+fn single_use_grant_card_filters(
+    parsed: &engine::parser::oracle::ParsedAbilities,
+) -> Vec<Option<TargetFilter>> {
+    fn walk(definition: &AbilityDefinition, out: &mut Vec<Option<TargetFilter>>) {
+        if let Effect::GrantCastingPermission {
+            permission:
+                CastingPermission::PlayFromExile {
+                    card_filter,
+                    single_use: true,
+                    ..
+                },
+            ..
+        } = definition.effect.as_ref()
+        {
+            out.push(card_filter.clone());
+        }
+        if let Some(sub) = definition.sub_ability.as_deref() {
+            walk(sub, out);
+        }
+        if let Some(alt) = definition.else_ability.as_deref() {
+            walk(alt, out);
+        }
+    }
+    let mut found = Vec::new();
+    for definition in &parsed.abilities {
+        walk(definition, &mut found);
+    }
+    for execute in parsed.triggers.iter().filter_map(|t| t.execute.as_deref()) {
+        walk(execute, &mut found);
+    }
+    found
 }
 
 /// Walk from the declare-attackers step to the postcombat main phase.
@@ -499,50 +540,66 @@ fn locke_grants_a_single_use_cast_until_end_of_turn() {
 /// been installed, which is exactly how this class of test goes green against a
 /// broken engine.
 ///
-/// CR 601.3: a printed type restriction stated as a SUFFIX is refused rather
-/// than silently dropped.
+/// CR 601.3 + CR 611.2a: a type restriction stated as a SUFFIX, as a HEAD, or as
+/// BOTH is never silently dropped by the promotion.
 ///
 /// The promotion reads the type gate off the cast HEAD (`parse_cast_type_gate`)
 /// and discards the caller's target, which it must — that target carries an
 /// exile-zone leg that is wrong for a milled pool. But
 /// `parse_from_among_exiled_this_way` lifts a SUFFIX gate ("cast a spell from
 /// among the **instant or sorcery** cards exiled this way") into exactly that
-/// discarded target, so the head is bare and the restriction would vanish.
+/// discarded target.
 ///
-/// Measured before the guard: that clause promoted to a grant with
-/// `card_filter: None`, authorizing every member of the tracked set regardless
-/// of type — a spell the card does not permit.
+/// Two widenings, measured, one guard:
+///   * suffix only — promoted with `card_filter: None`, authorizing every member
+///     of the tracked set regardless of type.
+///   * **head AND suffix together** — "cast an **artifact** spell from among the
+///     **instant or sorcery** cards exiled this way" promoted with
+///     `card_filter: Some(Artifact)`, keeping the head and dropping the suffix,
+///     so an artifact that is neither an instant nor a sorcery became castable.
+///     An earlier guard that asked only `head_gate.is_none()` caught the first
+///     and passed the second; the guard now compares the discarded restriction
+///     against the installed filter, which covers both with one question.
 ///
-/// ASSERTS THE ABSENCE OF THE GRANT, not a gap name, and the paired row is why.
-/// The identical sentence with a cap of TWO has always taken the long-standing
-/// `Refused` path, and both land on the same generic `effect_structure` gap —
-/// that is a pre-existing property of this sentence shape (the refusing cast
-/// clause takes the whole line down with it), NOT something this guard
-/// introduced. Pinning the gap name would therefore pin unrelated behaviour;
-/// pinning "no grant is installed" pins the widening this guard prevents.
+/// The refusal is an engine lowering limitation, not a rule — no CR speaks to
+/// where in a sentence a restriction is printed. CR 601.3 is cited for why the
+/// restriction matters at all: a player may begin to cast a spell only if an
+/// effect allows it, and a grant restricted to instants does not allow an
+/// artifact.
+///
+/// ASSERTS THE ABSENCE OF THE GRANT, not a gap name, and the cap-of-two row is
+/// why. That sibling has always refused through the pre-existing path and both
+/// land on the same generic `effect_structure` gap — a property of the sentence
+/// shape, not of this guard, so pinning the name would pin unrelated behaviour.
 #[test]
-fn a_suffix_only_type_gate_refuses_instead_of_widening_the_grant() {
-    let suffix_gated = parse_oracle_text(
-        "Exile the top five cards of your library. Until end of turn, you may cast \
-         a spell from among the instant or sorcery cards exiled this way.",
-        "Suffix Gate",
-        &[],
-        &[],
-        &[],
-    );
-    assert!(
-        !has_single_use_grant(&suffix_gated),
-        "CR 601.3: a type restriction the promotion cannot carry must refuse the \
-         clause, never produce an unfiltered grant over the whole tracked set"
-    );
+fn a_dropped_type_gate_refuses_instead_of_widening_the_grant() {
+    for (label, oracle) in [
+        (
+            "suffix only",
+            "Exile the top five cards of your library. Until end of turn, you may cast \
+             a spell from among the instant or sorcery cards exiled this way.",
+        ),
+        (
+            "head and suffix together",
+            "Exile the top five cards of your library. Until end of turn, you may cast \
+             an artifact spell from among the instant or sorcery cards exiled this way.",
+        ),
+    ] {
+        let parsed = parse_oracle_text(oracle, "Gate Probe", &[], &[], &[]);
+        assert!(
+            !has_single_use_grant(&parsed),
+            "{label}: a type restriction the promotion cannot carry must refuse the \
+             clause, never produce a grant that authorizes more than the card does"
+        );
+    }
 
     // The cap-of-two sibling refuses through the pre-existing path. Identical
-    // outcome, which is what establishes that the guard above lands the clause
-    // where this family already lands rather than inventing a failure mode.
+    // outcome, which is what establishes that the guard lands these clauses where
+    // the family already lands rather than inventing a failure mode.
     let cap_two = parse_oracle_text(
         "Exile the top five cards of your library. Until end of turn, you may cast \
          up to two spells from among the instant or sorcery cards exiled this way.",
-        "Suffix Gate Cap Two",
+        "Cap Two",
         &[],
         &[],
         &[],
@@ -552,11 +609,12 @@ fn a_suffix_only_type_gate_refuses_instead_of_widening_the_grant() {
         "the pre-existing refusal path must also install no grant"
     );
 
-    // DISCRIMINATING CONTROLS. Without these the assertions above would pass if
+    // DISCRIMINATING CONTROLS. Without these every assertion above would pass if
     // the promotion had simply stopped working.
     //
-    // (1) The same clause with NO type restriction still promotes: the guard
-    //     fires on the dropped restriction, not on the `exiled this way` surface.
+    // (1) No printed restriction at all: nothing can be lost, so it still
+    //     promotes. This is what proves the guard fires on the dropped
+    //     restriction and not on the `exiled this way` surface itself.
     let ungated = parse_oracle_text(
         "Exile the top five cards of your library. Until end of turn, you may cast \
          a spell from among the cards exiled this way.",
@@ -571,8 +629,8 @@ fn a_suffix_only_type_gate_refuses_instead_of_widening_the_grant() {
          the same surface must still promote"
     );
 
-    // (2) The same restriction stated on the HEAD is recovered by
-    //     `parse_cast_type_gate` and rides on `card_filter`.
+    // (2) HEAD-stated restriction: recovered by `parse_cast_type_gate`, so the
+    //     discarded target carries nothing the installed filter lacks.
     let head_gated = parse_oracle_text(
         "Exile the top five cards of your library. Until end of turn, you may cast \
          an instant or sorcery spell from among them.",
@@ -585,13 +643,127 @@ fn a_suffix_only_type_gate_refuses_instead_of_widening_the_grant() {
         has_single_use_grant(&head_gated),
         "control: a HEAD-stated type restriction must still promote"
     );
+    // BOTH legs asserted, not just one: a filter that retained only `Instant`
+    // would satisfy a substring check for `Instant` while still dropping half the
+    // printed restriction — the same silent narrowing in miniature.
+    let filters = single_use_grant_card_filters(&head_gated);
+    assert_eq!(
+        filters,
+        vec![Some(TargetFilter::Typed(TypedFilter::new(
+            TypeFilter::AnyOf(vec![TypeFilter::Instant, TypeFilter::Sorcery])
+        )))],
+        "control: the promoted grant must carry BOTH printed legs of the type \
+         restriction, or this row would pass on exactly the narrowed filter the \
+         guard exists to prevent"
+    );
+}
+
+/// CR 116.2a + CR 601.2a: playing one granted land SPENDS the single-use budget,
+/// so its sibling in the batch becomes unplayable.
+///
+/// The cast path spends its grant through `consume_single_use_play_from_exile`;
+/// the land path reached `finalize_committed_land_play` with no authorization at
+/// all for a graveyard-resident land, because the capture was gated on the exile
+/// zone. `record_graveyard_play_permission` only handles a static
+/// `GraveyardCastPermission`, so nothing spent the budget and every sibling land
+/// in the batch stayed playable.
+///
+/// THE SECOND LAND DROP IS LOAD-BEARING FOR THE ACTION-GATE HALF, and the two
+/// halves differ — measured, because the obvious reading is wrong for one of
+/// them. `graveyard_lands_playable_by_permission` is a PERMISSION sweep and does
+/// not consult the CR 116.2a one-per-turn limit, so the discovery assertion below
+/// discriminates with or without an extra land drop. The `act(PlayLand)`
+/// assertion does not: the action gate enforces the limit, so without a
+/// `MayPlayAdditionalLand` source it would error for the wrong reason and pass
+/// against a broken engine. Both assertions are kept because they check different
+/// surfaces agree; the extra land drop is what keeps the second one honest.
+/// Reverting the consumption fails the discovery assertion.
+#[test]
+fn playing_one_granted_land_spends_the_batch_budget_for_its_sibling() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Cross-Owner Mill Source",
+            1,
+            1,
+            "Whenever this creature attacks, each player mills a card. You may play \
+             a land from among those cards this turn.",
+        )
+        .id();
+    // CR 116.2a: a second legal land drop, so the one-per-turn limit cannot
+    // masquerade as the grant being spent.
+    scenario
+        .add_creature(P0, "Additional Land Drop", 1, 1)
+        .with_static(StaticMode::MayPlayAdditionalLand);
+    let my_land = scenario
+        .add_spell_to_library_top(P0, "My Milled Land", false)
+        .as_land()
+        .id();
+    let their_land = scenario
+        .add_spell_to_library_top(P1, "Their Milled Land", false)
+        .as_land()
+        .id();
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(source, AttackTarget::Player(P1))])
+        .expect("the source must be able to attack");
+    runner.advance_until_stack_empty();
+    advance_past_combat(&mut runner);
+
+    // Reach guards. Both lands must be milled into their OWNERS' graveyards and
+    // both must be playable before the budget is spent, or the negative below is
+    // an empty-set accident.
+    assert_eq!(
+        (zone_of(&runner, my_land), zone_of(&runner, their_land)),
+        (Zone::Graveyard, Zone::Graveyard),
+        "reach guard: both lands must have been milled"
+    );
+    let playable_before =
+        engine::game::casting::graveyard_lands_playable_by_permission(runner.state(), P0);
+    for (label, id) in [("controller's", my_land), ("opponent's", their_land)] {
+        assert!(
+            playable_before.iter().any(|(obj, _)| *obj == id),
+            "reach guard ({label}): both milled lands must be playable before the \
+             grant is spent"
+        );
+    }
+
+    let card_id = runner.state().objects[&my_land].card_id;
+    runner
+        .act(GameAction::PlayLand {
+            object_id: my_land,
+            card_id,
+        })
+        .expect("the first granted land play must be accepted");
+    assert_eq!(
+        zone_of(&runner, my_land),
+        Zone::Battlefield,
+        "reach guard: the first land must actually have been played"
+    );
+
+    // The load-bearing pair. A second land drop IS available, so a still-playable
+    // sibling here means the budget was never spent.
     assert!(
-        serde_json::to_string(&head_gated)
-            .expect("serializes")
-            .contains("\"Instant\""),
-        "control: the promoted grant must actually CARRY the printed type filter, \
-         or this row would pass on exactly the unfiltered grant the guard exists \
-         to prevent"
+        !engine::game::casting::graveyard_lands_playable_by_permission(runner.state(), P0)
+            .iter()
+            .any(|(obj, _)| *obj == their_land),
+        "CR 601.2a: the grant printed a budget of ONE, so playing the first land \
+         must make its sibling unplayable — a second land drop is available, so \
+         the one-per-turn limit is not what is stopping it"
+    );
+    let their_card_id = runner.state().objects[&their_land].card_id;
+    assert!(
+        runner
+            .act(GameAction::PlayLand {
+                object_id: their_land,
+                card_id: their_card_id,
+            })
+            .is_err(),
+        "the action gate must also refuse the sibling, not merely hide it from \
+         discovery — the two halves have to agree"
     );
 }
 

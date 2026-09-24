@@ -16170,6 +16170,21 @@ fn record_exile_play_permission(
     state: &mut GameState,
     authorization: Option<casting::ExileLandPlayAuthorization>,
 ) {
+    // CR 601.2a + CR 611.2a: a single-use grant authorizes ONE play across its
+    // whole window, shared by every object stamped with the same tracked set.
+    // Spent here rather than inside the frequency match below because the two are
+    // independent axes: `single_use` is a grant-scoped budget, `CastFrequency` is
+    // a per-source per-turn slot, and a grant can carry either, both, or neither.
+    // Folding this into an arm of that match would silently skip it for every
+    // frequency the arm does not name — which is exactly how the land path came
+    // to spend nothing at all.
+    if let Some(casting::ExileLandPlayAuthorization::ObjectAttached {
+        single_use_group: Some(group),
+        ..
+    }) = authorization
+    {
+        super::casting::consume_single_use_play_from_exile(state, group);
+    }
     match authorization {
         Some(casting::ExileLandPlayAuthorization::ObjectAttached {
             source,
@@ -16399,15 +16414,15 @@ fn handle_play_land(
     // CR 305.1 + CR 604.2: Check graveyard for play-from-graveyard permission
     // CR 604.2: Find graveyard play permission source (if any) for once-per-turn tracking.
     //
-    // DELIBERATELY NOT PRE-GATED on the acting player's OWN graveyard. CR 601.2a:
-    // a `PlayFromExile` grant names the player it authorizes, not the card's
-    // owner, so a land milled from an opponent's library can be inside the
+    // DELIBERATELY NOT PRE-GATED on the acting player's OWN graveyard. CR 116.2a:
+    // a land is put onto the battlefield "from the zone it was in", and a
+    // `PlayFromExile` grant names the player it authorizes rather than the
+    // card's owner, so a land milled from an opponent's library is inside the
     // printed permission. `graveyard_lands_playable_by_permission` is the single
-    // authority for that question and already answers it across every graveyard
-    // (see `non_owner_graveyard_play_from_exile_grants`), so an owner test here
-    // is redundant with the lookup it guards and only makes the two DISAGREE:
+    // authority for that question and answers it across every graveyard (see
+    // `non_owner_graveyard_play_from_exile_grants`), so an owner test here is
+    // redundant with the lookup it guards and only makes the two DISAGREE:
     // discovery would offer the land and this gate would reject the submitted
-    // action. That mismatch is the same defect the cast surface had in the
     // opposite direction, where the gate admitted what discovery never offered.
     // `an_opponent_owned_milled_land_is_offered_and_playable` pins the pair.
     let gy_permission_source =
@@ -16450,7 +16465,18 @@ fn handle_play_land(
             Some((src_id, frequency))
         });
     let in_library_with_permission = library_permission_src.is_some();
-    let exile_play_authorization = if state.exile.contains(&object_id) {
+    // CR 116.2a: a land is put onto the battlefield "from the zone it was in", so
+    // the play authority is elected by ZONE ELIGIBILITY, not by the exile zone
+    // alone. Gated on exile-or-graveyard to match
+    // `play_from_exile_object_in_cast_path`'s own zone contract — a land in the
+    // LIBRARY must not become playable through this route. Before this, a milled
+    // land carrying an object-attached grant was admitted above and then reached
+    // `finalize_committed_land_play` with no authorization, so its single-use
+    // budget was never spent and a sibling stayed playable.
+    let exile_play_authorization = if matches!(
+        state.objects.get(&object_id).map(|obj| obj.zone),
+        Some(Zone::Exile | Zone::Graveyard)
+    ) {
         super::casting::exile_land_play_authorization(state, player, object_id)
     } else {
         None

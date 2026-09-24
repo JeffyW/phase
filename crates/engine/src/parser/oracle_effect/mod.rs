@@ -27121,6 +27121,40 @@ fn from_among_batch_cast_effect(
     }
 }
 
+/// CR 601.3: The restriction a `from among` batch target carries BEYOND its
+/// zone binding — i.e. the part of the caller's target that
+/// `single_use_tracked_set_cast_grant` would throw away when it rebinds to the
+/// tracked set.
+///
+/// `None` means the target is a pure zone binding and nothing is lost. `Some`
+/// means the target restricts WHICH members may be cast, and the promotion must
+/// either represent that restriction on `card_filter` or refuse.
+///
+/// Compared against the head gate rather than merely tested for presence,
+/// because the two arms legitimately agree: the bare-anaphor arm builds its
+/// target with `exiled_cast_target_with_type_gate`, which reads the SAME
+/// `parse_cast_type_gate` the promotion does, so Chiss-Goria's `Artifact`
+/// appears on both sides and is not a loss. A conjunction with more than one
+/// non-zone leg returns the whole target, which can never equal a single head
+/// gate — so it refuses, which is the conservative answer for a shape no caller
+/// builds today.
+fn discarded_cast_restriction(target: &TargetFilter) -> Option<&TargetFilter> {
+    match target {
+        TargetFilter::ExiledBySource => None,
+        TargetFilter::And { filters } => {
+            let mut non_zone = filters
+                .iter()
+                .filter(|leg| !matches!(leg, TargetFilter::ExiledBySource));
+            let only = non_zone.next()?;
+            if non_zone.next().is_some() {
+                return Some(target);
+            }
+            Some(only)
+        }
+        other => Some(other),
+    }
+}
+
 /// CR 601.2a + CR 611.2a: the duration-scoped, capped-at-one grant over
 /// a chain-published batch.
 ///
@@ -27158,30 +27192,36 @@ fn single_use_tracked_set_cast_grant(
     if constraint.is_some() {
         return Effect::unimplemented(UNREPRESENTABLE_CAST_CAP_GAP, fragment);
     }
-    // CR 601.3: the printed type restriction can be stated in EITHER of two
-    // places, and this seam reads only one of them. A HEAD gate ("cast an
-    // artifact spell from among them" — Chiss-Goria) is recovered from the
-    // fragment by `parse_cast_type_gate` and becomes `card_filter` below. A
+    // CR 601.3 (a player may begin to cast a spell only if an effect allows it):
+    // the printed type restriction is part of WHAT the grant allows, so losing it
+    // authorizes casts the card does not. That restriction can be stated in
+    // either of two places, and this seam reads only one of them. A HEAD gate
+    // ("cast an artifact spell from among them" — Chiss-Goria) is recovered from
+    // the fragment by `parse_cast_type_gate` and becomes `card_filter` below. A
     // SUFFIX gate ("cast a spell from among the instant or sorcery cards exiled
     // this way") is lifted by `parse_from_among_exiled_this_way` into the
-    // caller's `target` instead — and the promotion DISCARDS that target,
-    // because it must (the target carries an exile-zone leg that is wrong for a
-    // milled pool; see below).
+    // caller's `target` instead — and the promotion DISCARDS that target, because
+    // it must (the target carries an exile-zone leg that is wrong for a milled
+    // pool; see below).
     //
-    // Measured: such a clause promoted to a grant with `card_filter: None`,
-    // authorizing every member of the tracked set regardless of type — a spell
-    // the card does not permit. Refuse instead. The gate is stated as "the
-    // discarded target carried a restriction the head did not", not as a list of
-    // shapes, so a new suffix-gate producer inherits the refusal rather than
-    // slipping past it.
+    // THE GUARD COMPARES THE TWO, rather than testing either alone. An earlier
+    // cut asked only `head_gate.is_none()`, which caught the suffix-only form and
+    // silently passed the COMBINATION: "cast an artifact spell from among the
+    // instant or sorcery cards exiled this way" has a head gate, so it promoted
+    // with `card_filter: Some(Artifact)` and dropped the instant-or-sorcery leg —
+    // authorizing an artifact that is neither. Asking instead "does the discarded
+    // target carry a restriction the installed filter does not represent?" covers
+    // suffix-only, head-only, and both-at-once with one question, and a future
+    // producer of either gate inherits it.
     //
-    // This is a REFUSAL, not a fix: carrying the suffix gate across would mean
-    // stripping its zone leg and re-hosting the rest on `card_filter`, which is
-    // a real capability this seam does not yet have. An honest gap is the
-    // correct landing until it does. No card in the corpus prints this shape
-    // today, so the refusal costs no coverage now and closes the widening.
+    // The refusal itself is an ENGINE LOWERING LIMITATION, not a rule: no CR
+    // speaks to where in a sentence a restriction is printed. Carrying the suffix
+    // gate across would mean stripping its zone leg and re-hosting the remainder
+    // on `card_filter`, a capability this seam does not have; an honest gap is
+    // the correct landing until it does. No corpus card prints either refused
+    // shape today (measured), so this costs no coverage and closes the widening.
     let head_gate = parse_cast_type_gate(fragment);
-    if head_gate.is_none() && !matches!(target, TargetFilter::ExiledBySource) {
+    if discarded_cast_restriction(target) != head_gate.as_ref() {
         return Effect::unimplemented(UNREPRESENTABLE_CAST_CAP_GAP, fragment);
     }
     Effect::GrantCastingPermission {
