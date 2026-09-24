@@ -59432,3 +59432,139 @@ mod unreadable_additional_cost_is_refused_not_free {
         );
     }
 }
+
+/// CR 601.2c + CR 602.2b + CR 115.1: the target-reading classifiers decide
+/// whether an activation's own cost rider has to wait for its committed targets.
+///
+/// One row per class of target read the exhaustive match covers, each beside a
+/// negative of the same shape, so a row can't pass because the classifier says
+/// `true` to everything. The shapes the old allowlist ALREADY caught
+/// (`Power { Target }`, `CountersOn { Target }`) are here too, as positive reach
+/// guards: they prove the rewrite didn't lose what it had.
+#[test]
+fn cost_rider_target_classifiers_cover_every_target_reading_shape() {
+    use crate::types::ability::{CastManaObjectScope, CastManaSpentMetric, ZoneRef};
+
+    let reads = quantity_ref_reads_target_object;
+    let target_player_filter =
+        || TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::TargetPlayer));
+    let you_filter = || TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+
+    // Already covered before the rewrite (reach guards).
+    assert!(reads(&QuantityRef::Power {
+        scope: ObjectScope::Target
+    }));
+    assert!(reads(&QuantityRef::CountersOn {
+        scope: ObjectScope::Target,
+        counter_type: None
+    }));
+    assert!(!reads(&QuantityRef::Power {
+        scope: ObjectScope::Source
+    }));
+
+    // Newly covered: object scope of the chain root's declared target.
+    assert!(reads(&QuantityRef::Power {
+        scope: ObjectScope::ChainRootTarget
+    }));
+    // A demonstrative back-reference is the effect-context referent, not a declared target.
+    assert!(!reads(&QuantityRef::Power {
+        scope: ObjectScope::Demonstrative
+    }));
+
+    // Newly covered: player-relative reads of the target player.
+    assert!(reads(&QuantityRef::HandSize {
+        player: PlayerScope::Target
+    }));
+    assert!(reads(&QuantityRef::LifeTotal {
+        player: PlayerScope::ParentObjectTargetController
+    }));
+    assert!(!reads(&QuantityRef::HandSize {
+        player: PlayerScope::Controller
+    }));
+
+    // Newly covered: variants named for a target.
+    assert!(reads(&QuantityRef::TargetZoneCardCount {
+        zone: ZoneRef::Graveyard
+    }));
+    assert!(reads(&QuantityRef::ManaSpentToCast {
+        scope: CastManaObjectScope::AbilityTarget,
+        metric: CastManaSpentMetric::Total,
+    }));
+    assert!(!reads(&QuantityRef::ManaSpentToCast {
+        scope: CastManaObjectScope::SelfObject,
+        metric: CastManaSpentMetric::Total,
+    }));
+
+    // Newly covered: filter-scoped counts over a target-relative filter.
+    assert!(reads(&QuantityRef::ObjectCount {
+        filter: target_player_filter()
+    }));
+    assert!(reads(&QuantityRef::ObjectCount {
+        filter: TargetFilter::ParentTarget
+    }));
+    assert!(!reads(&QuantityRef::ObjectCount {
+        filter: you_filter()
+    }));
+
+    // Nested wrappers are found through `QuantityExpr::any_ref`.
+    let nested = QuantityExpr::Offset {
+        inner: Box::new(QuantityExpr::Ref {
+            qty: QuantityRef::HandSize {
+                player: PlayerScope::Target,
+            },
+        }),
+        offset: 1,
+    };
+    assert!(quantity_expr_reads_target_object(&nested));
+
+    // ParsedCondition: newly covered arms, each beside its negative.
+    assert!(parsed_condition_reads_targets(
+        &ParsedCondition::QuantityVsEachOpponent {
+            lhs: QuantityRef::Power {
+                scope: ObjectScope::Target
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityRef::HandSize {
+                player: PlayerScope::Controller
+            },
+        }
+    ));
+    assert!(!parsed_condition_reads_targets(
+        &ParsedCondition::QuantityVsEachOpponent {
+            lhs: QuantityRef::HandSize {
+                player: PlayerScope::Controller
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityRef::HandSize {
+                player: PlayerScope::Controller
+            },
+        }
+    ));
+    assert!(parsed_condition_reads_targets(
+        &ParsedCondition::ControlsCreatureWithKeyword {
+            controller: ControllerRef::TargetPlayer,
+            keyword: crate::types::keywords::Keyword::Flying,
+        }
+    ));
+    assert!(!parsed_condition_reads_targets(
+        &ParsedCondition::ControlsCreatureWithKeyword {
+            controller: ControllerRef::You,
+            keyword: crate::types::keywords::Keyword::Flying,
+        }
+    ));
+    assert!(parsed_condition_reads_targets(
+        &ParsedCondition::PlayerCountAtLeast {
+            filter: PlayerFilter::ParentObjectTargetController,
+            minimum: 1,
+        }
+    ));
+    // Already covered, and still covered through `Not`.
+    assert!(parsed_condition_reads_targets(&ParsedCondition::Not {
+        condition: Box::new(ParsedCondition::SpellTargetsFilter {
+            filter: you_filter()
+        }),
+    }));
+    assert!(!parsed_condition_reads_targets(
+        &ParsedCondition::IsYourTurn
+    ));
+}

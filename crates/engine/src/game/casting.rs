@@ -3,11 +3,12 @@ use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, ActivationManaPaymentRestriction,
     AdditionalCost, BoardWideCostModifier, CardPlayMode, CardSelectionMode, CardTypeSetSource,
     CastCostModifier, CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification,
-    CostObjectCount, CostPaidObjectSnapshot, CostReduction, CounterCostSelection, Duration, Effect,
-    EffectKind, FilterProp, GameRestriction, ModalSelectionCondition, ObjectScope, ParsedCondition,
-    PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility,
-    RestrictionExpiry, RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
-    TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
+    ControllerRef, CostObjectCount, CostPaidObjectSnapshot, CostReduction, CounterCostSelection,
+    Duration, Effect, EffectKind, FilterProp, GameRestriction, ModalSelectionCondition,
+    ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr,
+    QuantityRef, ResolvedAbility, RestrictionExpiry, RestrictionPlayerScope, StaticCondition,
+    StaticDefinition, SubAbilityLink, TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
+    TypedFilter,
 };
 use crate::types::actions::{AlternativeCastDecision, GameAction};
 use crate::types::card::LayoutKind;
@@ -24795,68 +24796,395 @@ fn ability_cost_reduction_is_target_dependent(reduction: &CostReduction) -> bool
         || quantity_expr_reads_target_object(&reduction.count)
 }
 
+// CR 601.2c + CR 602.2b + CR 115.1: the classifiers below decide whether an
+// activation's own cost rider reads THIS activation's chosen targets, and so must
+// wait for them to be committed before it can be priced.
+//
+// The direction of error is what shapes them. A false NEGATIVE prices the rider
+// before any target exists, which is a silent misprice. So the two enums a rider is
+// built from, `QuantityRef` and `ParsedCondition`, are matched EXHAUSTIVELY: a new
+// variant fails to compile here until someone decides whether it reads a target.
+// The smaller scope types they carry are matched exhaustively for the same reason.
+// `TargetFilter` follows the repo's convention for filter predicates (explicit
+// recursion, `_ => false`; compare `TargetFilter::references_cost_paid_object`),
+// naming each variant that is relative to a chosen target.
+//
+// Measured on the corpus: of the 83 printed self cost riders, exactly 2 carry any
+// target reference (Dragonfire Blade, Raft Security Officer), both on targeted
+// abilities, and both were already classified as target-dependent before these
+// classifiers were widened. So widening them changes no current card.
+
 fn parsed_condition_reads_targets(condition: &ParsedCondition) -> bool {
     match condition {
+        // CR 115.1: the condition is ABOUT the chosen targets.
         ParsedCondition::SpellTargetsFilter { .. } => true,
         ParsedCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_expr_reads_target_object(lhs) || quantity_expr_reads_target_object(rhs)
+        }
+        ParsedCondition::QuantityVsEachOpponent { lhs, rhs, .. } => {
+            quantity_ref_reads_target_object(lhs) || quantity_ref_reads_target_object(rhs)
+        }
+        ParsedCondition::ControlsCreatureWithKeyword { controller, .. } => {
+            controller_ref_reads_chosen_target(controller)
+        }
+        ParsedCondition::YouAttackedWithAtLeast { filter, .. }
+        | ParsedCondition::YouCastSpellThisTurn { filter } => filter
+            .as_ref()
+            .is_some_and(target_filter_reads_chosen_target),
+        ParsedCondition::BattlefieldEntriesThisTurn { filter, .. } => {
+            target_filter_reads_chosen_target(filter)
+        }
+        ParsedCondition::PlayerCountAtLeast { filter, .. } => {
+            player_filter_reads_chosen_target(filter)
         }
         ParsedCondition::And { conditions } | ParsedCondition::Or { conditions } => {
             conditions.iter().any(parsed_condition_reads_targets)
         }
         ParsedCondition::Not { condition } => parsed_condition_reads_targets(condition),
-        _ => false,
+        // Source-, zone-, turn-history- and controller-relative facts: none names a
+        // target of this activation.
+        ParsedCondition::SourceInZone { .. }
+        | ParsedCondition::SourceIsAttacking
+        | ParsedCondition::SourceIsAttackingOrBlocking
+        | ParsedCondition::SourceIsBlocked
+        | ParsedCondition::SourcePowerAtLeast { .. }
+        | ParsedCondition::SourceHasCounterAtLeast { .. }
+        | ParsedCondition::SourceHasNoCounter { .. }
+        | ParsedCondition::SourceEnteredThisTurn
+        | ParsedCondition::SourceAttackedThisTurn
+        | ParsedCondition::SourceIsCreature
+        | ParsedCondition::SourceAttachedTo { .. }
+        | ParsedCondition::SourceUntappedAttachedTo { .. }
+        | ParsedCondition::SourceLacksKeyword { .. }
+        | ParsedCondition::SourceIsColor { .. }
+        | ParsedCondition::FirstSpellThisGame
+        | ParsedCondition::OpponentSearchedLibraryThisTurn
+        | ParsedCondition::BeenAttackedThisStep
+        | ParsedCondition::ZoneCardCountAtLeast { .. }
+        | ParsedCondition::ZoneCardTypeCountAtLeast { .. }
+        | ParsedCondition::ZoneCoreTypeCardCountAtLeast { .. }
+        | ParsedCondition::ZoneSubtypeCardCountAtLeast { .. }
+        | ParsedCondition::OpponentPoisonAtLeast { .. }
+        | ParsedCondition::HandSizeExact { .. }
+        | ParsedCondition::HandSizeOneOf { .. }
+        | ParsedCondition::CreaturesYouControlTotalPowerAtLeast { .. }
+        | ParsedCondition::YouControlLandSubtypeAny { .. }
+        | ParsedCondition::YouControlSubtypeCountAtLeast { .. }
+        | ParsedCondition::YouControlCoreTypeCountAtLeast { .. }
+        | ParsedCondition::YouControlColorPermanentCountAtLeast { .. }
+        | ParsedCondition::YouControlSubtypeOrGraveyardCardSubtype { .. }
+        | ParsedCondition::YouControlLegendaryCreature
+        | ParsedCondition::YouControlNamedPlaneswalker { .. }
+        | ParsedCondition::YouControlCreatureWithPowerAtLeast { .. }
+        | ParsedCondition::YouControlCreatureWithPt { .. }
+        | ParsedCondition::YouControlAnotherColorlessCreature
+        | ParsedCondition::YouControlSnowPermanentCountAtLeast { .. }
+        | ParsedCondition::YouControlDifferentPowerCreatureCountAtLeast { .. }
+        | ParsedCondition::YouControlLandsWithSameNameAtLeast { .. }
+        | ParsedCondition::YouControlNoCreatures
+        | ParsedCondition::YouAttackedThisTurn
+        | ParsedCondition::YouAttackedSourceControllerThisTurn
+        | ParsedCondition::YouPlayedLandThisTurn
+        | ParsedCondition::YouCastNoncreatureSpellThisTurn
+        | ParsedCondition::YouCastSpellCountAtLeast { .. }
+        | ParsedCondition::YouGainedLifeThisTurn
+        | ParsedCondition::YouCreatedTokenThisTurn
+        | ParsedCondition::YouDiscardedCardThisTurn
+        | ParsedCondition::YouSacrificedArtifactThisTurn
+        | ParsedCondition::CreatureDiedThisTurn
+        | ParsedCondition::YouHadCreatureEnterThisTurn
+        | ParsedCondition::YouHadAngelOrBerserkerEnterThisTurn
+        | ParsedCondition::YouHadArtifactEnterThisTurn
+        | ParsedCondition::CardsLeftYourGraveyardThisTurnAtLeast { .. }
+        | ParsedCondition::HasCityBlessing
+        | ParsedCondition::HasEnduringStory
+        | ParsedCondition::CompletedDungeon { .. }
+        | ParsedCondition::HasMaxSpeed
+        | ParsedCondition::IsYourTurn
+        | ParsedCondition::IsOpponentsTurn
+        | ParsedCondition::IsDuringUpkeep
+        | ParsedCondition::ControlsCommander { .. } => false,
     }
 }
 
+/// Delegates the traversal to `QuantityExpr::any_ref`, so a new expression
+/// wrapper can't bypass target detection.
 fn quantity_expr_reads_target_object(expr: &QuantityExpr) -> bool {
-    match expr {
-        QuantityExpr::Ref { qty } => quantity_ref_reads_target_object(qty),
-        QuantityExpr::Fixed { .. } => false,
-        QuantityExpr::DivideRounded { inner, .. }
-        | QuantityExpr::Offset { inner, .. }
-        | QuantityExpr::ClampMin { inner, .. }
-        | QuantityExpr::Multiply { inner, .. }
-        | QuantityExpr::UpTo { max: inner }
-        | QuantityExpr::Power {
-            exponent: inner, ..
-        } => quantity_expr_reads_target_object(inner),
-        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
-            exprs.iter().any(quantity_expr_reads_target_object)
-        }
-        QuantityExpr::Difference { left, right } => {
-            quantity_expr_reads_target_object(left) || quantity_expr_reads_target_object(right)
-        }
-    }
+    expr.any_ref(&mut quantity_ref_reads_target_object)
 }
 
 fn quantity_ref_reads_target_object(qty: &QuantityRef) -> bool {
-    matches!(
-        qty,
-        QuantityRef::CountersOn {
-            scope: ObjectScope::Target,
-            ..
-        } | QuantityRef::Power {
-            scope: ObjectScope::Target,
-        } | QuantityRef::BasePower {
-            scope: ObjectScope::Target,
-        } | QuantityRef::Intensity {
-            scope: ObjectScope::Target,
-        } | QuantityRef::Toughness {
-            scope: ObjectScope::Target,
-        } | QuantityRef::ObjectManaValue {
-            scope: ObjectScope::Target,
-        } | QuantityRef::ObjectColorCount {
-            scope: ObjectScope::Target,
-        } | QuantityRef::ObjectNameWordCount {
-            scope: ObjectScope::Target,
-        } | QuantityRef::ObjectTypelineComponentCount {
-            scope: ObjectScope::Target,
-        } | QuantityRef::ManaSymbolsInManaCost {
-            scope: ObjectScope::Target,
-            ..
+    match qty {
+        // Object-relative: reads a target iff the object is the chosen target.
+        QuantityRef::CountersOn { scope, .. }
+        | QuantityRef::Power { scope }
+        | QuantityRef::BasePower { scope }
+        | QuantityRef::Intensity { scope }
+        | QuantityRef::Toughness { scope }
+        | QuantityRef::ObjectManaValue { scope }
+        | QuantityRef::ObjectColorCount { scope }
+        | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::ObjectTypelineComponentCount { scope }
+        | QuantityRef::ManaSymbolsInManaCost { scope, .. } => {
+            object_scope_reads_chosen_target(scope)
         }
-    )
+        // Player-relative: reads a target iff the player is the chosen target.
+        QuantityRef::HandSize { player }
+        | QuantityRef::LifeTotal { player }
+        | QuantityRef::GraveyardSize { player }
+        | QuantityRef::LifeLostThisTurn { player }
+        | QuantityRef::PartySize { player }
+        | QuantityRef::Speed { player }
+        | QuantityRef::LifeGainedThisTurn { player }
+        | QuantityRef::CardsDrawnThisTurn { player }
+        | QuantityRef::LandsPlayedThisTurn { player, .. }
+        | QuantityRef::PlayerChosenNumber { player }
+        | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { player }
+        | QuantityRef::CardsDiscardedThisTurn { player }
+        | QuantityRef::PlayerActionsThisTurn { player, .. } => {
+            player_scope_reads_chosen_target(player)
+        }
+        QuantityRef::SacrificedThisTurn { player, filter }
+        | QuantityRef::BattlefieldEntriesThisTurn { player, filter }
+        | QuantityRef::TokensCreatedThisTurn { player, filter } => {
+            player_scope_reads_chosen_target(player) || target_filter_reads_chosen_target(filter)
+        }
+        // Named for a target outright.
+        QuantityRef::TargetObjectManaValue { .. }
+        | QuantityRef::TargetControllerCounter { .. }
+        | QuantityRef::TargetZoneCardCount { .. } => true,
+        // CR 601.2h: "mana spent to cast" the ability's target.
+        QuantityRef::ManaSpentToCast { scope, .. } => {
+            matches!(
+                scope,
+                crate::types::ability::CastManaObjectScope::AbilityTarget
+            )
+        }
+        // Filter-scoped counts: read a target iff their filter is target-relative.
+        QuantityRef::ObjectCount { filter }
+        | QuantityRef::ObjectCountDistinct { filter, .. }
+        | QuantityRef::ObjectCountBySharedQuality { filter, .. }
+        | QuantityRef::CountersOnObjects { filter, .. }
+        | QuantityRef::ControlledByEachPlayer { filter, .. }
+        | QuantityRef::EnteredThisTurn { filter }
+        | QuantityRef::ZoneChangeCountThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeAggregateThisTurn { filter, .. }
+        | QuantityRef::DistinctCounterKindsAmong { filter } => {
+            target_filter_reads_chosen_target(filter)
+        }
+        QuantityRef::FilteredTrackedSetSize { filter, .. } => {
+            target_filter_reads_chosen_target(filter)
+        }
+        QuantityRef::CounterAddedThisTurn { target, .. } => {
+            target_filter_reads_chosen_target(target)
+        }
+        QuantityRef::DamageDealtThisTurn { source, target, .. } => {
+            target_filter_reads_chosen_target(source) || target_filter_reads_chosen_target(target)
+        }
+        QuantityRef::ZoneCardCount { filter, .. }
+        | QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
+        | QuantityRef::AttackedThisTurn { filter, .. }
+        | QuantityRef::SpellsCastThisGame { filter, .. } => filter
+            .as_ref()
+            .is_some_and(target_filter_reads_chosen_target),
+        QuantityRef::PlayerCount { filter } | QuantityRef::EventContextPlayerCount { filter } => {
+            player_filter_reads_chosen_target(filter)
+        }
+        QuantityRef::BasicLandTypeCount { controller }
+        | QuantityRef::CommanderManaValue { owner: controller } => {
+            controller_ref_reads_chosen_target(controller)
+        }
+        QuantityRef::AttachmentsOnLeavingObject { controller, .. } => controller
+            .as_ref()
+            .is_some_and(controller_ref_reads_chosen_target),
+        QuantityRef::PropertyAggregate(aggregate) => {
+            card_type_set_source_reads_chosen_target(aggregate.source())
+        }
+        QuantityRef::DistinctCardTypes { source }
+        | QuantityRef::DistinctSubtypes { source, .. }
+        | QuantityRef::DistinctColorsAmong { source } => {
+            card_type_set_source_reads_chosen_target(source)
+        }
+        // Game, source, event-context, resolution and turn-history values: none is
+        // relative to a target of this activation.
+        QuantityRef::LifeAboveStarting
+        | QuantityRef::StartingLifeTotal
+        | QuantityRef::TriggeringDiscoverValue
+        | QuantityRef::TriggeringScryLookCount
+        | QuantityRef::TriggeringScryBottomCount
+        | QuantityRef::PlayerCounter { .. }
+        | QuantityRef::Variable { .. }
+        | QuantityRef::SelfManaValue
+        | QuantityRef::Devotion { .. }
+        | QuantityRef::CardsExiledBySource
+        | QuantityRef::ExiledCardPower { .. }
+        | QuantityRef::TrackedSetSize
+        | QuantityRef::ExiledFromHandThisResolution
+        | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousEffectCount
+        | QuantityRef::UnspentMana { .. }
+        | QuantityRef::EventContextAmount
+        | QuantityRef::EventContextSourceCostX
+        | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::BendTypesThisTurn
+        | QuantityRef::TurnsTaken
+        | QuantityRef::ChosenNumber
+        | QuantityRef::DescendedThisTurn
+        | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::DungeonsCompleted
+        | QuantityRef::CostXPaid
+        | QuantityRef::KickerCount
+        | QuantityRef::AdditionalCostPaymentCount
+        | QuantityRef::AdditionalCostPaymentCountFor { .. }
+        | QuantityRef::ConvokedCreatureCount
+        | QuantityRef::TimesCostPaidThisResolution
+        | QuantityRef::ColorsInCommandersColorIdentity
+        | QuantityRef::CommanderCastFromCommandZoneCount
+        | QuantityRef::VoteCount { .. } => false,
+    }
+}
+
+fn object_scope_reads_chosen_target(scope: &ObjectScope) -> bool {
+    match scope {
+        // CR 115.1 + CR 601.2c: a declared target, of this ability or of its
+        // chain root.
+        ObjectScope::Target | ObjectScope::ChainRootTarget => true,
+        // Resolved through the effect-context referent, the cost-paid object, the
+        // triggering event, or a resolution-local set: none is the declared target
+        // list of this activation.
+        ObjectScope::Source
+        | ObjectScope::Recipient
+        | ObjectScope::EventSource
+        | ObjectScope::CostPaidObject
+        | ObjectScope::Anaphoric
+        | ObjectScope::Demonstrative
+        | ObjectScope::AmassedArmy
+        | ObjectScope::EventTarget
+        | ObjectScope::OtherRevealedCard
+        | ObjectScope::OwnedLinkedExileCard
+        | ObjectScope::BatchSource => false,
+    }
+}
+
+fn player_scope_reads_chosen_target(player: &PlayerScope) -> bool {
+    match player {
+        PlayerScope::Target | PlayerScope::ParentObjectTargetController => true,
+        PlayerScope::AllPlayers { exclude, .. } => exclude
+            .as_deref()
+            .is_some_and(player_scope_reads_chosen_target),
+        PlayerScope::Controller
+        | PlayerScope::ScopedPlayer
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::RecipientController
+        | PlayerScope::DefendingPlayer
+        | PlayerScope::SourceChosenPlayer
+        | PlayerScope::AnyTurn
+        | PlayerScope::SpecificPlayer { .. } => false,
+    }
+}
+
+fn controller_ref_reads_chosen_target(controller: &ControllerRef) -> bool {
+    match controller {
+        ControllerRef::TargetPlayer
+        | ControllerRef::TargetOpponent
+        | ControllerRef::ParentTargetController
+        | ControllerRef::ParentTargetOwner => true,
+        ControllerRef::You
+        | ControllerRef::Opponent
+        | ControllerRef::ScopedPlayer
+        | ControllerRef::EventTargetController
+        | ControllerRef::DefendingPlayer
+        | ControllerRef::ChosenPlayer { .. }
+        | ControllerRef::SourceChosenPlayer
+        | ControllerRef::TriggeringPlayer
+        | ControllerRef::EnchantedPlayer
+        | ControllerRef::ActivePlayer
+        | ControllerRef::SpecificPlayer { .. } => false,
+    }
+}
+
+fn player_filter_reads_chosen_target(filter: &PlayerFilter) -> bool {
+    match filter {
+        PlayerFilter::ParentObjectTargetController | PlayerFilter::ParentObjectTargetOwner => true,
+        PlayerFilter::AllExcept { exclude } => player_filter_reads_chosen_target(exclude),
+        PlayerFilter::OpponentDealtDamage { source, .. } => source
+            .as_deref()
+            .is_some_and(target_filter_reads_chosen_target),
+        PlayerFilter::ControlsCount { filter, count, .. } => {
+            target_filter_reads_chosen_target(filter) || quantity_expr_reads_target_object(count)
+        }
+        PlayerFilter::PlayerAttribute { attr, value, .. } => {
+            quantity_ref_reads_target_object(attr) || quantity_expr_reads_target_object(value)
+        }
+        PlayerFilter::TrackedSetPossessor { filter, .. } => {
+            target_filter_reads_chosen_target(filter)
+        }
+        PlayerFilter::Controller
+        | PlayerFilter::Opponent
+        | PlayerFilter::DefendingPlayer
+        | PlayerFilter::OpponentLostLife
+        | PlayerFilter::OpponentGainedLife
+        | PlayerFilter::HasLostTheGame
+        | PlayerFilter::OpponentAttacked { .. }
+        | PlayerFilter::OpponentAttackingEnchantedPlayer
+        | PlayerFilter::All
+        | PlayerFilter::HighestSpeed
+        | PlayerFilter::ZoneChangedThisWay
+        | PlayerFilter::PerformedActionThisWay { .. }
+        | PlayerFilter::OwnersOfCardsExiledBySource
+        | PlayerFilter::TriggeringPlayer
+        | PlayerFilter::OpponentOtherThanTriggering
+        | PlayerFilter::OpponentOfTriggeringPlayer
+        | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+        | PlayerFilter::VotedFor { .. }
+        | PlayerFilter::ChosenPlayer { .. } => false,
+    }
+}
+
+fn card_type_set_source_reads_chosen_target(source: &CardTypeSetSource) -> bool {
+    match source {
+        CardTypeSetSource::Objects { filter } => target_filter_reads_chosen_target(filter),
+        CardTypeSetSource::TurnJournal { filter, .. } => filter
+            .as_ref()
+            .is_some_and(target_filter_reads_chosen_target),
+        CardTypeSetSource::AnyOf { sources } => {
+            sources.iter().any(card_type_set_source_reads_chosen_target)
+        }
+        CardTypeSetSource::Zone { .. }
+        | CardTypeSetSource::ExiledBySource
+        | CardTypeSetSource::TrackedSet { .. } => false,
+    }
+}
+
+/// CR 115.1: whether a filter is relative to a chosen target of this activation,
+/// either a parent-target anaphor or a controller bound to a declared target.
+fn target_filter_reads_chosen_target(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner => true,
+        TargetFilter::Typed(TypedFilter {
+            controller,
+            properties,
+            ..
+        }) => {
+            controller
+                .as_ref()
+                .is_some_and(controller_ref_reads_chosen_target)
+                || properties.iter().any(|prop| {
+                    matches!(prop, FilterProp::Owned { controller } if controller_ref_reads_chosen_target(controller))
+                })
+        }
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(target_filter_reads_chosen_target)
+        }
+        TargetFilter::Not { filter } => target_filter_reads_chosen_target(filter),
+        TargetFilter::TrackedSetFiltered { filter, .. } => target_filter_reads_chosen_target(filter),
+        _ => false,
+    }
 }
 
 fn self_cost_reduction_target_gate_satisfied(
