@@ -104,6 +104,16 @@ pub struct ActivationCostRouteCounters {
     pub zero_mana_leg_skips: u64,
 }
 
+/// Test-only count of work the target-completion walk actually PERFORMED, per
+/// [`WalkOp`](crate::game::ability_utils::WalkOp), recorded inside each
+/// operation rather than at its budget charge. Comparing it with the budget's
+/// own `charged` counts is what proves every unit of work was paid for.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompletionWalkWork {
+    pub per_op: [u32; crate::game::ability_utils::WalkOp::COUNT],
+}
+
 /// Test-only counters for the CR 508.1d attack-declaration solver
 /// (`combat::selectable_targets_by_attacker` and the strict validator it
 /// drives). Kept out of [`PerfCounterSnapshot`] for the same reason the two
@@ -234,6 +244,12 @@ thread_local! {
         Cell::new(ActivationCostRouteCounters {
             settlement_writebacks: 0,
             zero_mana_leg_skips: 0,
+        })
+    };
+    #[cfg(feature = "test-support")]
+    static COMPLETION_WALK_WORK: Cell<CompletionWalkWork> = const {
+        Cell::new(CompletionWalkWork {
+            per_op: [0; crate::game::ability_utils::WalkOp::COUNT],
         })
     };
     static LEGALITY_CLONE_PHASE: Cell<Option<LegalityClonePhase>> = const { Cell::new(None) };
@@ -639,6 +655,21 @@ pub fn activation_cost_route_snapshot() -> ActivationCostRouteCounters {
     ACTIVATION_COST_ROUTE_COUNTERS.with(Cell::get)
 }
 
+/// One unit of target-completion walk work, performed after its charge succeeded.
+#[cfg(feature = "test-support")]
+pub fn record_completion_walk_work(op: crate::game::ability_utils::WalkOp) {
+    COMPLETION_WALK_WORK.with(|cell| {
+        let mut work = cell.get();
+        work.per_op[op as usize] += 1;
+        cell.set(work);
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub fn completion_walk_work_snapshot() -> CompletionWalkWork {
+    COMPLETION_WALK_WORK.with(Cell::get)
+}
+
 #[cfg(feature = "test-support")]
 pub fn reset_prior_target_binding_counters() {
     PRIOR_TARGET_BINDING_COUNTERS
@@ -658,4 +689,6 @@ pub fn reset() {
     #[cfg(feature = "test-support")]
     ACTIVATION_COST_ROUTE_COUNTERS
         .with(|counters| counters.set(ActivationCostRouteCounters::default()));
+    #[cfg(feature = "test-support")]
+    COMPLETION_WALK_WORK.with(|counters| counters.set(CompletionWalkWork::default()));
 }
