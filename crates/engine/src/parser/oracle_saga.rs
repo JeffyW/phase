@@ -176,7 +176,22 @@ pub(crate) fn parse_saga_chapters(lines: &[&str], _card_name: &str) -> SagaChapt
                 match crate::parser::oracle_vote::parse_vote_block(effect_text, AbilityKind::Spell)
                 {
                     Some(vote_def) => vote_def,
-                    None => parse_effect_chain(effect_text, AbilityKind::Spell),
+                    // CR 700.2 + CR 700.2b: a chapter whose body is a modal
+                    // head followed by a bulleted option list ("Choose one —
+                    // • … • …", Life of Toshiro Umezawa I/II; "Choose one at
+                    // random —", Summon: Magus Sisters I/II/III) is a MODAL
+                    // triggered ability — a chapter ability is a triggered
+                    // ability (CR 714.2b), and its controller chooses the
+                    // mode(s) as it goes on the stack. The bullet lines were
+                    // space-joined into this body by the continuation branch
+                    // above, so the option list arrives inline; chain parsing
+                    // would execute every bullet sequentially instead of one
+                    // chosen mode. Try it before `parse_effect_chain`, mirroring
+                    // the vote dispatch directly above.
+                    None => {
+                        crate::parser::oracle_modal::try_parse_inline_modal_ability(effect_text)
+                            .unwrap_or_else(|| parse_effect_chain(effect_text, AbilityKind::Spell))
+                    }
                 };
             // CR 611.2b + CR 714.2b: A chapter ability that grants an ability with no
             // explicit duration in its Oracle text creates a continuous effect that
@@ -260,6 +275,16 @@ fn promote_grant_duration_for_chapter(execute: &mut AbilityDefinition, chapter_t
     if chapter_has_explicit_duration_suffix(chapter_text) {
         return;
     }
+    // CR 700.2: a MODAL chapter's root is a mode-dispatch marker that grants
+    // nothing on its own (`static_abilities` is empty) — any granted ability
+    // lives in the chosen mode. Promote inside each mode, where a grant can
+    // actually be, instead of stamping a duration onto the inert marker.
+    if execute.modal.is_some() {
+        for mode in &mut execute.mode_abilities {
+            promote_generic_effect_duration(&mut mode.effect);
+        }
+        return;
+    }
     promote_generic_effect_duration(&mut execute.effect);
 }
 
@@ -339,8 +364,193 @@ mod tests {
         )
     }
     use crate::types::ability::{
-        ContinuousModification, ControllerRef, FilterProp, PtValue, TypeFilter,
+        ContinuousModification, ControllerRef, FilterProp, PtValue, TargetSelectionMode, TypeFilter,
     };
+
+    /// CR 700.2: "An ability is modal if it has two or more options in a
+    /// bulleted list preceded by instructions for a player to choose."
+    /// CR 714.2b: a Saga chapter ability is a triggered ability, so CR 700.2b
+    /// governs it — the mode is chosen as the chapter ability is put on the stack.
+    ///
+    /// `is_chapter_body_continuation` folds the `•` lines into the chapter body,
+    /// so the modal head has to be recognized from the *joined inline* body.
+    /// Until it was, every bullet resolved sequentially: the +1/+1 counters were
+    /// silently dropped and "You gain 3 life" resolved on all three chapters.
+    #[test]
+    fn saga_chapter_with_random_modal_head_makes_each_bullet_a_mode() {
+        let lines = vec![
+            "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)",
+            "I, II, III \u{2014} Choose one at random \u{2014}",
+            "\u{2022} Combine Powers! \u{2014} Put three +1/+1 counters on target creature.",
+            "\u{2022} Defense! \u{2014} Put a shield counter on target creature. You gain 3 life.",
+            "\u{2022} Fight! \u{2014} This creature fights up to one target creature an opponent controls.",
+            "Haste",
+        ];
+        let (triggers, _, _) = saga_test_chapters(&lines, "Summon: Magus Sisters");
+
+        assert_eq!(
+            triggers.len(),
+            3,
+            "I, II, III should produce one chapter trigger each"
+        );
+
+        for trigger in &triggers {
+            let execute = trigger.execute.as_deref().expect("chapter has an ability");
+            let modal = execute
+                .modal
+                .as_ref()
+                .expect("bulleted chapter body is modal (CR 700.2)");
+            assert_eq!(modal.mode_count, 3, "three bullets are three modes");
+            assert_eq!((modal.min_choices, modal.max_choices), (1, 1));
+            // CR 700.2b override: "at random" replaces controller choice.
+            assert_eq!(modal.selection, TargetSelectionMode::Random);
+            assert_eq!(execute.mode_abilities.len(), 3);
+
+            // Positive reach guard: each bullet lowered into its own mode with
+            // the effect it prints, rather than into a shared sequential chain.
+            assert!(
+                matches!(
+                    &*execute.mode_abilities[0].effect,
+                    Effect::PutCounter { counter_type, count, .. }
+                        if *counter_type == CounterType::Plus1Plus1
+                            && *count == QuantityExpr::Fixed { value: 3 }
+                ),
+                "mode 1 puts three +1/+1 counters, got {:?}",
+                execute.mode_abilities[0].effect
+            );
+            assert!(
+                matches!(
+                    &*execute.mode_abilities[1].effect,
+                    Effect::PutCounter { counter_type, count, .. }
+                        if *counter_type == CounterType::Shield
+                            && *count == QuantityExpr::Fixed { value: 1 }
+                ),
+                "mode 2 puts a shield counter, got {:?}",
+                execute.mode_abilities[1].effect
+            );
+            assert!(
+                matches!(*execute.mode_abilities[2].effect, Effect::Fight { .. }),
+                "mode 3 fights, got {:?}",
+                execute.mode_abilities[2].effect
+            );
+
+            // The misprice this fixes: "You gain 3 life" belongs to mode 2 only.
+            // Before the modal head was recognized it sat in the chapter's own
+            // chain, so all three chapters gained 3 life unconditionally.
+            assert!(
+                !chain_contains_gain_life(execute),
+                "chapter root must not gain life outside a chosen mode"
+            );
+            assert!(
+                chain_contains_gain_life(&execute.mode_abilities[1]),
+                "mode 2 gains 3 life as a follow-on effect"
+            );
+
+            // The modal marker is inert, so the chapter grant-duration promoter
+            // must leave it alone rather than stamping a duration on it.
+            assert!(
+                matches!(
+                    *execute.effect,
+                    Effect::GenericEffect { duration: None, .. }
+                ),
+                "modal marker stays undated, got {:?}",
+                execute.effect
+            );
+        }
+    }
+
+    /// The other half of the class: a Saga whose modal chapters use *plain*
+    /// bullets and are followed by a further chapter. Guards both the
+    /// non-random (CR 700.2a/700.2b) chooser default and against the bullet
+    /// consumption running past the modal block into chapter III.
+    #[test]
+    fn saga_modal_chapter_bullets_stop_before_the_next_chapter() {
+        let lines = vec![
+            "(As this Saga enters and after your draw step, add a lore counter.)",
+            "I, II \u{2014} Choose one \u{2014}",
+            "\u{2022} Target creature gets +2/+2 until end of turn.",
+            "\u{2022} Target creature gets -1/-1 until end of turn.",
+            "\u{2022} You gain 2 life.",
+            "III \u{2014} Exile this Saga, then return it to the battlefield transformed under your control.",
+        ];
+        let (triggers, _, _) = saga_test_chapters(&lines, "Life of Toshiro Umezawa");
+
+        assert_eq!(triggers.len(), 3, "chapters I, II and III each trigger");
+
+        for trigger in triggers.iter().take(2) {
+            let execute = trigger.execute.as_deref().expect("chapter has an ability");
+            let modal = execute
+                .modal
+                .as_ref()
+                .expect("chapters I and II are modal (CR 700.2)");
+            assert_eq!(modal.mode_count, 3);
+            // CR 700.2a: absent an override, the controller chooses.
+            assert_eq!(modal.selection, TargetSelectionMode::Chosen);
+            assert_eq!(execute.mode_abilities.len(), 3);
+        }
+
+        // Chapter III is its own chapter, not a fourth mode of the block above.
+        let third = triggers[2]
+            .execute
+            .as_deref()
+            .expect("chapter III has an ability");
+        assert!(
+            third.modal.is_none(),
+            "chapter III is not modal, got {:?}",
+            third.modal
+        );
+        assert!(
+            matches!(*third.effect, Effect::ChangeZone { .. }),
+            "chapter III still exiles the Saga, got {:?}",
+            third.effect
+        );
+    }
+
+    /// Anti-widening control: a chapter whose em-dash is a flavor title, not a
+    /// modal head, must keep lowering as a plain effect chain. CR 700.2 requires
+    /// an instruction to choose, which this body has not got.
+    #[test]
+    fn saga_chapter_without_a_choose_instruction_is_not_modal() {
+        let lines = vec![
+            "(As this Saga enters and after your draw step, add a lore counter.)",
+            "I \u{2014} Draw a card.",
+            "II \u{2014} You gain 2 life.",
+        ];
+        let (triggers, _, _) = saga_test_chapters(&lines, "Control Saga");
+
+        assert_eq!(triggers.len(), 2);
+        for trigger in &triggers {
+            let execute = trigger.execute.as_deref().expect("chapter has an ability");
+            assert!(
+                execute.modal.is_none(),
+                "plain chapter body must not become modal, got {:?}",
+                execute.modal
+            );
+            assert!(execute.mode_abilities.is_empty());
+        }
+        // Positive reach guard for this control: the chapters really did parse,
+        // so `modal.is_none()` above is measuring a parsed chapter and not a
+        // silent failure to produce one.
+        let second = triggers[1].execute.as_deref().expect("chapter II parsed");
+        assert!(
+            chain_contains_gain_life(second),
+            "chapter II still gains life, got {:?}",
+            second.effect
+        );
+    }
+
+    /// Walk an ability's effect and its `sub_ability` chain looking for a
+    /// life-gain effect. Chapter bodies chain follow-on effects through
+    /// `sub_ability`, so a root-only check would miss them.
+    fn chain_contains_gain_life(ability: &AbilityDefinition) -> bool {
+        if matches!(*ability.effect, Effect::GainLife { .. }) {
+            return true;
+        }
+        ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(chain_contains_gain_life)
+    }
 
     #[test]
     fn parse_roman_numeral_range() {
