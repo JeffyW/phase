@@ -3109,11 +3109,23 @@ pub(crate) fn parse_static_line_inner(
         }
     }
 
-    // --- "The first activated ability [of <subject>] you activate ... costs {N} less to activate" ---
+    // --- "The first activated ability [of <subject>] you activate ... that targets <X> costs {N} less to activate" ---
     // CR 118.7 + CR 602.2b: once-per-turn activation-cost discount. The
     // frequency applies to the first QUALIFYING activation (including any
     // target gate), so the runtime records consumption only when the ability
     // reaches the stack.
+    //
+    // CR 605.1a: admitted ONLY when the line carries a target restriction. A
+    // mana ability "doesn't require a target", so a target-restricted ability can
+    // never be a mana ability, and for that class the non-mana stack-placement
+    // path is the COMPLETE set of points where the once-per-turn slot can be
+    // spent. Without a target restriction the counting set includes mana
+    // abilities. Tezzeret, Betrayer of Flesh's own ruling: the discount "does not
+    // exclude mana abilities". The mana-ability path applies no
+    // `ReduceAbilityCost` and records no consumption, so tapping an artifact for
+    // mana first would leave the discount for a later ability: a misprice. Such
+    // lines (Tezzeret) decline here and stay a strict parse failure until the
+    // mana-ability path consumes.
     if let Some(((subject, timing, targets, amount), _)) =
         nom_on_lower(tp.original, tp.lower, |i| {
             let (i, _) = tag("the first activated ability ").parse(i)?;
@@ -3154,6 +3166,7 @@ pub(crate) fn parse_static_line_inner(
                 ),
             ))
         })
+        .filter(|((_, _, targets, _), _)| targets.is_some())
     {
         let affected = subject.map(|subject| parse_type_phrase_folding(&subject).0);
         let mut def = StaticDefinition::new(StaticMode::ReduceAbilityCost {

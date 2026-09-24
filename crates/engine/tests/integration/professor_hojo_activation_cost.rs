@@ -9,8 +9,6 @@ use engine::types::triggers::TriggerMode;
 
 const HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.\nWhenever one or more creatures you control become the target of an activated ability, draw a card. This ability triggers only once each turn.";
 const KOPALA: &str = "Spells your opponents cast that target a Merfolk you control cost {2} more to cast.\nAbilities your opponents activate that target a Merfolk you control cost {2} more to activate.";
-const TEZZERET: &str =
-    "The first activated ability of an artifact you activate each turn costs {2} less to activate.";
 const FERVENT: &str = "First strike, haste\nWhenever Fervent Champion attacks, another target attacking Knight you control gets +1/+0 until end of turn.\nEquip abilities you activate that target Fervent Champion cost {3} less to activate.";
 const RAFT: &str = "{2}, {T}: Tap target creature. This ability costs {1} less to activate if it targets a creature with power 3 or less.";
 const TAP_ABILITY: &str = "{2}: Tap target creature.";
@@ -106,7 +104,7 @@ fn professor_hojo_static_parses_frequency_targets_and_turn_condition() {
 }
 
 #[test]
-fn target_restricted_cost_static_parses_kopala_tezzeret_and_equip() {
+fn target_restricted_cost_static_parses_kopala_and_equip() {
     let creature = vec!["Creature".to_string()];
     let kopala = reduce_ability_statics(KOPALA, "Kopala, Warden of Waves", &creature);
     let kopala_def = kopala
@@ -133,17 +131,6 @@ fn target_restricted_cost_static_parses_kopala_tezzeret_and_equip() {
     assert_eq!(*amount, 2);
     assert_eq!(*activator, Some(PlayerFilter::Opponent));
     assert!(targets.is_some(), "Kopala target gate must parse");
-
-    let artifact = vec!["Artifact".to_string()];
-    let tezzeret = reduce_ability_statics(TEZZERET, "Tezzeret, Betrayer of Flesh", &artifact);
-    let StaticMode::ReduceAbilityCost {
-        frequency, targets, ..
-    } = &tezzeret[0].mode
-    else {
-        unreachable!()
-    };
-    assert_eq!(*frequency, Some(CastFrequency::OncePerTurn));
-    assert!(targets.is_none());
 
     let fervent = reduce_ability_statics(FERVENT, "Fervent Champion", &creature);
     let StaticMode::ReduceAbilityCost {
@@ -633,4 +620,100 @@ fn settlement_writeback_and_zero_leg_skip_are_distinct_sites() {
             "and never the settlement write-back (it has no targets): {routes:?}"
         );
     }
+}
+
+/// Tezzeret, Betrayer of Flesh's full Oracle text (Scryfall `cards/named`).
+const TEZZERET_FULL: &str = "The first activated ability of an artifact you activate each turn costs {2} less to activate.\n+1: Draw two cards. Then discard two cards unless you discard an artifact card.\n\u{2212}2: Target artifact becomes an artifact creature. If it isn't a Vehicle, it has base power and toughness 4/4.\n\u{2212}6: You get an emblem with \"Whenever an artifact you control becomes tapped, draw a card.\"";
+
+fn card_face(name: &str, oracle: &str, types: &[&str]) -> engine::types::card::CardFace {
+    let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+    let parsed = parse_oracle_text(oracle, name, &[], &types, &[]);
+    engine::types::card::CardFace {
+        name: name.to_string(),
+        oracle_text: Some(oracle.to_string()),
+        abilities: parsed.abilities,
+        triggers: parsed.triggers,
+        static_abilities: parsed.statics,
+        replacements: parsed.replacements,
+        ..Default::default()
+    }
+}
+
+/// CR 605.1a: a once-per-turn activation discount WITHOUT a target restriction
+/// stays a strict parse failure, so its card is reported unsupported rather than
+/// silently mispriced.
+///
+/// Tezzeret's discount applies to "the first activated ability of an artifact you
+/// activate each turn", and its ruling says that "does not exclude mana abilities".
+/// The mana-ability path applies no `ReduceAbilityCost` and records no
+/// once-per-turn consumption. So if this line were supported, tapping an artifact
+/// for mana first would leave the discount for a later ability. Declining it keeps
+/// the card honestly red until that path consumes.
+///
+/// The paired control is Professor Hojo: the SAME grammar branch, with a target
+/// restriction. A target-restricted ability can never be a mana ability (CR
+/// 605.1a: a mana ability "doesn't require a target"), so Hojo stays supported.
+/// Without that control this test could pass because the branch broke outright,
+/// not because the target clause is what it requires.
+#[test]
+fn once_per_turn_discount_without_a_target_restriction_stays_unsupported() {
+    let tezzeret = card_face(
+        "Tezzeret, Betrayer of Flesh",
+        TEZZERET_FULL,
+        &["Planeswalker"],
+    );
+    // Strict failure: no discount static is emitted...
+    assert!(
+        !tezzeret
+            .static_abilities
+            .iter()
+            .any(|def| matches!(def.mode, StaticMode::ReduceAbilityCost { .. })),
+        "Tezzeret's discount must not parse to a ReduceAbilityCost static: {:?}",
+        tezzeret.static_abilities
+    );
+    // ...and the line surfaces as a recorded gap rather than vanishing.
+    assert!(
+        tezzeret.abilities.iter().any(|def| matches!(
+            &*def.effect,
+            Effect::Unimplemented { description: Some(d), .. }
+                if d.contains("The first activated ability of an artifact")
+        )),
+        "Tezzeret's discount line must stay an Unimplemented gap"
+    );
+    // Coverage red: the card is reported unsupported.
+    let gaps = engine::game::coverage::card_face_gaps(&tezzeret);
+    assert!(
+        !gaps.is_empty(),
+        "Tezzeret must be reported unsupported (a coverage gap), got no gaps"
+    );
+    // Reach guard: the rest of the card still parses, so the gap above is the
+    // discount line and not a collapsed card.
+    assert!(
+        tezzeret.abilities.len() >= 3,
+        "Tezzeret's three loyalty abilities must still parse: {:?}",
+        tezzeret.abilities
+    );
+
+    // Paired control: the same branch WITH a target restriction still parses,
+    // carries its target gate and the once-per-turn frequency, and leaves Hojo's
+    // card with no coverage gap.
+    let hojo = card_face("Professor Hojo", HOJO, &["Creature"]);
+    let discount = hojo
+        .static_abilities
+        .iter()
+        .find(|def| matches!(def.mode, StaticMode::ReduceAbilityCost { .. }))
+        .expect("control: Hojo's target-restricted discount still parses");
+    let StaticMode::ReduceAbilityCost {
+        frequency, targets, ..
+    } = &discount.mode
+    else {
+        unreachable!()
+    };
+    assert_eq!(*frequency, Some(CastFrequency::OncePerTurn));
+    assert!(targets.is_some(), "control: Hojo carries its target gate");
+    assert_eq!(
+        engine::game::coverage::card_face_gaps(&hojo),
+        Vec::<String>::new(),
+        "control: Hojo stays fully supported"
+    );
 }
