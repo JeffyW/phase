@@ -85,6 +85,7 @@ mod birgi;
 mod bishop_of_binding_where_x_exiled_card_power;
 mod black_bolt_lethal_voice_destroys_triggering_opponents_permanent;
 mod blessed_orator_other_anthem;
+mod blitz_em_dash_graveyard_cast;
 mod blizzard_brawl_snow_indestructible;
 mod bolas_citadel_regression;
 mod bombur_gentle_dreamer_conditional_untap;

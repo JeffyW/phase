@@ -7235,12 +7235,22 @@ fn casting_variant_candidates(
         candidates.push(CastingVariant::Dash);
     }
 
-    // CR 702.152a: Blitz is an opt-in alternative cost from hand; surface it as a
-    // candidate so the gate offers it (and so it is reachable when the printed
-    // cost is unaffordable). Read the *effective* spell keywords so a Blitz cost
-    // granted by a static (CR 604.1) is honored, not just printed Blitz.
+    // CR 702.152a: "Blitz [cost]" means "You may cast this card by paying [cost]
+    // rather than its mana cost" — an opt-in alternative cost (CR 118.9). Surface
+    // it as a candidate so the gate offers it (and so it is reachable when the
+    // printed cost is unaffordable). Read the *effective* spell keywords so a
+    // Blitz cost granted by a static (CR 604.1) is honored, not just printed Blitz.
     // CR 702.152b: only one Blitz may be applied to a spell, so the dedup-by-kind
     // `effective_spell_keywords` is the correct (single-instance) collector here.
+    //
+    // The zone gate here is HAND-ONLY, mirroring Bestow/Mutate/Warp. Blitz itself
+    // carries no zone restriction, but a graveyard blitz (Sabin, Master Monk /
+    // Tenacious Underdog: "You may cast this card from your graveyard using its
+    // blitz ability.") is authorized by the single `GraveyardPermission` candidate
+    // pushed above; the blitz *cost* is then substituted downstream by the Blitz
+    // offer block, which is zone-gated by `blitz_castable_zone`. Pushing Blitz as
+    // a second candidate here would surface a spurious two-option prompt whose
+    // printed-cost option that permission never granted (CR 118.9a).
     if obj.zone == Zone::Hand
         && effective_spell_keywords(state, player, object_id)
             .iter()
@@ -7748,20 +7758,28 @@ fn prepare_spell_cast_with_variant_override_inner(
         None
     };
 
-    // CR 702.152a: Blitz — when casting from hand with Keyword::Blitz, the blitz
-    // mana cost replaces the printed cost (opt-in via `variant_override`). Read
-    // the *effective* spell keywords so a Blitz cost granted by a static
+    // CR 702.152a: Blitz — when casting with Keyword::Blitz, the blitz mana
+    // sub-cost replaces the printed cost (opt-in via `variant_override`) and any
+    // non-mana residual ("Discard a card") is routed through
+    // `pay_additional_cost` by the Blitz branch in `casting_costs.rs`. Read the
+    // *effective* spell keywords so a Blitz cost granted by a static
     // (CR 604.1) is honored; CR 702.152b makes Blitz single-instance, so the
     // dedup-by-kind collector is correct.
-    let blitz_cost = if obj.zone == Zone::Hand {
+    let blitz_cost = if blitz_castable_zone(state, player, object_id, obj) {
         effective_spell_keywords_for(state, player, object_id, is_fuse_variant)
             .iter()
             .find_map(|k| match k {
-                crate::types::keywords::Keyword::Blitz(cost) => Some(cost.clone()),
+                crate::types::keywords::Keyword::Blitz(cost) => {
+                    Some(split_blitz_cost_components(cost))
+                }
                 _ => None,
             })
     } else {
         None
+    };
+    let (blitz_cost, blitz_non_mana_cost) = match blitz_cost {
+        Some((mana, non_mana)) => (mana, non_mana),
+        None => (None, None),
     };
 
     // CR 702.137a: Spectacle — when casting from hand with Keyword::Spectacle, the
@@ -8322,12 +8340,21 @@ fn prepare_spell_cast_with_variant_override_inner(
     } else {
         None
     };
-    // CR 702.152a: substitute the blitz mana cost only on the blitz path (opt-in).
+    // CR 702.152a: substitute the blitz mana sub-cost only on the blitz path (opt-in).
     let effective_blitz_cost_for_path = if casting_variant == CastingVariant::Blitz {
         blitz_cost
     } else {
         None
     };
+    // CR 702.152a + CR 601.2h: Mirror of `pure_non_mana_bestow` for Blitz. A
+    // hypothetical blitz cost that is entirely non-mana would zero the mana cost
+    // so the residual is routed through the additional-cost path. Both shipping
+    // em-dash blitz cards pair a mana sub-cost with their residual, so this stays
+    // `false` for them; the axis is kept symmetric with the other compound
+    // alternative costs.
+    let pure_non_mana_blitz = casting_variant == CastingVariant::Blitz
+        && blitz_non_mana_cost.is_some()
+        && effective_blitz_cost_for_path.is_none();
     // CR 702.137a: substitute the spectacle mana cost only on the spectacle path.
     let effective_spectacle_cost_for_path = if casting_variant == CastingVariant::Spectacle {
         spectacle_cost
@@ -8368,6 +8395,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         || pure_non_mana_flashback
         || pure_non_mana_evoke
         || pure_non_mana_bestow
+        || pure_non_mana_blitz
         || casting_variant == CastingVariant::Plot
     {
         crate::types::mana::ManaCost::NoCost
@@ -15647,11 +15675,17 @@ pub fn handle_cast_spell_with_payment_mode(
         }
     }
 
-    // CR 702.152a + CR 118.9: Blitz — opt-in pure-mana alternative cost. When a
-    // hand card has Keyword::Blitz and both the printed and blitz costs are
-    // affordable, present the choice; auto-route when only blitz is payable.
+    // CR 702.152a + CR 118.9: Blitz — opt-in alternative cost. When the card has
+    // Keyword::Blitz and both the printed and blitz costs are affordable, present
+    // the choice; auto-route when only blitz is payable.
+    // CR 702.152a + CR 601.2a: offered from the hand by default and from the
+    // GRAVEYARD when a permission lets the card be cast from there (Sabin, Master
+    // Monk / Tenacious Underdog: "You may cast this card from your graveyard using
+    // its blitz ability."). From the graveyard the permission grants only the
+    // blitz cast, so there is no printed-cost branch to compare against and the
+    // blitz path is taken directly. Mirrors the Bestow zone gate.
     if let Some(obj) = state.objects.get(&object_id) {
-        if obj.zone == Zone::Hand {
+        if blitz_castable_zone(state, player, object_id, obj) {
             // CR 604.1: honor a Blitz cost granted by a static, not only printed
             // Blitz. CR 702.152b makes Blitz single-instance, so the dedup-by-kind
             // `effective_spell_keywords` collector is correct here.
@@ -15662,18 +15696,52 @@ pub fn handle_cast_spell_with_payment_mode(
                     _ => None,
                 })
             {
-                // CR 601.2f: affordability and displayed costs reflect active
-                // cost modifiers, applied to both the printed and blitz costs.
+                // CR 601.2f-h + CR 118.9d: split the (possibly compound) blitz
+                // cost into its mana sub-cost and non-mana residual ("Discard a
+                // card" / "Pay 2 life"), then apply active cost modifiers to the
+                // mana sub-cost only — CR 118.9d applies modifiers to the
+                // alternative cost that is actually being paid.
+                let (blitz_mana_part, blitz_non_mana_part) =
+                    split_blitz_cost_components(&blitz_cost);
                 let normal_cost =
                     apply_cost_modifiers_to_base(state, player, object_id, obj.mana_cost.clone())
                         .unwrap_or_else(|| obj.mana_cost.clone());
-                let blitz_eff =
-                    apply_cost_modifiers_to_base(state, player, object_id, blitz_cost.clone())
-                        .unwrap_or(blitz_cost);
-                let normal_affordable =
-                    can_pay_cost_after_auto_tap(state, player, object_id, &normal_cost);
-                let blitz_affordable =
-                    can_pay_cost_after_auto_tap(state, player, object_id, &blitz_eff);
+                let blitz_mana_eff = blitz_mana_part.map(|m| {
+                    apply_cost_modifiers_to_base(state, player, object_id, m.clone()).unwrap_or(m)
+                });
+                let blitz_mana_affordable = match &blitz_mana_eff {
+                    Some(m) => can_pay_cost_after_auto_tap(state, player, object_id, m),
+                    // CR 118.3: a zero mana cost is always payable.
+                    None => true,
+                };
+                // CR 118.3 + CR 601.2h: the non-mana residual must be independently
+                // payable for the blitz option to surface — otherwise the offer
+                // would promise a cost the player cannot complete.
+                let blitz_non_mana_affordable = match &blitz_non_mana_part {
+                    Some(ab_cost) => ab_cost.is_payable(state, player, object_id),
+                    None => true,
+                };
+                let blitz_affordable = blitz_mana_affordable && blitz_non_mana_affordable;
+                // CR 601.2a: whether the PRINTED-cost cast is on offer at all.
+                // From hand it always is. From the graveyard it is only on offer
+                // when some permission authorizes an unconstrained cast (e.g.
+                // Muldrotha / Lurrus). A "using its blitz ability" permission
+                // (Sabin, Master Monk / Tenacious Underdog) does NOT: it grants
+                // the blitz cast only.
+                let from_hand = obj.zone == Zone::Hand;
+                let printed_cost_cast_allowed = from_hand
+                    || has_graveyard_cast_permission_without_keyword_constraint(
+                        state,
+                        player,
+                        object_id,
+                        KeywordKind::Blitz,
+                    );
+                // CR 118.9b: alternative costs are optional, so whenever BOTH the
+                // printed and blitz casts are legal and affordable the player must
+                // get the choice — including from the graveyard under an
+                // unconstrained permission.
+                let normal_affordable = printed_cost_cast_allowed
+                    && can_pay_cost_after_auto_tap(state, player, object_id, &normal_cost);
                 if normal_affordable && blitz_affordable {
                     return Ok(WaitingFor::AlternativeCastChoice {
                         player,
@@ -15682,8 +15750,8 @@ pub fn handle_cast_spell_with_payment_mode(
                         payment_mode,
                         keyword: crate::types::game_state::AlternativeCastKeyword::Blitz,
                         normal_cost,
-                        alternative_cost: Some(blitz_eff),
-                        alternative_additional_cost: None,
+                        alternative_cost: blitz_mana_eff,
+                        alternative_additional_cost: blitz_non_mana_part,
                         alternative_additional_cost_description: None,
                     });
                 }
@@ -15697,6 +15765,16 @@ pub fn handle_cast_spell_with_payment_mode(
                         payment_mode,
                         events,
                     );
+                }
+                // CR 601.2a + CR 118.9b: a "using its blitz ability" permission
+                // authorizes ONLY the blitz cast. When blitz is unaffordable and
+                // no *separate* permission grants an unconstrained graveyard cast,
+                // refuse rather than falling through to a printed-cost graveyard
+                // cast the permission never granted. Mirrors the Bestow guard.
+                if !printed_cost_cast_allowed {
+                    return Err(EngineError::InvalidAction(
+                        "No legal blitz cast from graveyard".to_string(),
+                    ));
                 }
                 // Otherwise (normal-only or neither): fall through to normal cast.
             }
@@ -22450,6 +22528,44 @@ pub(super) fn split_bestow_cost_components(
     match bestow {
         BestowCost::Mana(mana) => (Some(mana.clone()), None),
         BestowCost::NonMana(ab) => split_alt_cost_components(ab),
+    }
+}
+
+/// CR 702.152a + CR 601.2a: Zones from which a Blitz cast may be announced.
+/// Blitz is a static ability that functions while the card is on the stack, so
+/// the blitz *cast* is announced from whatever zone the card can legally be cast
+/// from: the hand by default, or the graveyard when a `GraveyardCastPermission`
+/// grants it ("You may cast this card from your graveyard using its blitz
+/// ability." — Sabin, Master Monk; Tenacious Underdog). Without the graveyard
+/// arm the permission would still allow the cast but the blitz alternative cost
+/// would never be offered, so the card would silently be cast for its printed
+/// mana cost from the graveyard. Mirrors the `bestow_zone_ok` gate (Detective's
+/// Phoenix), which has the identical permission rider.
+fn blitz_castable_zone(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    obj: &GameObject,
+) -> bool {
+    obj.zone == Zone::Hand
+        || (obj.zone == Zone::Graveyard
+            && graveyard_permission_source(state, player, object_id).is_some())
+}
+
+/// CR 702.152a + CR 601.2f-h: Blitz twin of `split_bestow_cost_components`.
+/// `BlitzCost::Mana` is the SNC printed shape (pure mana, "Blitz {1}{R}");
+/// `NonMana(...)` is the em-dash compound ("Blitz—{2}{R}{R}, Discard a card." on
+/// Sabin, Master Monk; "Blitz—{2}{B}{B}, Pay 2 life." on Tenacious Underdog) and
+/// delegates to the shared `split_alt_cost_components` walker, which extracts the
+/// mana sub-cost for the normal mana flow (CR 601.2g) and returns the residual
+/// (discard / pay life) for `pay_additional_cost` (CR 601.2h).
+pub(super) fn split_blitz_cost_components(
+    blitz: &crate::types::keywords::BlitzCost,
+) -> (Option<crate::types::mana::ManaCost>, Option<AbilityCost>) {
+    use crate::types::keywords::BlitzCost;
+    match blitz {
+        BlitzCost::Mana(mana) => (Some(mana.clone()), None),
+        BlitzCost::NonMana(ab) => split_alt_cost_components(ab),
     }
 }
 

@@ -7742,6 +7742,39 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
         }
     }
 
+    // CR 702.152a + CR 118.9 + CR 601.2h: Blitz twin of the Bestow branch above.
+    // A compound blitz cost ("Blitz—{2}{R}{R}, Discard a card." on Sabin, Master
+    // Monk; "Blitz—{2}{B}{B}, Pay 2 life." on Tenacious Underdog) routes its
+    // residual non-mana sub-cost through `pay_additional_cost`; the mana sub-cost
+    // was already substituted as the spell's mana cost in `prepare_spell_cast`
+    // and is paid through the normal mana-payment flow inside
+    // `pay_additional_cost`'s fall-through.
+    if casting_variant == CastingVariant::Blitz {
+        // CR 702.102b: GUARDED — this arm requires `casting_variant == Blitz`,
+        // which Fuse never equals, so a fused split cast never reaches this read.
+        let blitz_split = super::casting::effective_spell_keywords(state, player, object_id)
+            .iter()
+            .find_map(|k| match k {
+                crate::types::keywords::Keyword::Blitz(bc) => {
+                    Some(super::casting::split_blitz_cost_components(bc))
+                }
+                _ => None,
+            });
+        if let Some((_mana, Some(non_mana_cost))) = blitz_split {
+            let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+            pending.base_cost = base_cost.clone();
+            pending.casting_variant = casting_variant;
+            pending.casting_permission_index = casting_permission_index;
+            pending.cast_timing_permission = cast_timing_permission;
+            pending.distribute = distribute;
+            pending.origin_zone = origin_zone;
+            pending.payment_mode = payment_mode;
+            pending.additional_cost_flow =
+                imposed_required_cost.clone().map(AdditionalCost::Required);
+            return pay_additional_cost(state, player, non_mana_cost, pending, events);
+        }
+    }
+
     // CR 601.2b: Check for Defiler cost reduction — optional life payment for colored mana
     // reduction on matching-color permanent spells.
     if let Some(defiler) = find_defiler_reduction(state, player, object_id) {

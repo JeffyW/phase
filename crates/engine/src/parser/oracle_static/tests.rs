@@ -13167,7 +13167,9 @@ fn static_grant_blitz_self_mana_cost() {
     assert_eq!(
         def.mode,
         StaticMode::CastWithKeyword {
-            keyword: Keyword::Blitz(ManaCost::SelfManaCost),
+            keyword: Keyword::Blitz(crate::types::keywords::BlitzCost::Mana(
+                ManaCost::SelfManaCost
+            )),
         }
     );
     let Some(TargetFilter::Typed(tf)) = &def.affected else {
@@ -13204,7 +13206,9 @@ fn static_grant_blitz_simple_form() {
     assert_eq!(
         def.mode,
         StaticMode::CastWithKeyword {
-            keyword: Keyword::Blitz(ManaCost::SelfManaCost),
+            keyword: Keyword::Blitz(crate::types::keywords::BlitzCost::Mana(
+                ManaCost::SelfManaCost
+            )),
         }
     );
 }
