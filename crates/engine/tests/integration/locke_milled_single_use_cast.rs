@@ -42,7 +42,8 @@ use engine::types::ability::{
     AbilityDefinition, CastingPermission, Duration, Effect, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::card_type::CoreType;
+use engine::types::game_state::{ExileLink, ExileLinkKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -70,6 +71,14 @@ fn can_cast(runner: &GameRunner, id: ObjectId) -> bool {
     legal_actions(runner.state())
         .iter()
         .any(|action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == id))
+}
+
+/// CR 116.2a: a land is PLAYED, never cast, so it surfaces as
+/// `GameAction::PlayLand` — a different action than `can_cast` inspects.
+fn can_play_land(runner: &GameRunner, id: ObjectId) -> bool {
+    legal_actions(runner.state())
+        .iter()
+        .any(|action| matches!(action, GameAction::PlayLand { object_id, .. } if *object_id == id))
 }
 
 /// The `single_use` `PlayFromExile` grants recorded on `id`, with the duration
@@ -764,6 +773,122 @@ fn playing_one_granted_land_spends_the_batch_budget_for_its_sibling() {
             .is_err(),
         "the action gate must also refuse the sibling, not merely hide it from \
          discovery — the two halves have to agree"
+    );
+}
+
+/// A STATIC `ExileCastPermission { play_mode: Play }` with a this-turn pool and a
+/// `SourceController` grantee — the one shape that reaches the defect below.
+///
+/// SYNTHETIC, and deliberately so: no printed card has this shape today
+/// (measured over the card-data export: 13 `ExileCastPermission` statics, none
+/// this-turn + play + source-controller). The parser does support it — this text
+/// lowers to exactly that static — so it is a latent path, not an impossible one.
+/// Uba Mask looks like the natural carrier and CANNOT reach it: its
+/// `EachPlayerOwnExiles` pool filters on `exiled_by`, which zone exit clears.
+const THIS_TURN_EXILE_PLAY_SOURCE: &str =
+    "You may play lands and cast spells from among cards exiled with this artifact this turn.";
+
+/// CR 116.2a: a static exile-play permission must not reach a land that has LEFT
+/// exile, even though the land is still in the permission's pool.
+///
+/// Widening the play-land capture to graveyards was right for object-attached
+/// `PlayFromExile` grants, which travel with the card. It was wrong for the STATIC
+/// fallback, and the reason is invisible from the capture site: a this-turn pool
+/// (`cards_exiled_with_source_this_turn`) is keyed by `ObjectId`, which is stable
+/// across zone changes, and is cleared only at turn end — never on zone exit. So a
+/// land exiled with the source and then moved to a graveyard in the same turn is
+/// still in the pool, and the widened capture let the action gate play it FROM THE
+/// GRAVEYARD through a permission whose printed scope is cards *exiled* with the
+/// source. Measured with the guard neutralized: discovery did not offer it, and
+/// `PlayLand` returned `Ok` and moved it to the battlefield.
+///
+/// This is the fourth discovery/admission/completion zone disagreement on this
+/// branch, and the first the reviewer's library-land probe could not reach,
+/// because the land has to have been in exile first.
+///
+/// The exile is STAGED — link, this-turn pool entry and exiling player — the same
+/// way `uba_mask_draw_to_exile_play.rs` stages its permission predicate, because
+/// no printed card both exiles a land with this shape of source and is the source.
+/// The two zone moves are the production `zones::move_to_zone` primitive, so the
+/// zone-exit cleanup that matters here really runs.
+///
+/// POSITIVE REACH GUARDS: the land is playable while it is in exile, and it is
+/// still a member of the source's pool after it moves. Without the second, the
+/// negatives below would pass merely because the pool had been pruned.
+#[test]
+fn a_static_exile_permission_does_not_reach_a_land_that_left_exile() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_artifact_from_oracle(P0, "This-Turn Exile Source", THIS_TURN_EXILE_PLAY_SOURCE)
+        .id();
+    let land = scenario.add_card_to_library_top(P0, "Staged Land");
+    let mut runner = scenario.build();
+    {
+        let obj = runner.state_mut().objects.get_mut(&land).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.base_card_types = obj.card_types.clone();
+    }
+
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), land, Zone::Exile, &mut events);
+    {
+        let state = runner.state_mut();
+        state.exile_links.push(ExileLink {
+            exiled_id: land,
+            source_id: source,
+            kind: ExileLinkKind::TrackedBySource,
+        });
+        state
+            .cards_exiled_with_source_this_turn
+            .entry(source)
+            .or_default()
+            .push(land);
+        state.objects.get_mut(&land).unwrap().exiled_by = Some(P0);
+    }
+    assert!(
+        can_play_land(&runner, land),
+        "reach guard: the land must be playable through the static source while it \
+         is in exile, or the negatives below prove nothing"
+    );
+
+    engine::game::zones::move_to_zone(runner.state_mut(), land, Zone::Graveyard, &mut events);
+    assert_eq!(
+        zone_of(&runner, land),
+        Zone::Graveyard,
+        "reach guard: the land must actually have left exile"
+    );
+    assert!(
+        runner
+            .state()
+            .cards_exiled_with_source_this_turn
+            .get(&source)
+            .is_some_and(|pool| pool.contains(&land)),
+        "reach guard: the land must still be in the source's this-turn pool after \
+         leaving exile — this is what makes the defect reachable at all"
+    );
+
+    assert!(
+        !can_play_land(&runner, land),
+        "the static permission covers cards in exile; it must not surface a land \
+         that has moved to a graveyard"
+    );
+    let card_id = runner.state().objects[&land].card_id;
+    assert!(
+        runner
+            .act(GameAction::PlayLand {
+                object_id: land,
+                card_id,
+            })
+            .is_err(),
+        "CR 116.2a: the action gate must refuse it — this is the half that was \
+         broken; admitting it moves the land onto the battlefield from a zone it is \
+         not in, through a permission that never offered it"
+    );
+    assert_eq!(
+        zone_of(&runner, land),
+        Zone::Graveyard,
+        "the refused play must leave the land where it was"
     );
 }
 
