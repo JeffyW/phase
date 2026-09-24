@@ -51,6 +51,8 @@ enum Modifier {
     /// two-mana floor; it is the smallest floor an `{X}` cost can observe,
     /// because the `X` symbol already counts as one mana toward any floor.
     FlooredTwo(u32),
+    /// A −`amount` reducer with an arbitrary floor (0 = unfloored).
+    Reducer { amount: u32, floor: u32 },
 }
 
 fn colorless(n: usize) -> Vec<ManaUnit> {
@@ -130,6 +132,11 @@ impl Board {
                     scenario
                         .add_creature(P0, &format!("Floored reducer {i}"), 1, 1)
                         .with_static_definition(reducer(*amount, Some(2)));
+                }
+                Modifier::Reducer { amount, floor } => {
+                    scenario
+                        .add_creature(P0, &format!("Reducer {i}"), 1, 1)
+                        .with_static_definition(reducer(*amount, (*floor > 0).then_some(*floor)));
                 }
             }
         }
@@ -1113,4 +1120,35 @@ fn the_loyalty_placement_records_through_the_authority() {
         1
     );
     assert_eq!(runner.state().pending_activations, vec![(walker, index)]);
+}
+
+/// CR 601.2f "in any order": past eight reductions the election must still find
+/// every total. With these nine reducers on `{6}`, every ROTATION of the
+/// battlefield order locks `{0}`, but another order locks `{1}` — a sampled plan
+/// sees one total and would suppress the prompt, taking the `{1}` order away.
+/// The exact search offers both, and each elects as offered.
+#[test]
+fn nine_reductions_offer_a_total_only_a_non_rotation_order_reaches() {
+    let nine = [
+        (1, 0),
+        (1, 1),
+        (3, 2),
+        (2, 2),
+        (2, 0),
+        (1, 2),
+        (1, 1),
+        (1, 2),
+        (2, 0),
+    ]
+    .map(|(amount, floor)| Modifier::Reducer { amount, floor });
+    for (choice, expected_paid) in [(0, 0), (1, 1)] {
+        let mut board = Board::new(&nine, generic(6), None, 6);
+        board.activate().expect("legal");
+        assert_eq!(board.reductions().len(), 9, "reach guard: all nine apply");
+        assert_eq!(board.outcome_totals(), vec![0, 1]);
+        let pool = board.pool();
+        board.elect(choice).expect("legal");
+        assert!(board.on_stack());
+        assert_eq!(pool - board.pool(), expected_paid, "choice {choice}");
+    }
 }

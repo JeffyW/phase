@@ -24849,11 +24849,22 @@ fn reduce_generic_in_cost_with_minimum_mana(
     amount: u32,
     minimum_mana: u32,
 ) {
-    let reducible = total_mana_in_cost(cost)
-        .saturating_sub(minimum_mana)
-        .min(generic_mana_in_cost(cost));
-    let mut remaining = amount.min(reducible);
+    let mut remaining = floored_generic_reduction(
+        generic_mana_in_cost(cost),
+        total_mana_in_cost(cost),
+        amount,
+        minimum_mana,
+    );
     reduce_generic_in_cost_by(cost, &mut remaining);
+}
+
+/// CR 601.2f + CR 118.7a: how much generic mana a reduction of `amount` removes
+/// from a cost holding `generic` generic mana out of `total` mana, when it
+/// "can't reduce the mana in that cost to less than `minimum_mana`". The single
+/// scalar authority: [`reduce_generic_in_cost_with_minimum_mana`] applies it to a
+/// cost, and the activation election searches reachable totals with it.
+fn floored_generic_reduction(generic: u32, total: u32, amount: u32, minimum_mana: u32) -> u32 {
+    amount.min(total.saturating_sub(minimum_mana).min(generic))
 }
 
 /// The unfloored case of [`reduce_generic_in_cost_with_minimum_mana`], kept for
@@ -25192,10 +25203,17 @@ fn activation_mana_component(cost: &AbilityCost) -> ManaCost {
 /// commute ([`fold_activation_cost`]), so a set whose effective floors are all
 /// equal is never enumerated: that is exact, not a heuristic, and it keeps every
 /// ordinary activation (no reducer, one reducer, or only unfloored ones) silent.
-/// Otherwise every order is folded through the same arithmetic the lock applies,
-/// the results are deduped by the mana they demand, and the cheapest — the
-/// default — comes first. When agreement cannot be proven the caster is asked;
-/// the engine never picks. A budget-narrowed plan still prompts.
+///
+/// Otherwise the SET of reachable totals is computed exactly
+/// ([`reachable_activation_generics`]): the locked cost depends on an order only
+/// through its generic amount, so a search over (applied reductions, generic
+/// remaining) finds every total any order can lock, with a witness order for
+/// each, without enumerating permutations. Each witness is then folded through
+/// the lock's own arithmetic. The prompt is suppressed only on that exact proof
+/// that every order agrees; a sampled plan is never taken as evidence. Past the
+/// exact search's bound the caster is asked unconditionally — an unneeded prompt
+/// costs a click, a missing one takes a legal order away (CR 601.2f "in any
+/// order").
 pub(crate) fn analyze_activation_cost_election(
     snapshot: &ActivationCostSnapshot,
 ) -> Option<Vec<CostReductionOutcome>> {
@@ -25214,9 +25232,7 @@ pub(crate) fn analyze_activation_cost_election(
         return None;
     }
 
-    let plan = CandidatePlan::bounded(reductions.len(), 0);
-    let mut outcomes: Vec<CostReductionOutcome> = Vec::new();
-    for order in plan.order_iter(reductions.len()) {
+    let outcome_for = |order: Vec<usize>| {
         let provenances: Vec<ReductionProvenance> = order
             .iter()
             .map(|&index| reductions[index].provenance)
@@ -25227,16 +25243,118 @@ pub(crate) fn analyze_activation_cost_election(
             reductions,
             Some(&provenances),
         ));
-        if outcomes.iter().all(|o| o.locked_cost != locked_cost) {
-            outcomes.push(CostReductionOutcome {
-                order,
-                hybrid_announcement: Vec::new(),
-                locked_cost,
+        CostReductionOutcome {
+            order,
+            hybrid_announcement: Vec::new(),
+            locked_cost,
+        }
+    };
+
+    let generic = generic_mana_in_cost(&raised);
+    let non_generic = total_mana_in_cost(&raised).saturating_sub(generic);
+    let steps: Vec<(u32, u32)> = reductions
+        .iter()
+        .map(|entry| (activation_reduction_amount(entry), entry.minimum_mana))
+        .collect();
+    match reachable_activation_generics(generic, non_generic, &steps) {
+        Some(reachable) => {
+            let outcomes: Vec<CostReductionOutcome> = reachable
+                .into_iter()
+                .map(|(remaining, order)| {
+                    let outcome = outcome_for(order);
+                    debug_assert_eq!(
+                        outcome.locked_cost.mana_value(),
+                        activation_mana_component(&raised)
+                            .mana_value()
+                            .saturating_sub(generic - remaining),
+                        "the search and the lock's arithmetic must agree"
+                    );
+                    outcome
+                })
+                .collect();
+            // Ascending generic remaining: the cheapest (default) total first.
+            (outcomes.len() > 1).then_some(outcomes)
+        }
+        None => {
+            // Past the exact bound: prompt with every total a bounded plan
+            // reaches, plus the default, and never suppress.
+            let mut default_order: Vec<usize> = (0..reductions.len()).collect();
+            default_order.sort_by_key(|&index| {
+                std::cmp::Reverse(activation_effective_floor(&raised, &reductions[index]))
             });
+            let plan = CandidatePlan::bounded(reductions.len(), 0);
+            let mut outcomes: Vec<CostReductionOutcome> = Vec::new();
+            for order in std::iter::once(default_order).chain(plan.order_iter(reductions.len())) {
+                let outcome = outcome_for(order);
+                if outcomes
+                    .iter()
+                    .all(|o| o.locked_cost != outcome.locked_cost)
+                {
+                    outcomes.push(outcome);
+                }
+            }
+            outcomes.sort_by_key(|o| o.locked_cost.mana_value());
+            Some(outcomes)
         }
     }
-    outcomes.sort_by_key(|o| o.locked_cost.mana_value());
-    (outcomes.len() > 1).then_some(outcomes)
+}
+
+/// Upper bound on the reductions [`reachable_activation_generics`] searches
+/// exactly: `2^16` subsets of at most a handful of generic amounts each. Far past
+/// any real board — it takes sixteen reducers applying to one activation.
+const ACTIVATION_ELECTION_EXACT_MAX: usize = 16;
+
+/// CR 601.2f: every generic amount some order of `steps` can leave, each with a
+/// witness order, in ascending order. `steps` are `(amount, floor)` pairs applied
+/// with [`floored_generic_reduction`] to `generic` generic mana alongside
+/// `non_generic` other mana symbols. Exact: a subset search over (applied
+/// reductions, generic remaining), which is everything an order's result depends
+/// on. `None` past [`ACTIVATION_ELECTION_EXACT_MAX`].
+fn reachable_activation_generics(
+    generic: u32,
+    non_generic: u32,
+    steps: &[(u32, u32)],
+) -> Option<Vec<(u32, Vec<usize>)>> {
+    let n = steps.len();
+    if n > ACTIVATION_ELECTION_EXACT_MAX {
+        return None;
+    }
+    // states[mask]: generic remaining -> (generic before the last step, last step).
+    let mut states: Vec<std::collections::BTreeMap<u32, (u32, usize)>> =
+        vec![std::collections::BTreeMap::new(); 1 << n];
+    states[0].insert(generic, (generic, usize::MAX));
+    for mask in 0..(1usize << n) {
+        let current: Vec<u32> = states[mask].keys().copied().collect();
+        for x in current {
+            for (index, &(amount, floor)) in steps.iter().enumerate() {
+                if mask & (1 << index) != 0 {
+                    continue;
+                }
+                let next = x - floored_generic_reduction(x, x + non_generic, amount, floor);
+                states[mask | (1 << index)]
+                    .entry(next)
+                    .or_insert((x, index));
+            }
+        }
+    }
+    let full = (1usize << n) - 1;
+    Some(
+        states[full]
+            .keys()
+            .map(|&remaining| {
+                let mut order = Vec::with_capacity(n);
+                let (mut mask, mut x) = (full, remaining);
+                while mask != 0 {
+                    let (previous, index) = states[mask][&x];
+                    order.push(index);
+                    mask &= !(1 << index);
+                    x = previous;
+                }
+                order.reverse();
+                (remaining, order)
+            })
+            .collect(),
+    )
 }
 
 fn collect_static_activated_ability_cost_modifiers(

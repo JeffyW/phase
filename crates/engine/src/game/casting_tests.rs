@@ -59523,3 +59523,112 @@ fn activation_fold_applies_raises_before_reductions() {
         }
     );
 }
+
+/// CR 601.2f: the activation election's reachable-totals search is EXACT — it
+/// finds precisely the set of generic amounts that some order of the reductions
+/// leaves, each with a witness order that really produces it. Checked against a
+/// brute-force walk of every permutation over a deterministic sweep of boards
+/// (mixed amounts and floors, with and without other mana symbols).
+#[test]
+fn activation_reachable_totals_search_matches_every_permutation() {
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for rest in permutations(n - 1) {
+            for slot in 0..=rest.len() {
+                let mut order = rest.clone();
+                order.insert(slot, n - 1);
+                out.push(order);
+            }
+        }
+        out
+    }
+    fn run(generic: u32, non_generic: u32, steps: &[(u32, u32)], order: &[usize]) -> u32 {
+        order.iter().fold(generic, |x, &i| {
+            let (amount, floor) = steps[i];
+            x - floored_generic_reduction(x, x + non_generic, amount, floor)
+        })
+    }
+
+    // A small deterministic generator (no RNG dependency in the engine crate).
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let mut multi_total_boards = 0;
+    for _ in 0..400 {
+        let n = 2 + next(5) as usize; // 2..=6 reductions
+        let generic = next(10) as u32;
+        let non_generic = next(2) as u32;
+        let steps: Vec<(u32, u32)> = (0..n)
+            .map(|_| (1 + next(3) as u32, next(3) as u32))
+            .collect();
+        let brute: std::collections::BTreeSet<u32> = permutations(n)
+            .iter()
+            .map(|order| run(generic, non_generic, &steps, order))
+            .collect();
+        let found = reachable_activation_generics(generic, non_generic, &steps)
+            .expect("within the exact bound");
+        let totals: std::collections::BTreeSet<u32> =
+            found.iter().map(|(total, _)| *total).collect();
+        assert_eq!(
+            totals, brute,
+            "generic {generic}+{non_generic}, steps {steps:?}"
+        );
+        for (total, witness) in &found {
+            let mut sorted = witness.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..n).collect::<Vec<_>>(),
+                "a witness is a permutation"
+            );
+            assert_eq!(run(generic, non_generic, &steps, witness), *total);
+        }
+        if brute.len() > 1 {
+            multi_total_boards += 1;
+        }
+    }
+    // Reach guard: the sweep must include boards where the order matters.
+    assert!(multi_total_boards > 0);
+}
+
+/// CR 601.2f: past the exact search's bound the analyzer never proves agreement,
+/// so it never suppresses — it prompts even when, as here, every order happens
+/// to lock the same total (a large generic cost no floor can bind).
+#[test]
+fn activation_election_past_the_exact_bound_always_prompts() {
+    let reductions: Vec<CostReductionEntry> = (0..17u8)
+        .map(|index| CostReductionEntry {
+            amount: ManaCost::generic(1),
+            multiplier: 1,
+            reach: CostReductionReach::SpillsToGeneric,
+            provenance: ReductionProvenance::Static {
+                source: ObjectId(950),
+                ordinal: index,
+            },
+            display_name: format!("reducer {index}"),
+            minimum_mana: u32::from(index % 2),
+        })
+        .collect();
+    let snapshot = ActivationCostSnapshot {
+        base_cost: AbilityCost::Mana {
+            cost: ManaCost::generic(40),
+        },
+        raise_total: 0,
+        reductions,
+        lock: crate::types::casting_costs::ActivationCostLock::Open,
+    };
+    let outcomes = analyze_activation_cost_election(&snapshot)
+        .expect("past the exact bound the caster is always asked");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "every order locks {{23}} here, so one total is offered — but offered"
+    );
+}
