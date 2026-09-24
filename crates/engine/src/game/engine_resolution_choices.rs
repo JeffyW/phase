@@ -916,6 +916,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::OutsideGameChoice { .. }
             | WaitingFor::ChooseFromZoneChoice { .. }
             | WaitingFor::BeholdChoice { .. }
+            | WaitingFor::EmpowerJaceChoice { .. }
             | WaitingFor::ChooseOneOfBranch { .. }
             | WaitingFor::DiscardToHandSize { .. }
             | WaitingFor::ConniveDiscard { .. }
@@ -3483,6 +3484,43 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
+            WaitingFor::EmpowerJaceChoice {
+                player,
+                source_id,
+                choices,
+                count,
+            },
+            GameAction::SelectCards { cards: chosen },
+        ) => {
+            // CR 701.71a + CR 608.2d: choose exactly ONE Jace planeswalker token
+            // you control from the offered candidates.
+            if chosen.len() != 1 {
+                return Err(EngineError::InvalidAction(format!(
+                    "Empower Jace requires exactly one Jace token, got {}",
+                    chosen.len()
+                )));
+            }
+            // CR 704.4: no state-based action check occurs mid-resolution, so
+            // the stored candidates are still the legal set.
+            if !choices.contains(&chosen[0]) {
+                return Err(EngineError::InvalidAction(
+                    "Selected object is not a Jace token you control".to_string(),
+                ));
+            }
+            // CR 614.1 + CR 616.1: a counter-replacement choice (an optional
+            // replacement's accept/decline, or an ordering choice among several)
+            // can interrupt placement; leave it open and let the counter drain
+            // finish the instruction.
+            if !effects::empower_jace::place_loyalty_counters(
+                state, player, source_id, chosen[0], count, events,
+            ) {
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
+            }
+            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+        }
+        (
             WaitingFor::ClashChooseOpponent {
                 player,
                 candidates,
@@ -5215,10 +5253,24 @@ pub(super) fn handle_resolution_choice(
             )?;
             public_state::sync_waiting_for(state, &settled);
 
-            if matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.stack.is_empty() {
-                let _ = turns::advance_phase_once(state, events);
-                let advanced = turns::auto_advance(state, events);
-                public_state::sync_waiting_for(state, &advanced);
+            // A cleanup discard can be the final child of a nested resolution.
+            // Retire a now-complete carrier before asking the phase interpreter
+            // to cross Cleanup -> Untap; an unfinished carrier remains visible
+            // and the guarded transition below leaves the Priority window in
+            // place for the owner pipeline to resume it.
+            super::engine::settle_resolving_stack_entry_after_continuation_resume(state);
+
+            if matches!(state.waiting_for, WaitingFor::Priority { .. })
+                && state.stack.is_empty()
+                && !turns::phase_transition_requires_settlement(state)
+            {
+                match turns::advance_phase_once(state, events) {
+                    turns::AdvancePhaseOnce::Deferred => {}
+                    turns::AdvancePhaseOnce::Entry(_) | turns::AdvancePhaseOnce::Skipped => {
+                        let advanced = turns::auto_advance(state, events);
+                        public_state::sync_waiting_for(state, &advanced);
+                    }
+                }
             }
 
             // The suffix pipeline above already processed this action's discard

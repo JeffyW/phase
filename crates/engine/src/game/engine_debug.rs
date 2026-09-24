@@ -912,6 +912,7 @@ fn enter_battlefield_with_etb(
         chain_referent: crate::types::zones::ChainReferentIntent::Silent,
         enter_as_copy: None,
         discard_frame: None,
+        performed_by: None,
         applied: HashSet::new(),
     };
 
@@ -1832,6 +1833,7 @@ mod tests {
             display_name: "Test Token".to_string(),
             power: Some(0),
             toughness: Some(0),
+            loyalty: None,
             core_types: vec![CoreType::Creature],
             subtypes: Vec::new(),
             supertypes: Vec::new(),
