@@ -1465,8 +1465,10 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
         .collect()
 }
 
-/// CR 601.2a: object-tagged `PlayFromExile` grants on cards sitting in
-/// ANOTHER player's graveyard.
+/// CR 601.2a + CR 116.2a: object-tagged `PlayFromExile` grants on cards sitting in
+/// ANOTHER player's graveyard. Serves both surfaces: CR 601.2a for the cast half
+/// (a spell is moved "from where it is" to the stack) and CR 116.2a for the land
+/// half (a land is put onto the battlefield "from the zone it was in").
 ///
 /// A `PlayFromExile` permission names the player it was granted to
 /// (`granted_to`), and nothing in CR 601.2a ties that player to the card's owner
@@ -5901,7 +5903,7 @@ pub(super) enum ExileLandPlayAuthorization {
         source: ObjectId,
         frequency: CastFrequency,
         casting_permission_index: CastingPermissionIndex,
-        /// CR 601.2a + CR 611.2a: the tracked-set budget this grant shares with
+        /// CR 116.2a + CR 611.2a: the tracked-set budget this grant shares with
         /// its siblings, captured pre-move so `record_exile_play_permission` can
         /// spend it. `None` when the elected grant is not `single_use`.
         ///

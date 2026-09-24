@@ -16170,7 +16170,7 @@ fn record_exile_play_permission(
     state: &mut GameState,
     authorization: Option<casting::ExileLandPlayAuthorization>,
 ) {
-    // CR 601.2a + CR 611.2a: a single-use grant authorizes ONE play across its
+    // CR 116.2a + CR 611.2a: a single-use grant authorizes ONE play across its
     // whole window, shared by every object stamped with the same tracked set.
     // Spent here rather than inside the frequency match below because the two are
     // independent axes: `single_use` is a grant-scoped budget, `CastFrequency` is
