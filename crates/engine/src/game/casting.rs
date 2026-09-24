@@ -8965,6 +8965,8 @@ fn order_relevant_reductions(modifiers: &CollectedCostModifiers) -> Vec<CostRedu
             reach: m.reach,
             provenance: m.provenance,
             display_name: m.display_name.clone(),
+            // CR 601.2f: `ModifyCost` spell reductions carry no floor.
+            minimum_mana: 0,
         })
         .filter(|entry| entry.multiplier > 0 && entry.is_order_relevant())
         .collect()
@@ -9669,6 +9671,12 @@ fn cast_can_have_cost_modifiers(state: &GameState, pending: &PendingCast) -> boo
 }
 
 fn reduction_entry_to_mod(entry: CostReductionEntry) -> CostModification {
+    // The spell arithmetic has no floor to apply, so a floored (activation)
+    // entry reaching it would silently lose its floor.
+    debug_assert_eq!(
+        entry.minimum_mana, 0,
+        "a floored activation reduction must never reach the spell cost arithmetic"
+    );
     CostModification {
         is_raise: false,
         amount: entry.amount,
@@ -23523,6 +23531,7 @@ pub fn handle_activate_ability(
             is_activated: true,
             ability_index: Some(ability_index),
             ability_cost: ability_def.cost.clone(),
+            activation_cost_snapshot: None,
             unavailable_modes,
         });
     }

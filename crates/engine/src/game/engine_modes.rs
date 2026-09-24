@@ -29,6 +29,9 @@ pub(super) fn handle_ability_mode_choice(
         is_activated,
         ability_index,
         ability_cost,
+        // Threaded into the activated-mode continuation with the lock (the
+        // carrier is not populated before then).
+        activation_cost_snapshot: _,
         unavailable_modes,
     } = waiting_for
     else {

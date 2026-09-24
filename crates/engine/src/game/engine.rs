@@ -16122,6 +16122,7 @@ pub(super) fn begin_pending_trigger_target_selection(
                                     is_activated: false,
                                     ability_index: None,
                                     ability_cost: None,
+                                    activation_cost_snapshot: None,
                                     unavailable_modes,
                                 }));
                             }
@@ -16146,6 +16147,7 @@ pub(super) fn begin_pending_trigger_target_selection(
                 is_activated: false,
                 ability_index: None,
                 ability_cost: None,
+                activation_cost_snapshot: None,
                 unavailable_modes,
             }));
         }

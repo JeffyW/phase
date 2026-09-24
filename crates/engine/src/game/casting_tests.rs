@@ -28189,6 +28189,7 @@ fn set_triggered_ability_mode_choice(state: &mut GameState, player: PlayerId, so
         is_activated: false,
         ability_index: None,
         ability_cost: None,
+        activation_cost_snapshot: None,
         unavailable_modes: vec![],
     };
 }
