@@ -7018,9 +7018,15 @@ fn cast_permission_additional_extra_cost(
     casting_permission_index: Option<CastingPermissionIndex>,
 ) -> Option<AbilityCost> {
     let extra = match state.objects.get(&object_id).map(|obj| obj.zone) {
-        Some(Zone::Graveyard) => {
-            super::casting::graveyard_static_permission_extra_cost(state, player, object_id)
-        }
+        // CR 601.2a: read from the permission this cast commits to, the same
+        // election `finalize_cast` spends, so the rider charged here is the
+        // rider of the permission actually used.
+        Some(Zone::Graveyard) => super::casting::graveyard_static_permission_extra_cost(
+            state,
+            player,
+            object_id,
+            casting_variant,
+        ),
         // CR 601.2a: Bind to the source this cast commits to so the additional
         // rider is read from the elected permission, never a second active
         // permission for the same exiled spell. A non-`ExilePermission` exile
@@ -11131,8 +11137,13 @@ fn finalize_cast_with_phyrexian_choices_inner(
     let permission_authority = if source_zone == Zone::Graveyard
         && casting_variant.is_independent_alternative_cost_rider()
     {
-        super::casting::graveyard_rider_permission_authority(state, player, object_id)
-            .unwrap_or(casting_variant)
+        super::casting::graveyard_rider_permission_authority(
+            state,
+            player,
+            object_id,
+            casting_variant,
+        )
+        .unwrap_or(casting_variant)
     } else {
         casting_variant
     };
