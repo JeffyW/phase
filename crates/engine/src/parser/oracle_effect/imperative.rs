@@ -3841,6 +3841,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             count,
             position: LibraryPosition::Top,
             face_down,
+            actor: crate::types::ability::LibraryInstructionActor::Controller,
         },
         SearchCreationImperativeAst::CopyTokenOf {
             target,
@@ -15338,6 +15339,7 @@ pub(super) fn lower_zone_counter_ast(ast: ZoneCounterImperativeAst) -> Effect {
             count,
             position,
             face_down,
+            actor: crate::types::ability::LibraryInstructionActor::Controller,
         },
         ZoneCounterImperativeAst::Counter {
             target,
