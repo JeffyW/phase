@@ -1705,6 +1705,6 @@ mod exploit_ceased_exploiter_lki;
 mod extra_turn_quantity;
 mod optional_chain_link_prompt_description;
 mod planeswalker_token;
-mod ripple_reveal_choice_interaction;
 mod professor_hojo_activation_cost;
+mod ripple_reveal_choice_interaction;
 mod uba_mask_draw_to_exile_play;
