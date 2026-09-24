@@ -663,6 +663,79 @@ fn blitz_from_graveyard_keeps_the_permissions_enters_with_counter_rider() {
 
 const RIVETEERS_DECOY: &str = "This creature must be blocked if able.\nBlitz {3}{G} (If you cast this spell for its blitz cost, it gains haste and \"When this creature dies, draw a card.\" Sacrifice it at the beginning of the next end step.)";
 
+const BOON_SATYR: &str = "Flash\nBestow {3}{G}{G} (If you cast this card for its bestow cost, it's an Aura spell with enchant creature. It becomes a creature again if it's not attached.)\nEnchanted creature gets +4/+2.";
+
+/// CR 601.2a + CR 110.4 + CR 702.103b: the fix applies to every alternative
+/// cost that is the card's own, not only Blitz. Bestow is the other one that can
+/// be cast from the graveyard.
+///
+/// A bestowed spell is an Aura, not a creature (CR 702.103b), so under Muldrotha
+/// it is cast as an enchantment spell and spends the ENCHANTMENT slot, leaving
+/// the creature slot free (Muldrotha ruling, 2020-11-10: "you can cast a card
+/// with bestow as an enchantment spell"). Before the fix it spent neither.
+#[test]
+fn bestow_from_graveyard_under_muldrotha_spends_its_enchantment_slot() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Boon Satyr", 4, 2);
+    builder.with_mana_cost(ManaCost::Cost {
+        generic: 1,
+        shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+    });
+    builder.with_subtypes(vec!["Satyr"]);
+    builder.from_oracle_text_with_keywords(&["Flash", "Bestow"], BOON_SATYR);
+    let satyr = builder.id();
+    let mut runner = scenario.build();
+    // Boon Satyr is an Enchantment Creature. The graveyard builder seeds only
+    // Creature, so add Enchantment to both the current and base type lines.
+    {
+        let obj = runner.state_mut().objects.get_mut(&satyr).unwrap();
+        for types in [
+            &mut obj.card_types.core_types,
+            &mut obj.base_card_types.core_types,
+        ] {
+            if !types.contains(&CoreType::Enchantment) {
+                types.push(CoreType::Enchantment);
+            }
+        }
+    }
+    fill_mana(&mut runner, ManaType::Green);
+
+    cast_from_graveyard(&mut runner, satyr).expect("graveyard bestow cast must be legal");
+    if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+        runner
+            .choose_first_legal_target()
+            .expect("Muldrotha is a legal creature to enchant");
+    }
+
+    // Positive reach guard: the bestow cast completed, charging bestow's
+    // {3}{G}{G} = 5 rather than the printed {1}{G}{G} = 3.
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "Boon Satyr must be on the stack"
+    );
+    assert_eq!(runner.state().players[0].mana_pool.total(), 3);
+
+    let used = &runner.state().graveyard_cast_permissions_used_per_type;
+    assert!(
+        used.contains(&(muldrotha, CoreType::Enchantment)),
+        "a bestowed spell is an enchantment spell, so it must spend Muldrotha's \
+         enchantment slot, used: {used:?}"
+    );
+    assert!(
+        !used.contains(&(muldrotha, CoreType::Creature)),
+        "a bestowed spell is not a creature spell, so the creature slot must stay \
+         free, used: {used:?}"
+    );
+}
+
 /// CR 601.2a: when several permissions admit a graveyard cast, the player
 /// announces which one they use (Muldrotha, 2020-11-10 ruling). The engine
 /// picks only when the choice is strictly dominant, so an unlimited permission
