@@ -3499,27 +3499,26 @@ fn real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused() {
 
     // CR 611.2a: a stated duration IS the later priority window, so the cap of one
     // has a faithful home. Locke's duration is printed at the head of its sentence.
-    for (name, oracle, types, axis) in [(
+    let (name, oracle, types, axis) = (
         "Locke, Treasure Hunter",
         LOCKE_TREASURE_HUNTER,
         &["Creature", "Legendary"][..],
         "paid + leading duration, cap of one over a milled batch",
-    )] {
-        let gaps = all_gap_names(oracle, name, types);
-        assert!(
-            !gaps.iter().any(|gap| gap == "unrepresentable_cast_cap"),
-            "{name} ({axis}): a stated duration gives the printed cap of one a \
-             faithful home in `PlayFromExile {{ single_use: true }}`, so the clause \
-             must no longer refuse. gaps = {gaps:?}"
-        );
-        assert_eq!(
-            single_use_cast_grant_durations(oracle, name, types),
-            vec![Duration::UntilEndOfTurn],
-            "{name} ({axis}): exactly one single-use cast grant must be installed, \
-             carrying the PRINTED window — a `Duration::Permanent` here means the \
-             placeholder was never patched and the grant outlives the card's text"
-        );
-    }
+    );
+    let gaps = all_gap_names(oracle, name, types);
+    assert!(
+        !gaps.iter().any(|gap| gap == "unrepresentable_cast_cap"),
+        "{name} ({axis}): a stated duration gives the printed cap of one a \
+         faithful home in `PlayFromExile {{ single_use: true }}`, so the clause \
+         must no longer refuse. gaps = {gaps:?}"
+    );
+    assert_eq!(
+        single_use_cast_grant_durations(oracle, name, types),
+        vec![Duration::UntilEndOfTurn],
+        "{name} ({axis}): exactly one single-use cast grant must be installed, \
+         carrying the PRINTED window — a `Duration::Permanent` here means the \
+         placeholder was never patched and the grant outlives the card's text"
+    );
 
     // CR 611.2a: Chiss-Goria's CAP is representable — its trailing "this turn" is
     // the later window, exactly like Locke's leading one — but its "If you do, it
