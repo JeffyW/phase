@@ -59652,3 +59652,60 @@ fn activation_totals_route_on_the_computed_effective_floor() {
         ActivationTotalsMethod::ZeroOneFloors
     );
 }
+
+/// CR 601.2f: reduction amounts can be enormous — a dynamic count saturates at
+/// `u32::MAX` — and the closed form only COMPARES their sums with the generic
+/// mana, so it must neither overflow nor wrap. `{5}` with a saturated floor-1
+/// reduction and a floor-0 −2 still reaches exactly `{0}` (floor-1 first) and
+/// `{1}` (floor-0 first); two saturated reductions of one floor sum past
+/// `u32::MAX` and still leave only `{0}`.
+#[test]
+fn activation_totals_survive_saturated_reduction_amounts() {
+    let totals = |steps: &[(u32, u32)]| -> Vec<u32> {
+        activation_totals_zero_one_floors(5, steps)
+            .into_iter()
+            .map(|(total, _)| total)
+            .collect()
+    };
+    assert_eq!(totals(&[(2, 0), (u32::MAX, 1)]), vec![0, 1]);
+    assert_eq!(
+        totals(&[(u32::MAX, 1), (u32::MAX, 1), (u32::MAX, 0)]),
+        vec![0]
+    );
+    assert_eq!(totals(&[(u32::MAX, 0), (u32::MAX, 0), (1, 1)]), vec![0]);
+    // The canonical search takes the same amounts without overflow.
+    let canonical: Vec<u32> =
+        activation_totals_canonical_search(5, &[(u32::MAX, 2), (u32::MAX, 2), (2, 0)])
+            .into_iter()
+            .map(|(total, _)| total)
+            .collect();
+    assert_eq!(canonical, vec![0, 2]);
+
+    // End to end through the analyzer: a saturated floor-1 and a floor-0 −2 on
+    // `{5}` is a real election between `{0}` and `{1}`.
+    let entry = |amount: u32, minimum_mana: u32, ordinal: u8| CostReductionEntry {
+        amount: ManaCost::generic(amount),
+        multiplier: 1,
+        reach: CostReductionReach::SpillsToGeneric,
+        provenance: ReductionProvenance::Static {
+            source: ObjectId(970),
+            ordinal,
+        },
+        display_name: format!("reducer {ordinal}"),
+        minimum_mana,
+    };
+    let snapshot = ActivationCostSnapshot {
+        base_cost: AbilityCost::Mana {
+            cost: ManaCost::generic(5),
+        },
+        raise_total: 0,
+        reductions: vec![entry(u32::MAX, 1, 0), entry(2, 0, 1)],
+        lock: crate::types::casting_costs::ActivationCostLock::Open,
+    };
+    let outcomes = analyze_activation_cost_election(&snapshot).expect("two totals");
+    let offered: Vec<u32> = outcomes
+        .iter()
+        .map(|o| o.locked_cost.mana_value())
+        .collect();
+    assert_eq!(offered, vec![0, 1]);
+}

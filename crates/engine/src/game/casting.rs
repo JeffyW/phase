@@ -25360,10 +25360,18 @@ fn activation_totals_zero_one_floors(x: u32, steps: &[(u32, u32)]) -> Vec<(u32, 
             .filter(move |(_, &(_, f))| f == floor)
             .map(|(index, _)| index)
     };
-    let s0: u32 = steps.iter().filter(|s| s.1 == 0).map(|s| s.0).sum();
-    let s1: u32 = steps.iter().filter(|s| s.1 == 1).map(|s| s.0).sum();
-    if x > s0 + s1 {
-        return vec![(x - s0 - s1, (0..steps.len()).collect())];
+    // Saturating: a dynamic reduction can already be `u32::MAX`, and these
+    // sums are only compared with `x`, so saturating preserves every decision.
+    let class_total = |floor: u32| {
+        steps
+            .iter()
+            .filter(|s| s.1 == floor)
+            .fold(0u32, |sum, s| sum.saturating_add(s.0))
+    };
+    let (s0, s1) = (class_total(0), class_total(1));
+    let s = s0.saturating_add(s1);
+    if x > s {
+        return vec![(x - s, (0..steps.len()).collect())];
     }
     let mut totals = Vec::new();
     let y = if x >= 2 {
@@ -25407,7 +25415,7 @@ fn canonical_bag(
         let capped = amount.min(x - floor);
         let cap = (x - floor).div_ceil(capped);
         let slot = bag.entry((capped, floor)).or_insert(0);
-        *slot = (*slot + count).min(cap);
+        *slot = slot.saturating_add(count).min(cap);
     }
     bag.into_iter().collect()
 }
