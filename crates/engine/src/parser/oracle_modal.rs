@@ -1266,6 +1266,7 @@ pub(crate) fn lower_oracle_block_ir(
                     ),
                     choice: build_modal_choice(&header, &modes),
                     modes: parse_modal_mode_irs(&modes, AbilityKind::Spell, &mut mode_ctx),
+                    optionality: header.optionality,
                 };
                 ctx.diagnostics.extend(mode_ctx.diagnostics);
                 // CR 603.12: the printed instruction the mode list rides on is
@@ -2227,6 +2228,12 @@ pub(crate) fn try_parse_inline_modal_ability(effect_body: &str) -> Option<Abilit
     let modal = try_parse_inline_modal_ir(effect_body, &ParseContext::default())?;
     let mut ability = crate::parser::oracle_effect::lower_effect_chain_ir(&modal.marker);
     crate::parser::oracle_effect::finalize_effect_chain(&mut ability);
+    // CR 700.2b + CR 603.5: "you may choose one —" lets the controller decline.
+    // That is resolution-time optionality on the ability that resolves, as the
+    // block-level modal lowering sets it; `ModalChoice.min_choices` stays 1.
+    if matches!(modal.optionality, ModalOptionality::MayDecline) {
+        ability.optional = true;
+    }
     Some(
         ability.with_modal(
             modal.choice,
@@ -2258,6 +2265,7 @@ pub(crate) fn try_parse_inline_modal_ir(effect_body: &str, ctx: &ParseContext) -
         ),
         choice: build_modal_choice(&header, &modes),
         modes: parse_modal_mode_irs(&modes, AbilityKind::Spell, &mut mode_ctx),
+        optionality: header.optionality,
     })
 }
 
@@ -2830,6 +2838,40 @@ mod tests {
             &ParseContext::default()
         )
         .is_none());
+    }
+
+    /// CR 700.2b + CR 603.5: an inline trigger modal ("you may choose one — A;
+    /// or B") is optional. The trigger parser reads "you may" as trigger
+    /// optionality before the modal body is parsed, so this pins that the
+    /// inline modal path keeps it. The plain "choose one" trigger is the control.
+    #[test]
+    fn inline_modal_trigger_you_may_choose_one_is_optional() {
+        for (text, optional) in [
+            (
+                "When this creature enters, you may choose one \u{2014} Draw a card; or You gain 2 life.",
+                true,
+            ),
+            (
+                "When this creature enters, choose one \u{2014} Draw a card; or You gain 2 life.",
+                false,
+            ),
+        ] {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                text,
+                "Test Creature",
+                &[],
+                &["Creature".into()],
+                &[],
+            );
+            let trigger = parsed
+                .triggers
+                .first()
+                .unwrap_or_else(|| panic!("{text}: must parse to a trigger"));
+            let execute = trigger.execute.as_deref().expect("trigger has an ability");
+            assert!(execute.modal.is_some(), "{text}: must be modal");
+            assert_eq!(trigger.optional, optional, "{text}: trigger.optional");
+            assert_eq!(execute.optional, optional, "{text}: execute.optional");
+        }
     }
 
     #[test]

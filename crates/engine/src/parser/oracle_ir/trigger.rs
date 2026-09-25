@@ -6,7 +6,7 @@
 
 use serde::Serialize;
 
-use super::ast::parsed_clause;
+use super::ast::{parsed_clause, ModalOptionality};
 use super::context::ParseContext;
 use super::effect_chain::{DieResultBranchIr, EffectChainIr, ModalModeIr};
 use crate::types::ability::{
@@ -204,6 +204,10 @@ pub(crate) struct ModalIr {
     pub(crate) marker: EffectChainIr,
     pub(crate) choice: ModalChoice,
     pub(crate) modes: Vec<ModalModeIr>,
+    /// CR 700.2b + CR 603.5: whether the header lets the controller decline
+    /// ("you may choose one —"). `ModalChoice.min_choices` stays 1 either way;
+    /// declining is resolution-time optionality on the ability that resolves.
+    pub(crate) optionality: ModalOptionality,
 }
 
 /// CR 701.38: Typed vote trigger body.

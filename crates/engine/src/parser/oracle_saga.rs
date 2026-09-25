@@ -205,7 +205,12 @@ pub(crate) fn parse_saga_chapters(lines: &[&str], _card_name: &str) -> SagaChapt
             // duration to `UntilHostLeavesPlay` when the chapter text has no explicit
             // duration suffix.
             promote_grant_duration_for_chapter(&mut execute, effect_text);
-            let trigger = TriggerDefinition::new(TriggerMode::CounterAdded)
+            // CR 700.2b + CR 603.5: a "you may choose one —" chapter is optional.
+            // The resolving execute ability already carries the flag; stamp the
+            // definition too, as the block-level modal lowering does, so coverage
+            // and card-data export see it.
+            let optional = execute.modal.is_some() && execute.optional;
+            let mut trigger = TriggerDefinition::new(TriggerMode::CounterAdded)
                 .valid_card(TargetFilter::SelfRef)
                 .counter_filter(CounterTriggerFilter {
                     counter_type: crate::types::counter::CounterType::Lore,
@@ -219,6 +224,9 @@ pub(crate) fn parse_saga_chapters(lines: &[&str], _card_name: &str) -> SagaChapt
                 .execute(execute)
                 .trigger_zones(vec![Zone::Battlefield])
                 .description(format!("Chapter {n}"));
+            if optional {
+                trigger = trigger.optional();
+            }
             triggers.push((*line_idx, trigger));
         }
     }
@@ -272,17 +280,24 @@ pub(crate) fn is_saga_chapter(lower: &str) -> bool {
 /// and trample until end of turn." — `strip_trailing_duration` already extracted
 /// the explicit `UntilEndOfTurn` and we must preserve it).
 fn promote_grant_duration_for_chapter(execute: &mut AbilityDefinition, chapter_text: &str) {
-    if chapter_has_explicit_duration_suffix(chapter_text) {
+    // CR 700.2 + CR 611.2a: a MODAL chapter's root is a mode-dispatch marker that
+    // grants nothing on its own (`static_abilities` is empty) — any granted
+    // ability lives in the chosen mode. Each mode is its own printed instruction,
+    // and a continuous effect "lasts as long as stated by the spell or ability
+    // creating it", so each mode is judged on ITS OWN text (the bullet recorded
+    // in `mode_descriptions`), never on the joined chapter body: one mode's
+    // "until end of turn" must neither shield a sibling's duration-free grant
+    // from promotion nor be overwritten because a sibling has no suffix.
+    if let Some(modal) = &execute.modal {
+        let mode_texts = modal.mode_descriptions.clone();
+        for (mode, mode_text) in execute.mode_abilities.iter_mut().zip(&mode_texts) {
+            if !chapter_has_explicit_duration_suffix(mode_text) {
+                promote_generic_effect_duration(&mut mode.effect);
+            }
+        }
         return;
     }
-    // CR 700.2: a MODAL chapter's root is a mode-dispatch marker that grants
-    // nothing on its own (`static_abilities` is empty) — any granted ability
-    // lives in the chosen mode. Promote inside each mode, where a grant can
-    // actually be, instead of stamping a duration onto the inert marker.
-    if execute.modal.is_some() {
-        for mode in &mut execute.mode_abilities {
-            promote_generic_effect_duration(&mut mode.effect);
-        }
+    if chapter_has_explicit_duration_suffix(chapter_text) {
         return;
     }
     promote_generic_effect_duration(&mut execute.effect);
@@ -537,6 +552,94 @@ mod tests {
             "chapter II still gains life, got {:?}",
             second.effect
         );
+    }
+
+    /// Duration of mode `index`'s `GenericEffect`. Panics (the reach guard) when
+    /// the mode did not lower to a `GenericEffect`, so the duration assertions
+    /// can't pass vacuously on some other effect shape.
+    fn mode_generic_effect_duration(execute: &AbilityDefinition, index: usize) -> Option<Duration> {
+        match &*execute.mode_abilities[index].effect {
+            Effect::GenericEffect { duration, .. } => duration.clone(),
+            other => panic!("mode {index} must lower to a GenericEffect grant, got {other:?}"),
+        }
+    }
+
+    /// Parse a one-chapter modal saga with `bullets` and return the duration of
+    /// the "until end of turn" mode and of the duration-free grant.
+    fn modal_chapter_durations(
+        bullets: [&str; 2],
+        explicit_index: usize,
+    ) -> (Option<Duration>, Option<Duration>) {
+        let lines = vec![
+            "(As this Saga enters and after your draw step, add a lore counter.)",
+            "I \u{2014} Choose one \u{2014}",
+            bullets[0],
+            bullets[1],
+        ];
+        let (triggers, _, _) = saga_test_chapters(&lines, "Duration Saga");
+        let execute = triggers[0]
+            .execute
+            .as_deref()
+            .expect("chapter has an ability");
+        assert!(execute.modal.is_some(), "chapter must be modal");
+        (
+            mode_generic_effect_duration(execute, explicit_index),
+            mode_generic_effect_duration(execute, 1 - explicit_index),
+        )
+    }
+
+    const EXPLICIT_GRANT_MODE: &str =
+        "\u{2022} This Saga gains \"{T}: Add {C}.\" until end of turn.";
+    const BARE_GRANT_MODE: &str = "\u{2022} This Saga gains \"{T}: Add {R}.\"";
+
+    /// CR 611.2a + CR 700.2: each mode of a modal chapter is judged on its own
+    /// printed text. With the "until end of turn" mode FIRST, the joined chapter
+    /// ends without a suffix; that must not promote the explicit mode.
+    #[test]
+    fn modal_chapter_keeps_an_explicit_duration_before_a_bare_mode() {
+        let (explicit, bare) = modal_chapter_durations([EXPLICIT_GRANT_MODE, BARE_GRANT_MODE], 0);
+        assert_eq!(explicit, Some(Duration::UntilEndOfTurn));
+        assert_eq!(bare, Some(Duration::UntilHostLeavesPlay));
+    }
+
+    /// CR 611.2a + CR 700.2: with the "until end of turn" mode LAST, the joined
+    /// chapter ends with a suffix; that must not shield the bare grant from
+    /// promotion.
+    #[test]
+    fn modal_chapter_promotes_a_bare_mode_before_an_explicit_duration() {
+        let (explicit, bare) = modal_chapter_durations([BARE_GRANT_MODE, EXPLICIT_GRANT_MODE], 1);
+        assert_eq!(explicit, Some(Duration::UntilEndOfTurn));
+        assert_eq!(bare, Some(Duration::UntilHostLeavesPlay));
+    }
+
+    /// CR 700.2b + CR 603.5: "You may choose one —" lets the controller decline,
+    /// so the chapter's resolving ability and its trigger are optional, while
+    /// `min_choices` stays 1. The plain "Choose one —" chapter is the control.
+    #[test]
+    fn you_may_choose_one_chapter_is_optional() {
+        for (header, optional) in [
+            ("I \u{2014} You may choose one \u{2014}", true),
+            ("I \u{2014} Choose one \u{2014}", false),
+        ] {
+            let lines = vec![
+                "(As this Saga enters and after your draw step, add a lore counter.)",
+                header,
+                "\u{2022} Draw a card.",
+                "\u{2022} You gain 2 life.",
+            ];
+            let (triggers, _, _) = saga_test_chapters(&lines, "Optional Saga");
+            let execute = triggers[0]
+                .execute
+                .as_deref()
+                .expect("chapter has an ability");
+            let modal = execute
+                .modal
+                .as_ref()
+                .unwrap_or_else(|| panic!("{header}: chapter must be modal"));
+            assert_eq!(modal.min_choices, 1, "{header}: min_choices stays 1");
+            assert_eq!(execute.optional, optional, "{header}: execute.optional");
+            assert_eq!(triggers[0].optional, optional, "{header}: trigger.optional");
+        }
     }
 
     /// Walk an ability's effect and its `sub_ability` chain looking for a
