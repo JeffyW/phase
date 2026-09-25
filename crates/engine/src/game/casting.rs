@@ -3912,12 +3912,13 @@ pub(super) fn selected_exile_alt_cost_permission_enters_with_counter(
 // `StaticMode::{Graveyard,Exile}CastPermission.enters_with_counter`.
 pub(super) fn selected_static_permission_enters_with_counter(
     state: &GameState,
+    player: PlayerId,
     casting_variant: &crate::types::game_state::CastingVariant,
 ) -> Option<crate::types::counter::CounterType> {
     use crate::types::game_state::CastingVariant;
-    let source = match casting_variant {
-        CastingVariant::GraveyardPermission { source, .. }
-        | CastingVariant::ExilePermission { source, .. } => *source,
+    let (source, from_graveyard) = match casting_variant {
+        CastingVariant::GraveyardPermission { source, .. } => (*source, true),
+        CastingVariant::ExilePermission { source, .. } => (*source, false),
         _ => return None,
     };
     let source_obj = state.objects.get(&source)?;
@@ -3955,6 +3956,20 @@ pub(super) fn selected_static_permission_enters_with_counter(
                 .static_definitions
                 .iter_all()
                 .find_map(permission_counter)
+        })
+        // CR 611.2a + CR 614.1c: a RESOLUTION-CREATED graveyard permission ("Until
+        // end of turn, you may ... cast spells from your graveyard") is not on any
+        // object's statics; it is a grant on a transient continuous effect keyed
+        // on the card that created it. Read the rider from that same transient
+        // source, the one the permission election saw. Additive: fires only when
+        // neither static path finds a rider.
+        .or_else(|| {
+            if !from_graveyard {
+                return None;
+            }
+            transient_graveyard_permission_sources(state, player, Some(CardPlayMode::Cast))
+                .find(|candidate| candidate.source_id == source)
+                .and_then(|candidate| candidate.enters_with_counter.clone())
         })
 }
 

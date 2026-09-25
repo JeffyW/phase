@@ -1731,3 +1731,133 @@ fn blitz_from_graveyard_under_a_resolution_created_permission_is_not_refused() {
         .join()
         .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
 }
+
+/// Set `enters_with_counter` on every graveyard-cast permission a spell's
+/// ability grants: the permission rides a `GrantStaticAbility` modification
+/// on one of its `GenericEffect` statics. Returns how many were set.
+fn set_granted_permission_counter(
+    ability: &mut engine::types::ability::AbilityDefinition,
+    counter: Option<CounterType>,
+) -> usize {
+    fn set_on_static(
+        definition: &mut engine::types::ability::StaticDefinition,
+        counter: &Option<CounterType>,
+    ) -> usize {
+        let mut set = 0;
+        if let engine::types::statics::StaticMode::GraveyardCastPermission {
+            enters_with_counter,
+            ..
+        } = &mut definition.mode
+        {
+            *enters_with_counter = counter.clone();
+            set += 1;
+        }
+        for modification in definition.modifications.iter_mut() {
+            if let engine::types::ability::ContinuousModification::GrantStaticAbility {
+                definition,
+            } = modification
+            {
+                set += set_on_static(definition, counter);
+            }
+        }
+        set
+    }
+    let mut set = 0;
+    if let engine::types::ability::Effect::GenericEffect {
+        static_abilities, ..
+    } = &mut *ability.effect
+    {
+        for definition in static_abilities.iter_mut() {
+            set += set_on_static(definition, &counter);
+        }
+    }
+    if let Some(sub) = ability.sub_ability.as_deref_mut() {
+        set += set_granted_permission_counter(sub, counter);
+    }
+    set
+}
+
+/// Resolve Yawgmoth's Will with its granted graveyard permission's
+/// enters-with rider set to `counter`, cast a creature from the graveyard
+/// through it, and return the counters the creature entered with.
+fn counters_after_casting_under_a_transient_permission(
+    counter: Option<CounterType>,
+) -> std::collections::HashMap<CounterType, u32> {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let parsed = parse_oracle_text(
+                YAWGMOTHS_WILL,
+                "Yawgmoth's Will",
+                &[],
+                &["Sorcery".into()],
+                &[],
+            );
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let bears = scenario
+                .add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2)
+                .with_mana_cost(ManaCost::Cost {
+                    generic: 1,
+                    shards: vec![ManaCostShard::Green],
+                })
+                .id();
+            let mut will = scenario.add_spell_to_hand(P0, "Yawgmoth's Will", false);
+            let mut granted = 0;
+            for mut ability in parsed.abilities {
+                granted += set_granted_permission_counter(&mut ability, counter.clone());
+                will.with_ability_definition(ability);
+            }
+            // Reach guard: the rider really landed on the Will's granted permission.
+            assert_eq!(
+                granted, 1,
+                "Yawgmoth's Will must grant exactly one graveyard-cast permission"
+            );
+            let will = will.id();
+            let mut runner = scenario.build();
+            let _ = runner.cast(will).resolve();
+            fill_mana(&mut runner, ManaType::Green);
+
+            let card_id = runner.state().objects[&bears].card_id;
+            runner
+                .act(GameAction::CastSpell {
+                    object_id: bears,
+                    card_id,
+                    targets: vec![],
+                    payment_mode: CastPaymentMode::Auto,
+                })
+                .expect("the resolution-created permission must admit the graveyard cast");
+            runner.resolve_top();
+            let entered = &runner.state().objects[&bears];
+            assert_eq!(entered.zone, Zone::Battlefield, "the creature must resolve");
+            entered.counters.clone()
+        })
+        .expect("spawn 256MB test thread")
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+}
+
+/// CR 611.2a + CR 614.1c: a resolution-created graveyard permission's
+/// "enters with a counter" rider applies to a creature cast through it. No
+/// printed card grants a transient graveyard permission with such a rider, so
+/// the rider is set on Yawgmoth's Will's own grant; the grant still resolves
+/// through the engine exactly as the card's does.
+#[test]
+fn a_resolution_created_permissions_counter_rider_applies() {
+    let counters = counters_after_casting_under_a_transient_permission(Some(CounterType::Finality));
+    assert_eq!(
+        counters.get(&CounterType::Finality).copied(),
+        Some(1),
+        "the transient permission's finality rider must apply, counters: {counters:?}"
+    );
+}
+
+/// Control: with no rider on the transient permission, no counter is added.
+#[test]
+fn a_resolution_created_permission_without_a_rider_adds_no_counter() {
+    let counters = counters_after_casting_under_a_transient_permission(None);
+    assert!(
+        counters.is_empty(),
+        "no rider, so no counter, counters: {counters:?}"
+    );
+}

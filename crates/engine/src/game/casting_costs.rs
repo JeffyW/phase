@@ -11390,6 +11390,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // ETB counter on the same object so it enters carrying the counter.
     let static_perm_etb_counter = super::casting::selected_static_permission_enters_with_counter(
         state,
+        player,
         &permission_authority,
     );
     if let Some(counter_type) = static_perm_etb_counter {
