@@ -4149,6 +4149,12 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // check is robustly correct.
     gate_other_revealed_card_on_multiplayer_reveal(&mut result);
 
+    // CR 611.2a: a lingering cast grant's "If you do" rider runs at resolution,
+    // before any spell exists to receive it. Applied on the FINAL tree for the
+    // same reason as the gate above: only here are the grant and its rider both
+    // linked. See `refuse_cast_rider_on_lingering_grant`.
+    super::lower::refuse_cast_rider_on_lingering_grant(&mut result);
+
     // CR 608.2c + CR 107.1c: A trailing "repeat this process" directive sets a
     // chain-level loop predicate; apply it to the assembled root ability so the
     // resolver re-follows the whole chain.

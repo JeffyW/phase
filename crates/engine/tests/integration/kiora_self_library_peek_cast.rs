@@ -3498,22 +3498,13 @@ fn real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused() {
     }
 
     // CR 611.2a: a stated duration IS the later priority window, so the cap of one
-    // has a faithful home. Both positions are covered: Locke's duration is printed
-    // at the head of its sentence, Chiss-Goria's at the tail of its clause.
-    for (name, oracle, types, axis) in [
-        (
-            "Chiss-Goria, Forge Tyrant",
-            CHISS_GORIA_FORGE_TYRANT,
-            &["Creature", "Legendary", "Artifact"][..],
-            "paid + trailing duration, cap of one over a batch of five",
-        ),
-        (
-            "Locke, Treasure Hunter",
-            LOCKE_TREASURE_HUNTER,
-            &["Creature", "Legendary"][..],
-            "paid + leading duration, cap of one over a milled batch",
-        ),
-    ] {
+    // has a faithful home. Locke's duration is printed at the head of its sentence.
+    for (name, oracle, types, axis) in [(
+        "Locke, Treasure Hunter",
+        LOCKE_TREASURE_HUNTER,
+        &["Creature", "Legendary"][..],
+        "paid + leading duration, cap of one over a milled batch",
+    )] {
         let gaps = all_gap_names(oracle, name, types);
         assert!(
             !gaps.iter().any(|gap| gap == "unrepresentable_cast_cap"),
@@ -3529,6 +3520,40 @@ fn real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused() {
              placeholder was never patched and the grant outlives the card's text"
         );
     }
+
+    // CR 611.2a: Chiss-Goria's CAP is representable — its trailing "this turn" is
+    // the later window, exactly like Locke's leading one — but its "If you do, it
+    // has affinity for artifacts" rider is not. That rider runs during the grant's
+    // own resolution, before any spell has been cast, so it would silently do
+    // nothing. The card is therefore refused on a DIFFERENT, more precise gap than
+    // the cap refusal above: it is the rider, not the cap, that this engine cannot
+    // yet carry. Asserting the specific gap name keeps the two reasons from being
+    // conflated in coverage.
+    let gaps = all_gap_names(
+        CHISS_GORIA_FORGE_TYRANT,
+        "Chiss-Goria, Forge Tyrant",
+        &["Creature", "Legendary", "Artifact"],
+    );
+    assert!(
+        gaps.iter()
+            .any(|gap| gap == "cast_rider_on_lingering_grant"),
+        "Chiss-Goria (paid + trailing duration, with an \"if you do\" rider): the rider \
+         cannot reach the spell cast through a lingering grant, so the card must be \
+         refused on the rider gap rather than counted as supported. gaps = {gaps:?}"
+    );
+    assert!(
+        !gaps.iter().any(|gap| gap == "unrepresentable_cast_cap"),
+        "Chiss-Goria's cap of one is representable; only the rider is refused. gaps = {gaps:?}"
+    );
+    assert!(
+        single_use_cast_grant_durations(
+            CHISS_GORIA_FORGE_TYRANT,
+            "Chiss-Goria, Forge Tyrant",
+            &["Creature", "Legendary", "Artifact"],
+        )
+        .is_empty(),
+        "no grant may be installed for Chiss-Goria while its rider would be inert"
+    );
 }
 
 /// The durations of every `single_use` `PlayFromExile` grant on a parsed card's

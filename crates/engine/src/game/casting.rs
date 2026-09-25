@@ -6007,7 +6007,7 @@ fn exile_land_playable_by_static_permission(
     })
 }
 
-/// CR 116.2a + CR 305.1 + CR 113.6b: Elect the exact play authority for
+/// CR 116.2a + CR 305.1: Elect the exact play authority for
 /// `land_id` before the land changes zones. CR 116.2a puts the land onto the
 /// battlefield "from the zone it was in", so this is deliberately not
 /// exile-only: an object-attached `PlayFromExile { mode: Play }` grant is

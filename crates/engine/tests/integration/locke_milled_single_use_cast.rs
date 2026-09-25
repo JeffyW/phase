@@ -667,7 +667,7 @@ fn a_dropped_type_gate_refuses_instead_of_widening_the_grant() {
     );
 }
 
-/// CR 116.2a + CR 601.2a: playing one granted land SPENDS the single-use budget,
+/// CR 116.2a + CR 611.2a: playing one granted land SPENDS the single-use budget,
 /// so its sibling in the batch becomes unplayable.
 ///
 /// The cast path spends its grant through `consume_single_use_play_from_exile`;
@@ -759,7 +759,7 @@ fn playing_one_granted_land_spends_the_batch_budget_for_its_sibling() {
         !engine::game::casting::graveyard_lands_playable_by_permission(runner.state(), P0)
             .iter()
             .any(|(obj, _)| *obj == their_land),
-        "CR 601.2a: the grant printed a budget of ONE, so playing the first land \
+        "CR 116.2a + CR 611.2a: the grant printed a budget of ONE, so playing the first land \
          must make its sibling unplayable — a second land drop is available, so \
          the one-per-turn limit is not what is stopping it"
     );
@@ -892,7 +892,96 @@ fn a_static_exile_permission_does_not_reach_a_land_that_left_exile() {
     );
 }
 
-/// CR 305.1 + CR 601.2a: a land milled from an OPPONENT's library is offered by
+/// Verbatim Oracle text of Chiss-Goria, Forge Tyrant's attack trigger (Scryfall
+/// `cards/named?exact=Chiss-Goria, Forge Tyrant`).
+const CHISS_GORIA_TRIGGER: &str = "Whenever Chiss-Goria attacks, exile the top five cards of \
+     your library. You may cast an artifact spell from among them this turn. If you do, it has \
+     affinity for artifacts.";
+
+/// A creature face from Oracle text, for the public coverage authority.
+fn creature_face(name: &str, oracle: &str) -> engine::types::card::CardFace {
+    let parsed = parse_oracle_text(oracle, name, &[], &["Creature".to_string()], &[]);
+    engine::types::card::CardFace {
+        name: name.to_string(),
+        oracle_text: Some(oracle.to_string()),
+        abilities: parsed.abilities,
+        triggers: parsed.triggers,
+        static_abilities: parsed.statics,
+        replacements: parsed.replacements,
+        ..Default::default()
+    }
+}
+
+/// CR 611.2a: a lingering cast grant with an "If you do, it …" rider is reported
+/// as UNSUPPORTED, not silently counted as supported with an inert rider.
+///
+/// Chiss-Goria's grant is exercised at a later priority window, but its rider
+/// ("If you do, it has affinity for artifacts") runs during the same resolution
+/// as the grant, when no spell has been cast yet. Measured before this guard: the
+/// grant installed correctly and the chosen artifact never gained affinity — no
+/// keyword, no transient effect. The card still counted as supported. That is the
+/// defect: a coverage claim larger than the card's behaviour.
+///
+/// ASSERTED THROUGH THE PUBLIC COVERAGE AUTHORITY (`card_face_gaps`), not by
+/// string-matching the parse, because the claim under test is "the card reports
+/// itself unsupported". A census count could pass while the verdict reads green.
+///
+/// DISCRIMINATING CONTROLS. Without them the refusal could pass because promotion
+/// had stopped working:
+///   * the SAME clause with the rider removed still promotes, and reports no gap
+///     from this guard — it is the rider, not the grant, that is refused;
+///   * Locke, Treasure Hunter (a lingering grant with no rider) still promotes.
+#[test]
+fn a_lingering_grant_with_an_if_you_do_rider_is_reported_unsupported() {
+    let chiss = creature_face("Chiss-Goria, Forge Tyrant", CHISS_GORIA_TRIGGER);
+    let gaps = engine::game::coverage::card_face_gaps(&chiss);
+    assert!(
+        gaps.iter()
+            .any(|gap| gap.contains("cast_rider_on_lingering_grant")),
+        "Chiss-Goria's inert affinity rider must surface as an explicit coverage gap, \
+         got {gaps:?}"
+    );
+    assert!(
+        engine::game::coverage::card_face_has_unimplemented_parts(&chiss),
+        "the public verdict must read UNSUPPORTED"
+    );
+    let chiss_parse = parse_oracle_text(CHISS_GORIA_TRIGGER, "Chiss-Goria", &[], &[], &[]);
+    assert!(
+        !has_single_use_grant(&chiss_parse),
+        "no grant may be installed whose rider would silently do nothing"
+    );
+
+    // Control 1: the identical clause without the rider still promotes.
+    let no_rider = parse_oracle_text(
+        "Whenever this creature attacks, exile the top five cards of your library. You may \
+         cast an artifact spell from among them this turn.",
+        "No Rider",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        has_single_use_grant(&no_rider),
+        "control: without the rider there is nothing to lose, so the grant must still \
+         promote — the guard fires on the rider, not on the grant"
+    );
+
+    // Control 2: Locke is a lingering grant with no rider and stays supported.
+    let locke = creature_face("Locke, Treasure Hunter", LOCKE);
+    assert!(
+        !engine::game::coverage::card_face_gaps(&locke)
+            .iter()
+            .any(|gap| gap.contains("cast_rider_on_lingering_grant")),
+        "control: Locke has no rider and must not be touched by this guard"
+    );
+    let locke_parse = parse_oracle_text(LOCKE, "Locke, Treasure Hunter", &[], &[], &[]);
+    assert!(
+        has_single_use_grant(&locke_parse),
+        "control: Locke must still promote to the single-use grant"
+    );
+}
+
+/// CR 116.2a + CR 305.1: a land milled from an OPPONENT's library is offered by
 /// the land-play surface and the submitted action succeeds.
 ///
 /// The cast fix's land companion had the same defect in the opposite direction.
@@ -958,7 +1047,7 @@ fn an_opponent_owned_milled_land_is_offered_and_playable() {
         engine::game::casting::graveyard_lands_playable_by_permission(runner.state(), P0)
             .iter()
             .any(|(id, _)| *id == their_land),
-        "CR 601.2a: a `mode: Play` grant naming this player authorizes the land \
+        "CR 116.2a: a `mode: Play` grant naming this player authorizes the land \
          wherever it sits, so the land-play sweep must surface it"
     );
 
