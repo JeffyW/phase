@@ -1125,3 +1125,238 @@ fn a_deferred_lock_records_target_settlement_as_its_point() {
         }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// G: every cost-work entry refuses an unlocked carrier (G1), and each row's
+// board really reaches its entry (G2).
+// ---------------------------------------------------------------------------
+
+use engine::game::casting::ActivationCostGuardSite;
+use engine::types::counter::CounterType;
+use engine::types::game_state::{CounterCostChoice, ShardChoice};
+
+/// Re-opens every live activation carrier: the shape a route that bypassed
+/// target settlement would leave.
+fn open_live_carriers(r: &mut GameRunner) -> usize {
+    fn open(
+        snapshot: &mut Option<Box<engine::types::casting_costs::ActivationCostSnapshot>>,
+    ) -> usize {
+        match snapshot.as_deref_mut() {
+            Some(snapshot) => {
+                snapshot.lock = ActivationCostLock::Open;
+                1
+            }
+            None => 0,
+        }
+    }
+    let state = r.state_mut();
+    let mut opened = 0;
+    if let Some(pending) = state.pending_cast.as_deref_mut() {
+        opened += open(&mut pending.activation_cost_snapshot);
+    }
+    if let WaitingFor::PayCost {
+        resume: CostResume::Spell { spell } | CostResume::SpellCost { spell, .. },
+        ..
+    } = &mut state.waiting_for
+    {
+        opened += open(&mut spell.activation_cost_snapshot);
+    }
+    opened
+}
+
+/// One G row: `build` reaches a cost prompt with a LOCKED carrier and names
+/// the action that continues it.
+fn guard_row(site: ActivationCostGuardSite, build: impl Fn() -> (GameRunner, GameAction)) {
+    guard_reach(site, &build);
+    guard_refusal(site, &build);
+}
+
+/// G2 alone: the board reaches the entry with a locked carrier.
+fn guard_reach(site: ActivationCostGuardSite, build: &impl Fn() -> (GameRunner, GameAction)) {
+    let (mut r, action) = build();
+    perf_counters::reset();
+    r.act(action.clone())
+        .unwrap_or_else(|e| panic!("{site:?}: the locked control must proceed: {e:?}"));
+    let reaches = perf_counters::activation_cost_route_snapshot().guard_reaches;
+    assert!(
+        reaches[site as usize] > 0,
+        "{site:?}: the board must reach its entry: {reaches:?}"
+    );
+}
+
+/// G1: the same drive with the carrier re-opened is refused with no side effect.
+fn guard_refusal(site: ActivationCostGuardSite, build: &impl Fn() -> (GameRunner, GameAction)) {
+    let (mut r, action) = build();
+    assert!(
+        open_live_carriers(&mut r) > 0,
+        "{site:?}: a carrier to reopen"
+    );
+    let before = serde_json::to_value(r.state()).unwrap();
+    let refused = r.act(action);
+    let message = format!("{refused:?}");
+    assert!(
+        refused.is_err() && message.contains("must be locked"),
+        "{site:?}: an unlocked carrier is refused: {message}"
+    );
+    assert_eq!(
+        serde_json::to_value(r.state()).unwrap(),
+        before,
+        "{site:?}: nothing paid, moved or stacked"
+    );
+}
+
+/// `{2}` plus `extra` as the ability's cost, on a board with a target and the
+/// cost's fodder; returns the runner at the cost prompt after targeting.
+fn at_cost_prompt(cost: &str, pool: usize, fodder_counters: u32) -> (GameRunner, ObjectId) {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let fodder = s.add_creature(P0, "Fodder", 1, 1).id();
+    if fodder_counters > 0 {
+        s.with_counter(fodder, CounterType::Plus1Plus1, fodder_counters);
+    }
+    let bear = s.add_creature(P1, "Bear", 2, 2).id();
+    let src = s
+        .add_artifact_from_oracle(P0, "Engine", &format!("{cost}: Tap target creature."))
+        .id();
+    mana(&mut s, P0, pool);
+    let mut r = s.build();
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("activation starts");
+    if matches!(r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        act(
+            &mut r,
+            GameAction::SelectTargets {
+                targets: vec![object(bear)],
+            },
+        )
+        .expect("target chosen");
+    }
+    (r, fodder)
+}
+
+#[test]
+fn every_cost_work_entry_refuses_an_unlocked_carrier() {
+    guard_row(ActivationCostGuardSite::PushToStack, || {
+        let (r, fodder) = at_cost_prompt("{1}, Sacrifice a creature", 1, 0);
+        (
+            r,
+            GameAction::SelectCards {
+                cards: vec![fodder],
+            },
+        )
+    });
+    guard_row(ActivationCostGuardSite::ReturnToHand, || {
+        let (r, fodder) = at_cost_prompt(
+            "{1}, Return a creature you control to its owner's hand",
+            1,
+            0,
+        );
+        (
+            r,
+            GameAction::SelectCards {
+                cards: vec![fodder],
+            },
+        )
+    });
+    guard_row(ActivationCostGuardSite::RemoveCounter, || {
+        let (r, fodder) = at_cost_prompt(
+            "{1}, Remove a +1/+1 counter from a creature you control",
+            1,
+            1,
+        );
+        (
+            r,
+            GameAction::SelectCards {
+                cards: vec![fodder],
+            },
+        )
+    });
+    guard_row(ActivationCostGuardSite::RemoveCounterDistribution, || {
+        let (r, fodder) = at_cost_prompt(
+            "{1}, Remove two +1/+1 counters from among creatures you control",
+            1,
+            2,
+        );
+        (
+            r,
+            GameAction::ChooseRemoveCounterCostDistribution {
+                distribution: vec![CounterCostChoice {
+                    object_id: fodder,
+                    counter_type: CounterType::Plus1Plus1,
+                    count: 2,
+                }],
+            },
+        )
+    });
+    guard_row(ActivationCostGuardSite::PhyrexianResume, || {
+        let (r, _) = at_cost_prompt("{W/P}", 0, 0);
+        (
+            r,
+            GameAction::SubmitPhyrexianChoices {
+                choices: vec![ShardChoice::PayLife],
+            },
+        )
+    });
+}
+
+/// The entry an ordinary target-first mana payment finalizes through is
+/// reached inside the settling action itself, after the settlement lock, so no
+/// live carrier exists between the two to reopen: G2 only, with G1 held by the
+/// census's structural check that the entry calls the guard.
+#[test]
+fn a_settled_mana_payment_reaches_the_mana_resume_guard() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let bear = s.add_creature(P1, "Bear", 2, 2).id();
+    // A second legal target, so targets are chosen interactively.
+    s.add_creature(P1, "Other Bear", 2, 2);
+    let src = s
+        .add_artifact_from_oracle(P0, "Tapper", "{2}: Tap target creature.")
+        .id();
+    mana(&mut s, P0, 2);
+    let mut r = s.build();
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .unwrap();
+    guard_reach(ActivationCostGuardSite::ManaResume, &|| {
+        (
+            GameRunner::from_state(r.state().clone()),
+            GameAction::SelectTargets {
+                targets: vec![object(bear)],
+            },
+        )
+    });
+}
+
+/// The untargeted direct payment, reached for real. An untargeted cost never
+/// defers its lock, so no carrier it sees can be `Open`: G1 for it is the
+/// census's structural check. (`ReturnAfterAutomatic` is reached only after a
+/// replacement pauses a returned permanent's move, past the guarded return
+/// prompt; it too is held by the census.)
+#[test]
+fn the_untargeted_direct_payment_reaches_its_guard() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let src = s
+        .add_artifact_from_oracle(P0, "Lifestone", "{T}: You gain 1 life.")
+        .id();
+    let mut r = s.build();
+    perf_counters::reset();
+    r.activate(src, 0).resolve();
+    let reaches = perf_counters::activation_cost_route_snapshot().guard_reaches;
+    assert!(
+        reaches[ActivationCostGuardSite::DirectPay as usize] > 0,
+        "{reaches:?}"
+    );
+}

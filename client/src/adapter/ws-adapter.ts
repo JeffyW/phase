@@ -548,8 +548,14 @@ export class NativeEngineVersionMismatchError extends Error {
  *      PendingCast.activation_cost_snapshot and AbilityModeChoice
  *      activation_cost_snapshot fields are additive and skipped when empty, so
  *      every spell frame is byte-identical to v78.
+ *
+ * 80 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
+ *      Kopala): ReduceAbilityCost statics carry targets and frequency,
+ *      GameState records spent once-per-turn discounts, and the activation
+ *      cost carrier holds the target-settlement lock. A v79 peer would drop
+ *      these silently and price one activation differently.
  */
-export const PROTOCOL_VERSION = 79;
+export const PROTOCOL_VERSION = 80;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -106,6 +106,11 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  62 — game_setup and state_update carry GameState, whose reduce-ability-cost
+ *       statics can now carry a target restriction and a once-per-turn
+ *       frequency, whose per-turn ledger records spent once-per-turn discounts,
+ *       and whose activation cost carrier holds the target-settlement lock.
+ *       Bumped in lockstep with full-game protocol 80.
  *  61 — game_setup and state_update carry GameState, whose pending
  *       activations can now hold the CR 601.2f activated-ability cost election
  *       (ReductionProvenance::AbilityCostRider / TransientEffect, the
@@ -416,7 +421,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 61 as const;
+export const WIRE_PROTOCOL_VERSION = 62 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
