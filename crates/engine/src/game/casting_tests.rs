@@ -59888,3 +59888,81 @@ fn activation_totals_survive_saturated_reduction_amounts() {
         .collect();
     assert_eq!(offered, vec![0, 1]);
 }
+
+/// CR 118.3 + CR 601.2c: the activation-cost visitor on its walk. O5's shape
+/// (optional slots, the empty completion legal but unaffordable) is `Payable`
+/// with a witness that is NOT the empty completion; a tiny budget answers
+/// `Undecided` having charged exactly that budget.
+#[test]
+fn activation_cost_visitor_finds_a_non_empty_witness_and_stops_at_its_budget() {
+    use crate::game::ability_utils::WorkBudget;
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::identifiers::ObjectId;
+    use crate::types::mana::{ManaColor, ManaUnit};
+
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let hojo = s
+        .add_creature_from_oracle(
+            P0,
+            "Professor Hojo",
+            2,
+            2,
+            "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.",
+        )
+        .id();
+    for i in 0..6 {
+        s.add_creature(P1, &format!("Theirs {i}"), 1, 1);
+    }
+    let src = s
+        .add_artifact_from_oracle(P0, "Tapper", "{3}: Tap up to three target creatures.")
+        .id();
+    s.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(
+            ManaColor::Blue.into(),
+            ObjectId(0),
+            false,
+            Vec::new(),
+        )],
+    );
+    let runner = s.build();
+    let state = runner.state();
+    let ability_def = activation_ability_definition(state, src, 0).unwrap();
+    let base = ability_def.cost.clone().unwrap();
+    let independent =
+        collect_activation_cost_modifiers(state, &ability_def, P0, src, TargetGating::Independent);
+
+    let mut unlimited = WorkBudget::unlimited();
+    let (verdict, witness) = activation_cost_feasibility_search_with_witness(
+        state,
+        &ability_def,
+        P0,
+        src,
+        0,
+        &base,
+        &independent,
+        &mut unlimited,
+    );
+    assert_eq!(verdict, ActivationCostFeasibility::Payable);
+    let witness = witness.expect("a payable walk has a witness");
+    assert!(
+        witness.contains(&Some(TargetRef::Object(hojo))),
+        "the witness includes the qualifying creature, not the empty completion: {witness:?}"
+    );
+
+    let mut tiny = WorkBudget::new(3);
+    let (verdict, _) = activation_cost_feasibility_search_with_witness(
+        state,
+        &ability_def,
+        P0,
+        src,
+        0,
+        &base,
+        &independent,
+        &mut tiny,
+    );
+    assert_eq!(verdict, ActivationCostFeasibility::Undecided);
+    assert_eq!(tiny.charged_total(), 3, "charged == budget");
+    assert_eq!(tiny.refused().iter().sum::<u32>(), 1, "one refusal");
+}

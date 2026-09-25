@@ -1360,3 +1360,178 @@ fn the_untargeted_direct_payment_reaches_its_guard() {
         "{reaches:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R: every target-settlement route locks the deferred carrier exactly once,
+// before payment. Kopala's `{2}` tax is the observable: it exists only if the
+// route settled with the committed targets.
+// ---------------------------------------------------------------------------
+
+struct RouteBoard {
+    runner: GameRunner,
+    src: ObjectId,
+    merfolk: ObjectId,
+    bear: Option<ObjectId>,
+}
+
+/// P1 controls Kopala (itself a Merfolk) and, when `bear`, an untaxed Bear.
+fn route_board(ability: &str, bear: bool) -> RouteBoard {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let merfolk = s
+        .add_creature_from_oracle(P1, "Kopala, Warden of Waves", 2, 2, KOPALA)
+        .with_subtypes(vec!["Merfolk", "Wizard"])
+        .id();
+    let bear = bear.then(|| s.add_creature(P1, "Bear", 2, 2).id());
+    let src = s.add_artifact_from_oracle(P0, "Engine", ability).id();
+    mana(&mut s, P0, 8);
+    RouteBoard {
+        runner: s.build(),
+        src,
+        merfolk,
+        bear,
+    }
+}
+
+fn start(board: &mut RouteBoard) -> WaitingFor {
+    perf_counters::reset();
+    act(
+        &mut board.runner,
+        GameAction::ActivateAbility {
+            source_id: board.src,
+            ability_index: 0,
+        },
+    )
+    .expect("activation starts")
+}
+
+fn assert_route(board: &mut RouteBoard, route: &str, expected_paid: usize) {
+    finish(&mut board.runner, &[]);
+    let routes = perf_counters::activation_cost_route_snapshot();
+    assert_eq!(
+        routes.open_settlements, 1,
+        "{route}: the deferred lock ran once, at settlement: {routes:?}"
+    );
+    assert_eq!(8 - pool(&board.runner, P0), expected_paid, "{route}");
+}
+
+#[test]
+fn every_target_settlement_route_prices_the_committed_targets() {
+    // R2: one slot at a time.
+    let mut b = route_board("{2}: Tap target creature.", true);
+    start(&mut b);
+    act(
+        &mut b.runner,
+        GameAction::ChooseTarget {
+            target: Some(object(b.merfolk)),
+        },
+    )
+    .expect("R2 target");
+    assert_route(&mut b, "R2 ChooseTarget", 4);
+
+    // R3: a modal activation whose chosen mode's only legal target is taxed.
+    let mut b = route_board(
+        "{2}: Choose one \u{2014}\n\u{2022} Tap target creature an opponent controls.\n\u{2022} You gain 1 life.",
+        false,
+    );
+    start(&mut b);
+    act(&mut b.runner, GameAction::SelectModes { indices: vec![0] }).expect("R3 mode");
+    assert_route(&mut b, "R3 modal auto-target", 4);
+
+    // R5: a single legal target is selected automatically.
+    let mut b = route_board("{2}: Tap target creature an opponent controls.", false);
+    start(&mut b);
+    assert_route(&mut b, "R5 auto-target", 4);
+
+    // R6: X is announced before the X-dependent targets are chosen.
+    let mut b = route_board("{X}: Tap X target creatures.", true);
+    let wf = start(&mut b);
+    assert!(matches!(wf, WaitingFor::ChooseXValue { .. }), "{wf:?}");
+    act(&mut b.runner, GameAction::ChooseX { value: 1 }).expect("R6 X");
+    act(
+        &mut b.runner,
+        GameAction::SelectTargets {
+            targets: vec![object(b.merfolk)],
+        },
+    )
+    .expect("R6 target");
+    assert_route(&mut b, "R6 deferred X", 3);
+
+    // R9: divided damage across the taxed Merfolk and the Bear.
+    let mut b = route_board(
+        "{2}: Engine deals 2 damage divided as you choose among one or two targets.",
+        true,
+    );
+    let bear = b.bear.unwrap();
+    start(&mut b);
+    act(
+        &mut b.runner,
+        GameAction::SelectTargets {
+            targets: vec![object(b.merfolk), object(bear)],
+        },
+    )
+    .expect("R9 targets");
+    assert!(
+        matches!(
+            b.runner.state().waiting_for,
+            WaitingFor::DistributeAmong { .. }
+        ),
+        "R9 reach guard: the division is chosen before payment"
+    );
+    {
+        act(
+            &mut b.runner,
+            GameAction::DistributeAmong {
+                distribution: vec![(object(b.merfolk), 1), (object(bear), 1)],
+            },
+        )
+        .expect("R9 distribution");
+    }
+    assert_route(&mut b, "R9 divided", 4);
+}
+
+// ---------------------------------------------------------------------------
+// O5 / O6: optional target slots. The empty completion is always legal; with
+// Hojo's discount it is also the one completion that is NOT affordable.
+// ---------------------------------------------------------------------------
+
+fn up_to_three_offered(own_creature_targetable: bool) -> (bool, u64) {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    for i in 0..4 {
+        s.add_creature(P1, &format!("Theirs {i}"), 1, 1);
+    }
+    let text = if own_creature_targetable {
+        "{3}: Tap up to three target creatures."
+    } else {
+        "{3}: Tap up to three target creatures an opponent controls."
+    };
+    let src = s.add_artifact_from_oracle(P0, "Tapper", text).id();
+    mana(&mut s, P0, 1);
+    let r = s.build();
+    perf_counters::reset();
+    let offered = can_activate_ability_now(r.state(), P0, src, 0);
+    (
+        offered,
+        perf_counters::activation_cost_route_snapshot().window_searches,
+    )
+}
+
+/// O5: only a completion that includes Hojo itself (a creature you control)
+/// costs `{1}`; the empty completion costs `{3}`. The walk must go past the
+/// refused empty completion to find it. O6: with no creature you control
+/// targetable, every completion costs `{3}`, even though the empty one is legal.
+#[test]
+fn optional_slots_are_searched_past_an_unaffordable_empty_completion() {
+    assert_eq!(
+        up_to_three_offered(true),
+        (true, 1),
+        "O5: Payable, by walking"
+    );
+    assert_eq!(
+        up_to_three_offered(false),
+        (false, 1),
+        "O6: Unpayable, by walking"
+    );
+}
