@@ -25204,16 +25204,30 @@ fn activation_mana_component(cost: &AbilityCost) -> ManaCost {
 /// equal is never enumerated: that is exact, not a heuristic, and it keeps every
 /// ordinary activation (no reducer, one reducer, or only unfloored ones) silent.
 ///
-/// Otherwise the SET of reachable totals is computed exactly
-/// ([`reachable_activation_generics`]): the locked cost depends on an order only
-/// through its generic amount, so a search over (applied reductions, generic
-/// remaining) finds every total any order can lock, with a witness order for
-/// each, without enumerating permutations. Each witness is then folded through
-/// the lock's own arithmetic. The prompt is suppressed only on that exact proof
-/// that every order agrees; a sampled plan is never taken as evidence. Past the
-/// exact search's bound the caster is asked unconditionally — an unneeded prompt
-/// costs a click, a missing one takes a legal order away (CR 601.2f "in any
-/// order").
+/// Otherwise the SET of reachable totals is computed exactly. The locked cost
+/// depends on an order only through its generic amount (every reduction is
+/// generic-only, and a given total reduction is spread over the mana legs
+/// deterministically), so what the caster elects is a TOTAL; one witness order
+/// per total is offered, and each is folded through the lock's own arithmetic.
+/// [`activation_totals_route`] picks the method from the COMPUTED effective
+/// floors, per reducer, at runtime:
+///
+/// * every effective floor in `{0, 1}` — true of every printed card, whose floors
+///   read "less than one mana" or nothing — takes the proven O(n) closed form
+///   ([`activation_totals_zero_one_floors`]);
+/// * any effective floor of 2 or more takes the exact canonical-state search
+///   ([`activation_totals_canonical_search`]). That search is exponential in the
+///   generic amount in the worst case (it is independent of the reducer count),
+///   and no printed card reaches it today. The known direction for a general
+///   pseudo-polynomial algorithm is the last-clamp decomposition: a total is
+///   either `x − Σ(reducers fired unclamped)` with every reducer whose floor is
+///   below the total firing, or `L − Σ(reducers fired after the last clamp at
+///   level L)`, which splits the reducers below `L` into pre-clamp (absorbed),
+///   post-clamp and unused under a window constraint on the pre-clamp value.
+///
+/// Neither method samples, so every consumer (the AI, Manabrew, the modal) sees
+/// the complete list, and the prompt is suppressed only on an exact proof that
+/// every order locks the same total (CR 601.2f "in any order").
 pub(crate) fn analyze_activation_cost_election(
     snapshot: &ActivationCostSnapshot,
 ) -> Option<Vec<CostReductionOutcome>> {
@@ -25251,110 +25265,242 @@ pub(crate) fn analyze_activation_cost_election(
     };
 
     let generic = generic_mana_in_cost(&raised);
-    let non_generic = total_mana_in_cost(&raised).saturating_sub(generic);
+    // CR 601.2f: the per-reducer effective floor, computed on the RAISED cost.
+    // Raises only ever add generic mana (`increase_generic_in_cost`), so the
+    // non-generic symbols a floor subtracts are the printed cost's own.
     let steps: Vec<(u32, u32)> = reductions
         .iter()
-        .map(|entry| (activation_reduction_amount(entry), entry.minimum_mana))
+        .map(|entry| {
+            (
+                activation_reduction_amount(entry),
+                activation_effective_floor(&raised, entry),
+            )
+        })
         .collect();
-    match reachable_activation_generics(generic, non_generic, &steps) {
-        Some(reachable) => {
-            let outcomes: Vec<CostReductionOutcome> = reachable
-                .into_iter()
-                .map(|(remaining, order)| {
-                    let outcome = outcome_for(order);
-                    debug_assert_eq!(
-                        outcome.locked_cost.mana_value(),
-                        activation_mana_component(&raised)
-                            .mana_value()
-                            .saturating_sub(generic - remaining),
-                        "the search and the lock's arithmetic must agree"
-                    );
-                    outcome
-                })
-                .collect();
-            // Ascending generic remaining: the cheapest (default) total first.
-            (outcomes.len() > 1).then_some(outcomes)
+    let reachable = match activation_totals_route(&steps) {
+        ActivationTotalsMethod::ZeroOneFloors => activation_totals_zero_one_floors(generic, &steps),
+        ActivationTotalsMethod::CanonicalSearch => {
+            activation_totals_canonical_search(generic, &steps)
         }
-        None => {
-            // Past the exact bound: prompt with every total a bounded plan
-            // reaches, plus the default, and never suppress.
-            let mut default_order: Vec<usize> = (0..reductions.len()).collect();
-            default_order.sort_by_key(|&index| {
-                std::cmp::Reverse(activation_effective_floor(&raised, &reductions[index]))
-            });
-            let plan = CandidatePlan::bounded(reductions.len(), 0);
-            let mut outcomes: Vec<CostReductionOutcome> = Vec::new();
-            for order in std::iter::once(default_order).chain(plan.order_iter(reductions.len())) {
-                let outcome = outcome_for(order);
-                if outcomes
-                    .iter()
-                    .all(|o| o.locked_cost != outcome.locked_cost)
-                {
-                    outcomes.push(outcome);
-                }
-            }
-            outcomes.sort_by_key(|o| o.locked_cost.mana_value());
-            Some(outcomes)
-        }
+    };
+    let outcomes: Vec<CostReductionOutcome> = reachable
+        .into_iter()
+        .map(|(remaining, order)| {
+            let outcome = outcome_for(order);
+            debug_assert_eq!(
+                outcome.locked_cost.mana_value(),
+                activation_mana_component(&raised)
+                    .mana_value()
+                    .saturating_sub(generic - remaining),
+                "the reachable-totals method and the lock's arithmetic must agree"
+            );
+            outcome
+        })
+        .collect();
+    // Ascending generic remaining: the cheapest (default) total first.
+    (outcomes.len() > 1).then_some(outcomes)
+}
+
+/// How the activation election computes its reachable totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationTotalsMethod {
+    /// Every effective floor is 0 or 1: the proven O(n) closed form.
+    ZeroOneFloors,
+    /// Some effective floor is 2 or more: the exact canonical-state search.
+    CanonicalSearch,
+}
+
+/// CR 601.2f: route on the COMPUTED effective floor of every reducer, so a
+/// reducer whose floor reaches 2 falls through to the exact search
+/// automatically instead of into a closed form that does not cover it.
+pub(crate) fn activation_totals_route(steps: &[(u32, u32)]) -> ActivationTotalsMethod {
+    if steps.iter().all(|&(_, floor)| floor <= 1) {
+        ActivationTotalsMethod::ZeroOneFloors
+    } else {
+        ActivationTotalsMethod::CanonicalSearch
     }
 }
 
-/// Upper bound on the reductions [`reachable_activation_generics`] searches
-/// exactly: `2^16` subsets of at most a handful of generic amounts each. Far past
-/// any real board — it takes sixteen reducers applying to one activation.
-const ACTIVATION_ELECTION_EXACT_MAX: usize = 16;
-
-/// CR 601.2f: every generic amount some order of `steps` can leave, each with a
-/// witness order, in ascending order. `steps` are `(amount, floor)` pairs applied
-/// with [`floored_generic_reduction`] to `generic` generic mana alongside
-/// `non_generic` other mana symbols. Exact: a subset search over (applied
-/// reductions, generic remaining), which is everything an order's result depends
-/// on. `None` past [`ACTIVATION_ELECTION_EXACT_MAX`].
-fn reachable_activation_generics(
-    generic: u32,
-    non_generic: u32,
-    steps: &[(u32, u32)],
-) -> Option<Vec<(u32, Vec<usize>)>> {
-    let n = steps.len();
-    if n > ACTIVATION_ELECTION_EXACT_MAX {
-        return None;
+/// CR 601.2f: one reducer of `amount` with effective floor `floor` applied to
+/// `x` generic mana — the scalar form of [`floored_generic_reduction`] once the
+/// non-generic symbols are folded into the floor.
+fn activation_generic_step(x: u32, amount: u32, floor: u32) -> u32 {
+    if x <= floor {
+        x
+    } else {
+        x - amount.min(x - floor)
     }
-    // states[mask]: generic remaining -> (generic before the last step, last step).
-    let mut states: Vec<std::collections::BTreeMap<u32, (u32, usize)>> =
-        vec![std::collections::BTreeMap::new(); 1 << n];
-    states[0].insert(generic, (generic, usize::MAX));
-    for mask in 0..(1usize << n) {
-        let current: Vec<u32> = states[mask].keys().copied().collect();
-        for x in current {
-            for (index, &(amount, floor)) in steps.iter().enumerate() {
-                if mask & (1 << index) != 0 {
-                    continue;
-                }
-                let next = x - floored_generic_reduction(x, x + non_generic, amount, floor);
-                states[mask | (1 << index)]
-                    .entry(next)
-                    .or_insert((x, index));
-            }
+}
+
+/// CR 601.2f: the exact reachable totals (generic remaining, witness order) for
+/// reducers whose effective floors are all 0 or 1, in O(n). With `x` the generic
+/// mana and `S0` / `S1` the total floor-0 / floor-1 amounts, `S = S0 + S1`:
+///
+/// (a) `x − S ≥ 1`: the only total is `x − S`. Before any reducer `k` runs the
+///     value is at least `x − (S − a_k) ≥ 1 + a_k`, so no reducer is dead (the
+///     value stays at least 2) or clamps (the value minus `a_k` stays at least
+///     1), and every reducer subtracts in full.
+/// (b) `x − S ≤ 0`: the totals are within `{0, 1}`. A total of 2 or more would
+///     keep every value above both floors, so nothing is dead or clamped and the
+///     total would be `x − S ≤ 0`.
+///     * 0 is reachable iff the default order reaches it — floor-1 first, then
+///       floor-0, the proven minimum ([`fold_activation_cost`]) — that is, iff
+///       `S0 ≥ y` with `y = max(x − S1, 1)` when `x ≥ 2` and `y = x` otherwise.
+///     * 1 is reachable iff `x − S0 ≥ 1`. If: fire every floor-0 reducer first
+///       (by (a)'s argument none clamps), then the floor-1 reducers, which take
+///       any value of 2 or more to 1 because `x − S ≤ 0`. Only if: a total of 1
+///       means no floor-0 reducer clamped (that gives 0, and values never rise)
+///       or was dead (that needs a value of 0), so each subtracted in full.
+fn activation_totals_zero_one_floors(x: u32, steps: &[(u32, u32)]) -> Vec<(u32, Vec<usize>)> {
+    debug_assert!(steps.iter().all(|&(_, floor)| floor <= 1));
+    let by_floor = |floor: u32| {
+        steps
+            .iter()
+            .enumerate()
+            .filter(move |(_, &(_, f))| f == floor)
+            .map(|(index, _)| index)
+    };
+    let s0: u32 = steps.iter().filter(|s| s.1 == 0).map(|s| s.0).sum();
+    let s1: u32 = steps.iter().filter(|s| s.1 == 1).map(|s| s.0).sum();
+    if x >= s0 + s1 + 1 {
+        return vec![(x - s0 - s1, (0..steps.len()).collect())];
+    }
+    let mut totals = Vec::new();
+    let y = if x >= 2 {
+        x.saturating_sub(s1).max(1)
+    } else {
+        x
+    };
+    if s0 >= y {
+        // The default: floor-1 reducers first, then floor-0.
+        totals.push((0, by_floor(1).chain(by_floor(0)).collect()));
+    }
+    if x >= s0 + 1 {
+        totals.push((1, by_floor(0).chain(by_floor(1)).collect()));
+    }
+    totals
+}
+
+/// A reducer as the canonical search sees it: (amount capped at the generic
+/// mana above its floor, effective floor).
+type CanonicalReducer = (u32, u32);
+/// The live unused reducers, canonically: sorted, merged, and count-capped.
+type CanonicalBag = Vec<(CanonicalReducer, u32)>;
+
+/// CR 601.2f: canonicalize the live unused reducers at `x` generic mana. Three
+/// rewrites keep the search exact while bounding it by `x` rather than by the
+/// reducer count: a reducer whose floor is at least `x` is dead forever (the
+/// generic mana never rises) and is dropped; an amount larger than `x − floor`
+/// always clamps to the floor, now and later, so it is capped there; and at most
+/// `⌈(x − floor) / amount⌉` copies of one type can ever fire before the floor
+/// stops them, so the count is capped there too.
+fn canonical_bag(
+    x: u32,
+    reducers: impl IntoIterator<Item = (CanonicalReducer, u32)>,
+) -> CanonicalBag {
+    let mut bag: std::collections::BTreeMap<CanonicalReducer, u32> =
+        std::collections::BTreeMap::new();
+    for ((amount, floor), count) in reducers {
+        if floor >= x || count == 0 || amount == 0 {
+            continue;
+        }
+        let capped = amount.min(x - floor);
+        let cap = (x - floor).div_ceil(capped);
+        let slot = bag.entry((capped, floor)).or_insert(0);
+        *slot = (*slot + count).min(cap);
+    }
+    bag.into_iter().collect()
+}
+
+type CanonicalMemo =
+    HashMap<(u32, CanonicalBag), std::collections::BTreeMap<u32, Option<CanonicalReducer>>>;
+
+/// Every total reachable from `(x, bag)`, each with the first reducer type of a
+/// path that reaches it (`None` once no live reducer remains).
+fn canonical_totals(x: u32, bag: &CanonicalBag, memo: &mut CanonicalMemo) -> Vec<u32> {
+    if let Some(known) = memo.get(&(x, bag.clone())) {
+        return known.keys().copied().collect();
+    }
+    let mut totals: std::collections::BTreeMap<u32, Option<CanonicalReducer>> =
+        std::collections::BTreeMap::new();
+    if bag.is_empty() {
+        totals.insert(x, None);
+    }
+    for (index, &(reducer, _)) in bag.iter().enumerate() {
+        let next_x = activation_generic_step(x, reducer.0, reducer.1);
+        let next_bag = canonical_bag(
+            next_x,
+            bag.iter()
+                .enumerate()
+                .map(|(other, &(r, count))| (r, if other == index { count - 1 } else { count })),
+        );
+        for total in canonical_totals(next_x, &next_bag, memo) {
+            totals.entry(total).or_insert(Some(reducer));
         }
     }
-    let full = (1usize << n) - 1;
-    Some(
-        states[full]
-            .keys()
-            .map(|&remaining| {
-                let mut order = Vec::with_capacity(n);
-                let (mut mask, mut x) = (full, remaining);
-                while mask != 0 {
-                    let (previous, index) = states[mask][&x];
-                    order.push(index);
-                    mask &= !(1 << index);
-                    x = previous;
-                }
-                order.reverse();
-                (remaining, order)
-            })
-            .collect(),
-    )
+    let keys = totals.keys().copied().collect();
+    memo.insert((x, bag.clone()), totals);
+    keys
+}
+
+/// CR 601.2f: the exact reachable totals (generic remaining, witness order) for
+/// ANY effective floors, by a memoized search over (generic remaining,
+/// [`canonical_bag`]). Exact for every reducer count; its state space depends
+/// only on the generic amount, but grows exponentially in it in the worst case.
+/// Reached only when some effective floor is 2 or more, which no printed card
+/// produces today.
+fn activation_totals_canonical_search(x: u32, steps: &[(u32, u32)]) -> Vec<(u32, Vec<usize>)> {
+    let start = canonical_bag(x, steps.iter().map(|&reducer| (reducer, 1)));
+    let mut memo = CanonicalMemo::new();
+    let totals = canonical_totals(x, &start, &mut memo);
+    totals
+        .into_iter()
+        .map(|total| {
+            // Walk the recorded first steps back into concrete reducers: at each
+            // state pick any unused reducer that canonicalizes to the recorded
+            // type there — every such reducer acts identically from this point.
+            let mut used = vec![false; steps.len()];
+            let mut order = Vec::with_capacity(steps.len());
+            let (mut current, mut bag) = (x, start.clone());
+            while let Some(Some(reducer)) = memo
+                .get(&(current, bag.clone()))
+                .and_then(|known| known.get(&total).copied())
+            {
+                let index = steps
+                    .iter()
+                    .enumerate()
+                    .position(|(index, &(amount, floor))| {
+                        !used[index]
+                            && floor == reducer.1
+                            && floor < current
+                            && amount.min(current - floor) == reducer.0
+                    })
+                    .expect("a canonical reducer type always has a concrete reducer behind it");
+                used[index] = true;
+                order.push(index);
+                let next = activation_generic_step(current, reducer.0, reducer.1);
+                bag = canonical_bag(
+                    next,
+                    bag.iter()
+                        .map(|&(r, count)| (r, if r == reducer { count - 1 } else { count })),
+                );
+                current = next;
+            }
+            // Every reducer not on the path is dead by now: applying it changes
+            // nothing, so it goes last.
+            order.extend((0..steps.len()).filter(|&index| !used[index]));
+            debug_assert_eq!(
+                order.iter().fold(x, |g, &index| activation_generic_step(
+                    g,
+                    steps[index].0,
+                    steps[index].1
+                )),
+                total,
+                "the witness order must reach its total"
+            );
+            (total, order)
+        })
+        .collect()
 }
 
 fn collect_static_activated_ability_cost_modifiers(

@@ -1152,3 +1152,46 @@ fn nine_reductions_offer_a_total_only_a_non_rotation_order_reaches() {
         assert_eq!(pool - board.pool(), expected_paid, "choice {choice}");
     }
 }
+
+/// CR 601.2f "in any order", on the proven closed form past the old
+/// sixteen-reducer bound: seventeen reducers with floors 0 and 1 on `{12}`. The
+/// default order and every rotation of the battlefield order lock `{0}`; firing
+/// every floor-0 reducer first locks `{1}`. A sampled plan would publish `{0}`
+/// alone as the whole menu; the closed form offers both.
+#[test]
+fn seventeen_reductions_offer_a_total_no_sampled_order_reaches() {
+    let seventeen = [
+        (1, 0),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (1, 1),
+        (1, 1),
+        (2, 1),
+        (2, 1),
+        (1, 1),
+        (2, 0),
+        (1, 1),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+    ]
+    .map(|(amount, floor)| Modifier::Reducer { amount, floor });
+    for (choice, expected_paid) in [(0, 0), (1, 1)] {
+        let mut board = Board::new(&seventeen, generic(12), None, 12);
+        board.activate().expect("legal");
+        assert_eq!(
+            board.reductions().len(),
+            17,
+            "reach guard: all seventeen apply"
+        );
+        assert_eq!(board.outcome_totals(), vec![0, 1]);
+        let pool = board.pool();
+        board.elect(choice).expect("legal");
+        assert!(board.on_stack());
+        assert_eq!(pool - board.pool(), expected_paid, "choice {choice}");
+    }
+}

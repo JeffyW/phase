@@ -59524,13 +59524,13 @@ fn activation_fold_applies_raises_before_reductions() {
     );
 }
 
-/// CR 601.2f: the activation election's reachable-totals search is EXACT — it
-/// finds precisely the set of generic amounts that some order of the reductions
-/// leaves, each with a witness order that really produces it. Checked against a
-/// brute-force walk of every permutation over a deterministic sweep of boards
-/// (mixed amounts and floors, with and without other mana symbols).
+/// CR 601.2f: both reachable-totals methods are EXACT — each finds precisely the
+/// set of generic amounts some order of the reducers leaves, with a witness
+/// order that really produces each one. Checked against a brute-force walk of
+/// every permutation over a deterministic sweep: the closed form on boards whose
+/// effective floors are all 0 or 1, the canonical search on every board.
 #[test]
-fn activation_reachable_totals_search_matches_every_permutation() {
+fn activation_reachable_totals_match_every_permutation() {
     fn permutations(n: usize) -> Vec<Vec<usize>> {
         if n == 0 {
             return vec![Vec::new()];
@@ -59545,11 +59545,21 @@ fn activation_reachable_totals_search_matches_every_permutation() {
         }
         out
     }
-    fn run(generic: u32, non_generic: u32, steps: &[(u32, u32)], order: &[usize]) -> u32 {
-        order.iter().fold(generic, |x, &i| {
+    fn run(x: u32, steps: &[(u32, u32)], order: &[usize]) -> u32 {
+        order.iter().fold(x, |g, &i| {
             let (amount, floor) = steps[i];
-            x - floored_generic_reduction(x, x + non_generic, amount, floor)
+            activation_generic_step(g, amount, floor)
         })
+    }
+    fn check(x: u32, steps: &[(u32, u32)], found: &[(u32, Vec<usize>)], brute: &BTreeSet<u32>) {
+        let totals: BTreeSet<u32> = found.iter().map(|(total, _)| *total).collect();
+        assert_eq!(&totals, brute, "generic {x}, steps {steps:?}");
+        for (total, witness) in found {
+            let mut sorted = witness.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..steps.len()).collect::<Vec<_>>());
+            assert_eq!(run(x, steps, witness), *total);
+        }
     }
 
     // A small deterministic generator (no RNG dependency in the engine crate).
@@ -59560,75 +59570,85 @@ fn activation_reachable_totals_search_matches_every_permutation() {
         seed ^= seed << 17;
         seed % bound
     };
-    let mut multi_total_boards = 0;
-    for _ in 0..400 {
-        let n = 2 + next(5) as usize; // 2..=6 reductions
-        let generic = next(10) as u32;
-        let non_generic = next(2) as u32;
+    let (mut zero_one_boards, mut multi_total_boards) = (0, 0);
+    for board in 0..800 {
+        let n = 1 + next(6) as usize; // 1..=6 reducers
+        let x = next(13) as u32;
+        // Half the boards keep every floor in {0, 1}; the rest reach 3.
+        let floor_bound = if board % 2 == 0 { 2 } else { 4 };
         let steps: Vec<(u32, u32)> = (0..n)
-            .map(|_| (1 + next(3) as u32, next(3) as u32))
+            .map(|_| (1 + next(4) as u32, next(floor_bound) as u32))
             .collect();
-        let brute: std::collections::BTreeSet<u32> = permutations(n)
+        let brute: BTreeSet<u32> = permutations(n)
             .iter()
-            .map(|order| run(generic, non_generic, &steps, order))
+            .map(|order| run(x, &steps, order))
             .collect();
-        let found = reachable_activation_generics(generic, non_generic, &steps)
-            .expect("within the exact bound");
-        let totals: std::collections::BTreeSet<u32> =
-            found.iter().map(|(total, _)| *total).collect();
-        assert_eq!(
-            totals, brute,
-            "generic {generic}+{non_generic}, steps {steps:?}"
+        check(
+            x,
+            &steps,
+            &activation_totals_canonical_search(x, &steps),
+            &brute,
         );
-        for (total, witness) in &found {
-            let mut sorted = witness.clone();
-            sorted.sort_unstable();
-            assert_eq!(
-                sorted,
-                (0..n).collect::<Vec<_>>(),
-                "a witness is a permutation"
+        if activation_totals_route(&steps) == ActivationTotalsMethod::ZeroOneFloors {
+            check(
+                x,
+                &steps,
+                &activation_totals_zero_one_floors(x, &steps),
+                &brute,
             );
-            assert_eq!(run(generic, non_generic, &steps, witness), *total);
+            zero_one_boards += 1;
         }
         if brute.len() > 1 {
             multi_total_boards += 1;
         }
     }
-    // Reach guard: the sweep must include boards where the order matters.
+    // Reach guards: both methods were exercised, on boards where order matters.
+    assert!(zero_one_boards > 0);
     assert!(multi_total_boards > 0);
 }
 
-/// CR 601.2f: past the exact search's bound the analyzer never proves agreement,
-/// so it never suppresses — it prompts even when, as here, every order happens
-/// to lock the same total (a large generic cost no floor can bind).
+/// CR 601.2f: the route keys on the COMPUTED effective floor of each reducer. A
+/// printed "can't reduce below two mana" floor is effective floor 1 against a
+/// cost with one coloured symbol (closed form), but effective floor 2 against a
+/// generic-only cost (canonical search) — and there both methods' boards agree
+/// with brute force (the sweep above). A floor-{0,1} board past the old
+/// sixteen-reducer bound still takes the closed form.
 #[test]
-fn activation_election_past_the_exact_bound_always_prompts() {
-    let reductions: Vec<CostReductionEntry> = (0..17u8)
-        .map(|index| CostReductionEntry {
-            amount: ManaCost::generic(1),
-            multiplier: 1,
-            reach: CostReductionReach::SpillsToGeneric,
-            provenance: ReductionProvenance::Static {
-                source: ObjectId(950),
-                ordinal: index,
-            },
-            display_name: format!("reducer {index}"),
-            minimum_mana: u32::from(index % 2),
-        })
-        .collect();
-    let snapshot = ActivationCostSnapshot {
-        base_cost: AbilityCost::Mana {
-            cost: ManaCost::generic(40),
+fn activation_totals_route_on_the_computed_effective_floor() {
+    let floored_two = CostReductionEntry {
+        amount: ManaCost::generic(2),
+        multiplier: 1,
+        reach: CostReductionReach::SpillsToGeneric,
+        provenance: ReductionProvenance::Static {
+            source: ObjectId(960),
+            ordinal: 0,
         },
-        raise_total: 0,
-        reductions,
-        lock: crate::types::casting_costs::ActivationCostLock::Open,
+        display_name: "floor two".to_string(),
+        minimum_mana: 2,
     };
-    let outcomes = analyze_activation_cost_election(&snapshot)
-        .expect("past the exact bound the caster is always asked");
+    let red_three = AbilityCost::Mana {
+        cost: ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 3,
+        },
+    };
+    let three = AbilityCost::Mana {
+        cost: ManaCost::generic(3),
+    };
+    let floor_on = |cost: &AbilityCost| activation_effective_floor(cost, &floored_two);
+    assert_eq!(floor_on(&red_three), 1);
+    assert_eq!(floor_on(&three), 2);
     assert_eq!(
-        outcomes.len(),
-        1,
-        "every order locks {{23}} here, so one total is offered — but offered"
+        activation_totals_route(&[(2, floor_on(&red_three)), (2, 0)]),
+        ActivationTotalsMethod::ZeroOneFloors
+    );
+    assert_eq!(
+        activation_totals_route(&[(2, floor_on(&three)), (2, 0)]),
+        ActivationTotalsMethod::CanonicalSearch
+    );
+    let seventeen: Vec<(u32, u32)> = (0..17).map(|i| (1 + i % 2, i % 2)).collect();
+    assert_eq!(
+        activation_totals_route(&seventeen),
+        ActivationTotalsMethod::ZeroOneFloors
     );
 }
