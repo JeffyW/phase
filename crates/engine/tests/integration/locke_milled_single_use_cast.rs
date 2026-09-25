@@ -912,7 +912,7 @@ fn creature_face(name: &str, oracle: &str) -> engine::types::card::CardFace {
     }
 }
 
-/// CR 611.2a: a lingering cast grant with an "If you do, it …" rider is reported
+/// CR 608.2c + CR 611.2f: a lingering cast grant with an "If you do, it …" rider is reported
 /// as UNSUPPORTED, not silently counted as supported with an inert rider.
 ///
 /// Chiss-Goria's grant is exercised at a later priority window, but its rider

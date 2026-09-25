@@ -1610,8 +1610,15 @@ pub(super) fn gate_other_revealed_card_on_multiplayer_reveal(def: &mut AbilityDe
 /// cannot be carried to the spell cast through it.
 pub(super) const CAST_RIDER_ON_LINGERING_GRANT_GAP: &str = "cast_rider_on_lingering_grant";
 
-/// CR 611.2a: refuse a `GrantCastingPermission` whose "If you do, …" rider cannot
+/// CR 608.2c + CR 611.2f: refuse a `GrantCastingPermission` whose "If you do, …" rider cannot
 /// reach the spell it describes.
+///
+/// The two rules are the two halves of the problem. CR 608.2c: the rider is an
+/// instruction of the SAME resolution as the grant, followed in printed order, so
+/// it executes before any spell has been cast. CR 611.2f: an effect that modifies
+/// "the next spell a player casts" does not begin immediately; it applies when that
+/// spell is put on the stack. The card's rider needs the second behaviour, and this
+/// grant has no channel to deliver it.
 ///
 /// A lingering grant is exercised at a LATER priority window. But its "If you do"
 /// rider — a sibling gated on `EffectOutcome(OptionalEffectPerformed)` — runs
