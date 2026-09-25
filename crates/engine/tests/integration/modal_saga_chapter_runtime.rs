@@ -3,7 +3,7 @@
 //! A chapter whose body is "Choose one —" followed by bullets is a modal
 //! triggered ability (CR 700.2, CR 714.2b): exactly one mode resolves. These
 //! tests drive the real Saga pipeline — the lore counter added after the draw
-//! step (CR 714.3b) fires the chapter-I `CounterAdded` trigger, the mode is
+//! step (CR 714.3c) fires the chapter-I `CounterAdded` trigger, the mode is
 //! chosen as it is put on the stack (CR 700.2b), and the chapter resolves —
 //! rather than inspecting parsed definitions.
 //!
@@ -34,7 +34,7 @@ fn lore_count(runner: &GameRunner, saga: ObjectId) -> u32 {
 }
 
 /// Advance from P0's upkeep, through the draw step, into P0's precombat main,
-/// where CR 714.3b adds a lore counter and chapter I triggers. Parking in P0's
+/// where CR 714.3c adds a lore counter and chapter I triggers. Parking in P0's
 /// own upkeep keeps the opponent's turn (and its combat) out of the way. Then
 /// choose `mode` if the game asks (a chosen-mode chapter), take the first legal
 /// target for every target prompt, and resolve the stack.
@@ -52,7 +52,7 @@ fn fire_chapter_one(runner: &mut GameRunner, saga: ObjectId, mode: Option<usize>
     assert_eq!(
         lore_count(runner, saga),
         1,
-        "CR 714.3b must add the first lore counter, firing chapter I; saga: zone={:?} \
+        "CR 714.3c must add the first lore counter, firing chapter I; saga: zone={:?} \
          types={:?} counters={:?} phase={:?} turn={} active={:?}",
         runner.state().objects[&saga].zone,
         runner.state().objects[&saga].card_types,
