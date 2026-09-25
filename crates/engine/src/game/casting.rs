@@ -15382,6 +15382,22 @@ pub fn handle_cast_spell(
     )
 }
 
+/// CR 601.2b + CR 118.9d: can an alternative cost's mana part be paid, counting a
+/// matching Defiler's optional reduction? CR 118.9d applies cost reductions to
+/// the alternative cost being paid, and a Defiler's "you may pay 2 life ... cost
+/// {C} less" is one of them, so an alternative cost affordable only with it is
+/// still on offer. Mirrors the castability check in `can_cast_prepared_now`.
+fn alternative_cost_mana_affordable(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    mana: &ManaCost,
+) -> bool {
+    can_pay_cost_after_auto_tap(state, player, object_id, mana)
+        || casting_costs::defiler_reduced_cost(state, player, object_id, mana)
+            .is_some_and(|reduced| can_pay_cost_after_auto_tap(state, player, object_id, &reduced))
+}
+
 fn normal_cast_choice_cost_and_affordability(
     state: &GameState,
     player: PlayerId,
@@ -15486,9 +15502,9 @@ fn evoke_cast_choice_eligibility(
         apply_cost_modifiers_to_base(state, player, object_id, mana_cost.clone())
             .unwrap_or_else(|| mana_cost.clone())
     });
-    let evoke_mana_affordable = alternative_cost
-        .as_ref()
-        .is_none_or(|mana_cost| can_pay_cost_after_auto_tap(state, player, object_id, mana_cost));
+    let evoke_mana_affordable = alternative_cost.as_ref().is_none_or(|mana_cost| {
+        alternative_cost_mana_affordable(state, player, object_id, mana_cost)
+    });
     let evoke_non_mana_affordable = evoke_non_mana_part
         .as_ref()
         .is_none_or(|cost| cost.is_payable(state, player, object_id));
@@ -15856,7 +15872,7 @@ pub fn handle_cast_spell_with_payment_mode(
                 let normal_affordable =
                     can_pay_cost_after_auto_tap(state, player, object_id, &normal_cost);
                 let dash_affordable =
-                    can_pay_cost_after_auto_tap(state, player, object_id, &dash_eff);
+                    alternative_cost_mana_affordable(state, player, object_id, &dash_eff);
                 if normal_affordable && dash_affordable {
                     return Ok(WaitingFor::AlternativeCastChoice {
                         player,
@@ -15921,7 +15937,7 @@ pub fn handle_cast_spell_with_payment_mode(
                     apply_cost_modifiers_to_base(state, player, object_id, m.clone()).unwrap_or(m)
                 });
                 let blitz_mana_affordable = match &blitz_mana_eff {
-                    Some(m) => can_pay_cost_after_auto_tap(state, player, object_id, m),
+                    Some(m) => alternative_cost_mana_affordable(state, player, object_id, m),
                     // CR 118.3: a zero mana cost is always payable.
                     None => true,
                 };
@@ -16314,7 +16330,7 @@ pub fn handle_cast_spell_with_payment_mode(
                         .unwrap_or_else(|| m.clone())
                 });
                 let bestow_mana_affordable = match &bestow_mana_eff {
-                    Some(m) => can_pay_cost_after_auto_tap(state, player, object_id, m),
+                    Some(m) => alternative_cost_mana_affordable(state, player, object_id, m),
                     // CR 118.3: a zero mana cost is always payable.
                     None => true,
                 };

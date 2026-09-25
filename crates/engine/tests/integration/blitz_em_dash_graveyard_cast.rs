@@ -1302,3 +1302,369 @@ fn blitz_needing_a_permanent_type_choice_is_not_offered() {
          goes to the slot prompt, got {waiting:?}"
     );
 }
+
+const KRARK_CLAN_IRONWORKS: &str = "Sacrifice an artifact: Add {C}{C}.";
+
+/// CR 601.2a: a graveyard cast commits to one permission as its costs begin, and
+/// that permission is the one spent, even if its source leaves during payment.
+///
+/// Exploration Broodship is scanned before Muldrotha, so it is elected and its
+/// land sacrifice is charged. Broodship is then sacrificed to Krark-Clan
+/// Ironworks for mana mid-payment. Re-electing at finalization would find only
+/// Muldrotha and spend Muldrotha's creature slot for a cast Broodship paid for.
+#[test]
+fn blitz_keeps_its_elected_permission_when_the_source_leaves_mid_payment() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let broodship = scenario
+        .add_artifact_from_oracle(P0, "Exploration Broodship", EXPLORATION_BROODSHIP)
+        .id();
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let ironworks = scenario
+        .add_artifact_from_oracle(P0, "Krark-Clan Ironworks", KRARK_CLAN_IRONWORKS)
+        .id();
+    let land = scenario.add_basic_land(P0, ManaColor::Green);
+    let guardian = scenario
+        .add_creature_to_graveyard(P0, "Caldaia Guardian", 4, 3)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Green],
+        })
+        .with_keyword(caldaia_blitz())
+        .id();
+    let mut runner = scenario.build();
+    // Blitz {2}{G} is affordable from the pool alone, so it is offered; the
+    // Ironworks activation below is the mid-payment board change.
+    for _ in 0..3 {
+        runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Green,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+    }
+
+    let card_id = runner.state().objects[&guardian].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: guardian,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .expect("graveyard cast must be legal");
+    runner
+        .act(GameAction::ChooseAlternativeCast {
+            choice: AlternativeCastDecision::Alternative,
+        })
+        .expect("choosing blitz must be legal");
+    // Broodship's rider: sacrifice a land.
+    runner
+        .act(GameAction::SelectCards { cards: vec![land] })
+        .expect("paying Broodship's land sacrifice must be legal");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ManaPayment { .. }
+    ));
+    // Mid-payment: sacrifice Broodship to Krark-Clan Ironworks for mana.
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: ironworks,
+            ability_index: 0,
+        })
+        .expect("Krark-Clan Ironworks must be activatable during payment");
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![broodship],
+        })
+        .expect("sacrificing Broodship for mana must be legal");
+    runner
+        .act(GameAction::PassPriority)
+        .expect("committing the payment must complete the cast");
+
+    // Positive reach guard: the cast completed, Broodship's rider was charged,
+    // and Broodship really left mid-payment.
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "Caldaia must be on the stack"
+    );
+    assert_eq!(runner.state().objects[&land].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&broodship].zone, Zone::Graveyard);
+
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used
+            .contains(&broodship),
+        "Broodship admitted and was charged for this cast, so its slot is the one spent"
+    );
+    assert!(
+        !runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "Muldrotha did not admit this cast, so its creature slot must stay free, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+}
+
+const DEFILER_OF_INSTINCT: &str = "First strike\nAs an additional cost to cast red permanent spells, you may pay 2 life. Those spells cost {R} less to cast if you paid life this way. This effect reduces only the amount of red mana you pay.\nWhenever you cast a red permanent spell, this creature deals 1 damage to any target.";
+
+/// Put Defiler of Instinct on P0's battlefield with the statics its Oracle text
+/// parses to (not its cast trigger, which would add an unrelated target prompt).
+fn add_defiler_of_instinct(scenario: &mut GameScenario) -> ObjectId {
+    let parsed = parse_oracle_text(
+        DEFILER_OF_INSTINCT,
+        "Defiler of Instinct",
+        &["First strike".into()],
+        &["Creature".into()],
+        &["Phyrexian".into(), "Kavu".into()],
+    );
+    assert!(
+        parsed
+            .statics
+            .iter()
+            .any(|s| format!("{s:?}").contains("DefilerCostReduction")),
+        "Defiler of Instinct must parse to a Defiler cost reduction, got {:?}",
+        parsed.statics
+    );
+    let mut defiler = scenario.add_creature(P0, "Defiler of Instinct", 3, 3);
+    for s in parsed.statics {
+        defiler.with_static_definition(s);
+    }
+    defiler.id()
+}
+
+/// Sabin in the graveyard with its own blitz rider, Defiler of Instinct out,
+/// a card in hand for the discard, and `red` red mana in the pool.
+fn sabin_with_defiler(red: usize) -> (GameRunner, ObjectId, ObjectId) {
+    let parsed = parse_oracle_text(
+        SABIN,
+        "Sabin, Master Monk",
+        &[],
+        &["Legendary".into(), "Creature".into()],
+        &["Human".into(), "Noble".into(), "Monk".into()],
+    );
+    let own_rider = parsed
+        .statics
+        .first()
+        .expect("graveyard-cast permission static must parse")
+        .clone();
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_defiler_of_instinct(&mut scenario);
+    let sabin = scenario
+        .add_creature_to_graveyard(P0, "Sabin, Master Monk", 4, 3)
+        .with_static_definition(own_rider)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 4,
+            shards: vec![ManaCostShard::Red],
+        })
+        .with_keyword(blitz_keyword(&parsed))
+        .with_color(vec![ManaColor::Red])
+        .id();
+    let filler = scenario.add_card_to_hand(P0, "Filler Card");
+    let mut runner = scenario.build();
+    for _ in 0..red {
+        runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+    }
+    (runner, sabin, filler)
+}
+
+/// CR 601.2b + CR 118.9d: a matching Defiler's reduction applies to Sabin's
+/// blitz cost. Blitz {2}{R}{R} less {R} is 3 mana, and only 3 red mana is
+/// available, so the cast is affordable ONLY with the Defiler. The Defiler is
+/// offered before the discard residual, and the discard is still paid.
+#[test]
+fn blitz_with_a_non_mana_rider_offers_a_matching_defiler() {
+    let (mut runner, sabin, filler) = sabin_with_defiler(3);
+    let life_before = runner.state().players[0].life;
+
+    let card_id = runner.state().objects[&sabin].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: sabin,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("blitz affordable with the Defiler reduction must be castable");
+    // Positive reach guard: the Defiler choice is offered.
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::DefilerPayment { .. }
+        ),
+        "the matching Defiler must be offered, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::DecideOptionalCost { pay: true })
+        .expect("paying the Defiler's life must be legal");
+    pay_offered_costs(&mut runner);
+
+    assert_eq!(runner.state().objects[&sabin].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().players[0].life,
+        life_before - 2,
+        "the Defiler's 2 life must be paid"
+    );
+    assert_eq!(
+        runner.state().objects[&filler].zone,
+        Zone::Graveyard,
+        "blitz's discard residual must still be paid"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "blitz {{2}}{{R}}{{R}} less the Defiler's {{R}} costs exactly the 3 mana available"
+    );
+}
+
+/// Control: declining the Defiler pays the full blitz cost and the discard.
+#[test]
+fn blitz_with_a_declined_defiler_pays_its_full_cost_and_rider() {
+    let (mut runner, sabin, filler) = sabin_with_defiler(4);
+    let life_before = runner.state().players[0].life;
+
+    let card_id = runner.state().objects[&sabin].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: sabin,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("graveyard blitz must be castable");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::DefilerPayment { .. }
+    ));
+    runner
+        .act(GameAction::DecideOptionalCost { pay: false })
+        .expect("declining the Defiler must be legal");
+    pay_offered_costs(&mut runner);
+
+    assert_eq!(runner.state().objects[&sabin].zone, Zone::Stack);
+    assert_eq!(runner.state().players[0].life, life_before);
+    assert_eq!(runner.state().objects[&filler].zone, Zone::Graveyard);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "the full blitz {{2}}{{R}}{{R}} = 4 must be paid"
+    );
+}
+
+const PHOENIX_ORACLE: &str = "Bestow\u{2014}{R}, Collect evidence 6. (To pay this bestow cost, pay {R} and exile cards with total mana value 6 or greater from your graveyard.)\nFlying, haste\nEnchanted creature gets +2/+2 and has flying and haste.\nYou may cast this card from your graveyard using its bestow ability.";
+
+/// CR 601.2b + CR 118.9d: the same Defiler composition on a residual branch
+/// this change did not introduce: Detective's Phoenix's compound bestow
+/// ("{R}, Collect evidence 6"). Defiler of Instinct removes the {R}, so with
+/// no mana at all the bestow is affordable ONLY with the Defiler, and Collect
+/// evidence is still paid.
+#[test]
+fn compound_bestow_offers_a_matching_defiler_and_still_collects_evidence() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_defiler_of_instinct(&mut scenario);
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Detective's Phoenix", 2, 2);
+    builder.with_mana_cost(ManaCost::Cost {
+        shards: vec![ManaCostShard::Red, ManaCostShard::Red],
+        generic: 3,
+    });
+    builder.with_subtypes(vec!["Phoenix"]);
+    builder.with_color(vec![ManaColor::Red]);
+    builder.from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE);
+    let phoenix = builder.id();
+    let mut runner = scenario.build();
+    {
+        let obj = runner.state_mut().objects.get_mut(&phoenix).unwrap();
+        for types in [
+            &mut obj.card_types.core_types,
+            &mut obj.base_card_types.core_types,
+        ] {
+            if !types.contains(&CoreType::Enchantment) {
+                types.push(CoreType::Enchantment);
+            }
+        }
+    }
+    let fodder: Vec<ObjectId> = (0..2)
+        .map(|i| {
+            let card_id = engine::types::identifiers::CardId(runner.state().next_object_id);
+            let id = engine::game::zones::create_object(
+                runner.state_mut(),
+                card_id,
+                P0,
+                format!("Evidence {i}"),
+                Zone::Graveyard,
+            );
+            runner.state_mut().objects.get_mut(&id).unwrap().mana_cost = ManaCost::generic(3);
+            id
+        })
+        .collect();
+    let life_before = runner.state().players[0].life;
+
+    let card_id = runner.state().objects[&phoenix].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: phoenix,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("bestow affordable with the Defiler reduction must be castable");
+    // The Aura target may be chosen first; the Defiler must come before the
+    // Collect evidence residual.
+    if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+        runner
+            .choose_first_legal_target()
+            .expect("Defiler of Instinct is a legal creature to enchant");
+    }
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::DefilerPayment { .. }
+        ),
+        "the matching Defiler must be offered, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::DecideOptionalCost { pay: true })
+        .expect("paying the Defiler's life must be legal");
+    match runner.state().waiting_for.clone() {
+        WaitingFor::CollectEvidenceChoice { .. } => {
+            runner
+                .act(GameAction::SelectCards {
+                    cards: fodder.clone(),
+                })
+                .expect("collecting evidence with two MV-3 cards must be legal");
+        }
+        other => panic!("Collect evidence must still be asked for, got {other:?}"),
+    }
+    if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+        runner
+            .choose_first_legal_target()
+            .expect("Defiler of Instinct is a legal creature to enchant");
+    }
+
+    assert_eq!(runner.state().objects[&phoenix].zone, Zone::Stack);
+    assert_eq!(runner.state().players[0].life, life_before - 2);
+    for id in &fodder {
+        assert_eq!(
+            runner.state().objects[id].zone,
+            Zone::Exile,
+            "Collect evidence must still be paid"
+        );
+    }
+}

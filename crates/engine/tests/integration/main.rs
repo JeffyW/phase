@@ -27,6 +27,7 @@ mod ajani_nacatl_pariah_sacrifice_outlet_6018;
 mod ajani_nacatl_pariah_transform;
 mod alchemists_gift_pump_modal_keyword_choice;
 mod all_player_library_wheel;
+mod alternative_cost_defiler_offers;
 mod ambuscade_one_sided_fight_anaphoric;
 mod amphin_mutineer_regression;
 mod anax_instead_branch_not_chain;
