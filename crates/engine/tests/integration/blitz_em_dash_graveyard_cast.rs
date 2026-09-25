@@ -1668,3 +1668,66 @@ fn compound_bestow_offers_a_matching_defiler_and_still_collects_evidence() {
         );
     }
 }
+
+const YAWGMOTHS_WILL: &str = "Until end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+
+/// CR 601.2a + CR 611.2c: a resolution-created graveyard permission (Yawgmoth's
+/// Will) admits a blitz cast too. The single election reads the same permission
+/// scan castability does, including its transient (resolution-created) sources,
+/// so the recorded authority is found and the cast is not refused by the
+/// fail-closed check at finalization.
+///
+/// Runs on a 256 MB stack because `parse_oracle_text` overflows the default test
+/// stack on Yawgmoth's Will (see `will_cycle_delivery.rs`).
+#[test]
+fn blitz_from_graveyard_under_a_resolution_created_permission_is_not_refused() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let guardian = scenario
+                .add_creature_to_graveyard(P0, "Caldaia Guardian", 4, 3)
+                .with_mana_cost(ManaCost::Cost {
+                    generic: 3,
+                    shards: vec![ManaCostShard::Green],
+                })
+                .with_keyword(caldaia_blitz())
+                .id();
+            let will = scenario
+                .add_spell_to_hand_from_oracle(P0, "Yawgmoth's Will", false, YAWGMOTHS_WILL)
+                .id();
+            let mut runner = scenario.build();
+            let _ = runner.cast(will).resolve();
+            fill_mana(&mut runner, ManaType::Green);
+
+            // Positive reach guard: the Will resolved, so the graveyard cast is
+            // admitted by its resolution-created permission alone.
+            let waiting = cast_from_graveyard(&mut runner, guardian)
+                .expect("Yawgmoth's Will must admit the graveyard cast");
+            assert!(
+                matches!(
+                    waiting,
+                    WaitingFor::AlternativeCastChoice {
+                        keyword: engine::types::game_state::AlternativeCastKeyword::Blitz,
+                        ..
+                    }
+                ),
+                "the Will authorizes the printed cast too, so blitz is a choice, got {waiting:?}"
+            );
+            runner
+                .act(GameAction::ChooseAlternativeCast {
+                    choice: AlternativeCastDecision::Alternative,
+                })
+                .expect("the blitz cast under the Will must not be refused at finalization");
+            assert_eq!(runner.state().objects[&guardian].zone, Zone::Stack);
+            assert_eq!(
+                runner.state().players[0].mana_pool.total(),
+                5,
+                "blitz {{2}}{{G}} = 3 of the 8 mana must be spent"
+            );
+        })
+        .expect("spawn 256MB test thread")
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+}

@@ -151,3 +151,112 @@ fn dash_affordable_only_with_a_defiler_is_offered() {
         "dash {{2}}{{R}} less {{R}} costs exactly the 2 mana available"
     );
 }
+
+const DEFILER_OF_FLESH: &str = "Menace\nAs an additional cost to cast black permanent spells, you may pay 2 life. Those spells cost {B} less to cast if you paid life this way. This effect reduces only the amount of black mana you pay.\nWhenever you cast a black permanent spell, target creature you control gets +1/+1 and gains menace until end of turn.";
+
+const TENACIOUS_UNDERDOG: &str = "Blitz\u{2014}{2}{B}{B}, Pay 2 life. (If you cast this spell for its blitz cost, it gains haste and \"When this creature dies, draw a card.\" Sacrifice it at the beginning of the next end step.)\nYou may cast this card from your graveyard using its blitz ability.";
+
+/// Tenacious Underdog in the graveyard (blitz via its own rider), Defiler of
+/// Flesh out, four black mana, and P0 at `life`.
+fn underdog_with_defiler(life: i32) -> (GameRunner, ObjectId) {
+    let parsed = parse_oracle_text(
+        TENACIOUS_UNDERDOG,
+        "Tenacious Underdog",
+        &[],
+        &["Creature".into()],
+        &["Human".into(), "Warrior".into()],
+    );
+    let blitz = parsed
+        .extracted_keywords
+        .iter()
+        .find(|k| matches!(k, engine::types::keywords::Keyword::Blitz(_)))
+        .expect("blitz keyword must be extracted")
+        .clone();
+    let own_rider = parsed
+        .statics
+        .first()
+        .expect("graveyard-cast permission static must parse")
+        .clone();
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_defiler(
+        &mut scenario,
+        "Defiler of Flesh",
+        DEFILER_OF_FLESH,
+        "Menace",
+    );
+    let underdog = scenario
+        .add_creature_to_graveyard(P0, "Tenacious Underdog", 3, 2)
+        .with_static_definition(own_rider)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Black],
+        })
+        .with_keyword(blitz)
+        .with_color(vec![ManaColor::Black])
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().players[0].life = life;
+    for _ in 0..4 {
+        runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
+            ManaType::Black,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
+    }
+    (runner, underdog)
+}
+
+fn cast_underdog(runner: &mut GameRunner, underdog: ObjectId) {
+    let card_id = runner.state().objects[&underdog].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: underdog,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the graveyard blitz cast is legal");
+}
+
+/// CR 601.2h + CR 119.4: at 3 life, blitz's "Pay 2 life" and the Defiler's 2
+/// life together (4) can't both be paid, and partial payments aren't allowed,
+/// so the Defiler must not be offered. The cast still completes, paying the
+/// blitz life on its own.
+#[test]
+fn defiler_is_not_offered_when_its_life_and_the_residuals_exceed_the_life_total() {
+    let (mut runner, underdog) = underdog_with_defiler(3);
+    cast_underdog(&mut runner, underdog);
+
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::DefilerPayment { .. }
+        ),
+        "4 life can't be paid from 3, so the Defiler must not be offered"
+    );
+    assert_eq!(runner.state().objects[&underdog].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().players[0].life,
+        1,
+        "only blitz's 2 life is paid"
+    );
+}
+
+/// Positive control: at 4 life the combined 4 life is payable, so the Defiler
+/// is offered.
+#[test]
+fn defiler_is_offered_when_its_life_and_the_residuals_are_payable() {
+    let (mut runner, underdog) = underdog_with_defiler(4);
+    cast_underdog(&mut runner, underdog);
+
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::DefilerPayment { .. }
+        ),
+        "4 life is payable from 4, so the Defiler must be offered, got {:?}",
+        runner.state().waiting_for
+    );
+}

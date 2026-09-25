@@ -5389,7 +5389,7 @@ fn transient_graveyard_permission_sources(
                     play_mode,
                     graveyard_destination_replacement,
                     ref extra_cost,
-                    ..
+                    ref enters_with_counter,
                 } = definition.mode
                 else {
                     return None;
@@ -5410,6 +5410,7 @@ fn transient_graveyard_permission_sources(
                         frequency,
                         graveyard_destination_replacement,
                         extra_cost,
+                        enters_with_counter,
                     })
             })
         })
