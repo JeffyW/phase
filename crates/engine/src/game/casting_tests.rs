@@ -59879,7 +59879,9 @@ fn activation_totals_survive_saturated_reduction_amounts() {
         once_per_turn_sources: Vec::new(),
         mana_carrier: crate::types::casting_costs::ManaCarrier::Whole,
         settlement_tail: None,
-        lock: crate::types::casting_costs::ActivationCostLock::Open,
+        lock: crate::types::casting_costs::ActivationCostLock::Open {
+            point: Default::default(),
+        },
     };
     let outcomes = analyze_activation_cost_election(&snapshot).expect("two totals");
     let offered: Vec<u32> = outcomes
@@ -59965,4 +59967,127 @@ fn activation_cost_visitor_finds_a_non_empty_witness_and_stops_at_its_budget() {
     assert_eq!(verdict, ActivationCostFeasibility::Undecided);
     assert_eq!(tiny.charged_total(), 3, "charged == budget");
     assert_eq!(tiny.refused().iter().sum::<u32>(), 1, "one refusal");
+}
+
+/// CR 601.2b + CR 601.2f: the X lock acts on an `XAnnounced` carrier ONLY. A
+/// carrier whose open lock names any other point passes through the X
+/// announcement neither folded nor locked, its concrete `{X}` leg left in
+/// `pending.cost` for the later point to price (`Announcement` stands in for a
+/// later point here: it is the only other variant). The `XAnnounced` control
+/// folds and locks on the same pending activation.
+#[test]
+fn the_x_lock_passes_through_a_carrier_deferred_to_another_point() {
+    use crate::types::casting_costs::{ActivationCostLock, ActivationCostLockPoint};
+    let x_leg = ManaCost::Cost {
+        shards: vec![ManaCostShard::X],
+        generic: 3,
+    };
+    let pending_with = |point: ActivationCostLockPoint| {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(9_910),
+            PlayerId(0),
+            "X Activator".to_string(),
+            Zone::Battlefield,
+        );
+        let snapshot = ActivationCostSnapshot {
+            base_cost: AbilityCost::Mana {
+                cost: x_leg.clone(),
+            },
+            raise_total: 0,
+            reductions: vec![CostReductionEntry {
+                amount: ManaCost::generic(2),
+                multiplier: 1,
+                reach: CostReductionReach::SpillsToGeneric,
+                provenance: ReductionProvenance::Static {
+                    source: ObjectId(971),
+                    ordinal: 0,
+                },
+                display_name: "reducer".to_string(),
+                minimum_mana: 0,
+            }],
+            once_per_turn_sources: Vec::new(),
+            mana_carrier: crate::types::casting_costs::ManaCarrier::Whole,
+            settlement_tail: None,
+            lock: ActivationCostLock::Open { point },
+        };
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        ability.set_chosen_x_recursive(2);
+        let mut cost = x_leg.clone();
+        cost.concretize_x(2);
+        state.pending_cast = Some(Box::new(PendingCast::for_activation(
+            source,
+            ability,
+            cost,
+            0,
+            Some(Box::new(snapshot)),
+        )));
+        state
+    };
+
+    let mut state = pending_with(ActivationCostLockPoint::Announcement);
+    let before = state.pending_cast.clone();
+    assert!(
+        deferred_activation_mana_for_x(before.as_deref().unwrap(), 2).is_none(),
+        "only an XAnnounced carrier prices the X cap"
+    );
+    assert_eq!(
+        lock_activation_cost_at_x(&mut state, PlayerId(0), None).unwrap(),
+        None
+    );
+    assert_eq!(state.pending_cast, before, "neither folded nor locked");
+    assert_eq!(state.pending_cast.as_ref().unwrap().cost.mana_value(), 5);
+
+    let mut state = pending_with(ActivationCostLockPoint::XAnnounced);
+    assert_eq!(
+        deferred_activation_mana_for_x(state.pending_cast.as_deref().unwrap(), 2)
+            .map(|cost| cost.mana_value()),
+        Some(3)
+    );
+    assert_eq!(
+        lock_activation_cost_at_x(&mut state, PlayerId(0), None).unwrap(),
+        None
+    );
+    let pending = state.pending_cast.as_deref().unwrap();
+    assert_eq!(pending.cost.mana_value(), 3, "folded against X=2");
+    assert!(matches!(
+        pending.activation_cost_snapshot.as_ref().unwrap().lock,
+        ActivationCostLock::Locked {
+            point: ActivationCostLockPoint::XAnnounced,
+            order: None,
+        }
+    ));
+}
+
+/// Every open lock point round-trips, tagged with its point.
+#[test]
+fn an_open_lock_round_trips_its_point() {
+    use crate::types::casting_costs::{ActivationCostLock, ActivationCostLockPoint};
+    assert_eq!(
+        serde_json::to_string(&ActivationCostLock::Open {
+            point: ActivationCostLockPoint::XAnnounced
+        })
+        .unwrap(),
+        r#"{"type":"Open","data":{"point":"XAnnounced"}}"#
+    );
+    for point in [
+        ActivationCostLockPoint::Announcement,
+        ActivationCostLockPoint::XAnnounced,
+    ] {
+        let lock = ActivationCostLock::Open { point };
+        let json = serde_json::to_string(&lock).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ActivationCostLock>(&json).unwrap(),
+            lock
+        );
+    }
 }

@@ -675,7 +675,7 @@ pub fn record_activation_settlement(
         let mut counters = cell.get();
         counters.settlements += 1;
         match snapshot.map(|snapshot| &snapshot.lock) {
-            Some(crate::types::casting_costs::ActivationCostLock::Open) => {
+            Some(crate::types::casting_costs::ActivationCostLock::Open { .. }) => {
                 counters.open_settlements += 1;
             }
             Some(crate::types::casting_costs::ActivationCostLock::Locked { .. }) => {}

@@ -2091,14 +2091,14 @@ export interface ActivationCostSnapshot {
   // Set only while a target-settlement election prompt is outstanding.
   settlement_tail?: "SurfaceThenBoundary" | "Boundary";
   lock:
-    | { type: "Open" }
+    | { type: "Open"; data: { point?: ActivationCostLockPoint } }
     | {
         type: "Locked";
         data: { point?: ActivationCostLockPoint; order?: ReductionProvenance[] };
       };
 }
 
-export type ActivationCostLockPoint = "Announcement" | "TargetSettlement";
+export type ActivationCostLockPoint = "Announcement" | "XAnnounced" | "TargetSettlement";
 
 /// CR 601.2b + CR 601.2f: the caster's announced nonhybrid equivalents and the
 /// order their reductions are applied in, as one recorded election.

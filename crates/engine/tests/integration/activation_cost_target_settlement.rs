@@ -303,13 +303,85 @@ fn sacrifice_board(have: usize) -> (GameRunner, ObjectId, ObjectId, ObjectId, Ob
     (s.build(), src, merfolk, bear, fodder)
 }
 
-/// CR 601.2h: "Unpayable costs can't be paid." With exactly `{2}`, choosing
-/// the Merfolk makes the total `{4}`. The selection is refused before anything
-/// is paid: no `ManaPayment`, the pool and the fodder untouched, the stack
-/// empty, and the target prompt still live, so the Bear can be chosen.
+/// The whole game state as JSON, minus the fields a reversal legitimately
+/// moves: the revision (the transport's staleness key) and the interaction
+/// authority bound to the current decision.
+fn state_without_revision(r: &GameRunner) -> serde_json::Value {
+    let mut value = serde_json::to_value(r.state()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    for key in [
+        "state_revision",
+        "active_interaction_slots",
+        "interaction_authority",
+        "next_interaction_slot_id",
+    ] {
+        object.remove(key);
+    }
+    value
+}
+
+/// The paths at which two JSON values differ, for readable failures.
+fn json_diff(path: &str, a: &serde_json::Value, b: &serde_json::Value, out: &mut Vec<String>) {
+    match (a, b) {
+        (serde_json::Value::Object(x), serde_json::Value::Object(y)) => {
+            for key in x.keys().chain(y.keys().filter(|k| !x.contains_key(*k))) {
+                let null = serde_json::Value::Null;
+                json_diff(
+                    &format!("{path}.{key}"),
+                    x.get(key).unwrap_or(&null),
+                    y.get(key).unwrap_or(&null),
+                    out,
+                );
+            }
+        }
+        (serde_json::Value::Array(x), serde_json::Value::Array(y)) if x.len() == y.len() => {
+            for (i, (p, q)) in x.iter().zip(y).enumerate() {
+                json_diff(&format!("{path}[{i}]"), p, q, out);
+            }
+        }
+        _ if a != b => out.push(format!("{path}: {a} -> {b}")),
+        _ => {}
+    }
+}
+
+#[track_caller]
+fn assert_same_state(before: &serde_json::Value, after: &serde_json::Value, what: &str) {
+    let mut diffs = Vec::new();
+    json_diff("", before, after, &mut diffs);
+    assert!(diffs.is_empty(), "{what}: {diffs:#?}");
+}
+
+fn tap_land_for_mana(r: &mut GameRunner, land: ObjectId) {
+    let (_, _, grouped) = engine::ai_support::legal_actions_full(r.state());
+    let selection = grouped
+        .get(&land)
+        .into_iter()
+        .flatten()
+        .find_map(|action| match action {
+            GameAction::TapLandForMana { selection } => Some(selection.clone()),
+            _ => None,
+        })
+        .expect("the engine authors the land's mana selection");
+    act(r, GameAction::TapLandForMana { selection }).expect("tap the land");
+    assert_eq!(
+        r.state().lands_tapped_for_mana.get(&P0),
+        Some(&vec![land]),
+        "reach guard: the tap opened a mana-undo window"
+    );
+}
+
+/// CR 601.2h + CR 733.1: with exactly `{2}`, choosing the Merfolk makes the
+/// total `{4}`. The activation can't be completed legally, so it is reversed
+/// ENTIRELY, to priority, with the state from before `ActivateAbility`: the
+/// target declaration and every other pre-lock trace are gone. CR 733.2: a
+/// fresh, legal activation choosing the Bear then succeeds.
 #[test]
-fn settlement_refuses_a_target_whose_price_is_unaffordable_before_any_payment() {
+fn an_unaffordable_target_reverses_the_whole_activation_to_priority() {
     let (mut r, src, merfolk, bear, fodder) = sacrifice_board(2);
+    // Settle the scenario's lazily-initialized layer bases first, so the
+    // comparison sees only what the activation did.
+    engine::game::layers::flush_layers(r.state_mut());
+    let before_activation = state_without_revision(&r);
     let wf = act(
         &mut r,
         GameAction::ActivateAbility {
@@ -319,25 +391,32 @@ fn settlement_refuses_a_target_whose_price_is_unaffordable_before_any_payment() 
     )
     .expect("offered: the Bear is affordable");
     assert!(matches!(wf, WaitingFor::TargetSelection { .. }), "{wf:?}");
-    let before = serde_json::to_value(r.state()).unwrap();
 
-    let refused = act(
-        &mut r,
-        GameAction::SelectTargets {
+    let result = r
+        .act(GameAction::SelectTargets {
             targets: vec![object(merfolk)],
-        },
-    );
-    assert!(refused.is_err(), "the taxed target is refused: {refused:?}");
-    assert_eq!(
-        serde_json::to_value(r.state()).unwrap(),
-        before,
-        "nothing changed: no payment, no sacrifice, no stack entry"
+        })
+        .expect("a reversal is a result, not a rejection");
+    assert!(!result.disposition.is_applied(), "typed reversal");
+    assert!(matches!(result.waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert_same_state(
+        &before_activation,
+        &state_without_revision(&r),
+        "after the reversal",
     );
     assert_eq!(pool(&r, P0), 2);
     assert_eq!(r.state().objects[&fodder].zone, Zone::Battlefield);
     assert_eq!(stack_len(&r), 0);
 
-    // H1-2, the control: the Bear pays {2} and the sacrifice.
+    // CR 733.2: a fresh activation, choosing the untaxed Bear.
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("a fresh activation");
     act(
         &mut r,
         GameAction::SelectTargets {
@@ -351,9 +430,67 @@ fn settlement_refuses_a_target_whose_price_is_unaffordable_before_any_payment() 
     assert_eq!(stack_len(&r), 1);
 }
 
-/// H1-4: a refused target spends nothing, including Hojo's once-per-turn slot.
+/// The same reversal keeps an accumulating loop period and a real manual
+/// mana-undo window exactly as they were: nothing was accepted before the lock.
 #[test]
-fn a_refused_target_leaves_the_once_per_turn_discount_unspent() {
+fn an_unaffordable_target_reversal_keeps_the_loop_period_and_mana_undo_window() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.add_creature_from_oracle(P1, "Kopala, Warden of Waves", 2, 2, KOPALA)
+        .with_subtypes(vec!["Merfolk", "Wizard"]);
+    let merfolk = s
+        .add_creature(P1, "Merfolk", 2, 2)
+        .with_subtypes(vec!["Merfolk"])
+        .id();
+    s.add_creature(P1, "Bear", 2, 2);
+    s.add_creature(P0, "Fodder", 1, 1);
+    let land = s.add_basic_land(P0, ManaColor::White);
+    let src = s
+        .add_artifact_from_oracle(
+            P0,
+            "Altar",
+            "{2}, Sacrifice a creature: Tap target creature. Create a 1/1 white Soldier creature token.",
+        )
+        .id();
+    mana(&mut s, P0, 1);
+    let mut r = s.build();
+    r.state_mut().loop_detection = engine::types::game_state::LoopDetectionMode::On;
+    let card_id = r.state().objects[&src].card_id;
+    r.state_mut().last_loop_action_sequence = vec![engine::types::game_state::LoopActionContext {
+        card_id,
+        controller: P0,
+        action: engine::types::game_state::LoopAction::Activate {
+            source_id: src,
+            ability_index: 0,
+        },
+        convoke: None,
+        pins: Vec::new(),
+    }];
+    tap_land_for_mana(&mut r, land);
+    let before = state_without_revision(&r);
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("offered: the Bear is affordable");
+    let result = r
+        .act(GameAction::SelectTargets {
+            targets: vec![object(merfolk)],
+        })
+        .expect("a reversal is a result");
+    assert!(!result.disposition.is_applied());
+    assert_same_state(&before, &state_without_revision(&r), "after the reversal");
+    act(&mut r, GameAction::UntapLandForMana { object_id: land })
+        .expect("the mana-undo window survived the reversal");
+}
+
+/// H1-4: a reversed activation spends nothing, including Hojo's once-per-turn
+/// slot.
+#[test]
+fn a_reversed_activation_leaves_the_once_per_turn_discount_unspent() {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     library(&mut s, P0);
@@ -367,35 +504,31 @@ fn a_refused_target_leaves_the_once_per_turn_discount_unspent() {
             "{4}, Sacrifice a creature: Tap target creature.",
         )
         .id();
-    s.add_creature(P1, "Bear", 2, 2);
+    let bear = s.add_creature(P1, "Bear", 2, 2).id();
     mana(&mut s, P0, 2);
     let mut r = s.build();
-    act(
-        &mut r,
-        GameAction::ActivateAbility {
-            source_id: src,
-            ability_index: 0,
-        },
-    )
-    .expect("offered through Hojo's discount");
-    let bear = r
-        .state()
-        .objects
-        .values()
-        .find(|o| o.name == "Bear")
-        .unwrap()
-        .id;
-    assert!(
+    let activate = |r: &mut GameRunner| {
         act(
-            &mut r,
-            GameAction::SelectTargets {
-                targets: vec![object(bear)],
+            r,
+            GameAction::ActivateAbility {
+                source_id: src,
+                ability_index: 0,
             },
         )
-        .is_err(),
+        .expect("offered through Hojo's discount")
+    };
+    activate(&mut r);
+    let result = r
+        .act(GameAction::SelectTargets {
+            targets: vec![object(bear)],
+        })
+        .expect("a reversal is a result");
+    assert!(
+        !result.disposition.is_applied(),
         "the Bear gets no discount, so {{4}} is unaffordable"
     );
     assert!(r.state().ability_cost_discount_used.is_empty());
+    activate(&mut r);
     act(
         &mut r,
         GameAction::SelectTargets {
@@ -405,6 +538,119 @@ fn a_refused_target_leaves_the_once_per_turn_discount_unspent() {
     .expect("your own creature gets Hojo's discount");
     finish(&mut r, &[fodder]);
     assert_eq!(pool(&r, P0), 0, "paid {{2}}: the discount was still there");
+}
+
+/// HIGH 2: a deferred lock with no election accepts the activation exactly
+/// once, at the lock, before payment: its loop step is recorded once (not at
+/// `ActivateAbility`, which accepted nothing) and the mana-undo window closes.
+#[test]
+fn a_settled_lock_with_no_election_accepts_the_activation_exactly_once() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature(P1, "Theirs", 1, 1);
+    let land = s.add_basic_land(P0, ManaColor::White);
+    let src = s
+        .add_artifact_from_oracle(
+            P0,
+            "Engine",
+            "{3}: Tap target creature. Create a 1/1 white Soldier creature token.",
+        )
+        .id();
+    let mut r = s.build();
+    r.state_mut().loop_detection = engine::types::game_state::LoopDetectionMode::On;
+    tap_land_for_mana(&mut r, land);
+    // The manual land tap opened this controller's loop period; an accepted
+    // activation appends one step to it.
+    let period = r.state().last_loop_action_sequence.len();
+
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("Hojo makes {3} cost {1}");
+    assert_eq!(
+        r.state().last_loop_action_sequence.len(),
+        period,
+        "not accepted before its cost locks"
+    );
+    assert!(
+        r.state().lands_tapped_for_mana.contains_key(&P0),
+        "the window stays open until the lock"
+    );
+    act(
+        &mut r,
+        GameAction::SelectTargets {
+            targets: vec![object(own)],
+        },
+    )
+    .expect("targets settle, and the lock runs");
+    assert_eq!(
+        r.state().last_loop_action_sequence.len(),
+        period + 1,
+        "accepted exactly once, at the settlement lock"
+    );
+    assert!(
+        !r.state().lands_tapped_for_mana.contains_key(&P0),
+        "accepting closed the mana-undo window"
+    );
+    finish(&mut r, &[]);
+    assert_eq!(
+        r.state().last_loop_action_sequence.len(),
+        period + 1,
+        "and not again"
+    );
+}
+
+/// HIGH 2's election twin: the settlement election accepts nothing at its
+/// prompt and accepts exactly once on its resume.
+#[test]
+fn a_settlement_election_accepts_the_activation_once_on_its_resume() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    s.add_artifact_from_oracle(P0, "Training Grounds", GROUNDS_FLOORED);
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature(P1, "Bear", 2, 2);
+    let src = s
+        .add_creature_from_oracle(
+            P0,
+            "Tapper",
+            2,
+            2,
+            "{3}: Tap target creature. Create a 1/1 white Soldier creature token.",
+        )
+        .id();
+    mana(&mut s, P0, 5);
+    let mut r = s.build();
+    unsick(&mut r, src);
+    r.state_mut().loop_detection = engine::types::game_state::LoopDetectionMode::On;
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .unwrap();
+    select_own_and_reach_the_election(&mut r, own);
+    assert!(
+        r.state().last_loop_action_sequence.is_empty(),
+        "the settlement prompt accepted nothing"
+    );
+    elect_total(&mut r, 1).expect("the election resumes");
+    finish(&mut r, &[]);
+    assert_eq!(
+        r.state().last_loop_action_sequence.len(),
+        1,
+        "accepted once, on resume"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +709,12 @@ fn the_caster_elects_the_reduction_order_at_target_settlement() {
             .activation_cost_snapshot
             .as_deref()
             .expect("the prompt carries the carrier");
-        assert!(matches!(snapshot.lock, ActivationCostLock::Open));
+        assert!(matches!(
+            snapshot.lock,
+            ActivationCostLock::Open {
+                point: ActivationCostLockPoint::TargetSettlement
+            }
+        ));
         assert!(
             snapshot.settlement_tail.is_some(),
             "the resume names its tail"
@@ -688,7 +939,12 @@ fn a_modal_activations_open_carrier_survives_a_restore_at_mode_choice() {
         };
         let snapshot = activation_cost_snapshot.as_deref().expect("carrier");
         assert!(
-            matches!(snapshot.lock, ActivationCostLock::Open),
+            matches!(
+                snapshot.lock,
+                ActivationCostLock::Open {
+                    point: ActivationCostLockPoint::TargetSettlement
+                }
+            ),
             "reach guard: the lock waits for the targets"
         );
         let printed_generic = match ability_cost {
@@ -1143,7 +1399,9 @@ fn open_live_carriers(r: &mut GameRunner) -> usize {
     ) -> usize {
         match snapshot.as_deref_mut() {
             Some(snapshot) => {
-                snapshot.lock = ActivationCostLock::Open;
+                snapshot.lock = ActivationCostLock::Open {
+                    point: ActivationCostLockPoint::TargetSettlement,
+                };
                 1
             }
             None => 0,
@@ -1534,4 +1792,51 @@ fn optional_slots_are_searched_past_an_unaffordable_empty_completion() {
         (false, 1),
         "O6: Unpayable, by walking"
     );
+}
+
+/// R9 + accept-at-lock: a divided activation waits in `DistributeAmong` with
+/// its lock still open (the division comes before settlement), so it is
+/// accepted at the settlement lock AFTER the split: not at `ActivateAbility`,
+/// not at the target choice, and not skipped.
+#[test]
+fn a_divided_activation_is_accepted_at_its_settlement_lock_after_the_split() {
+    let mut b = route_board(
+        "{2}: Engine deals 2 damage divided as you choose among one or two targets. Create a 1/1 white Soldier creature token.",
+        true,
+    );
+    b.runner.state_mut().loop_detection = engine::types::game_state::LoopDetectionMode::On;
+    let bear = b.bear.unwrap();
+    start(&mut b);
+    assert!(b.runner.state().last_loop_action_sequence.is_empty());
+    act(
+        &mut b.runner,
+        GameAction::SelectTargets {
+            targets: vec![object(b.merfolk), object(bear)],
+        },
+    )
+    .expect("targets");
+    assert!(
+        matches!(
+            b.runner.state().waiting_for,
+            WaitingFor::DistributeAmong { .. }
+        ),
+        "reach guard: the division prompt"
+    );
+    assert!(
+        b.runner.state().last_loop_action_sequence.is_empty(),
+        "the division comes before the lock: nothing accepted yet"
+    );
+    act(
+        &mut b.runner,
+        GameAction::DistributeAmong {
+            distribution: vec![(object(b.merfolk), 1), (object(bear), 1)],
+        },
+    )
+    .expect("the split");
+    assert_eq!(
+        b.runner.state().last_loop_action_sequence.len(),
+        1,
+        "accepted exactly once, at the settlement lock after the split"
+    );
+    assert_route(&mut b, "R9 divided, accepted", 4);
 }
