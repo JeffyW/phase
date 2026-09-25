@@ -23360,7 +23360,7 @@ pub fn handle_activate_ability(
 /// activation (CR 601.2f + CR 602.2b).
 pub(crate) enum ActivationElectionResume {
     /// The activation continued under the elected order.
-    Continued(WaitingFor),
+    Continued(Box<WaitingFor>),
     /// CR 601.2h: the elected total could not be paid, so the activation is
     /// reversed. The action boundary restores the pre-action state; nothing here
     /// undoes anything.
@@ -23409,7 +23409,7 @@ pub(crate) fn resume_activation_after_cost_election(
             Some(snapshot),
             events,
         ) {
-            Ok(waiting_for) => ActivationElectionResume::Continued(waiting_for),
+            Ok(waiting_for) => ActivationElectionResume::Continued(Box::new(waiting_for)),
             Err(_) => ActivationElectionResume::Reversed,
         },
     )

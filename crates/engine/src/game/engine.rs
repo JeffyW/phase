@@ -11712,7 +11712,7 @@ fn apply_non_priority_pass_action(
             )? {
                 casting::ActivationElectionResume::Continued(wf) => {
                     record_non_mana_activation_accepted(state, player, source_id, ability_index);
-                    wf
+                    *wf
                 }
                 // CR 601.2h: the elected total cannot be paid, so the activation
                 // is reversed. The action boundary restores its pre-action
