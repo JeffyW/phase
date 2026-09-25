@@ -557,14 +557,15 @@ fn x_zero_activation_still_pays_a_target_gated_tax() {
 #[test]
 fn settlement_writeback_and_zero_leg_skip_are_distinct_sites() {
     use engine::game::perf_counters;
-    const TRAINING_GROUNDS_FLOOR: &str = "Activated abilities of creatures you control cost {2} less to activate. This effect can't reduce the mana in that cost to less than one mana.";
 
-    // Target-first, folds to {0}: Training Grounds (-2, floor 1) plus Hojo (-2) on
-    // {3}, targeting your own creature, with no mana. Priced at settlement.
+    // Target-first, folds to {0}: an unfloored -2 plus Hojo (-2) on {3},
+    // targeting your own creature, with no mana. Priced at settlement. Both
+    // reductions are unfloored, so every order locks {0} and no CR 601.2f
+    // election is raised.
     {
         let mut s = GameScenario::new();
         s.at_phase(Phase::PreCombatMain);
-        s.add_artifact_from_oracle(P0, "Training Grounds", TRAINING_GROUNDS_FLOOR);
+        s.add_artifact_from_oracle(P0, "Training Grounds", TRAINING_GROUNDS);
         s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
         let own = s.add_creature(P0, "Own", 1, 1).id();
         // Hojo's trigger draws a card when your creature is targeted, so the

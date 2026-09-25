@@ -2625,6 +2625,10 @@ fn finish_selected_return_to_hand_after_automatic(
     park_events_after_completion: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    super::casting::require_locked_activation_cost(
+        pending.activation_cost_snapshot.as_deref(),
+        super::casting::ActivationCostGuardSite::ReturnAfterAutomatic,
+    )?;
     if let Some(cost) = automatic_remaining {
         let ability_index = pending.activation_ability_index.ok_or_else(|| {
             EngineError::InvalidAction(
@@ -4157,6 +4161,10 @@ pub(crate) fn handle_return_to_hand_for_cost(
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    super::casting::require_locked_activation_cost(
+        pending.activation_cost_snapshot.as_deref(),
+        super::casting::ActivationCostGuardSite::ReturnToHand,
+    )?;
     let cost_event_start = events.len();
     if chosen.len() != count {
         return Err(EngineError::InvalidAction(format!(
@@ -4275,6 +4283,10 @@ pub(crate) fn handle_remove_counter_for_cost(
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    super::casting::require_locked_activation_cost(
+        pending.activation_cost_snapshot.as_deref(),
+        super::casting::ActivationCostGuardSite::RemoveCounter,
+    )?;
     if selection == CounterCostSelection::AmongObjects {
         return Err(EngineError::InvalidAction(
             "Counter distribution is required for from-among counter costs".to_string(),
@@ -4404,6 +4416,10 @@ pub(crate) fn handle_remove_counter_distribution_for_cost(
     distribution: &[CounterCostChoice],
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    super::casting::require_locked_activation_cost(
+        pending.activation_cost_snapshot.as_deref(),
+        super::casting::ActivationCostGuardSite::RemoveCounterDistribution,
+    )?;
     if selection != CounterCostSelection::AmongObjects {
         return Err(EngineError::InvalidAction(
             "Counter distribution is only valid for from-among counter costs".to_string(),
@@ -5408,6 +5424,7 @@ pub(crate) fn finish_activated_ability_at_payment_boundary(
         pending.pending_loyalty_activation_player,
         pending.activation_trigger_collection.clone(),
         pending.crime_candidate,
+        pending.activation_cost_snapshot.as_deref(),
         events,
     )
 }
@@ -5421,11 +5438,18 @@ pub(crate) fn finish_activated_ability_at_payment_boundary(
 pub(crate) fn finish_target_selected_activated_ability_at_payment_boundary(
     state: &mut GameState,
     player: PlayerId,
-    mut pending: PendingCast,
+    pending: PendingCast,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    super::casting::settle_activation_targets(state, &mut pending);
-    finish_activated_ability_at_payment_boundary(state, player, pending, events)
+    // CR 601.2c + CR 602.2b: every target-first route funnels through here once
+    // its targets are committed, so the target-settlement cost lock runs here.
+    super::casting::settle_activation_cost(
+        state,
+        player,
+        pending,
+        crate::types::casting_costs::SettledTail::Boundary,
+        events,
+    )
 }
 
 /// Identifies which target-first activation handoff is deciding whether to
@@ -6221,8 +6245,16 @@ pub(super) fn push_activated_ability_to_stack(
     mut pending_loyalty_activation_player: Option<PlayerId>,
     activation_trigger_collection: Option<Box<super::triggers::PendingActivationTriggerCollection>>,
     crime_candidate: bool,
+    // CR 601.2f + CR 602.2b: the activation's cost-modifier carrier, handed to
+    // every root this function rebuilds.
+    activation_cost_snapshot: Option<&crate::types::casting_costs::ActivationCostSnapshot>,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    super::casting::require_locked_activation_cost(
+        activation_cost_snapshot,
+        super::casting::ActivationCostGuardSite::PushToStack,
+    )?;
+    let carrier = || activation_cost_snapshot.map(|snapshot| Box::new(snapshot.clone()));
     // CR 602.2b + CR 601.2c-h: This is also a defensive entry point for
     // resumed activation roots. If a caller still has both unchosen targets and
     // an unpaid cost suffix, route it through the same target-first transaction
@@ -6232,10 +6264,14 @@ pub(super) fn push_activated_ability_to_stack(
         let assigned_targets = flatten_targets_in_chain(&resolved);
         if !target_slots.is_empty() {
             let pending = |resolved: ResolvedAbility| {
-                let mut pending =
-                    PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+                let mut pending = PendingCast::for_activation(
+                    source_id,
+                    resolved,
+                    ManaCost::NoCost,
+                    ability_index,
+                    carrier(),
+                );
                 pending.activation_cost = remaining_cost.cloned();
-                pending.activation_ability_index = Some(ability_index);
                 pending.pending_loyalty_activation_player = pending_loyalty_activation_player;
                 pending.activation_trigger_collection = activation_trigger_collection.clone();
                 pending
@@ -6332,16 +6368,16 @@ pub(super) fn push_activated_ability_to_stack(
             ));
         }
 
-        let mut pending_interactive =
-            PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+        let mut pending_interactive = PendingCast::for_activation(
+            source_id,
+            resolved.clone(),
+            ManaCost::NoCost,
+            ability_index,
+            carrier(),
+        );
         pending_interactive.activation_cost = Some(cost.clone());
-        pending_interactive.activation_ability_index = Some(ability_index);
         pending_interactive.pending_loyalty_activation_player = pending_loyalty_activation_player;
-        if matches!(target_selection, ActivationTargetSelection::Settled) {
-            super::casting::settle_activation_targets(state, &mut pending_interactive);
-        } else {
-            pending_interactive.activation_target_selection = target_selection;
-        }
+        pending_interactive.activation_target_selection = target_selection;
         pending_interactive.activation_trigger_collection = activation_trigger_collection.clone();
         if let Some(waiting_for) = surface_next_unpaid_interactive_activation_cost(
             state,
@@ -6382,6 +6418,7 @@ pub(super) fn push_activated_ability_to_stack(
                 cost.clone(),
                 ability_index,
                 target_selection,
+                carrier(),
             ));
         }
         // CR 606.3: A `[−X]` loyalty ability is modeled as a chosen-X removal of
@@ -6418,18 +6455,18 @@ pub(super) fn push_activated_ability_to_stack(
                 events,
             )?
         {
-            let mut pending =
-                PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+            let mut pending = PendingCast::for_activation(
+                source_id,
+                resolved.clone(),
+                ManaCost::NoCost,
+                ability_index,
+                carrier(),
+            );
             pending.activation_cost = remaining_cost;
-            pending.activation_ability_index = Some(ability_index);
             pending.pending_loyalty_activation_player = should_record_loyalty
                 .then_some(player)
                 .or(pending_loyalty_activation_player);
-            if matches!(target_selection, ActivationTargetSelection::Settled) {
-                super::casting::settle_activation_targets(state, &mut pending);
-            } else {
-                pending.activation_target_selection = target_selection;
-            }
+            pending.activation_target_selection = target_selection;
             pending.activation_trigger_collection = activation_trigger_collection.clone();
             if let Some(pending) = attach_pending_cast_to_cost_move(state, Box::new(pending)) {
                 state.pending_cast = Some(pending);
@@ -6573,7 +6610,6 @@ pub(super) fn push_ability_entry(
 
     // CR 603.4: Stamp the printed-ability index for per-turn resolution tracking.
     resolved.ability_index = Some(ability_index);
-    let consumed_discount_sources = resolved.ability_cost_discount_static_sources.clone();
     stack::push_to_stack(
         state,
         StackEntry {
@@ -6592,25 +6628,12 @@ pub(super) fn push_ability_entry(
         super::planeswalker::record_loyalty_activation(state, source_id, activation_player);
     }
 
-    restrictions::record_ability_activation(state, source_id, ability_index);
-    for discount_source in consumed_discount_sources {
-        state.ability_cost_discount_used.insert(discount_source);
-    }
-    // CR 117.1b: Priority permits unbounded activation. `pending_activations`
-    // is a per-priority-window AI-guard — see `GameState::pending_activations`.
-    state.pending_activations.push((source_id, ability_index));
-    events.push(GameEvent::AbilityActivated {
-        player_id: player,
-        source_id,
-        // CR 606.2: Classify loyalty vs. normal from the source ability cost.
-        kind: super::planeswalker::activated_ability_kind(state, source_id, ability_index),
-    });
-    // CR 702.142b: Emit additional event when a boast ability is activated.
-    super::casting_targets::emit_keyword_ability_event_if_tagged(
+    super::casting::record_activated_ability_placed(
         state,
+        player,
         source_id,
         ability_index,
-        player,
+        entry_id,
         events,
     );
     if let Some(mut collection) = activation_trigger_collection {
@@ -8016,6 +8039,8 @@ fn accepted_defiler_reduction_entry(
         reach,
         provenance: ReductionProvenance::Defiler,
         display_name,
+        // CR 601.2f: a spell reduction; no floor.
+        minimum_mana: 0,
     }
 }
 
@@ -14207,6 +14232,10 @@ fn finalize_mana_payment_with_resume(
         pending_for_restore = pending.clone();
 
         if let Some(ability_index) = pending.activation_ability_index {
+            super::casting::require_locked_activation_cost(
+                pending.activation_cost_snapshot.as_deref(),
+                super::casting::ActivationCostGuardSite::ManaResume,
+            )?;
             let excluded_sources = pending
                 .activation_cost
                 .as_ref()
@@ -14702,6 +14731,10 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
         pending_for_restore = pending.clone();
 
         if let Some(ability_index) = pending.activation_ability_index {
+            super::casting::require_locked_activation_cost(
+                pending.activation_cost_snapshot.as_deref(),
+                super::casting::ActivationCostGuardSite::PhyrexianResume,
+            )?;
             let excluded_sources = pending
                 .activation_cost
                 .as_ref()
@@ -14761,6 +14794,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
                 pending.pending_loyalty_activation_player,
                 pending.activation_trigger_collection.clone(),
                 pending.crime_candidate,
+                pending.activation_cost_snapshot.as_deref(),
                 events,
             );
         }
@@ -16165,6 +16199,7 @@ mod tests {
             declared_mana_additions: Vec::new(),
             accepted_cost_reductions: Vec::new(),
             cost_reduction_election: None,
+            activation_cost_snapshot: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: Some(0),
@@ -21975,6 +22010,7 @@ mod tests {
             declared_mana_additions: Vec::new(),
             accepted_cost_reductions: Vec::new(),
             cost_reduction_election: None,
+            activation_cost_snapshot: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -22116,6 +22152,7 @@ mod tests {
             declared_mana_additions: Vec::new(),
             accepted_cost_reductions: Vec::new(),
             cost_reduction_election: None,
+            activation_cost_snapshot: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -22226,6 +22263,7 @@ mod tests {
             declared_mana_additions: Vec::new(),
             accepted_cost_reductions: Vec::new(),
             cost_reduction_election: None,
+            activation_cost_snapshot: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -22325,6 +22363,7 @@ mod tests {
             declared_mana_additions: Vec::new(),
             accepted_cost_reductions: Vec::new(),
             cost_reduction_election: None,
+            activation_cost_snapshot: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -22457,6 +22496,7 @@ mod tests {
             declared_mana_additions: Vec::new(),
             accepted_cost_reductions: Vec::new(),
             cost_reduction_election: None,
+            activation_cost_snapshot: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -25655,6 +25695,7 @@ its replicate cost was paid.)\nDraw a card.";
             None,
             None,
             false,
+            None,
             &mut events,
         );
     }
@@ -25695,6 +25736,7 @@ its replicate cost was paid.)\nDraw a card.";
             None,
             None,
             false,
+            None,
             &mut events,
         )
         .expect("direct activation root must enter target selection");

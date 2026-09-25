@@ -102,6 +102,17 @@ pub struct ActivationCostRouteCounters {
     pub settlement_writebacks: u64,
     /// Times the mana-leg finalizer found a zero leg and skipped payment.
     pub zero_mana_leg_skips: u64,
+    /// Times `settle_activation_cost` ran, whatever its carrier.
+    pub settlements: u64,
+    /// Of those, the ones that found an `Open` carrier (a deferred lock).
+    pub open_settlements: u64,
+    /// Of those, the ones that found no carrier at all.
+    pub carrierless_settlements: u64,
+    /// Times pre-activation feasibility had to walk target assignments because
+    /// the target-free bounds didn't decide it.
+    pub window_searches: u64,
+    /// Reaches of each unlocked-cost guard, indexed by `ActivationCostGuardSite`.
+    pub guard_reaches: [u64; crate::game::casting::ActivationCostGuardSite::COUNT],
 }
 
 /// Test-only count of work the target-completion walk actually PERFORMED, per
@@ -244,6 +255,11 @@ thread_local! {
         Cell::new(ActivationCostRouteCounters {
             settlement_writebacks: 0,
             zero_mana_leg_skips: 0,
+            settlements: 0,
+            open_settlements: 0,
+            carrierless_settlements: 0,
+            window_searches: 0,
+            guard_reaches: [0; crate::game::casting::ActivationCostGuardSite::COUNT],
         })
     };
     #[cfg(feature = "test-support")]
@@ -646,6 +662,46 @@ pub fn record_activation_zero_mana_leg_skip() {
     ACTIVATION_COST_ROUTE_COUNTERS.with(|cell| {
         let mut counters = cell.get();
         counters.zero_mana_leg_skips += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 601.2c + CR 602.2b: one run of the target-settlement cost lock.
+#[cfg(feature = "test-support")]
+pub fn record_activation_settlement(
+    snapshot: Option<&crate::types::casting_costs::ActivationCostSnapshot>,
+) {
+    ACTIVATION_COST_ROUTE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.settlements += 1;
+        match snapshot.map(|snapshot| &snapshot.lock) {
+            Some(crate::types::casting_costs::ActivationCostLock::Open) => {
+                counters.open_settlements += 1;
+            }
+            Some(crate::types::casting_costs::ActivationCostLock::Locked { .. }) => {}
+            None => counters.carrierless_settlements += 1,
+        }
+        cell.set(counters);
+    });
+}
+
+/// CR 601.2f: one reach of an unlocked-cost guard.
+#[cfg(feature = "test-support")]
+pub fn record_activation_cost_guard(site: crate::game::casting::ActivationCostGuardSite) {
+    ACTIVATION_COST_ROUTE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.guard_reaches[site as usize] += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 118.3 + CR 601.2c: one pre-activation feasibility walk over target
+/// assignments.
+#[cfg(feature = "test-support")]
+pub fn record_activation_cost_window_search() {
+    ACTIVATION_COST_ROUTE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.window_searches += 1;
         cell.set(counters);
     });
 }
