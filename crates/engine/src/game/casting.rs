@@ -10288,10 +10288,18 @@ pub(super) fn build_choose_x_cost_previews(
     min: u32,
     max: u32,
 ) -> Vec<(u32, ManaCost)> {
-    if pending.base_cost.is_none() {
+    if min > max || max.saturating_sub(min) > 100 {
         return Vec::new();
     }
-    if min > max || max.saturating_sub(min) > 100 {
+    // CR 601.2b + CR 601.2f: a deferred mana-`{X}` activation previews the
+    // default-order total its X lock will fold (the cheapest the caster can
+    // elect).
+    if deferred_activation_mana_for_x(pending, min).is_some() {
+        return (min..=max)
+            .filter_map(|x| deferred_activation_mana_for_x(pending, x).map(|cost| (x, cost)))
+            .collect();
+    }
+    if pending.base_cost.is_none() {
         return Vec::new();
     }
     (min..=max)
@@ -23368,10 +23376,15 @@ pub(crate) enum ActivationElectionResume {
 }
 
 /// CR 601.2f + CR 602.2b: continue an activation after the caster elected its
-/// reduction order. Re-enters the announcement with the prompt's snapshot,
-/// locked under that order — never re-collected (CR 601.2h). Re-running the
-/// announcement is sound because the lock precedes every mutation: nothing
-/// changed between the prompt and this answer.
+/// reduction order, at the point its open lock names — never re-collecting the
+/// modifiers (CR 601.2h).
+///
+/// * `Announcement`: re-enter the announcement with the prompt's snapshot,
+///   locked under that order. Sound because this lock precedes every mutation:
+///   nothing changed between the prompt and this answer.
+/// * `XAnnounced`: the announced X is already on the pending activation; re-fold
+///   its concrete cost under the elected order and continue to payment. The
+///   activation was accepted at announcement, so nothing is re-announced.
 pub(crate) fn resume_activation_after_cost_election(
     state: &mut GameState,
     player: PlayerId,
@@ -23388,41 +23401,237 @@ pub(crate) fn resume_activation_after_cost_election(
         ));
     };
     let mut snapshot = snapshot.clone();
-    match snapshot.lock {
-        ActivationCostLock::Open => {}
+    let point = match snapshot.lock {
+        ActivationCostLock::Open { point } => point,
         ActivationCostLock::Locked { .. } => {
             return Err(EngineError::InvalidAction(
                 "this activation's cost is already locked".to_string(),
             ));
         }
-    }
+    };
     snapshot.lock = ActivationCostLock::Locked {
-        point: ActivationCostLockPoint::Announcement,
+        point,
         order: Some(order),
     };
-    Ok(
-        match activate_with_cost_carrier(
+    let resumed = match point {
+        ActivationCostLockPoint::Announcement => activate_with_cost_carrier(
             state,
             player,
             pending.object_id,
             ability_index,
             Some(snapshot),
             events,
-        ) {
-            Ok(waiting_for) => ActivationElectionResume::Continued(Box::new(waiting_for)),
-            Err(_) => ActivationElectionResume::Reversed,
-        },
-    )
+        ),
+        ActivationCostLockPoint::XAnnounced => {
+            let mut pending = pending.clone();
+            let object_id = pending.object_id;
+            apply_activation_x_fold(&mut pending, snapshot);
+            state.pending_cast = Some(Box::new(pending));
+            apply_post_x_cost_modifiers(state, player, object_id);
+            ensure_x_locked_activation_payable(state, player)
+                .and_then(|()| casting_costs::enter_payment_step(state, player, None, events))
+        }
+    };
+    Ok(match resumed {
+        Ok(waiting_for) => ActivationElectionResume::Continued(Box::new(waiting_for)),
+        Err(_) => ActivationElectionResume::Reversed,
+    })
 }
 
-/// CR 601.2f + CR 602.2b: the elected order a locked snapshot carries, if any.
+/// CR 601.2f: the elected order a locked snapshot carries, if any.
 fn locked_activation_order(snapshot: &ActivationCostSnapshot) -> Option<&[ReductionProvenance]> {
     match &snapshot.lock {
         ActivationCostLock::Locked {
             order: Some(order), ..
         } => Some(order),
-        ActivationCostLock::Locked { order: None, .. } | ActivationCostLock::Open => None,
+        ActivationCostLock::Locked { order: None, .. } | ActivationCostLock::Open { .. } => None,
     }
+}
+
+/// The activation's whole cost with its announced X concrete: the (concrete)
+/// mana leg in `pending.cost` followed by the residual in
+/// `pending.activation_cost`, whose other mana legs, if any, count toward the
+/// same floors ("the mana in that cost").
+fn activation_x_whole_cost(pending: &PendingCast) -> AbilityCost {
+    let mut legs = vec![AbilityCost::Mana {
+        cost: pending.cost.clone(),
+    }];
+    match pending.activation_cost.clone() {
+        Some(AbilityCost::Composite { costs }) => legs.extend(costs),
+        Some(other) => legs.push(other),
+        None => {}
+    }
+    if legs.len() == 1 {
+        legs.pop().expect("one leg")
+    } else {
+        AbilityCost::Composite { costs: legs }
+    }
+}
+
+/// Split a folded whole cost back into the pending activation's mana leg and
+/// residual — the inverse of [`activation_x_whole_cost`]. The X leg stays first,
+/// so reductions come off it before any later mana leg, and every non-mana leg
+/// is preserved in order.
+fn split_activation_x_whole_cost(pending: &mut PendingCast, folded: AbilityCost) {
+    let mut legs = match folded {
+        AbilityCost::Composite { costs } => costs,
+        other => vec![other],
+    };
+    let first = legs.remove(0);
+    let AbilityCost::Mana { cost } = first else {
+        unreachable!("the X mana leg is always the whole cost's first leg")
+    };
+    pending.cost = cost;
+    pending.activation_cost = match legs.len() {
+        0 => None,
+        1 => legs.pop(),
+        _ => Some(AbilityCost::Composite { costs: legs }),
+    };
+}
+
+/// CR 601.2b + CR 601.2f: fold a mana-`{X}` activation's modifiers into its
+/// now-concrete cost under `snapshot.lock`'s order (the default when none was
+/// elected), write the result back, and carry the locked snapshot on.
+fn apply_activation_x_fold(pending: &mut PendingCast, snapshot: Box<ActivationCostSnapshot>) {
+    let folded = fold_activation_cost(
+        &snapshot.base_cost,
+        snapshot.raise_total,
+        &snapshot.reductions,
+        locked_activation_order(&snapshot),
+    );
+    split_activation_x_whole_cost(pending, folded);
+    pending.activation_cost_snapshot = Some(snapshot);
+}
+
+/// CR 601.2h + CR 602.2b: the locked total of an X-locked election must be
+/// payable before the payment step opens — otherwise an unpayable elected total
+/// would leave a payment prompt the caster can only cancel. The mana leg is
+/// judged by the feasibility authority the spell route uses before it opens a
+/// manual payment (`can_feasibly_pay_mana_cost`), the other legs by the
+/// announcement gate (`is_payable_for_activation`).
+fn ensure_x_locked_activation_payable(
+    state: &GameState,
+    player: PlayerId,
+) -> Result<(), EngineError> {
+    let pending = state.pending_cast.as_deref().ok_or_else(|| {
+        EngineError::InvalidAction("an X-locked activation must be pending".to_string())
+    })?;
+    let mana_payable = pending.cost.mana_value() == 0
+        || can_feasibly_pay_mana_cost(state, player, Some(pending.object_id), &pending.cost);
+    if mana_payable
+        && activation_x_whole_cost(pending).is_payable_for_activation(
+            state,
+            player,
+            pending.object_id,
+            pending.activation_ability_index,
+        )
+    {
+        Ok(())
+    } else {
+        Err(EngineError::ActionNotAllowed(
+            "Cannot pay activation cost".to_string(),
+        ))
+    }
+}
+
+/// CR 601.2b + CR 601.2f: the default-order mana total a deferred mana-`{X}`
+/// activation locks for a candidate X — the per-X authority behind the X cap and
+/// the X previews. `None` unless `pending` is such an activation.
+pub(super) fn deferred_activation_mana_for_x(pending: &PendingCast, x: u32) -> Option<ManaCost> {
+    let snapshot = pending.activation_cost_snapshot.as_deref()?;
+    if !matches!(
+        snapshot.lock,
+        ActivationCostLock::Open {
+            point: ActivationCostLockPoint::XAnnounced
+        }
+    ) {
+        return None;
+    }
+    let mut concrete = pending.clone();
+    concrete.cost.concretize_x(x);
+    let folded = fold_activation_cost(
+        &activation_x_whole_cost(&concrete),
+        snapshot.raise_total,
+        &snapshot.reductions,
+        None,
+    );
+    Some(activation_mana_component(&folded))
+}
+
+/// CR 601.2b + CR 601.2f + CR 602.2b: the `XAnnounced` lock. Runs once X has
+/// been concretized on the pending activation and before payment: re-captures
+/// the concrete whole cost as the fold base, and either locks the default order
+/// or — when two orders lock different totals — raises the election. The
+/// election may only be raised for an X the cheapest order can pay: the rest of
+/// the activation is dry-run on an owned clone under the default first, and an
+/// error rejects the X (CR 602.2 -> CR 601.2), as an unpayable X always has.
+/// `Ok(None)` means the lock ran (or did not apply) and the caller continues.
+pub(crate) fn lock_activation_cost_at_x(
+    state: &mut GameState,
+    player: PlayerId,
+    convoke_mode: Option<crate::types::game_state::ConvokeMode>,
+) -> Result<Option<WaitingFor>, EngineError> {
+    let Some(pending) = state.pending_cast.as_deref() else {
+        return Ok(None);
+    };
+    let Some(snapshot) = pending.activation_cost_snapshot.as_deref() else {
+        return Ok(None);
+    };
+    if !matches!(
+        snapshot.lock,
+        ActivationCostLock::Open {
+            point: ActivationCostLockPoint::XAnnounced
+        }
+    ) {
+        return Ok(None);
+    }
+    let mut snapshot = Box::new(snapshot.clone());
+    snapshot.base_cost = activation_x_whole_cost(pending);
+
+    if let Some(outcomes) = analyze_activation_cost_election(&snapshot) {
+        let mut dry_run = state.clone();
+        let object_id = pending.object_id;
+        {
+            let pending = dry_run
+                .pending_cast
+                .as_mut()
+                .expect("checked pending cast presence");
+            let mut locked = snapshot.clone();
+            locked.lock = ActivationCostLock::Locked {
+                point: ActivationCostLockPoint::XAnnounced,
+                order: None,
+            };
+            apply_activation_x_fold(pending, locked);
+        }
+        apply_post_x_cost_modifiers(&mut dry_run, player, object_id);
+        ensure_x_locked_activation_payable(&dry_run, player)?;
+        casting_costs::enter_payment_step(&mut dry_run, player, convoke_mode, &mut Vec::new())?;
+
+        let mut pending = *state
+            .pending_cast
+            .take()
+            .expect("checked pending cast presence");
+        let reductions = snapshot.reductions.clone();
+        pending.activation_cost_snapshot = Some(snapshot);
+        return Ok(Some(WaitingFor::OrderCostReductions {
+            player,
+            reductions,
+            hybrid_symbols: Vec::new(),
+            outcomes,
+            pending_cast: Box::new(pending),
+        }));
+    }
+
+    snapshot.lock = ActivationCostLock::Locked {
+        point: ActivationCostLockPoint::XAnnounced,
+        order: None,
+    };
+    let pending = state
+        .pending_cast
+        .as_mut()
+        .expect("checked pending cast presence");
+    apply_activation_x_fold(pending, snapshot);
+    Ok(None)
 }
 
 /// CR 602.2: the one activation path. `carrier` is `None` for a fresh
@@ -23504,7 +23713,7 @@ fn activate_with_cost_carrier(
     // itself is written only by the lock, further down.
     let mut carrier = match carrier {
         Some(snapshot) => {
-            if matches!(snapshot.lock, ActivationCostLock::Open) {
+            if matches!(snapshot.lock, ActivationCostLock::Open { .. }) {
                 debug_assert!(false, "an activation re-entered with an unlocked cost");
                 return Err(EngineError::InvalidAction(
                     "an activation re-entered with its cost still unlocked".to_string(),
@@ -23515,11 +23724,21 @@ fn activate_with_cost_carrier(
         None => ability_def.cost.clone().map(|base_cost| {
             let modifiers =
                 collect_activation_cost_modifiers(state, &ability_def, player, source_id);
+            // CR 601.2b + CR 601.2f: a MANA `{X}` is announced before the total
+            // cost is determined, and a floor counts the cost's mana, so such a
+            // lock waits for X. The discriminator is the typed cost structure
+            // (a mana leg carrying an `X` shard); a non-mana X (remove X
+            // counters, pay X energy) changes no mana and locks here.
+            let point = if casting_costs::extract_x_mana_cost(&base_cost).is_some() {
+                ActivationCostLockPoint::XAnnounced
+            } else {
+                ActivationCostLockPoint::Announcement
+            };
             Box::new(ActivationCostSnapshot {
                 base_cost,
                 raise_total: modifiers.raise_total,
                 reductions: modifiers.reductions,
-                lock: ActivationCostLock::Open,
+                lock: ActivationCostLock::Open { point },
             })
         }),
     };
@@ -23589,7 +23808,14 @@ fn activate_with_cost_carrier(
     // first mutation or payment, so every continuation below — modes, X, targets,
     // interactive costs and the `{0}` direct push — sees the locked total.
     let election = match carrier.as_deref() {
-        Some(snapshot) if matches!(snapshot.lock, ActivationCostLock::Open) => {
+        Some(snapshot)
+            if matches!(
+                snapshot.lock,
+                ActivationCostLock::Open {
+                    point: ActivationCostLockPoint::Announcement
+                }
+            ) =>
+        {
             analyze_activation_cost_election(snapshot)
         }
         _ => None,
@@ -23636,16 +23862,36 @@ fn activate_with_cost_carrier(
             pending_cast: Box::new(pending),
         });
     }
+    let mut deferred_to_x = false;
     if let Some(snapshot) = carrier.as_mut() {
-        if matches!(snapshot.lock, ActivationCostLock::Open) {
-            snapshot.lock = ActivationCostLock::Locked {
+        match snapshot.lock {
+            ActivationCostLock::Open {
                 point: ActivationCostLockPoint::Announcement,
-                order: None,
-            };
+            } => {
+                snapshot.lock = ActivationCostLock::Locked {
+                    point: ActivationCostLockPoint::Announcement,
+                    order: None,
+                };
+            }
+            ActivationCostLock::Open {
+                point: ActivationCostLockPoint::XAnnounced,
+            } => deferred_to_x = true,
+            ActivationCostLock::Locked { .. } => {}
         }
     }
-    // The lock is the only writer of the ability's cost.
-    ability_def.cost = preview_cost;
+    // The lock is the only writer of the ability's cost. A lock deferred to the
+    // X announcement leaves the printed cost unfolded: its `{X}` leg is folded,
+    // whole, once X is concrete (`lock_activation_cost_at_x`).
+    ability_def.cost = if deferred_to_x {
+        carrier.as_ref().map(|snapshot| snapshot.base_cost.clone())
+    } else {
+        preview_cost
+    };
+    // Every continuation below reads the cost the lock wrote, not the preview.
+    let activation_cost = ability_def
+        .cost
+        .clone()
+        .map(|cost| activation_cost_for_affordability(cost, ability_def.ability_tag));
 
     // CR 602.2b: Announce → choose modes → choose targets → pay costs.
     // Modal detection must happen BEFORE cost payment.

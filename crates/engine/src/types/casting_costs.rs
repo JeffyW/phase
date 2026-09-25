@@ -269,10 +269,15 @@ pub struct ActivationCostSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ActivationCostLock {
-    /// Not locked yet: the caster's CR 601.2f answer is outstanding. Held by
-    /// the pending activation a `WaitingFor::OrderCostReductions` prompt
-    /// carries.
-    Open,
+    /// Not locked yet. `point` is where it WILL lock: the pending activation a
+    /// `WaitingFor::OrderCostReductions` prompt carries names the continuation
+    /// its answer resumes, and a carrier whose lock was deferred past
+    /// announcement (a mana `{X}`, announced later — CR 601.2b before
+    /// CR 601.2f) names the later point that locks it.
+    Open {
+        #[serde(default)]
+        point: ActivationCostLockPoint,
+    },
     /// Locked exactly once, at `point`. `order` is the caster's elected
     /// reduction order; `None` means no order was observable, so the
     /// caster-optimal default governs.
@@ -284,13 +289,21 @@ pub enum ActivationCostLock {
     },
 }
 
-/// The fold point after which an activation's cost lock ran, and so where the
-/// activation resumes once the caster answers. Externally tagged so a later
-/// fold point can be added without changing `Announcement`'s bytes.
+/// The fold point after which an activation's cost lock runs, and so where the
+/// activation resumes once the caster answers. The contract every point obeys:
+/// a lock DEFERS while a later fold can still change the modifiers or the cost
+/// they apply to, and runs exactly once, after the final fold and before the
+/// first payment. Externally tagged so a later fold point can be added without
+/// changing an existing point's bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActivationCostLockPoint {
     /// CR 602.2b + CR 601.2b-f: the activation's announcement, where every
-    /// activation cost modifier this engine models is determined.
+    /// activation cost modifier this engine models is determined — the final
+    /// fold unless the cost carries a mana `{X}`.
     #[default]
     Announcement,
+    /// CR 601.2b + CR 601.2f: a mana `{X}` is announced before the total cost
+    /// is determined, so its reductions (and their floors, which count the
+    /// cost's mana) are folded and locked once X is chosen.
+    XAnnounced,
 }

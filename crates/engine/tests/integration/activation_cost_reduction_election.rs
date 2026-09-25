@@ -695,40 +695,147 @@ fn a_modal_activation_elects_before_choosing_modes() {
     assert_eq!(pool - board.pool(), 1);
 }
 
-/// `{X}`: the election precedes the X announcement. The `X` symbol counts as one
-/// mana toward a floor, so only a floor of two is observable here: −2 (floor
-/// two) and −2 (unfloored) on `{X}{3}` lock `{X}` or `{X}{1}`.
+/// The lock a pending activation's carrier currently holds.
+fn pending_lock(state: &GameState) -> ActivationCostLock {
+    let pending = match &state.waiting_for {
+        WaitingFor::ChooseXValue { pending_cast, .. }
+        | WaitingFor::OrderCostReductions { pending_cast, .. } => pending_cast.as_ref(),
+        _ => state
+            .pending_cast
+            .as_deref()
+            .expect("an in-flight activation"),
+    };
+    pending
+        .activation_cost_snapshot
+        .as_ref()
+        .expect("the carrier")
+        .lock
+        .clone()
+}
+
+/// CR 601.2b + CR 601.2f: a mana `{X}` is announced BEFORE the total cost is
+/// determined, and Training Grounds counts "the mana in that cost" — the
+/// announced X included. `{X}{1}` with Training Grounds: X=3 is `{4}` reduced to
+/// `{2}`; X=0 is `{1}`, which the floor leaves at `{1}`.
 #[test]
-fn an_x_activation_elects_before_announcing_x() {
+fn an_x_activation_is_priced_against_the_announced_x() {
+    for (x, paid) in [(3, 2), (0, 1)] {
+        let mut board = Board::with_activator(
+            &[Modifier::Grounds],
+            Activator::Oracle("{X}{1}: You gain X life."),
+            6,
+        );
+        board.activate().expect("legal");
+        assert!(
+            matches!(board.state().waiting_for, WaitingFor::ChooseXValue { .. }),
+            "X is announced first, got {:?}",
+            board.state().waiting_for
+        );
+        assert_eq!(
+            pending_lock(board.state()),
+            ActivationCostLock::Open {
+                point: ActivationCostLockPoint::XAnnounced
+            },
+            "a mana X defers the lock to its announcement"
+        );
+        let pool = board.pool();
+        board
+            .runner
+            .act(GameAction::ChooseX { value: x })
+            .expect("a legal X");
+        assert!(board.on_stack());
+        assert_eq!(pool - board.pool(), paid, "X={x}");
+    }
+}
+
+/// `{X}`: the election follows the X announcement, against the concrete cost.
+/// X=2 on `{X}{3}` is `{5}`: −2 (floor two) then −2 locks `{1}`; the reverse
+/// locks `{2}`. The prompt survives a serde round trip at this point.
+#[test]
+fn an_x_activation_elects_after_announcing_x() {
     let mut board = Board::with_activator(
         &[Modifier::FlooredTwo(2), Modifier::Unfloored(2)],
         Activator::Oracle("{X}{3}: You gain X life."),
         6,
     );
-    let before = board_snapshot(board.state());
     board.activate().expect("legal");
-    assert_same_json(
-        &before,
-        &board_snapshot(board.state()),
-        "the board at the prompt",
-    );
-    // The locked costs are `{X}` and `{X}{1}`. A mana value counts an unchosen
-    // X as 0 (the CR 202.3e convention), so their totals are 0 and 1.
-    assert_eq!(board.outcome_totals(), vec![0, 1]);
-    board.elect(1).expect("legal");
     let WaitingFor::ChooseXValue { .. } = board.state().waiting_for else {
         panic!(
             "expected the X announcement, got {:?}",
             board.state().waiting_for
         );
     };
-    assert_lock(
-        board
-            .state()
-            .pending_cast
-            .as_ref()
-            .and_then(|p| p.activation_cost_snapshot.as_deref()),
-        "the X prompt's pending activation",
+    let before = board_snapshot(board.state());
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 2 })
+        .expect("a legal X");
+    assert_same_json(
+        &before,
+        &board_snapshot(board.state()),
+        "the board at the prompt",
+    );
+    assert_eq!(board.outcome_totals(), vec![1, 2]);
+    assert_eq!(
+        pending_lock(board.state()),
+        ActivationCostLock::Open {
+            point: ActivationCostLockPoint::XAnnounced
+        }
+    );
+    let json = serde_json::to_string(board.state()).unwrap();
+    let restored: GameState = serde_json::from_str(&json).unwrap();
+    // `allows_cancel_cast` / `has_pending_cast` are derived at serialization,
+    // not restored; everything else survives.
+    let persisted = |mut value: serde_json::Value| {
+        let object = value.as_object_mut().unwrap();
+        object.remove("allows_cancel_cast");
+        object.remove("has_pending_cast");
+        value
+    };
+    assert_same_json(
+        &persisted(serde_json::from_str(&json).unwrap()),
+        &persisted(serde_json::to_value(&restored).unwrap()),
+        "the restored prompt",
+    );
+    *board.runner.state_mut() = restored;
+
+    let pool = board.pool();
+    board.elect(1).expect("legal");
+    assert!(board.on_stack());
+    assert_eq!(pool - board.pool(), 2, "the elected {{2}}");
+}
+
+/// Control: a NON-mana X (remove X counters) changes no mana, so its lock stays
+/// at announcement and the election precedes the X announcement.
+#[test]
+fn a_non_mana_x_activation_still_elects_at_announcement() {
+    let mut board = Board::with_activator(
+        &[Modifier::Grounds, Modifier::Unfloored(2)],
+        Activator::Oracle("{3}, Remove X +1/+1 counters from this creature: You gain X life."),
+        5,
+    );
+    let source = board.source;
+    board
+        .runner
+        .state_mut()
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .counters
+        .insert(engine::types::counter::CounterType::Plus1Plus1, 3);
+    board.activate().expect("legal");
+    assert_eq!(board.outcome_totals(), vec![0, 1]);
+    assert_eq!(
+        pending_lock(board.state()),
+        ActivationCostLock::Open {
+            point: ActivationCostLockPoint::Announcement
+        }
+    );
+    board.elect(1).expect("legal");
+    assert!(
+        matches!(board.state().waiting_for, WaitingFor::ChooseXValue { .. }),
+        "X is announced after the election, got {:?}",
+        board.state().waiting_for
     );
     let pool = board.pool();
     board
@@ -736,7 +843,100 @@ fn an_x_activation_elects_before_announcing_x() {
         .act(GameAction::ChooseX { value: 2 })
         .expect("a legal X");
     assert!(board.on_stack());
-    assert_eq!(pool - board.pool(), 3, "X=2 plus the elected {{1}}");
+    assert_eq!(pool - board.pool(), 1, "the elected {{1}}");
+}
+
+/// CR 601.2b + CR 601.2f: reductions raise the X cap. `{X}{3}` with Training
+/// Grounds and an unfloored −2, three mana: X=4 is `{7}` reduced to `{3}`.
+/// Folding at announcement would lock `{X}` for a cap of 3.
+#[test]
+fn reductions_raise_the_x_cap_of_a_deferred_activation() {
+    let mut board = Board::with_activator(
+        &[Modifier::Grounds, Modifier::Unfloored(2)],
+        Activator::Oracle("{X}{3}: You gain X life."),
+        3,
+    );
+    board.activate().expect("legal");
+    let WaitingFor::ChooseXValue {
+        max,
+        ref x_cost_previews,
+        ..
+    } = board.state().waiting_for
+    else {
+        panic!("expected the X announcement");
+    };
+    assert_eq!(max, 4);
+    let preview = |x: u32| {
+        x_cost_previews
+            .iter()
+            .find(|(value, _)| *value == x)
+            .map(|(_, cost)| cost.mana_value())
+    };
+    assert_eq!(preview(0), Some(0));
+    assert_eq!(preview(4), Some(3));
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 4 })
+        .expect("the cap is affordable");
+    assert!(board.on_stack());
+    assert_eq!(board.pool(), 0);
+}
+
+/// CR 601.2h + CR 602.2b: an unpayable elected total at the X lock reverses the
+/// activation. X precedes every cost on this route, so NOTHING was paid: the
+/// board is the board from before the activation. (The activation was accepted
+/// at `ActivateAbility`, so this is the `CancelCast`-from-`ChooseXValue`
+/// reversal, not the pre-announcement one.)
+#[test]
+fn an_unpayable_election_at_the_x_lock_reverses_with_nothing_paid() {
+    // X=0 on {X}{5}: −2 (floor two) then −3 locks {0}; the reverse locks {2}.
+    let mut board = Board::with_activator(
+        &[Modifier::FlooredTwo(2), Modifier::Unfloored(3)],
+        Activator::Oracle("{X}{5}, {T}: You gain X life."),
+        1,
+    );
+    let before = board_snapshot(board.state());
+    board.activate().expect("legal");
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 0 })
+        .expect("a legal X");
+    assert_eq!(board.outcome_totals(), vec![0, 2]);
+    let result = board.elect(1).expect("a legal election is not an error");
+    assert_eq!(result.disposition, ActionDisposition::Reversed);
+    assert!(matches!(result.waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert!(board.state().pending_cast.is_none());
+    assert!(!board.state().objects[&board.source].tapped, "no tap paid");
+    assert_same_json(
+        &before,
+        &board_snapshot(board.state()),
+        "after the reversal",
+    );
+}
+
+/// CR 602.2a + CR 732.2a: a deferred X lock comes after acceptance, so the
+/// election at the X lock records no second loop step.
+#[test]
+fn an_x_lock_election_records_its_loop_step_exactly_once() {
+    let mut board = loop_board(
+        &[Modifier::FlooredTwo(2), Modifier::Unfloored(2)],
+        "{X}{3}: Create X 1/1 white Soldier creature tokens.",
+        6,
+    );
+    board.activate().expect("legal");
+    assert_eq!(
+        board.state().last_loop_action_sequence.len(),
+        1,
+        "accepted at ActivateAbility"
+    );
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 2 })
+        .expect("a legal X");
+    assert_eq!(board.outcome_totals(), vec![1, 2]);
+    board.elect(0).expect("legal");
+    assert!(board.on_stack());
+    assert_eq!(board.state().last_loop_action_sequence.len(), 1);
 }
 
 /// Targets: the election precedes target selection, and the target prompt's

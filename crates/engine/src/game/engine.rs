@@ -11688,9 +11688,13 @@ fn apply_non_priority_pass_action(
                 hybrid_announcement,
             },
         ) if pending_cast.activation_cost_snapshot.is_some() => {
-            // CR 601.2f + CR 602.2b: an ACTIVATION's election. The acceptance
-            // authority brackets the resume exactly as it brackets
-            // `ActivateAbility`, and records only if the activation continued.
+            // CR 601.2f + CR 602.2b: an ACTIVATION's election. An election raised
+            // at announcement stopped BEFORE the activation was accepted, so the
+            // acceptance authority brackets its resume exactly as it brackets
+            // `ActivateAbility` and records only if the activation continued. An
+            // election raised once X was announced comes after acceptance: the
+            // activation was already accepted (and recorded) at `ActivateAbility`,
+            // so it is not accepted a second time.
             let player = *player;
             let (source_id, ability_index) = (
                 pending_cast.object_id,
@@ -11700,7 +11704,18 @@ fn apply_non_priority_pass_action(
                     )
                 })?,
             );
-            let _ = begin_non_mana_activation(state, player);
+            let accepts_here = matches!(
+                pending_cast
+                    .activation_cost_snapshot
+                    .as_deref()
+                    .map(|snapshot| &snapshot.lock),
+                Some(crate::types::casting_costs::ActivationCostLock::Open {
+                    point: crate::types::casting_costs::ActivationCostLockPoint::Announcement,
+                })
+            );
+            if accepts_here {
+                let _ = begin_non_mana_activation(state, player);
+            }
             match engine_casting::resume_activation_cost_election(
                 state,
                 player,
@@ -11711,7 +11726,14 @@ fn apply_non_priority_pass_action(
                 &mut events,
             )? {
                 casting::ActivationElectionResume::Continued(wf) => {
-                    record_non_mana_activation_accepted(state, player, source_id, ability_index);
+                    if accepts_here {
+                        record_non_mana_activation_accepted(
+                            state,
+                            player,
+                            source_id,
+                            ability_index,
+                        );
+                    }
                     *wf
                 }
                 // CR 601.2h: the elected total cannot be paid, so the activation
@@ -12874,14 +12896,22 @@ fn apply_non_priority_pass_action(
                 object_id,
                 value,
             });
-            // CR 601.2b + CR 601.2f: X is now locked in. Re-derive the full
-            // concrete cost from the captured base — all reductions, target-
-            // dependent modifiers, and Strive re-applied, with floors (Trinisphere
-            // class) run LAST — against the now-concrete total, before payment is
-            // determined. (Legacy/in-flight pending casts without a captured base
-            // fall back to flooring the already-concretized cost.)
-            casting::apply_post_x_cost_modifiers(state, player, object_id);
-            casting_costs::enter_payment_step(state, player, convoke_mode, &mut events)?
+            // CR 601.2b + CR 601.2f + CR 602.2b: an activation whose mana `{X}`
+            // deferred its cost lock locks it now, against the concrete cost —
+            // and may raise the reduction-order election here.
+            if let Some(prompt) = casting::lock_activation_cost_at_x(state, player, convoke_mode)? {
+                prompt
+            } else {
+                // CR 601.2b + CR 601.2f: X is now locked in. Re-derive the full
+                // concrete cost from the captured base — all reductions, target-
+                // dependent modifiers, and Strive re-applied, with floors
+                // (Trinisphere class) run LAST — against the now-concrete total,
+                // before payment is determined. (Legacy/in-flight pending casts
+                // without a captured base fall back to flooring the
+                // already-concretized cost.)
+                casting::apply_post_x_cost_modifiers(state, player, object_id);
+                casting_costs::enter_payment_step(state, player, convoke_mode, &mut events)?
+            }
         }
         // CR 601.2c + CR 115.1: The spell controller chose which opponent announces
         // an "of an opponent's choice" target slot. Record it on the in-flight cast
