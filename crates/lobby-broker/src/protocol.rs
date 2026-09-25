@@ -1851,7 +1851,7 @@ mod tests {
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 78);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 79);
     }
 
     #[test]
