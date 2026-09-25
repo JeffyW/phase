@@ -205,10 +205,10 @@ pub(crate) fn parse_saga_chapters(lines: &[&str], _card_name: &str) -> SagaChapt
             // duration to `UntilHostLeavesPlay` when the chapter text has no explicit
             // duration suffix.
             promote_grant_duration_for_chapter(&mut execute, effect_text);
-            // CR 700.2b + CR 603.5: a "you may choose one —" chapter is optional.
-            // The resolving execute ability already carries the flag; stamp the
-            // definition too, as the block-level modal lowering does, so coverage
-            // and card-data export see it.
+            // CR 603.3c + CR 700.2b: a "you may choose one —" chapter lets the
+            // controller choose no mode. The resolving execute ability already
+            // carries the flag; stamp the definition too, as the block-level
+            // modal lowering does, so coverage and card-data export see it.
             let optional = execute.modal.is_some() && execute.optional;
             let mut trigger = TriggerDefinition::new(TriggerMode::CounterAdded)
                 .valid_card(TargetFilter::SelfRef)
@@ -612,9 +612,10 @@ mod tests {
         assert_eq!(bare, Some(Duration::UntilHostLeavesPlay));
     }
 
-    /// CR 700.2b + CR 603.5: "You may choose one —" lets the controller decline,
-    /// so the chapter's resolving ability and its trigger are optional, while
-    /// `min_choices` stays 1. The plain "Choose one —" chapter is the control.
+    /// CR 603.3c + CR 700.2b: "You may choose one —" lets the controller choose
+    /// no mode, so the chapter's resolving ability and its trigger are marked
+    /// optional (the engine's model of that decline), while `min_choices` stays
+    /// 1. The plain "Choose one —" chapter is the control.
     #[test]
     fn you_may_choose_one_chapter_is_optional() {
         for (header, optional) in [

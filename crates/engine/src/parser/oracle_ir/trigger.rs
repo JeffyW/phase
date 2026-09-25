@@ -204,9 +204,11 @@ pub(crate) struct ModalIr {
     pub(crate) marker: EffectChainIr,
     pub(crate) choice: ModalChoice,
     pub(crate) modes: Vec<ModalModeIr>,
-    /// CR 700.2b + CR 603.5: whether the header lets the controller decline
-    /// ("you may choose one —"). `ModalChoice.min_choices` stays 1 either way;
-    /// declining is resolution-time optionality on the ability that resolves.
+    /// CR 603.3c + CR 700.2b: whether the header lets the controller choose no
+    /// mode ("you may choose one —"); the modal choice, including choosing none,
+    /// is made as the ability is put on the stack. The engine models the decline
+    /// as `optional` on the ability that resolves, as the block-level modal
+    /// lowering does, so `ModalChoice.min_choices` stays 1 either way.
     pub(crate) optionality: ModalOptionality,
 }
 

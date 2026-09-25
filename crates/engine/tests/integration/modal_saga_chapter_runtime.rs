@@ -140,13 +140,23 @@ fn chosen_mode_of_a_modal_chapter_resolves_alone() {
     );
 }
 
+/// Which bullet of Summon: Magus Sisters' chapter resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MagusMode {
+    CombinePowers,
+    Defense,
+    Fight,
+}
+
+/// Fire Summon: Magus Sisters' chapter I in a game seeded with `seed` and
+/// return the mode that resolved.
+///
 /// CR 700.2 + CR 700.2b: a "choose one at random" chapter resolves exactly one
-/// mode, whichever the game picks. The old sequential chain gained 3 life with
-/// no shield counter and no +1/+1 counters — a result no single mode produces —
-/// so these assertions hold for every mode and fail only for that chain.
-#[test]
-fn random_mode_of_a_modal_chapter_resolves_exactly_one_mode() {
-    let mut scenario = GameScenario::new();
+/// mode. The old sequential chain gained 3 life with no shield counter and no
+/// +1/+1 counters, a result no single mode produces, so the two assertions
+/// below hold for every mode and fail only for that chain.
+fn magus_chapter_one_mode(seed: u64) -> MagusMode {
+    let mut scenario = GameScenario::new_n_player(2, seed);
     scenario.at_phase(Phase::PreCombatMain);
     let saga = scenario
         .add_creature(P0, "Summon: Magus Sisters", 5, 5)
@@ -188,12 +198,42 @@ fn random_mode_of_a_modal_chapter_resolves_exactly_one_mode() {
         .count();
     assert_eq!(
         applied, 1,
-        "exactly one mode must resolve: combine_powers={combine_powers} \
+        "seed {seed}: exactly one mode must resolve: combine_powers={combine_powers} \
          defense={defense} fight={fight}"
     );
     assert_eq!(
         gained_life, defense,
-        "3 life belongs to the Defense! mode only: gained_life={gained_life} \
+        "seed {seed}: 3 life belongs to the Defense! mode only: gained_life={gained_life} \
          defense={defense}"
     );
+    if combine_powers {
+        MagusMode::CombinePowers
+    } else if defense {
+        MagusMode::Defense
+    } else {
+        MagusMode::Fight
+    }
+}
+
+/// CR 700.2 + CR 700.2b: a "choose one at random" chapter resolves exactly one
+/// mode, whichever the game picks. Each seed below was measured to pick a
+/// different mode, so all three bullets are exercised; the helper's two
+/// assertions (exactly one mode applied, life only with Defense!) hold on every
+/// run. Seed 42 is the default `GameScenario::new()` seed the single-run version
+/// of this test used; pinning it too means a change in how the game draws the
+/// random mode shows up here rather than silently shifting coverage.
+#[test]
+fn random_mode_of_a_modal_chapter_resolves_exactly_one_mode() {
+    for (seed, expected) in [
+        (0, MagusMode::CombinePowers),
+        (1, MagusMode::Defense),
+        (2, MagusMode::Fight),
+        (42, MagusMode::CombinePowers),
+    ] {
+        assert_eq!(
+            magus_chapter_one_mode(seed),
+            expected,
+            "seed {seed} must pick {expected:?}"
+        );
+    }
 }
