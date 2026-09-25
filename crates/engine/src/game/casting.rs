@@ -25362,7 +25362,7 @@ fn activation_totals_zero_one_floors(x: u32, steps: &[(u32, u32)]) -> Vec<(u32, 
     };
     let s0: u32 = steps.iter().filter(|s| s.1 == 0).map(|s| s.0).sum();
     let s1: u32 = steps.iter().filter(|s| s.1 == 1).map(|s| s.0).sum();
-    if x >= s0 + s1 + 1 {
+    if x > s0 + s1 {
         return vec![(x - s0 - s1, (0..steps.len()).collect())];
     }
     let mut totals = Vec::new();
@@ -25375,7 +25375,7 @@ fn activation_totals_zero_one_floors(x: u32, steps: &[(u32, u32)]) -> Vec<(u32, 
         // The default: floor-1 reducers first, then floor-0.
         totals.push((0, by_floor(1).chain(by_floor(0)).collect()));
     }
-    if x >= s0 + 1 {
+    if x > s0 {
         totals.push((1, by_floor(0).chain(by_floor(1)).collect()));
     }
     totals
