@@ -105,8 +105,20 @@ impl Board {
     }
 
     fn with_activator(modifiers: &[Modifier], activator: Activator, pool: usize) -> Self {
+        Self::with_setup(modifiers, activator, pool, |_| {})
+    }
+
+    /// As [`Board::with_activator`], with `setup` run on the scenario before it
+    /// is built (to add pieces that are not cost modifiers, such as lands).
+    fn with_setup(
+        modifiers: &[Modifier],
+        activator: Activator,
+        pool: usize,
+        setup: impl FnOnce(&mut GameScenario),
+    ) -> Self {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
+        setup(&mut scenario);
         for (i, modifier) in modifiers.iter().enumerate() {
             match modifier {
                 Modifier::Grounds => {
@@ -914,8 +926,9 @@ fn an_unpayable_election_at_the_x_lock_reverses_with_nothing_paid() {
     );
 }
 
-/// CR 602.2a + CR 732.2a: a deferred X lock comes after acceptance, so the
-/// election at the X lock records no second loop step.
+/// CR 602.2a + CR 732.2a: an activation is accepted where its cost locks, so a
+/// deferred X lock records its loop step at the lock — once — not at
+/// `ActivateAbility`.
 #[test]
 fn an_x_lock_election_records_its_loop_step_exactly_once() {
     let mut board = loop_board(
@@ -924,19 +937,216 @@ fn an_x_lock_election_records_its_loop_step_exactly_once() {
         6,
     );
     board.activate().expect("legal");
-    assert_eq!(
-        board.state().last_loop_action_sequence.len(),
-        1,
-        "accepted at ActivateAbility"
+    assert!(
+        board.state().last_loop_action_sequence.is_empty(),
+        "not accepted before its cost locks"
     );
     board
         .runner
         .act(GameAction::ChooseX { value: 2 })
         .expect("a legal X");
     assert_eq!(board.outcome_totals(), vec![1, 2]);
+    assert!(board.state().last_loop_action_sequence.is_empty());
     board.elect(0).expect("legal");
     assert!(board.on_stack());
     assert_eq!(board.state().last_loop_action_sequence.len(), 1);
+
+    // Without an election the X lock itself accepts, once.
+    let mut board = loop_board(
+        &[Modifier::Grounds],
+        "{X}{3}: Create X 1/1 white Soldier creature tokens.",
+        6,
+    );
+    board.activate().expect("legal");
+    assert!(board.state().last_loop_action_sequence.is_empty());
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 2 })
+        .expect("a legal X");
+    assert!(board.on_stack());
+    assert_eq!(board.state().last_loop_action_sequence.len(), 1);
+}
+
+/// CR 601.2h + CR 733.1 + CR 733.2: the X-lock reversal reverses the ENTIRE
+/// activation — including the bookkeeping of a real manual mana-ability
+/// activation made before it and an accumulating loop period. The land's mana
+/// stays undoable afterwards, the loop period is exactly as it was, and the
+/// player has priority. The same holds for the player's own cancel at the X
+/// prompt; the default order, by contrast, is accepted exactly once.
+#[test]
+fn an_x_lock_reversal_restores_the_mana_undo_window_and_the_loop_period() {
+    const TEXT: &str = "{X}{5}: Create X 1/1 white Soldier creature tokens.";
+    let build = || {
+        let mut land = None;
+        let mut board = Board::with_setup(
+            &[Modifier::FlooredTwo(2), Modifier::Unfloored(3)],
+            Activator::Oracle(TEXT),
+            0,
+            |scenario| {
+                land = Some(scenario.add_basic_land(P0, engine::types::mana::ManaColor::White));
+            },
+        );
+        let land = land.expect("the land");
+        board.runner.state_mut().loop_detection = engine::types::game_state::LoopDetectionMode::On;
+        // An accumulating loop period for this controller: an accepted
+        // activation would APPEND to it.
+        let card_id = board.state().objects[&board.source].card_id;
+        board.runner.state_mut().last_loop_action_sequence =
+            vec![engine::types::game_state::LoopActionContext {
+                card_id,
+                controller: P0,
+                action: engine::types::game_state::LoopAction::Activate {
+                    source_id: board.source,
+                    ability_index: board.ability_index,
+                },
+                convoke: None,
+                pins: Vec::new(),
+            }];
+        // A real manual mana-ability activation, through the engine-authored
+        // selection.
+        let (_, _, grouped) = engine::ai_support::legal_actions_full(board.state());
+        let selection = grouped
+            .get(&land)
+            .into_iter()
+            .flatten()
+            .find_map(|action| match action {
+                GameAction::TapLandForMana { selection } => Some(selection.clone()),
+                _ => None,
+            })
+            .expect("the engine authors the land's mana selection");
+        board
+            .runner
+            .act(GameAction::TapLandForMana { selection })
+            .expect("tap the land");
+        assert_eq!(
+            board.state().lands_tapped_for_mana.get(&P0),
+            Some(&vec![land]),
+            "reach guard: the tap opened a mana-undo window"
+        );
+        (board, land)
+    };
+
+    // The elected {2} cannot be paid from the land's one mana: reversed.
+    let (mut board, land) = build();
+    let before = board_snapshot(board.state());
+    board.activate().expect("legal");
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 0 })
+        .expect("a legal X");
+    assert_eq!(board.outcome_totals(), vec![0, 2]);
+    let result = board.elect(1).expect("a legal election is not an error");
+    assert_eq!(result.disposition, ActionDisposition::Reversed);
+    assert!(matches!(result.waiting_for, WaitingFor::Priority { player } if player == P0));
+    assert_same_json(
+        &before,
+        &board_snapshot(board.state()),
+        "after the X-lock reversal",
+    );
+    board
+        .runner
+        .act(GameAction::UntapLandForMana { object_id: land })
+        .expect("the mana-undo window survived the reversal");
+    assert!(!board.state().objects[&land].tapped);
+
+    // The player's own cancel at the X prompt reverses the same way.
+    let (mut board, land) = build();
+    let before = board_snapshot(board.state());
+    board.activate().expect("legal");
+    board.runner.act(GameAction::CancelCast).expect("cancel");
+    assert_same_json(
+        &before,
+        &board_snapshot(board.state()),
+        "after cancelling at the X prompt",
+    );
+    board
+        .runner
+        .act(GameAction::UntapLandForMana { object_id: land })
+        .expect("the mana-undo window survived the cancel");
+
+    // Control: the default order is accepted, exactly once.
+    let (mut board, _) = build();
+    let steps = board.state().last_loop_action_sequence.len();
+    board.activate().expect("legal");
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 0 })
+        .expect("a legal X");
+    let result = board.elect(0).expect("legal");
+    assert_eq!(result.disposition, ActionDisposition::Applied);
+    assert!(board.on_stack());
+    assert_eq!(board.state().last_loop_action_sequence.len(), steps + 1);
+    assert!(
+        !board.state().lands_tapped_for_mana.contains_key(&P0),
+        "the accepted activation closed the mana-undo window"
+    );
+}
+
+/// CR 601.2b: a modal mana-`{X}` activation announces X with its modes — before
+/// targets and before any cost (CR 601.2c, CR 601.2h) — so its X is priced and
+/// its discard paid only after X. `{X}{3}, Discard a card` with Training
+/// Grounds, X=2: `{5}` reduced to `{3}`. (X used to be skipped on this route,
+/// the discard paid first and X silently 0.)
+#[test]
+fn a_modal_x_activation_announces_x_before_targets_and_costs() {
+    let mut board = Board::with_activator(
+        &[Modifier::Grounds],
+        Activator::Oracle(
+            "{X}{3}, Discard a card: Choose one —\n• You gain X life.\n• This creature deals 1 damage to any target.",
+        ),
+        5,
+    );
+    let card = {
+        let state = board.runner.state_mut();
+        let id = engine::game::zones::create_object(
+            state,
+            engine::types::identifiers::CardId(8_801),
+            P0,
+            "Discard Fodder".to_string(),
+            engine::types::zones::Zone::Hand,
+        );
+        engine::game::layers::evaluate_layers(state);
+        id
+    };
+    board.activate().expect("legal");
+    board
+        .runner
+        .act(GameAction::SelectModes { indices: vec![1] })
+        .expect("a legal mode");
+    assert!(
+        matches!(board.state().waiting_for, WaitingFor::ChooseXValue { .. }),
+        "X follows the modes, got {:?}",
+        board.state().waiting_for
+    );
+    board
+        .runner
+        .act(GameAction::ChooseX { value: 2 })
+        .expect("a legal X");
+    assert!(
+        matches!(
+            board.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "targets follow X, got {:?}",
+        board.state().waiting_for
+    );
+    let pool = board.pool();
+    board
+        .runner
+        .act(GameAction::SelectTargets {
+            targets: vec![engine::types::ability::TargetRef::Player(P1)],
+        })
+        .expect("a legal target");
+    board
+        .runner
+        .act(GameAction::SelectCards { cards: vec![card] })
+        .expect("a legal discard");
+    assert!(board.on_stack());
+    assert_eq!(pool - board.pool(), 3);
+    assert!(
+        board.state().players[0].hand.is_empty(),
+        "the discard was paid"
+    );
 }
 
 /// Targets: the election precedes target selection, and the target prompt's

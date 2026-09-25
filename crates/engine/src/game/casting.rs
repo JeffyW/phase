@@ -23383,8 +23383,10 @@ pub(crate) enum ActivationElectionResume {
 ///   locked under that order. Sound because this lock precedes every mutation:
 ///   nothing changed between the prompt and this answer.
 /// * `XAnnounced`: the announced X is already on the pending activation; re-fold
-///   its concrete cost under the elected order and continue to payment. The
-///   activation was accepted at announcement, so nothing is re-announced.
+///   its concrete cost under the elected order and continue to payment. Its
+///   modes and X were announced before the lock (its targets and costs follow
+///   it), so nothing is re-announced. The caller accepts the activation if it
+///   continues.
 pub(crate) fn resume_activation_after_cost_election(
     state: &mut GameState,
     player: PlayerId,

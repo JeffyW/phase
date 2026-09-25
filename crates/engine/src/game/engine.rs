@@ -5971,6 +5971,37 @@ fn restore_non_mana_activation(
     }
 }
 
+/// CR 601.2f + CR 602.2: whether the in-flight activation `waiting_for` is
+/// paused on still has an OPEN cost lock. The acceptance authority runs where
+/// the cost locks: an activation paused before its lock (at its cost election,
+/// or with its lock deferred to a later point such as the X announcement) has
+/// not been accepted, so reversing it — by the player's cancel or because the
+/// locked total proves unpayable (CR 601.2h -> CR 733.1) — has no acceptance
+/// bookkeeping to undo.
+fn activation_cost_still_open(state: &GameState, waiting_for: &WaitingFor) -> bool {
+    let carrier = match waiting_for {
+        WaitingFor::OrderCostReductions { pending_cast, .. }
+        | WaitingFor::ChooseXValue { pending_cast, .. }
+        | WaitingFor::TargetSelection { pending_cast, .. } => {
+            pending_cast.activation_cost_snapshot.as_deref()
+        }
+        WaitingFor::AbilityModeChoice {
+            activation_cost_snapshot,
+            ..
+        } => activation_cost_snapshot.as_deref(),
+        _ => state
+            .pending_cast
+            .as_deref()
+            .and_then(|pending| pending.activation_cost_snapshot.as_deref()),
+    };
+    carrier.is_some_and(|snapshot| {
+        matches!(
+            snapshot.lock,
+            crate::types::casting_costs::ActivationCostLock::Open { .. }
+        )
+    })
+}
+
 /// CR 602.2a + CR 732.2a: the acceptance authority, phase two — record an
 /// ACCEPTED non-mana activation into the current loop period. Recorded at
 /// acceptance, not at stack placement, because `record_loop_pin` attaches the
@@ -10737,15 +10768,11 @@ fn apply_action(
     // CR 723.5a: the tracking records whose resources were spent, so it is keyed
     // to the seat that spent them, as the insert side already is.
     match &action {
-        // CR 601.2f: cancelling an ACTIVATION's cost election reverses an
-        // activation that never began paying; its mana-undo window was left
-        // intact at the prompt and must survive the reversal.
-        GameAction::CancelCast
-            if matches!(
-                &state.waiting_for,
-                WaitingFor::OrderCostReductions { pending_cast, .. }
-                    if pending_cast.activation_cost_snapshot.is_some()
-            ) => {}
+        // CR 601.2f + CR 602.2: cancelling an activation whose cost has not
+        // locked (its cost election, or a prompt before a deferred lock) reverses
+        // an activation that was never accepted; its mana-undo window was left
+        // intact and must survive the reversal.
+        GameAction::CancelCast if activation_cost_still_open(state, &state.waiting_for) => {}
         GameAction::PassPriority
         | GameAction::PlayLand { .. }
         | GameAction::CastSpell { .. }
@@ -11073,10 +11100,13 @@ fn apply_non_priority_pass_action(
                     ability_index,
                     &mut events,
                 )?;
-                if matches!(wf, WaitingFor::OrderCostReductions { .. }) {
-                    // CR 601.2f: the activation stopped at its cost election, before
-                    // anything was accepted — leave the mana-undo window as it was,
-                    // so a reversal returns to exactly the pre-activation state.
+                if activation_cost_still_open(state, &wf) {
+                    // CR 601.2f + CR 602.2: the activation stopped before its cost
+                    // locked (at its cost election, or deferred to its X
+                    // announcement), so it is not accepted yet — leave the
+                    // mana-undo window as it was and record no loop step, so a
+                    // reversal before the lock returns to exactly the
+                    // pre-activation state. The lock accepts it.
                     restore_non_mana_activation(state, *player, cleared);
                 } else {
                     record_non_mana_activation_accepted(state, *player, source_id, ability_index);
@@ -11688,13 +11718,12 @@ fn apply_non_priority_pass_action(
                 hybrid_announcement,
             },
         ) if pending_cast.activation_cost_snapshot.is_some() => {
-            // CR 601.2f + CR 602.2b: an ACTIVATION's election. An election raised
-            // at announcement stopped BEFORE the activation was accepted, so the
-            // acceptance authority brackets its resume exactly as it brackets
-            // `ActivateAbility` and records only if the activation continued. An
-            // election raised once X was announced comes after acceptance: the
-            // activation was already accepted (and recorded) at `ActivateAbility`,
-            // so it is not accepted a second time.
+            // CR 601.2f + CR 602.2b: an ACTIVATION's election. The election is
+            // raised by the cost lock — at announcement or once X is announced —
+            // and an activation is accepted where its cost locks, so it has not
+            // been accepted yet. The acceptance authority brackets the resume
+            // exactly as it brackets `ActivateAbility`, and records only if the
+            // activation continued.
             let player = *player;
             let (source_id, ability_index) = (
                 pending_cast.object_id,
@@ -11704,18 +11733,7 @@ fn apply_non_priority_pass_action(
                     )
                 })?,
             );
-            let accepts_here = matches!(
-                pending_cast
-                    .activation_cost_snapshot
-                    .as_deref()
-                    .map(|snapshot| &snapshot.lock),
-                Some(crate::types::casting_costs::ActivationCostLock::Open {
-                    point: crate::types::casting_costs::ActivationCostLockPoint::Announcement,
-                })
-            );
-            if accepts_here {
-                let _ = begin_non_mana_activation(state, player);
-            }
+            let _ = begin_non_mana_activation(state, player);
             match engine_casting::resume_activation_cost_election(
                 state,
                 player,
@@ -11726,14 +11744,7 @@ fn apply_non_priority_pass_action(
                 &mut events,
             )? {
                 casting::ActivationElectionResume::Continued(wf) => {
-                    if accepts_here {
-                        record_non_mana_activation_accepted(
-                            state,
-                            player,
-                            source_id,
-                            ability_index,
-                        );
-                    }
+                    record_non_mana_activation_accepted(state, player, source_id, ability_index);
                     *wf
                 }
                 // CR 601.2h: the elected total cannot be paid, so the activation
@@ -12898,10 +12909,34 @@ fn apply_non_priority_pass_action(
             });
             // CR 601.2b + CR 601.2f + CR 602.2b: an activation whose mana `{X}`
             // deferred its cost lock locks it now, against the concrete cost —
-            // and may raise the reduction-order election here.
+            // and may raise the reduction-order election here. The activation is
+            // accepted where its cost locks, so a lock that completes here (no
+            // election) runs the acceptance authority; an election accepts on
+            // its resume instead.
+            let x_lock_acceptance = state
+                .pending_cast
+                .as_deref()
+                .filter(|pending| {
+                    pending.activation_cost_snapshot.as_deref().is_some_and(|snapshot| {
+                        matches!(
+                            snapshot.lock,
+                            crate::types::casting_costs::ActivationCostLock::Open {
+                                point: crate::types::casting_costs::ActivationCostLockPoint::XAnnounced,
+                            }
+                        )
+                    })
+                })
+                .and_then(|pending| {
+                    pending
+                        .activation_ability_index
+                        .map(|index| (pending.object_id, index))
+                });
             if let Some(prompt) = casting::lock_activation_cost_at_x(state, player, convoke_mode)? {
                 prompt
             } else {
+                if x_lock_acceptance.is_some() {
+                    let _ = begin_non_mana_activation(state, player);
+                }
                 // CR 601.2b + CR 601.2f: X is now locked in. Re-derive the full
                 // concrete cost from the captured base — all reductions, target-
                 // dependent modifiers, and Strive re-applied, with floors
@@ -12910,7 +12945,12 @@ fn apply_non_priority_pass_action(
                 // without a captured base fall back to flooring the
                 // already-concretized cost.)
                 casting::apply_post_x_cost_modifiers(state, player, object_id);
-                casting_costs::enter_payment_step(state, player, convoke_mode, &mut events)?
+                let wf =
+                    casting_costs::enter_payment_step(state, player, convoke_mode, &mut events)?;
+                if let Some((source_id, ability_index)) = x_lock_acceptance {
+                    record_non_mana_activation_accepted(state, player, source_id, ability_index);
+                }
+                wf
             }
         }
         // CR 601.2c + CR 115.1: The spell controller chose which opponent announces
