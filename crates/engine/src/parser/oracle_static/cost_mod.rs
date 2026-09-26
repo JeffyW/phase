@@ -210,6 +210,24 @@ pub(crate) fn split_ability_target_restriction(
     Ok(("", (i.trim(), None)))
 }
 
+/// [`split_ability_target_restriction`] for a phrase that must carry NOTHING
+/// but an optional target restriction between its ability subject and ` cost`.
+/// Any other qualifier there ("equip abilities you activate OF OTHER
+/// EQUIPMENT cost …") restricts which abilities the modifier applies to, and
+/// this parser has no field for it, so the line is refused (a nom `Verify`
+/// error) rather than emitted as a broader, unrestricted modifier.
+pub(crate) fn split_bare_ability_target_restriction(
+    i: &str,
+) -> OracleResult<'_, Option<TargetFilter>> {
+    map(
+        nom::combinator::verify(split_ability_target_restriction, |(residue, _)| {
+            residue.trim().is_empty()
+        }),
+        |(_, targets)| targets,
+    )
+    .parse(i)
+}
+
 pub(crate) fn parse_activated_cost_reduction_minimum_mana(lower: &str) -> Option<u32> {
     preceded(
         take_until::<_, _, OracleError<'_>>(

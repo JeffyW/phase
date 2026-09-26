@@ -1840,3 +1840,188 @@ fn a_divided_activation_is_accepted_at_its_settlement_lock_after_the_split() {
     );
     assert_route(&mut b, "R9 divided, accepted", 4);
 }
+
+// ---------------------------------------------------------------------------
+// Review round 4: a self rider whose CONDITION reads the chosen target.
+// ---------------------------------------------------------------------------
+
+/// Gives `src`'s first ability `rider`, on both its printed and its live
+/// ability lists, so a layer pass keeps it.
+fn set_cost_rider(
+    r: &mut GameRunner,
+    src: ObjectId,
+    rider: Option<engine::types::ability::CostReduction>,
+) {
+    let obj = r.state_mut().objects.get_mut(&src).unwrap();
+    std::sync::Arc::make_mut(&mut obj.base_abilities)[0].cost_reduction = rider.clone();
+    std::sync::Arc::make_mut(&mut obj.abilities)[0].cost_reduction = rider;
+}
+
+/// `{3}: Tap target creature`, with a self rider "costs {2} less to activate if
+/// the targeted object's mana value is 3 or more", built at the building-block
+/// level (no printed card has this shape; the class is any rider whose
+/// `QuantityComparison` reads `ObjectManaValue { scope: Target }`).
+fn target_mana_value_rider_paid(target_mana_value: u32) -> usize {
+    use engine::types::ability::{
+        CostReduction, ObjectScope, ParsedCondition, QuantityExpr, QuantityRef,
+    };
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let target = s
+        .add_creature(P1, "Target", 2, 2)
+        .with_mana_cost(ManaCost::generic(target_mana_value))
+        .id();
+    s.add_creature(P1, "Other", 2, 2);
+    let src = s
+        .add_artifact_from_oracle(P0, "Tapper", "{3}: Tap target creature.")
+        .id();
+    mana(&mut s, P0, 8);
+    let mut r = s.build();
+    let comparator: engine::types::ability::Comparator =
+        serde_json::from_str("\"GE\"").expect("the GE comparator");
+    set_cost_rider(
+        &mut r,
+        src,
+        Some(CostReduction {
+            mode: CostModifyMode::Reduce,
+            amount_per: 2,
+            count: QuantityExpr::Fixed { value: 1 },
+            condition: Some(ParsedCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::Target,
+                    },
+                },
+                comparator,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }),
+        }),
+    );
+    let before = pool(&r, P0);
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("the activation starts");
+    act(
+        &mut r,
+        GameAction::SelectTargets {
+            targets: vec![object(target)],
+        },
+    )
+    .expect("the target settles");
+    finish(&mut r, &[]);
+    assert!(r.state().objects[&target].tapped || stack_len(&r) == 1);
+    before - pool(&r, P0)
+}
+
+/// CR 601.2c + CR 601.2f + CR 602.2b: the rider's condition is decided by the
+/// committed target: mana value 4 qualifies ({1}), mana value 1 does not ({3}).
+/// Priced without targets, the comparison would read 0 and never qualify.
+#[test]
+fn a_self_rider_condition_that_reads_the_target_is_priced_with_the_target() {
+    assert_eq!(
+        target_mana_value_rider_paid(4),
+        1,
+        "target-positive: {{3}} - {{2}}"
+    );
+    assert_eq!(
+        target_mana_value_rider_paid(1),
+        3,
+        "target-negative: full price"
+    );
+}
+
+/// A rider condition that reads a target through a shape this engine can't
+/// evaluate against targets is refused, never priced without its target: the
+/// ability is not offered, and an explicit activation is rejected before
+/// anything is announced.
+#[test]
+fn a_self_rider_condition_the_engine_cannot_price_with_targets_is_refused() {
+    use engine::types::ability::{CostReduction, ParsedCondition, QuantityExpr};
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.add_creature(P1, "Target", 2, 2);
+    let src = s
+        .add_artifact_from_oracle(P0, "Tapper", "{3}: Tap target creature.")
+        .id();
+    mana(&mut s, P0, 8);
+    let mut r = s.build();
+    set_cost_rider(
+        &mut r,
+        src,
+        Some(CostReduction {
+            mode: CostModifyMode::Reduce,
+            amount_per: 2,
+            count: QuantityExpr::Fixed { value: 1 },
+            condition: Some(ParsedCondition::ControlsCreatureWithKeyword {
+                controller: engine::types::ability::ControllerRef::TargetPlayer,
+                keyword: engine::types::keywords::Keyword::Flying,
+            }),
+        }),
+    );
+    assert!(
+        !can_activate_ability_now(r.state(), P0, src, 0),
+        "not offered"
+    );
+    let before = serde_json::to_value(r.state()).unwrap();
+    assert!(r
+        .act(GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        })
+        .is_err());
+    assert_eq!(serde_json::to_value(r.state()).unwrap(), before);
+}
+
+/// Review round 4: a modal `{X}` activation whose chosen mode declares no
+/// target. The lock waits for target settlement (another mode could target, and
+/// Hojo's discount passes its non-target gates), X is announced after the mode,
+/// and the deferred target selection then finds no slot. The lock must still run
+/// there, with no target-gated modifier: mode 2 at X = 2 pays `{2}`.
+#[test]
+fn a_modal_x_activation_whose_chosen_mode_has_no_target_still_locks_its_cost() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    s.add_creature(P0, "Own", 1, 1);
+    let src = s
+        .add_artifact_from_oracle(
+            P0,
+            "Modal X",
+            "{X}: Choose one \u{2014}\n\u{2022} Tap target creature.\n\u{2022} You gain X life.",
+        )
+        .id();
+    mana(&mut s, P0, 6);
+    let mut r = s.build();
+    let before = pool(&r, P0);
+    perf_counters::reset();
+    let wf = act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("the activation starts");
+    assert!(matches!(wf, WaitingFor::AbilityModeChoice { .. }), "{wf:?}");
+    let wf =
+        act(&mut r, GameAction::SelectModes { indices: vec![1] }).expect("the untargeted mode");
+    assert!(
+        matches!(wf, WaitingFor::ChooseXValue { .. }),
+        "reach guard: X after modes: {wf:?}"
+    );
+    act(&mut r, GameAction::ChooseX { value: 2 }).expect("X = 2");
+    finish(&mut r, &[]);
+    assert_eq!(stack_len(&r), 1, "the activation reached the stack");
+    assert_eq!(before - pool(&r, P0), 2, "X = 2, no target, no discount");
+    assert_eq!(
+        perf_counters::activation_cost_route_snapshot().open_settlements,
+        1,
+        "the deferred lock ran once"
+    );
+}

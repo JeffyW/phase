@@ -23230,6 +23230,11 @@ pub(crate) fn activation_verdict(
             return ActivationVerdict::Illegal;
         }
     }
+    // CR 601.2f: a cost rider whose target-reading condition this engine can't
+    // evaluate against targets leaves the price undeterminable: not offered.
+    if !activation_cost_rider_is_priceable(&ability_def) {
+        return ActivationVerdict::Illegal;
+    }
     // CR 601.2f: Apply self-referential cost reduction before affordability check.
     // CR 601.2c + CR 602.2b: a cost that may depend on the targets is judged
     // over the legal assignments; `proved_unpayable` means none is affordable.
@@ -24007,6 +24012,13 @@ fn activate_with_cost_carrier(
         }
     }
 
+    // CR 601.2f: a price that can't be determined can't be announced.
+    if !activation_cost_rider_is_priceable(&ability_def) {
+        return Err(EngineError::ActionNotAllowed(
+            "this ability's cost depends on its target in a way that can't be determined"
+                .to_string(),
+        ));
+    }
     // CR 601.2f + CR 602.2b: collect this activation's cost modifiers exactly
     // once (or, resuming the caster's election, take the snapshot its prompt
     // carried) and fold the PREVIEW the gates below read. The ability's cost
@@ -26312,8 +26324,87 @@ fn parsed_condition_satisfied_with_committed_targets(
         ParsedCondition::Not { condition } => !parsed_condition_satisfied_with_committed_targets(
             state, player, source_id, ability, condition,
         ),
+        // CR 601.2c + CR 601.2f: a comparison that reads the chosen target is
+        // resolved against the committed targets, through the same resolver the
+        // rider's count uses, so condition and count can't disagree.
+        ParsedCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } if parsed_condition_reads_targets(condition) => comparator.evaluate(
+            super::quantity::resolve_quantity_with_targets(state, lhs, ability),
+            super::quantity::resolve_quantity_with_targets(state, rhs, ability),
+        ),
+        // The per-opponent comparison binds each opponent as the scoped player
+        // for its right-hand side, exactly as the target-free evaluator does,
+        // with the committed targets supplied to both sides.
+        ParsedCondition::QuantityVsEachOpponent {
+            lhs,
+            comparator,
+            rhs,
+        } if parsed_condition_reads_targets(condition) => {
+            let targets = flatten_targets_in_chain(ability);
+            let resolve = |qty: &QuantityRef, scope: PlayerId| {
+                super::quantity::resolve_quantity_scoped_with_targets(
+                    state,
+                    &QuantityExpr::Ref { qty: qty.clone() },
+                    source_id,
+                    scope,
+                    &targets,
+                )
+            };
+            let lhs_value = resolve(lhs, player);
+            state
+                .players
+                .iter()
+                .filter(|candidate| candidate.id != player)
+                .all(|candidate| comparator.evaluate(lhs_value, resolve(rhs, candidate.id)))
+        }
         _ => restrictions::evaluate_condition(state, player, source_id, condition),
     }
+}
+
+/// CR 601.2c + CR 601.2f: whether a self cost rider's condition can be decided
+/// against committed targets by this engine. The target-free condition
+/// evaluator (`restrictions::evaluate_condition`) sees no targets, so a
+/// condition that reads one must be evaluated through
+/// [`parsed_condition_satisfied_with_committed_targets`]; the shapes it does
+/// not cover are refused, so an ability whose price can't be determined is
+/// never offered or placed rather than silently priced without its target.
+///
+/// Measured on the corpus: no printed card reaches a refused shape.
+fn cost_rider_condition_is_priceable(condition: &ParsedCondition) -> bool {
+    if !parsed_condition_reads_targets(condition) {
+        return true;
+    }
+    match condition {
+        ParsedCondition::SpellTargetsFilter { .. }
+        | ParsedCondition::QuantityComparison { .. }
+        | ParsedCondition::QuantityVsEachOpponent { .. } => true,
+        ParsedCondition::And { conditions } | ParsedCondition::Or { conditions } => {
+            conditions.iter().all(cost_rider_condition_is_priceable)
+        }
+        ParsedCondition::Not { condition } => cost_rider_condition_is_priceable(condition),
+        // Target-relative only through a filter or controller the target-free
+        // evaluator resolves without targets.
+        ParsedCondition::ControlsCreatureWithKeyword { .. }
+        | ParsedCondition::YouAttackedWithAtLeast { .. }
+        | ParsedCondition::YouCastSpellThisTurn { .. }
+        | ParsedCondition::BattlefieldEntriesThisTurn { .. }
+        | ParsedCondition::PlayerCountAtLeast { .. } => false,
+        // `parsed_condition_reads_targets` admits no other variant.
+        _ => false,
+    }
+}
+
+/// Whether `ability_def`'s own cost rider can be priced (see
+/// [`cost_rider_condition_is_priceable`]).
+pub(crate) fn activation_cost_rider_is_priceable(ability_def: &AbilityDefinition) -> bool {
+    ability_def
+        .cost_reduction
+        .as_ref()
+        .and_then(|rider| rider.condition.as_ref())
+        .is_none_or(cost_rider_condition_is_priceable)
 }
 
 /// CR 601.2c + CR 602.2b: whether an activation's cost may gain a target-gated

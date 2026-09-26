@@ -17640,28 +17640,41 @@ fn static_reduce_ability_cost_ninjutsu() {
     );
 }
 
+/// CR 601.2f + CR 602.2b: a qualifier between an activated-ability cost
+/// modifier's ability subject and "cost" restricts WHICH abilities it applies
+/// to. The modifier has no field for an arbitrary qualifier, so the line is
+/// refused rather than emitted as a broader modifier: "Equip abilities you
+/// activate of other Equipment" is not a discount on every equip ability.
+/// Controls: the same lines without the qualifier (or with only a target
+/// restriction) still parse.
 #[test]
-fn static_reduce_equip_abilities_with_object_qualifier() {
-    let def = parse_static_line(
-        "Equip abilities you activate of other Equipment cost {1} less to activate.",
-    )
-    .expect("should parse ReduceAbilityCost");
-    assert_eq!(
-        def.mode,
-        StaticMode::ReduceAbilityCost {
-            mode: CostModifyMode::Reduce,
-            keyword: "equip".to_string(),
-            amount: 1,
-            minimum_mana: None,
-            dynamic_count: None,
-            exemption: ActivationExemption::None,
-            // CR 602.2: "abilities you activate" is activator-scoped.
-            activator: Some(PlayerFilter::Controller),
-
-            targets: None,
-            frequency: None,
-        }
-    );
+fn activated_ability_cost_modifier_refuses_an_unmodelled_qualifier() {
+    fn reduces(line: &str) -> bool {
+        parse_static_line(line)
+            .is_some_and(|def| matches!(def.mode, StaticMode::ReduceAbilityCost { .. }))
+    }
+    // The keyword + activator arm.
+    assert!(!reduces(
+        "Equip abilities you activate of other Equipment cost {1} less to activate."
+    ));
+    assert!(reduces(
+        "Equip abilities you activate cost {1} less to activate."
+    ));
+    assert!(reduces(
+        "Equip abilities you activate that target a creature you control cost {1} less to activate."
+    ));
+    // The once-per-turn (Hojo) arm.
+    assert!(!reduces(
+        "The first activated ability you activate during your turn of an artifact that targets a creature you control costs {2} less to activate."
+    ));
+    assert!(reduces(
+        "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate."
+    ));
+    // The unscoped / activator arm.
+    assert!(!reduces(
+        "Abilities you activate of legendary creatures cost {1} less to activate."
+    ));
+    assert!(reduces("Abilities you activate cost {1} less to activate."));
 }
 
 // --- Phase 33-01: Conditional, dynamic, and non-standard enchanted/equipped patterns ---

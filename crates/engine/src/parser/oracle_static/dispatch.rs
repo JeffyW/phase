@@ -3062,7 +3062,7 @@ pub(crate) fn parse_static_line_inner(
                 )
                 .parse(i)?;
                 let (i, target_text) = take_until(" cost ").parse(i)?;
-                let (_, (_, targets)) = split_ability_target_restriction(target_text)?;
+                let (_, targets) = split_bare_ability_target_restriction(target_text)?;
                 let (i, _) = tag(" cost ").parse(i)?;
                 let (i, amt) =
                     nom::sequence::delimited(tag("{"), nom_primitives::parse_number, tag("}"))
@@ -3151,7 +3151,7 @@ pub(crate) fn parse_static_line_inner(
             ))
             .parse(i)?;
             let (i, target_text) = take_until(" costs {").parse(i)?;
-            let (_, (_, targets)) = split_ability_target_restriction(target_text)?;
+            let (_, targets) = split_bare_ability_target_restriction(target_text)?;
             let (i, _) = tag(" costs {").parse(i)?;
             let (i, amount) = nom_primitives::parse_number(i)?;
             let (i, _) = tag("} less to activate").parse(i)?;
@@ -3497,7 +3497,7 @@ pub(crate) fn parse_static_line_inner(
             ))
             .parse(i)?;
             let (i, target_text) = take_until(" cost {").parse(i)?;
-            let (_, (_, targets)) = split_ability_target_restriction(target_text)?;
+            let (_, targets) = split_bare_ability_target_restriction(target_text)?;
             let (i, _) = tag(" cost {").parse(i)?;
             let (i, amount) = nom_primitives::parse_number(i)?;
             let (i, _) = tag("} ").parse(i)?;

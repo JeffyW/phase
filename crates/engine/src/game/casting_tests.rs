@@ -59489,7 +59489,9 @@ fn cost_rider_target_classifiers_cover_every_target_reading_shape() {
 
     // Newly covered: variants named for a target.
     assert!(reads(&QuantityRef::TargetZoneCardCount {
-        zone: ZoneRef::Graveyard
+        zone: ZoneRef::Graveyard,
+        scope: ControllerRef::TargetPlayer,
+        binding: Default::default(),
     }));
     assert!(reads(&QuantityRef::ManaSpentToCast {
         scope: CastManaObjectScope::AbilityTarget,
@@ -60092,6 +60094,72 @@ fn an_open_lock_round_trips_its_point() {
         assert_eq!(
             serde_json::from_str::<ActivationCostLock>(&json).unwrap(),
             lock
+        );
+    }
+}
+
+/// Every transport (WASM `to_js`, the WebSocket server, Tauri, the P2P host's
+/// export) carries the activation cost carrier through `serde_json`. This pins
+/// each value #9248 adds through that one layer: both mana carriers, both
+/// settlement tails, the target-settlement lock point on an open and a locked
+/// carrier, and a non-empty once-per-turn source list.
+#[test]
+fn activation_cost_snapshot_round_trips_every_target_settlement_value() {
+    use crate::types::casting_costs::{ActivationCostLockPoint, ManaCarrier, SettledTail};
+    let base = ActivationCostSnapshot {
+        base_cost: AbilityCost::Mana {
+            cost: ManaCost::generic(3),
+        },
+        raise_total: 2,
+        reductions: Vec::new(),
+        once_per_turn_sources: vec![ObjectId(41), ObjectId(42)],
+        mana_carrier: ManaCarrier::Whole,
+        settlement_tail: None,
+        lock: ActivationCostLock::Open {
+            point: ActivationCostLockPoint::TargetSettlement,
+        },
+    };
+    let mut cases = Vec::new();
+    for mana_carrier in [ManaCarrier::Whole, ManaCarrier::Split] {
+        for settlement_tail in [
+            None,
+            Some(SettledTail::SurfaceThenBoundary),
+            Some(SettledTail::Boundary),
+        ] {
+            for lock in [
+                ActivationCostLock::Open {
+                    point: ActivationCostLockPoint::TargetSettlement,
+                },
+                ActivationCostLock::Locked {
+                    point: ActivationCostLockPoint::TargetSettlement,
+                    order: None,
+                },
+            ] {
+                cases.push(ActivationCostSnapshot {
+                    mana_carrier,
+                    settlement_tail,
+                    lock,
+                    ..base.clone()
+                });
+            }
+        }
+    }
+    assert_eq!(cases.len(), 12);
+    for snapshot in cases {
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: ActivationCostSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, snapshot, "{json}");
+    }
+    // The defaults are omitted, so a pre-#9248 carrier is byte-identical.
+    let json = serde_json::to_value(ActivationCostSnapshot {
+        once_per_turn_sources: Vec::new(),
+        ..base.clone()
+    })
+    .unwrap();
+    for absent in ["once_per_turn_sources", "mana_carrier", "settlement_tail"] {
+        assert!(
+            json.get(absent).is_none(),
+            "{absent} omitted when default: {json}"
         );
     }
 }
