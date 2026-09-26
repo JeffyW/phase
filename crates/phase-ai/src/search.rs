@@ -15254,7 +15254,6 @@ mod tests {
                     ability_index: Some(0),
                     rules_execution_node: None,
                     ability_snapshot: Some(ability),
-                    activation_record: None,
                     color_override: None,
                     resume: ManaAbilityResume::Priority,
                     cost_move_resume: None,

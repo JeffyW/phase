@@ -1688,7 +1688,6 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source: ObjectId(1),
                 source_lki: first_lki.clone(),
                 ability_tag: None,
-                is_mana_ability: false,
                 is_loyalty_ability: false,
                 targets: vec![ActivationTargetFact::Object {
                     id: ObjectId(2),
@@ -1703,7 +1702,6 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source: ObjectId(2),
                 source_lki: second_lki.clone(),
                 ability_tag: None,
-                is_mana_ability: false,
                 is_loyalty_ability: true,
                 targets: vec![ActivationTargetFact::Player(PlayerId(0))],
             }]),

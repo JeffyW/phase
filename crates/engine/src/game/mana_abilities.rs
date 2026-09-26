@@ -11,7 +11,7 @@ use crate::types::ability_visit::{
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
-    AbilityActivationRecord, CostResume, GameState, ManaAbilityCostCursor, ManaAbilityCostParent,
+    CostResume, GameState, ManaAbilityCostCursor, ManaAbilityCostParent,
     ManaAbilityCostParentLifecycle, ManaAbilityCostResolutionMode, ManaAbilityResume, ManaChoice,
     ManaChoiceContext, ManaChoicePrompt, ManaColorChoiceResume, ManaTriggerFixedPointResume,
     PayCostKind, PayableResource, PendingCostMoveResume, PendingManaAbility, ProductionOverride,
@@ -584,15 +584,6 @@ pub(super) fn resolve_mana_ability_excluding(
         ability_index,
         rules_execution_node,
         ability_snapshot: Some(ability_def.clone()),
-        // CR 602.2 + CR 605.3a (capture M): before its cost is paid.
-        activation_record: super::casting::capture_activation_record_from(
-            state,
-            player,
-            source_id,
-            Some(ability_def),
-            &[],
-        )
-        .map(Box::new),
         color_override,
         // The direct resolver normally leaves its caller's waiting root
         // untouched.  Its ordinary completion must therefore return to
@@ -971,15 +962,6 @@ pub fn activate_mana_ability(
             ability_index: Some(ability_index),
             rules_execution_node,
             ability_snapshot: Some(ability_def.clone()),
-            // CR 602.2 + CR 605.3a (capture M): before its cost is paid.
-            activation_record: super::casting::capture_activation_record_from(
-                state,
-                player,
-                source_id,
-                Some(ability_def),
-                &[],
-            )
-            .map(Box::new),
             color_override,
             resume,
             cost_move_resume: None,
@@ -1003,23 +985,15 @@ fn complete_mana_ability_activation(
     source_id: ObjectId,
     ability_index: Option<usize>,
     player: PlayerId,
-    record: Option<&AbilityActivationRecord>,
     events: &mut Vec<GameEvent>,
 ) {
     let Some(ability_index) = ability_index else {
         return;
     };
-    // CR 602.2: publish the facts captured at this mana ability's announcement.
-    // A pending mana ability restored from before the journal existed carries
-    // none; it is counted as before and adds no journal row. No supported
-    // "first activated ability each turn" modifier can read a mana ability's
-    // row (each is target-gated, and CR 605.1a: a mana ability has no target).
-    super::restrictions::record_ability_activation(
-        state,
-        source_id,
-        ability_index,
-        record.cloned(),
-    );
+    // CR 602.2 + CR 605.3a: counted like every activation, but not journaled:
+    // the turn journal holds non-mana activations only (see
+    // `GameState::abilities_activated_this_turn_by_player`).
+    super::restrictions::record_ability_activation(state, source_id, ability_index, None);
     super::casting_targets::emit_keyword_ability_event_if_tagged(
         state,
         source_id,
@@ -1350,7 +1324,6 @@ pub fn handle_choose_mana_color(
             pending.source_id,
             pending.ability_index,
             pending.player,
-            pending.activation_record.as_deref(),
             events,
         );
     });
@@ -3186,7 +3159,6 @@ fn finish_mana_ability_cost_payment(
             pending.source_id,
             pending.ability_index,
             pending.player,
-            pending.activation_record.as_deref(),
             events,
         );
     }
@@ -11037,7 +11009,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -11138,7 +11109,6 @@ mod tests {
             player: PlayerId(0),
             source_id: source,
             ability_snapshot: None,
-            activation_record: None,
             ability_index: Some(0),
             rules_execution_node: None,
             color_override: None,
@@ -11352,7 +11322,6 @@ mod tests {
                 ability_index: Some(0),
                 rules_execution_node: None,
                 ability_snapshot: None,
-                activation_record: None,
                 color_override: None,
                 resume: ManaAbilityResume::Priority,
                 cost_move_resume: None,
@@ -11586,7 +11555,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -11693,7 +11661,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -12757,7 +12724,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -13294,7 +13260,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -13860,7 +13825,6 @@ mod tests {
             ability_index: None,
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -13934,7 +13898,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Black)),
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -14063,7 +14026,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Green)),
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -14130,7 +14092,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Red)),
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,
@@ -14289,7 +14250,6 @@ mod tests {
             ability_index: Some(0),
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Green)),
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,

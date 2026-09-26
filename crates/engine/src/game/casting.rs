@@ -25278,8 +25278,7 @@ pub(crate) fn capture_activation_record(
 }
 
 /// [`capture_activation_record`] from an ability definition and its committed
-/// targets: the mana-ability announcement (which has a definition snapshot and
-/// no targets, CR 605.1a) comes here directly.
+/// targets.
 pub(crate) fn capture_activation_record_from(
     state: &GameState,
     player: PlayerId,
@@ -25313,7 +25312,6 @@ pub(crate) fn capture_activation_record_from(
         source: source_id,
         source_lki,
         ability_tag: def.and_then(|def| def.ability_tag),
-        is_mana_ability: def.is_some_and(super::mana_abilities::is_mana_ability),
         is_loyalty_ability: def
             .and_then(|def| def.cost.as_ref())
             .is_some_and(crate::types::ability::is_loyalty_ability_cost),
@@ -27919,7 +27917,8 @@ fn earlier_activation_this_turn_qualified(
                 active_keyword: record
                     .ability_tag
                     .map(crate::types::ability::AbilityTag::keyword_str),
-                is_mana: record.is_mana_ability,
+                // The journal holds non-mana activations only.
+                is_mana: false,
                 is_loyalty: record.is_loyalty_ability,
             };
             reduce_ability_cost_non_target_gates_admit(

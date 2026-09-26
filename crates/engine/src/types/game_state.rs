@@ -1155,13 +1155,18 @@ pub struct CastOccurrence {
     pub turn_journal_index: u32,
 }
 
-/// CR 602.2 + CR 601.2c: one activated ability that was activated this turn,
-/// with the facts a "the first activated ability you activate each turn that
-/// …" modifier (Professor Hojo) needs, captured when the ability was activated,
-/// before any of its cost was paid. The activation analog of
+/// CR 602.2 + CR 601.2c: one NON-MANA activated ability that was activated this
+/// turn, with the facts a "the first activated ability you activate each turn
+/// that …" modifier (Professor Hojo) needs, captured when the ability was
+/// activated, before any of its cost was paid. The activation analog of
 /// [`SpellCastRecord`]: characteristics are snapshots, never re-read later, so
 /// a target that afterwards changes controller or leaves still qualified or
 /// didn't exactly as it did when the ability was activated.
+///
+/// Mana abilities (CR 605) are not journaled, manual or automatic: every
+/// supported reader is target-gated, and a mana ability has no target (CR
+/// 605.1a). An untargeted "first activated ability" reader that counts mana
+/// abilities (Tezzeret, Betrayer of Flesh) needs mana-ability history first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AbilityActivationRecord {
     pub activator: PlayerId,
@@ -1172,11 +1177,9 @@ pub struct AbilityActivationRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_tag: Option<crate::types::ability::AbilityTag>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub is_mana_ability: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_loyalty_ability: bool,
     /// CR 115.1: the committed targets of the whole chain, empty for an
-    /// untargeted or mana ability (CR 605.1a).
+    /// untargeted ability.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub targets: Vec<ActivationTargetFact>,
 }
@@ -8356,17 +8359,6 @@ pub struct PendingManaAbility {
     /// chosen-color resume can resolve from LKI even when `source_id` is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_snapshot: Option<AbilityDefinition>,
-    /// CR 602.2 + CR 605.3a: this mana ability's journal facts, captured at its
-    /// announcement, before its cost is paid; published when it completes.
-    ///
-    /// Never serialized, so no transport, save, or viewer projection carries
-    /// it: a mana ability's pending state nests inside many payment and resume
-    /// carriers, and this keeps the draft out of all of them structurally. A
-    /// mana ability suspended across a save therefore completes with no draft
-    /// and adds no journal row (see `complete_mana_ability_activation`); no
-    /// supported modifier can read a mana ability's row (CR 605.1a).
-    #[serde(skip)]
-    pub activation_record: Option<Box<AbilityActivationRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_override: Option<ProductionOverride>,
     pub resume: ManaAbilityResume,
@@ -19577,15 +19569,16 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub alt_cost_grant_permissions_used: HashSet<ObjectId>,
-    /// CR 602.2 + CR 601.2i: Per-player activated-ability history this turn,
-    /// in activation order: the activation analog of
-    /// `spells_cast_this_turn_by_player`. Each record is captured before the
-    /// activation's cost is paid and appended only when it is placed on the
-    /// stack (or, for a mana ability, completed), so a "the first activated
-    /// ability you activate each turn …" modifier (CR 611.3a: applied to
-    /// whatever its text indicates, including activations made before the
-    /// modifier's source existed) reads the whole turn. Engine authority,
-    /// cleared from every viewer projection.
+    /// CR 602.2 + CR 601.2i: Per-player history of the NON-MANA activated
+    /// abilities activated this turn, in activation order: the activation
+    /// analog of `spells_cast_this_turn_by_player`. Each record is captured
+    /// before the activation's cost is paid and appended only when it is placed
+    /// on the stack, so a "the first activated ability you activate each turn
+    /// …" modifier (CR 611.3a: applied to whatever its text indicates,
+    /// including activations made before the modifier's source existed) reads
+    /// the whole turn. Mana abilities are not journaled (see
+    /// [`AbilityActivationRecord`]). Engine authority, cleared from every
+    /// viewer projection.
     ///
     /// Boxed to preserve the `GameState` stack budget (see
     /// `types/game_state_size.rs`): empty on almost every board.
@@ -33795,7 +33788,6 @@ mod tests {
                         ability_index: None,
                         rules_execution_node: None,
                         ability_snapshot: None,
-                        activation_record: None,
                         color_override: None,
                         resume: ManaAbilityResume::Priority,
                         cost_move_resume: None,
@@ -37585,7 +37577,6 @@ mod tests {
                     ability_index: None,
                     rules_execution_node: None,
                     ability_snapshot: None,
-                    activation_record: None,
                     color_override: None,
                     resume: ManaAbilityResume::Priority,
                     cost_move_resume: None,

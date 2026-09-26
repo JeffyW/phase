@@ -13,8 +13,8 @@ use engine::types::actions::GameAction;
 use engine::types::casting_costs::{ActivationCostLock, ActivationCostLockPoint};
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    AbilityActivationRecord, ActivationTargetFact, CostResume, ManaChoice, ManaChoiceContext,
-    PersistedGameState, PersistedRestoreFinalization, WaitingFor,
+    AbilityActivationRecord, ActivationTargetFact, CostResume, ManaChoice, PersistedGameState,
+    PersistedRestoreFinalization, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
@@ -2903,14 +2903,24 @@ fn an_activation_that_lost_its_draft_is_reversed_not_recorded() {
     assert!(journal(&r, P0).is_empty(), "no journal row");
 }
 
+/// The journal holds non-mana activations only: a mana ability is counted
+/// (CR 602.5b) but not journaled, whether the player activates it (here, one
+/// that suspends on its color choice) or payment auto-taps it (a basic land's
+/// intrinsic ability). The non-mana ability it paid for is journaled.
 #[test]
-fn a_mana_choice_suspension_projects_no_activation_record() {
+fn mana_abilities_are_not_journaled_manual_or_automatic() {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     let prism = s
         .add_artifact_from_oracle(P0, "Prism", "{T}: Add one mana of any color.")
         .id();
+    let forest = s.add_basic_land(P0, ManaColor::Green);
+    let lifestone = s
+        .add_artifact_from_oracle(P0, "Lifestone", "{2}: You gain 1 life.")
+        .id();
     let mut r = s.build();
+
+    // Manual.
     act(
         &mut r,
         GameAction::ActivateAbility {
@@ -2919,19 +2929,10 @@ fn a_mana_choice_suspension_projects_no_activation_record() {
         },
     )
     .expect("mana ability");
-    let WaitingFor::ChooseManaColor {
-        context: ManaChoiceContext::ManaAbility(pending),
-        ..
-    } = &r.state().waiting_for
-    else {
-        panic!("expected the color choice, got {:?}", r.state().waiting_for);
-    };
     assert!(
-        pending
-            .activation_record
-            .as_deref()
-            .is_some_and(|draft| draft.is_mana_ability && draft.source == prism),
-        "authoritative: the suspended mana ability keeps its draft"
+        matches!(r.state().waiting_for, WaitingFor::ChooseManaColor { .. }),
+        "reach guard: suspended on the color choice, got {:?}",
+        r.state().waiting_for
     );
     assert_projections_carry_no_records(&r, &[P0, P1], "mana choice");
     act(
@@ -2942,11 +2943,32 @@ fn a_mana_choice_suspension_projects_no_activation_record() {
         },
     )
     .expect("color");
+    assert_eq!(
+        r.state().activated_abilities_this_turn.get(&(prism, 0)),
+        Some(&1),
+        "reach guard: the manual mana ability completed and was counted"
+    );
+    assert!(journal(&r, P0).is_empty(), "manual: not journaled");
+
+    // Automatic: the Prism's mana floats; payment auto-taps the Forest.
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: lifestone,
+            ability_index: 0,
+        },
+    )
+    .expect("activation");
+    finish(&mut r, &[]);
     assert!(
-        journal(&r, P0)
-            .iter()
-            .any(|row| row.is_mana_ability && row.source == prism),
-        "the mana ability is journaled when it completes"
+        r.state().objects[&forest].tapped,
+        "reach guard: payment auto-tapped the Forest"
+    );
+    let rows = journal(&r, P0);
+    assert_eq!(
+        rows.iter().map(|row| row.source).collect::<Vec<_>>(),
+        vec![lifestone],
+        "automatic: only the ability it paid for is journaled"
     );
 }
 

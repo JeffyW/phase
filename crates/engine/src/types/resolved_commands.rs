@@ -3914,7 +3914,6 @@ mod tests {
             source: ObjectId(9),
             source_lki: object.snapshot_public_characteristics(),
             ability_tag: None,
-            is_mana_ability: false,
             is_loyalty_ability: false,
             targets: vec![crate::types::game_state::ActivationTargetFact::Player(
                 PlayerId(1),

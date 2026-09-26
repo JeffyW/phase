@@ -60182,7 +60182,6 @@ fn an_activation_journal_row_round_trips() {
         source,
         source_lki: state.objects[&source].snapshot_public_characteristics(),
         ability_tag: Some(crate::types::ability::AbilityTag::Boast),
-        is_mana_ability: true,
         is_loyalty_ability: true,
         targets: vec![
             ActivationTargetFact::Player(PlayerId(1)),

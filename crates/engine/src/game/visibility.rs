@@ -1036,9 +1036,8 @@ pub(crate) fn proposer_hidden_view(state: &GameState, proposer: PlayerId) -> Gam
 ///
 /// The two resume carriers are also dropped wholesale later in this
 /// projection; clearing their records here keeps the redaction local to one
-/// place. Never serialized, so structurally absent from every projection: a
-/// pending mana ability's record (`PendingManaAbility::activation_record`,
-/// wherever that pending nests) and `pending_discard_for_cost`.
+/// place. `pending_discard_for_cost` is never serialized. Mana abilities carry
+/// no record at all (they are not journaled).
 fn redact_activation_records(filtered: &mut GameState) {
     use crate::types::game_state::{
         CollectEvidenceResume, DeferredLifeCostResume, PendingCast, PendingCostMoveResume,
@@ -3402,7 +3401,6 @@ mod tests {
             ability_index: None,
             rules_execution_node: None,
             ability_snapshot: None,
-            activation_record: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             cost_move_resume: None,

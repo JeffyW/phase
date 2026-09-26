@@ -116,8 +116,9 @@ pub(crate) fn validate_spell_cast_recording(
 /// CR 602.5b: Increment exactly one activated-ability occurrence's turn and
 /// game counters, and (CR 602.2 + CR 601.2i) append its captured
 /// [`AbilityActivationRecord`] to its activator's turn journal. The single
-/// write path for the journal: the placement authority and the mana-ability
-/// completion both come here.
+/// write path for the journal: only the stack-placement authority passes a
+/// record; a mana ability's completion counts with `None` (mana abilities are
+/// not journaled).
 pub fn record_ability_activation(
     state: &mut GameState,
     source: ObjectId,
