@@ -228,6 +228,30 @@ pub(crate) fn split_bare_ability_target_restriction(
     .parse(i)
 }
 
+/// [`split_ability_target_restriction`] for a phrase that may also name the
+/// abilities' SOURCES: "equip abilities you activate OF OTHER EQUIPMENT cost …"
+/// (Bladehold War-Whip). Returns `(source filter, target restriction)`. The
+/// qualifier must be exactly `of <type phrase>`; anything else is refused like
+/// [`split_bare_ability_target_restriction`]. Input is lowercase.
+pub(crate) fn split_ability_source_and_target_restriction(
+    i: &str,
+) -> OracleResult<'_, (Option<TargetFilter>, Option<TargetFilter>)> {
+    let (rest, (residue, targets)) = split_ability_target_restriction(i)?;
+    let residue = residue.trim();
+    if residue.is_empty() {
+        return Ok((rest, (None, targets)));
+    }
+    let (subject, _) = tag::<_, _, OracleError<'_>>("of ").parse(residue)?;
+    let (source, remainder) = parse_type_phrase_folding(subject);
+    if !remainder.trim().is_empty() || matches!(source, TargetFilter::Any) {
+        return Err(nom::Err::Error(OracleError::new(
+            residue,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok((rest, (Some(source), targets)))
+}
+
 pub(crate) fn parse_activated_cost_reduction_minimum_mana(lower: &str) -> Option<u32> {
     preceded(
         take_until::<_, _, OracleError<'_>>(

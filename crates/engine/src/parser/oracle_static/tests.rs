@@ -17640,6 +17640,47 @@ fn static_reduce_ability_cost_ninjutsu() {
     );
 }
 
+/// CR 602.2: "Equip abilities you activate of other Equipment" (Bladehold
+/// War-Whip) discounts equip abilities whose SOURCE is another Equipment: the
+/// "of <sources>" qualifier is the `affected` filter, not dropped (which would
+/// discount War-Whip's own equip too).
+#[test]
+fn static_reduce_equip_abilities_with_object_qualifier() {
+    let def = parse_static_line(
+        "Equip abilities you activate of other Equipment cost {1} less to activate.",
+    )
+    .expect("should parse ReduceAbilityCost");
+    assert_eq!(
+        def.mode,
+        StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
+            keyword: "equip".to_string(),
+            amount: 1,
+            minimum_mana: None,
+            dynamic_count: None,
+            exemption: ActivationExemption::None,
+            // CR 602.2: "abilities you activate" is activator-scoped.
+            activator: Some(PlayerFilter::Controller),
+            targets: None,
+            frequency: None,
+        }
+    );
+    let Some(TargetFilter::Typed(source)) = def.affected else {
+        panic!("the qualifier scopes the sources: {:?}", def.affected);
+    };
+    assert!(
+        source
+            .type_filters
+            .iter()
+            .any(|f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("equipment"))),
+        "{source:?}"
+    );
+    assert!(
+        source.properties.contains(&FilterProp::Another),
+        "other: {source:?}"
+    );
+}
+
 /// CR 601.2f + CR 602.2b: a qualifier between an activated-ability cost
 /// modifier's ability subject and "cost" restricts WHICH abilities it applies
 /// to. The modifier has no field for an arbitrary qualifier, so the line is
@@ -17653,9 +17694,9 @@ fn activated_ability_cost_modifier_refuses_an_unmodelled_qualifier() {
         parse_static_line(line)
             .is_some_and(|def| matches!(def.mode, StaticMode::ReduceAbilityCost { .. }))
     }
-    // The keyword + activator arm.
+    // The keyword + activator arm: an unmodelled qualifier is refused.
     assert!(!reduces(
-        "Equip abilities you activate of other Equipment cost {1} less to activate."
+        "Equip abilities you activate while you're attacking cost {1} less to activate."
     ));
     assert!(reduces(
         "Equip abilities you activate cost {1} less to activate."

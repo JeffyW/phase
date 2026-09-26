@@ -2025,3 +2025,51 @@ fn a_modal_x_activation_whose_chosen_mode_has_no_target_still_locks_its_cost() {
         "the deferred lock ran once"
     );
 }
+
+/// CR 602.2: Bladehold War-Whip's "Equip abilities you activate of other
+/// Equipment cost {1} less" discounts another Equipment's equip, not its own.
+#[test]
+fn bladehold_war_whip_discounts_other_equipment_only() {
+    const WAR_WHIP: &str = "Equip abilities you activate of other Equipment cost {1} less to activate.\nEquipped creature has double strike.\nEquip {3}{R}{W}";
+    fn equip_paid(own: bool) -> usize {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let whip = s
+            .add_artifact_from_oracle(P0, "Bladehold War-Whip", WAR_WHIP)
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let other = s
+            .add_artifact_from_oracle(P0, "Other Blade", "Equip {2}")
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let bear = s.add_creature(P0, "Bear", 2, 2).id();
+        s.with_mana_pool(
+            P0,
+            [ManaColor::Red, ManaColor::White]
+                .into_iter()
+                .chain(std::iter::repeat_n(ManaColor::Blue, 6))
+                .map(|c| ManaUnit::new(c.into(), ObjectId(0), false, Vec::new()))
+                .collect(),
+        );
+        let mut r = s.build();
+        let src = if own { whip } else { other };
+        let equip_index = r.state().objects[&src]
+            .abilities
+            .iter()
+            .position(|a| a.ability_tag.is_some())
+            .expect("an equip ability");
+        let before = pool(&r, P0);
+        r.activate(src, equip_index).target_object(bear).resolve();
+        before - pool(&r, P0)
+    }
+    assert_eq!(
+        equip_paid(false),
+        1,
+        "another Equipment's {{2}} equip costs {{1}}"
+    );
+    assert_eq!(
+        equip_paid(true),
+        5,
+        "War-Whip's own {{3}}{{R}}{{W}} is not discounted"
+    );
+}

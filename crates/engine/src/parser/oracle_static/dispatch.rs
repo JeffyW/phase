@@ -3054,7 +3054,7 @@ pub(crate) fn parse_static_line_inner(
         && nom_primitives::scan_contains(tp.lower, "less to activate")
     {
         // Extract keyword name and amount via nom combinators
-        if let Some(((keyword, targets, amount), remainder)) =
+        if let Some(((keyword, source, targets, amount), remainder)) =
             nom_on_lower(tp.original, tp.lower, |i| {
                 let (i, kw) = terminated(
                     nom::bytes::complete::take_until(" abilities you activate"),
@@ -3062,15 +3062,16 @@ pub(crate) fn parse_static_line_inner(
                 )
                 .parse(i)?;
                 let (i, target_text) = take_until(" cost ").parse(i)?;
-                let (_, targets) = split_bare_ability_target_restriction(target_text)?;
+                let (_, (source, targets)) =
+                    split_ability_source_and_target_restriction(target_text)?;
                 let (i, _) = tag(" cost ").parse(i)?;
                 let (i, amt) =
                     nom::sequence::delimited(tag("{"), nom_primitives::parse_number, tag("}"))
                         .parse(i)?;
                 let (i, _) = tag(" less to activate").parse(i)?;
-                Ok((i, (kw.to_string(), targets, amt)))
+                Ok((i, (kw.to_string(), source, targets, amt)))
             })
-            .filter(|((keyword, _, _), _)| !keyword.trim().is_empty())
+            .filter(|((keyword, _, _, _), _)| !keyword.trim().is_empty())
         {
             // CR 601.2f: Extract optional "for each [X]" dynamic count clause from remainder.
             let remainder_lower = remainder.to_lowercase();
@@ -3091,20 +3092,24 @@ pub(crate) fn parse_static_line_inner(
             // not who controls the ability's source. Emit the activator axis rather
             // than a `controller(You)` source filter, which mis-scoped abilities on
             // permanents another player controls but this player may activate.
-            return Some(
-                StaticDefinition::new(StaticMode::ReduceAbilityCost {
-                    mode: CostModifyMode::Reduce,
-                    keyword: keyword.trim().to_string(),
-                    amount,
-                    minimum_mana: parse_activated_cost_reduction_minimum_mana(tp.lower),
-                    dynamic_count,
-                    exemption: ActivationExemption::None,
-                    activator: Some(PlayerFilter::Controller),
-                    targets,
-                    frequency: None,
-                })
-                .description(text.to_string()),
-            );
+            // CR 602.2: an "of <sources>" qualifier additionally scopes WHICH
+            // abilities by their source ("of other Equipment").
+            let mut def = StaticDefinition::new(StaticMode::ReduceAbilityCost {
+                mode: CostModifyMode::Reduce,
+                keyword: keyword.trim().to_string(),
+                amount,
+                minimum_mana: parse_activated_cost_reduction_minimum_mana(tp.lower),
+                dynamic_count,
+                exemption: ActivationExemption::None,
+                activator: Some(PlayerFilter::Controller),
+                targets,
+                frequency: None,
+            })
+            .description(text.to_string());
+            if let Some(source) = source {
+                def = def.affected(source);
+            }
+            return Some(def);
         }
     }
 
