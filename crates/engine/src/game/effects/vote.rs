@@ -900,7 +900,7 @@ mod tests {
             parent_target_missing_reason: None,
 
             activation_cost_reduction: None,
-            ability_cost_discount_static_sources: Vec::new(),
+            activation_record: None,
         };
 
         let mut events = Vec::new();
@@ -1019,7 +1019,7 @@ mod tests {
             mode_abilities: vec![],
             parent_target_missing_reason: None,
             activation_cost_reduction: None,
-            ability_cost_discount_static_sources: Vec::new(),
+            activation_record: None,
         }
     }
 
@@ -1468,7 +1468,7 @@ mod tests {
             parent_target_missing_reason: None,
 
             activation_cost_reduction: None,
-            ability_cost_discount_static_sources: Vec::new(),
+            activation_record: None,
         };
 
         // Resolution parks on VoteChoice with controller as first subject.
@@ -1645,7 +1645,7 @@ mod tests {
             parent_target_missing_reason: None,
 
             activation_cost_reduction: None,
-            ability_cost_discount_static_sources: Vec::new(),
+            activation_record: None,
         };
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).expect("vote initiates");

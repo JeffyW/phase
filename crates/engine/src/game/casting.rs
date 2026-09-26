@@ -18,6 +18,7 @@ use crate::types::casting_costs::{
     CostReductionOutcome, ManaCarrier, ReductionProvenance, SettledTail,
 };
 use crate::types::events::{ActivatedAbilityKind, GameEvent};
+use crate::types::game_state::{AbilityActivationRecord, ActivationTargetFact, LKISnapshot};
 use crate::types::game_state::{
     ActivationResidual, ActivationTargetSelection, AlternativeAdditionalCostDescription,
     CastOfferKind, CastPaymentMode, CastingPermissionIndex, CastingVariant,
@@ -24061,7 +24062,6 @@ fn activate_with_cost_carrier(
                 base_cost,
                 raise_total: modifiers.raise_total,
                 reductions: modifiers.reductions,
-                once_per_turn_sources: modifiers.once_per_turn_sources,
                 mana_carrier: ManaCarrier::Whole,
                 settlement_tail: None,
                 lock: ActivationCostLock::Open { point },
@@ -24245,14 +24245,6 @@ fn activate_with_cost_carrier(
     } else {
         preview_cost
     };
-    // CR 602.2b: the once-per-turn slots this activation's LOCKED cost spends,
-    // stamped onto every `ResolvedAbility` built below so the placement
-    // authority spends exactly them. A deferred activation stamps at its lock.
-    let consumed_discount_sources: Vec<ObjectId> = carrier
-        .as_deref()
-        .filter(|snapshot| matches!(snapshot.lock, ActivationCostLock::Locked { .. }))
-        .map(|snapshot| snapshot.once_per_turn_sources.clone())
-        .unwrap_or_default();
     // Every continuation below reads the cost the lock wrote, not the preview.
     let activation_cost = ability_def
         .cost
@@ -24281,8 +24273,7 @@ fn activate_with_cost_carrier(
         let mut unavailable_modes = compute_unavailable_modes(state, source_id, &modal);
         let x_dependent_modal_targets = ability_def.cost.as_ref().is_some_and(|cost| {
             ability_def.mode_abilities.iter().any(|mode| {
-                let mut resolved = build_resolved_from_def(mode, source_id, player);
-                resolved.ability_cost_discount_static_sources = consumed_discount_sources.clone();
+                let resolved = build_resolved_from_def(mode, source_id, player);
                 (casting_costs::extract_x_mana_cost(cost).is_some()
                     || casting_costs::activation_cost_needs_x_choice(&resolved, cost))
                     && ability_target_legality_needs_chosen_x(&resolved, mode.distribute.as_ref())
@@ -24358,7 +24349,6 @@ fn activate_with_cost_carrier(
     // `else_ability`, and other typed fields survive into resolution
     // (issue #310 — same root cause as the spell-cast path).
     let mut resolved = build_resolved_from_def(&ability_def, source_id, player);
-    resolved.ability_cost_discount_static_sources = consumed_discount_sources;
     // CR 602.2b -> CR 601.2b: activating an ability follows the spell-announcement rules
     // 601.2b-i identically, so a text-defined, announce-locked X ("where X is <count> as
     // you activate this ability") is measured HERE — at announcement, before targets are
@@ -24368,6 +24358,11 @@ fn activate_with_cost_carrier(
     // CR 603.4: Stamp the printed-ability index for per-turn resolution tracking
     // before any branch path that pushes this ability onto the stack.
     resolved.ability_index = Some(ability_index);
+    // CR 602.2 + CR 601.2c (capture A): the activation's journal facts,
+    // captured now, before any cost is paid. Target settlement adds the
+    // committed targets on every target-first route.
+    resolved.activation_record =
+        capture_activation_record(state, player, source_id, ability_index, &resolved).map(Box::new);
     // CR 602.2b + CR 601.2b/c: an X announcement can determine how many
     // targets an ability has. Before X is chosen, target-slot construction may
     // reject that specific class of otherwise legal activation; defer only that
@@ -25130,6 +25125,11 @@ fn activate_with_cost_carrier(
     }
 
     // Push to stack
+    // CR 602.2: the record captured before payment is required to place the
+    // ability; without one the activation can't complete legally and is
+    // reversed (never recorded from post-payment facts).
+    let mut resolved = resolved;
+    let record = take_activation_record(&mut resolved, player)?;
     let entry_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;
     let announced_targets = flatten_targets_in_chain(&resolved);
@@ -25150,11 +25150,47 @@ fn activate_with_cost_carrier(
     );
     commit_crime_after_stack_placement(state, crime_candidate, player, events);
 
-    record_activated_ability_placed(state, player, source_id, ability_index, entry_id, events);
+    record_activated_ability_placed(
+        state,
+        player,
+        source_id,
+        ability_index,
+        entry_id,
+        record,
+        events,
+    );
 
     priority::clear_priority_passes(state);
 
     Ok(WaitingFor::Priority { player })
+}
+
+/// CR 602.2 + CR 601.2c: take an activation's pre-payment record for its
+/// placement. A missing record means the activation's facts were never
+/// captured before payment, so it can't be completed legally: it is reversed
+/// at the action boundary with nothing recorded.
+pub(crate) fn take_activation_record(
+    ability: &mut ResolvedAbility,
+    player: PlayerId,
+) -> Result<AbilityActivationRecord, EngineError> {
+    ability
+        .activation_record
+        .take()
+        .map(|record| *record)
+        .ok_or(EngineError::ActivationReversed { player })
+}
+
+/// [`take_activation_record`]'s check, for a continuation that places the
+/// ability later and must refuse before it pays anything.
+pub(crate) fn require_activation_record(
+    ability: &ResolvedAbility,
+    player: PlayerId,
+) -> Result<(), EngineError> {
+    if ability.activation_record.is_some() {
+        Ok(())
+    } else {
+        Err(EngineError::ActivationReversed { player })
+    }
 }
 
 /// CR 602.2 + CR 117.1b: the bookkeeping every placement of a player-activated
@@ -25171,12 +25207,18 @@ fn activate_with_cost_carrier(
 /// placed ability is read from THAT entry by id — never from the top of the
 /// stack, which cannot tell two activations of one permanent's same ability
 /// apart.
+///
+/// `record` is the activation's facts, captured before any of its cost was
+/// paid (CR 601.2c precedes CR 601.2h). It is a required input: a placement
+/// cannot be recorded without it, so no site can publish facts read after
+/// payment, and none can leave a placed activation out of the turn journal.
 pub(crate) fn record_activated_ability_placed(
     state: &mut GameState,
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
     placed_entry: ObjectId,
+    record: AbilityActivationRecord,
     events: &mut Vec<GameEvent>,
 ) {
     // The caller just pushed this entry, and `stack::push_to_stack` always
@@ -25194,17 +25236,7 @@ pub(crate) fn record_activated_ability_placed(
                 )),
         "record_activated_ability_placed must name the entry its caller just pushed"
     );
-    // CR 602.2b: spend the once-per-turn cost-modifier slots this activation
-    // used, read from the placed entry itself.
-    let spent = once_per_turn_slots_spent_by_placed_entry(
-        state,
-        player,
-        source_id,
-        ability_index,
-        placed_entry,
-    );
-    state.ability_cost_discount_used.extend(spent);
-    restrictions::record_ability_activation(state, source_id, ability_index);
+    restrictions::record_ability_activation(state, source_id, ability_index, Some(record));
     // CR 117.1b: Priority permits unbounded activation. `pending_activations`
     // is a per-priority-window AI-guard — see `GameState::pending_activations`.
     state.pending_activations.push((source_id, ability_index));
@@ -25224,62 +25256,115 @@ pub(crate) fn record_activated_ability_placed(
     );
 }
 
-/// CR 602.2b: the once-per-turn modifier slots ("the first activated ability
-/// you activate ... costs {2} less") the entry `placed_entry` spends.
-///
-/// A settled activation carries them, stamped when its cost locked. A loyalty
-/// ability's fast path folds no cost, so its slots are determined here from the
-/// entry's committed targets: a reduction can't touch a bare `Loyalty` cost, but
-/// that ability is still the first qualifying one this turn.
-fn once_per_turn_slots_spent_by_placed_entry(
+/// CR 602.2 + CR 601.2c: capture an activation's journal facts while they are
+/// live, before any of its cost is paid: the activator, the source as it is
+/// now, and the committed targets of the whole chain (CR 115.1), each object
+/// target as it is now. The activation analog of building a
+/// `SpellCastRecord` at cast time.
+pub(crate) fn capture_activation_record(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
-    placed_entry: ObjectId,
-) -> Vec<ObjectId> {
-    let Some(placed) = state
-        .stack
+    ability: &ResolvedAbility,
+) -> Option<AbilityActivationRecord> {
+    capture_activation_record_from(
+        state,
+        player,
+        source_id,
+        activation_ability_definition(state, source_id, ability_index).as_ref(),
+        &flatten_targets_in_chain(ability),
+    )
+}
+
+/// [`capture_activation_record`] from an ability definition and its committed
+/// targets: the mana-ability announcement (which has a definition snapshot and
+/// no targets, CR 605.1a) comes here directly.
+pub(crate) fn capture_activation_record_from(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    def: Option<&AbilityDefinition>,
+    targets: &[TargetRef],
+) -> Option<AbilityActivationRecord> {
+    // The source exists whenever its ability is announced; a missing one
+    // yields no record, which the placement authority refuses (fail-closed).
+    let source_lki = state
+        .objects
+        .get(&source_id)?
+        .snapshot_public_characteristics();
+    let targets = targets
         .iter()
-        .find(|entry| entry.id == placed_entry)
-        .and_then(|entry| match &entry.kind {
-            StackEntryKind::ActivatedAbility { ability, .. } => Some(ability.as_ref()),
-            _ => None,
+        .filter_map(|target| match target {
+            TargetRef::Player(player) => Some(ActivationTargetFact::Player(*player)),
+            TargetRef::Object(id) => {
+                state
+                    .objects
+                    .get(id)
+                    .map(|obj| ActivationTargetFact::Object {
+                        id: *id,
+                        lki: Box::new(obj.snapshot_public_characteristics()),
+                    })
+            }
         })
-    else {
-        return Vec::new();
+        .collect();
+    Some(AbilityActivationRecord {
+        activator: player,
+        source: source_id,
+        source_lki,
+        ability_tag: def.and_then(|def| def.ability_tag),
+        is_mana_ability: def.is_some_and(super::mana_abilities::is_mana_ability),
+        is_loyalty_ability: def
+            .and_then(|def| def.cost.as_ref())
+            .is_some_and(crate::types::ability::is_loyalty_ability_cost),
+        targets,
+    })
+}
+
+/// CR 602.2 + CR 601.2c: at target settlement, replace a captured record's
+/// targets with the committed chain targets as they are now, before payment. An
+/// activation that reaches settlement without a record (a pending restored from
+/// before the journal existed) is captured whole here, still before payment.
+fn capture_settled_targets(state: &GameState, player: PlayerId, pending: &mut PendingCast) {
+    let Some(ability_index) = pending.activation_ability_index else {
+        return;
     };
-    let Some(ability_def) = activation_ability_definition(state, source_id, ability_index) else {
-        return placed.ability_cost_discount_static_sources.clone();
+    let Some(fresh) = capture_activation_record(
+        state,
+        player,
+        pending.object_id,
+        ability_index,
+        &pending.ability,
+    ) else {
+        return;
     };
-    let is_loyalty = ability_def
-        .cost
-        .as_ref()
-        .is_some_and(crate::types::ability::is_loyalty_ability_cost);
-    if !is_loyalty {
-        return placed.ability_cost_discount_static_sources.clone();
+    match pending.ability.activation_record.as_deref_mut() {
+        Some(record) => record.targets = fresh.targets,
+        None => pending.ability.activation_record = Some(Box::new(fresh)),
     }
-    let mut spent = collect_activation_cost_modifiers(
+}
+
+/// Test fixtures that park a hand-built activation `PendingCast` mid-pipeline
+/// skip its announcement, so they stamp the pre-payment record that announcement
+/// would have captured. Panics on a spell pending or a missing source.
+#[cfg(any(test, feature = "test-support"))]
+pub fn stamp_announced_activation_record(
+    state: &GameState,
+    player: PlayerId,
+    pending: &mut PendingCast,
+) {
+    let ability_index = pending
+        .activation_ability_index
+        .expect("stamp_announced_activation_record needs an activation pending");
+    let record = capture_activation_record(
         state,
-        &ability_def,
         player,
-        source_id,
-        TargetGating::Independent,
-    );
-    spent.extend(collect_activation_cost_modifiers(
-        state,
-        &ability_def,
-        player,
-        source_id,
-        TargetGating::Committed(placed),
-    ));
-    let mut sources = placed.ability_cost_discount_static_sources.clone();
-    for source in spent.once_per_turn_sources {
-        if !sources.contains(&source) {
-            sources.push(source);
-        }
-    }
-    sources
+        pending.object_id,
+        ability_index,
+        &pending.ability,
+    )
+    .expect("stamp_announced_activation_record needs the activation's source");
+    pending.ability.activation_record = Some(Box::new(record));
 }
 
 /// CR 601.2i: If the player is unable or unwilling to complete a cast, the
@@ -25728,11 +25813,6 @@ pub(crate) struct ActivationCostModifiers {
     /// Every applying reduction, in canonical collection order: the ability's own
     /// rider, then battlefield statics, then duration-scoped continuous effects.
     pub(crate) reductions: Vec<CostReductionEntry>,
-    /// The once-per-turn sources among the applying modifiers. Applying spends
-    /// the slot when the activation reaches the stack, even if the modifier
-    /// changed nothing (Professor Hojo's ruling: it "will have no effect on an
-    /// activation cost of {G}", and that activation is still the first).
-    pub(crate) once_per_turn_sources: Vec<ObjectId>,
 }
 
 impl ActivationCostModifiers {
@@ -25764,24 +25844,8 @@ impl ActivationCostModifiers {
         }
     }
 
-    fn spend_once_per_turn(&mut self, source: ObjectId) {
-        if !self.once_per_turn_sources.contains(&source) {
-            self.once_per_turn_sources.push(source);
-        }
-    }
-
-    /// Appends `other`'s modifiers after this collection's, keeping canonical
-    /// order within each.
-    pub(crate) fn extend(&mut self, other: ActivationCostModifiers) {
-        self.raise_total = self.raise_total.saturating_add(other.raise_total);
-        self.reductions.extend(other.reductions);
-        for source in other.once_per_turn_sources {
-            self.spend_once_per_turn(source);
-        }
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
-        self.raise_total == 0 && self.reductions.is_empty() && self.once_per_turn_sources.is_empty()
+        self.raise_total == 0 && self.reductions.is_empty()
     }
 }
 
@@ -26357,11 +26421,12 @@ fn parsed_condition_satisfied_with_committed_targets(
                 )
             };
             let lhs_value = resolve(lhs, player);
-            state
-                .players
-                .iter()
-                .filter(|candidate| candidate.id != player)
-                .all(|candidate| comparator.evaluate(lhs_value, resolve(rhs, candidate.id)))
+            // CR 102.2 + CR 102.3 + CR 800.4a: each opponent still in the game,
+            // not every other seat (a player who left the game or a teammate is
+            // not an opponent).
+            super::players::opponents(state, player)
+                .into_iter()
+                .all(|opponent| comparator.evaluate(lhs_value, resolve(rhs, opponent)))
         }
         _ => restrictions::evaluate_condition(state, player, source_id, condition),
     }
@@ -26821,6 +26886,18 @@ pub(crate) fn settle_activation_cost(
     #[cfg(feature = "test-support")]
     super::perf_counters::record_activation_settlement(pending.activation_cost_snapshot.as_deref());
     pending.activation_target_selection = ActivationTargetSelection::Settled;
+    // CR 602.2 + CR 601.2c (capture T): every settled target-first route
+    // passes here after its targets are committed and before any payment, so
+    // the committed targets' facts are captured now, whatever the lock.
+    let activator = pending.ability.controller;
+    capture_settled_targets(state, activator, &mut pending);
+    // CR 602.2 + CR 601.2f: from here on the draft is an invariant of the
+    // pending activation, so an activation that couldn't be captured (its
+    // source is gone) is reversed now, before any of its cost is paid, rather
+    // than at placement.
+    if pending.activation_ability_index.is_some() {
+        require_activation_record(&pending.ability, player)?;
+    }
     let open = pending
         .activation_cost_snapshot
         .as_deref()
@@ -26933,11 +27010,6 @@ fn lock_activation_cost_at_settlement(
         .expect("settlement locks an open carrier");
     snapshot.raise_total = snapshot.raise_total.saturating_add(committed.raise_total);
     snapshot.reductions.extend(committed.reductions);
-    for source in committed.once_per_turn_sources {
-        if !snapshot.once_per_turn_sources.contains(&source) {
-            snapshot.once_per_turn_sources.push(source);
-        }
-    }
     snapshot.mana_carrier = mana_carrier;
     if let Some(base) = base {
         // Re-captured from the carrier: an X chosen since announcement is
@@ -26949,8 +27021,6 @@ fn lock_activation_cost_at_settlement(
             point: ActivationCostLockPoint::TargetSettlement,
             order: None,
         };
-        pending.ability.ability_cost_discount_static_sources =
-            snapshot.once_per_turn_sources.clone();
         return Ok(SettlementLock::Locked);
     }
 
@@ -27005,7 +27075,7 @@ fn settled_activation_total_cost(
 }
 
 /// CR 601.2f + CR 118.7: write the settled fold back to the carrier that holds
-/// the unpaid mana, and stamp the once-per-turn slots the activation spends.
+/// the unpaid mana.
 /// Only the mana component changes: `fold_activation_cost` touches only
 /// `AbilityCost::Mana` legs, so a `Whole` carrier's non-mana legs are kept, and a
 /// `Split` carrier's non-mana residual in `activation_cost` is not touched.
@@ -27023,7 +27093,6 @@ fn write_back_settled_activation_cost(
         &snapshot.reductions,
         order,
     );
-    let once_per_turn_sources = snapshot.once_per_turn_sources.clone();
     match snapshot.mana_carrier {
         ManaCarrier::Whole => pending.activation_cost = Some(folded),
         ManaCarrier::Split => match folded {
@@ -27043,7 +27112,6 @@ fn write_back_settled_activation_cost(
             }
         },
     }
-    pending.ability.ability_cost_discount_static_sources = once_per_turn_sources;
 }
 
 /// CR 601.2f + CR 602.2b: resume a target-settlement election. The caster's
@@ -27643,9 +27711,6 @@ fn collect_static_activated_ability_cost_modifiers(
                 static_source.controller,
                 &ctx,
             ) {
-                if applied.once_per_turn {
-                    modifiers.spend_once_per_turn(static_source.id);
-                }
                 modifiers.push(
                     applied.mode,
                     applied.amount,
@@ -27691,9 +27756,6 @@ fn collect_static_activated_ability_cost_modifiers(
                 tce.controller,
                 &ctx,
             ) {
-                if applied.once_per_turn {
-                    modifiers.spend_once_per_turn(tce.source_id);
-                }
                 let (mode, amount, minimum_mana) =
                     (applied.mode, applied.amount, applied.minimum_mana);
                 let display_name = state
@@ -27732,9 +27794,153 @@ struct AppliedAbilityCostModifier {
     mode: CostModifyMode,
     amount: u32,
     minimum_mana: u32,
-    /// CR 602.2b: a once-per-turn modifier ("the first activated ability you
-    /// activate ... each turn") whose slot this activation spends.
-    once_per_turn: bool,
+}
+
+/// The activating side of a `ReduceAbilityCost` applicability check, for the
+/// activation being priced now or for one recorded earlier this turn. The gates
+/// below read only this, so "does this modifier apply to that activation" is
+/// one predicate for both, and the history check can't drift from the price.
+struct ActivationView<'a> {
+    activator: PlayerId,
+    source: ObjectId,
+    /// `None`: the live source. `Some`: its facts as they were when activated.
+    source_lki: Option<&'a LKISnapshot>,
+    active_keyword: Option<&'static str>,
+    is_mana: bool,
+    is_loyalty: bool,
+}
+
+/// CR 601.2f + CR 118.7 + CR 605.1a + CR 606.1 + CR 602.2: whether a
+/// `ReduceAbilityCost` static's keyword, mana-ability exemption, activator, and
+/// source (`affected`) gates admit `view`. Its `targets` gate is separate,
+/// because a live activation's targets may not be committed yet.
+#[allow(clippy::too_many_arguments)]
+fn reduce_ability_cost_non_target_gates_admit(
+    state: &GameState,
+    view: &ActivationView<'_>,
+    keyword: &str,
+    exemption: ActivationExemption,
+    activator: Option<&PlayerFilter>,
+    affected: Option<&TargetFilter>,
+    static_controller: PlayerId,
+    filter_ctx: &super::filter::FilterContext,
+) -> bool {
+    // CR 601.2f + CR 606.1: match the "activated" blanket arm, a tag-keyed keyword
+    // (power-up, exhaust, …), or the "loyalty" arm against a loyalty ability's cost.
+    let keyword_matches = keyword == "activated"
+        || Some(keyword) == view.active_keyword
+        || (keyword == "loyalty" && view.is_loyalty);
+    if !keyword_matches {
+        return false;
+    }
+    // CR 605.1a: a mana ability bypasses a "unless they're mana abilities"
+    // adjustment (Suppression Field's tax, Zirda's discount).
+    if exemption == ActivationExemption::ManaAbilities && view.is_mana {
+        return false;
+    }
+    // CR 602.2: an activator-scoped static ("abilities you activate" — Zirda, the
+    // Dawnwaker; Fluctuator) keys off WHO is activating the ability, evaluated
+    // relative to the static's controller — NOT who controls the ability's source.
+    // Reuse the activator-permission predicate with the static's controller as the
+    // reference point so "you" resolves to the static controller. `None` leaves the
+    // source/global scope untouched.
+    if let Some(activator) = activator {
+        if !player_may_begin_activating(state, view.activator, static_controller, Some(activator)) {
+            return false;
+        }
+    }
+    // CR 602.2: scope by the source filter against the ability's SOURCE permanent.
+    affected.is_none_or(|filter| match view.source_lki {
+        None => super::filter::matches_target_filter(state, view.source, filter, filter_ctx),
+        Some(lki) => super::filter::matches_target_filter_on_lki_snapshot(
+            state,
+            view.source,
+            lki,
+            filter,
+            filter_ctx,
+        ),
+    })
+}
+
+/// CR 601.2c + CR 115.1: whether any committed target of a recorded activation
+/// matched `filter` as it was when the ability was activated.
+fn recorded_targets_match_filter(
+    state: &GameState,
+    record: &AbilityActivationRecord,
+    filter: &TargetFilter,
+    static_source_id: ObjectId,
+    static_controller: PlayerId,
+) -> bool {
+    let ctx = super::filter::FilterContext::from_source_with_controller(
+        static_source_id,
+        static_controller,
+    );
+    record.targets.iter().any(|fact| match fact {
+        ActivationTargetFact::Object { id, lki } => {
+            super::filter::matches_target_filter_on_lki_snapshot(state, *id, lki, filter, &ctx)
+        }
+        ActivationTargetFact::Player(player) => target_ref_matches_cost_filter(
+            state,
+            static_source_id,
+            static_controller,
+            &TargetRef::Player(*player),
+            filter,
+        ),
+    })
+}
+
+/// CR 611.3a + CR 602.2: "the first activated ability … you activate each
+/// turn …" is a fact about the turn, not about this modifier's source: an
+/// activation made before the source existed, or before it left and returned,
+/// still counts. True when an activation already recorded this turn satisfies
+/// every gate of this modifier (the same gates the price uses), so the
+/// current activation is not the first.
+#[allow(clippy::too_many_arguments)]
+fn earlier_activation_this_turn_qualified(
+    state: &GameState,
+    keyword: &str,
+    exemption: ActivationExemption,
+    activator: Option<&PlayerFilter>,
+    affected: Option<&TargetFilter>,
+    targets: Option<&TargetFilter>,
+    static_source_id: ObjectId,
+    static_controller: PlayerId,
+    filter_ctx: &super::filter::FilterContext,
+) -> bool {
+    state
+        .abilities_activated_this_turn_by_player
+        .values()
+        .flatten()
+        .any(|record| {
+            let view = ActivationView {
+                activator: record.activator,
+                source: record.source,
+                source_lki: Some(&record.source_lki),
+                active_keyword: record
+                    .ability_tag
+                    .map(crate::types::ability::AbilityTag::keyword_str),
+                is_mana: record.is_mana_ability,
+                is_loyalty: record.is_loyalty_ability,
+            };
+            reduce_ability_cost_non_target_gates_admit(
+                state,
+                &view,
+                keyword,
+                exemption,
+                activator,
+                affected,
+                static_controller,
+                filter_ctx,
+            ) && targets.is_none_or(|filter| {
+                recorded_targets_match_filter(
+                    state,
+                    record,
+                    filter,
+                    static_source_id,
+                    static_controller,
+                )
+            })
+        })
 }
 
 /// CR 604.1: presence gate for the transient (duration-scoped) `ReduceAbilityCost`
@@ -27798,34 +28004,27 @@ fn resolve_one_reduce_ability_cost(
     else {
         return None;
     };
-    // CR 601.2f + CR 606.1: match the "activated" blanket arm, a tag-keyed keyword
-    // (power-up, exhaust, …), or the "loyalty" arm against a loyalty ability's cost.
-    let keyword_matches = keyword == "activated"
-        || Some(keyword.as_str()) == active_keyword
-        || (keyword == "loyalty" && ability_is_loyalty);
-    if !keyword_matches || *amount == 0 {
+    if *amount == 0 {
         return None;
     }
-    // CR 605.1a: a mana ability bypasses a "unless they're mana abilities"
-    // adjustment (Suppression Field's tax, Zirda's discount).
-    if *exemption == ActivationExemption::ManaAbilities && ability_is_mana {
-        return None;
-    }
-    // CR 602.2: an activator-scoped static ("abilities you activate" — Zirda, the
-    // Dawnwaker; Fluctuator) keys off WHO is activating the ability, evaluated
-    // relative to the static's controller — NOT who controls the ability's source.
-    // Reuse the activator-permission predicate with the static's controller as the
-    // reference point so "you" resolves to the static controller. `None` leaves the
-    // source/global scope untouched.
-    if let Some(activator) = activator {
-        if !player_may_begin_activating(state, player, static_controller, Some(activator)) {
-            return None;
-        }
-    }
-    // CR 602.2: scope by the source filter against the ability's SOURCE permanent.
-    if affected.is_some_and(|filter| {
-        !super::filter::matches_target_filter(state, ability_source_id, filter, filter_ctx)
-    }) {
+    let view = ActivationView {
+        activator: player,
+        source: ability_source_id,
+        source_lki: None,
+        active_keyword,
+        is_mana: ability_is_mana,
+        is_loyalty: ability_is_loyalty,
+    };
+    if !reduce_ability_cost_non_target_gates_admit(
+        state,
+        &view,
+        keyword,
+        *exemption,
+        activator.as_ref(),
+        affected,
+        static_controller,
+        filter_ctx,
+    ) {
         return None;
     }
     // CR 601.2c + CR 602.2b: a `targets` restriction ("that targets a creature
@@ -27848,10 +28047,22 @@ fn resolve_one_reduce_ability_cost(
             }
         }
     }
-    // CR 602.2b: a once-per-turn modifier whose slot is already spent this
-    // turn no longer applies.
-    let once_per_turn = matches!(frequency, Some(CastFrequency::OncePerTurn));
-    if once_per_turn && state.ability_cost_discount_used.contains(&static_source_id) {
+    // CR 611.3a + CR 602.2: a once-per-turn modifier applies only to the
+    // turn's FIRST activation that satisfies all of its gates, whenever that
+    // activation happened relative to the modifier's source.
+    if matches!(frequency, Some(CastFrequency::OncePerTurn))
+        && earlier_activation_this_turn_qualified(
+            state,
+            keyword,
+            *exemption,
+            activator.as_ref(),
+            affected,
+            targets.as_ref(),
+            static_source_id,
+            static_controller,
+            filter_ctx,
+        )
+    {
         return None;
     }
     // CR 601.2f + CR 208.1 + CR 113.7: When `dynamic_count` is present the per-unit
@@ -27875,7 +28086,6 @@ fn resolve_one_reduce_ability_cost(
         mode: *mode,
         amount: effective,
         minimum_mana: minimum_mana.unwrap_or(0),
-        once_per_turn,
     })
 }
 

@@ -123,7 +123,7 @@ fn handle_activated_mode_choice(
     let ActivatedModeChoice {
         player,
         source_id,
-        resolved,
+        mut resolved,
         ability_index,
         ability_cost,
         activation_cost_snapshot,
@@ -131,6 +131,13 @@ fn handle_activated_mode_choice(
         mode_abilities,
         indices,
     } = choice;
+    // CR 602.2 + CR 601.2c (capture A, modal): the chosen modes' chain is built
+    // here, after the announcement returned for the mode choice, so its journal
+    // facts are captured now, before any cost is paid. Target settlement adds
+    // the committed targets.
+    resolved.activation_record =
+        casting::capture_activation_record(state, player, source_id, ability_index, &resolved)
+            .map(Box::new);
 
     let target_constraints = target_constraints_from_modal(&modal);
 

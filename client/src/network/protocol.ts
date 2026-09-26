@@ -108,9 +108,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * Bumps to date:
  *  63 — game_setup and state_update carry GameState, whose reduce-ability-cost
  *       statics can now carry a target restriction and a once-per-turn
- *       frequency, whose per-turn ledger records spent once-per-turn discounts,
- *       and whose activation cost carrier holds the target-settlement lock.
- *       Bumped in lockstep with full-game protocol 81.
+ *       frequency, whose per-turn activation journal records each turn's
+ *       activations, and whose activation cost carrier holds the
+ *       target-settlement lock. Bumped in lockstep with full-game protocol 81.
  *  62 — game_setup and state_update carry GameState, whose exile look links
  *       now carry { grant, lookers, source_incarnation }, and DerivedViews
  *       gains linked_exile_ids, which the board renders directly. Bumped in

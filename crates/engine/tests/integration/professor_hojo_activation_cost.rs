@@ -646,10 +646,10 @@ fn card_face(name: &str, oracle: &str, types: &[&str]) -> engine::types::card::C
 ///
 /// Tezzeret's discount applies to "the first activated ability of an artifact you
 /// activate each turn", and its ruling says that "does not exclude mana abilities".
-/// The mana-ability path applies no `ReduceAbilityCost` and records no
-/// once-per-turn consumption. So if this line were supported, tapping an artifact
-/// for mana first would leave the discount for a later ability. Declining it keeps
-/// the card honestly red until that path consumes.
+/// The mana-ability path applies no `ReduceAbilityCost`, so if this line were
+/// supported, a mana ability that was the turn's first activation would go
+/// undiscounted. Declining it keeps the card honestly red until that path
+/// prices activations.
 ///
 /// The paired control is Professor Hojo: the SAME grammar branch, with a target
 /// restriction. A target-restricted ability can never be a mana ability (CR

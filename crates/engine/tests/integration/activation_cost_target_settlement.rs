@@ -5,6 +5,7 @@
 //! exist, affordability is judged over the legal assignments.
 
 use engine::game::casting::can_activate_ability_now;
+use engine::game::filter_state_for_viewer;
 use engine::game::perf_counters;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{AbilityCost, StaticDefinition, TargetRef};
@@ -12,10 +13,11 @@ use engine::types::actions::GameAction;
 use engine::types::casting_costs::{ActivationCostLock, ActivationCostLockPoint};
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    CostResume, PersistedGameState, PersistedRestoreFinalization, WaitingFor,
+    AbilityActivationRecord, ActivationTargetFact, CostResume, ManaChoice, ManaChoiceContext,
+    PersistedGameState, PersistedRestoreFinalization, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaColor, ManaCost, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::statics::{ActivationExemption, CastFrequency, CostModifyMode, StaticMode};
@@ -84,6 +86,15 @@ fn finish(runner: &mut GameRunner, pay_with: &[ObjectId]) -> WaitingFor {
                     },
                 )
                 .expect("cost payment");
+            }
+            WaitingFor::OrderTriggers { triggers, .. } => {
+                act(
+                    runner,
+                    GameAction::OrderTriggers {
+                        order: (0..triggers.len()).collect(),
+                    },
+                )
+                .expect("trigger order");
             }
             other => panic!("unexpected prompt while paying: {other:?}"),
         }
@@ -527,7 +538,10 @@ fn a_reversed_activation_leaves_the_once_per_turn_discount_unspent() {
         !result.disposition.is_applied(),
         "the Bear gets no discount, so {{4}} is unaffordable"
     );
-    assert!(r.state().ability_cost_discount_used.is_empty());
+    assert!(
+        r.state().abilities_activated_this_turn_by_player.is_empty(),
+        "a reversed activation leaves no journal row"
+    );
     activate(&mut r);
     act(
         &mut r,
@@ -830,7 +844,10 @@ fn an_unpayable_elected_total_at_settlement_reverses_the_activation() {
     assert!(!result.disposition.is_applied(), "typed reversal");
     assert!(matches!(r.state().waiting_for, WaitingFor::Priority { .. }));
     assert_eq!(stack_len(&r), 0);
-    assert!(r.state().ability_cost_discount_used.is_empty());
+    assert!(
+        r.state().abilities_activated_this_turn_by_player.is_empty(),
+        "a reversed activation leaves no journal row"
+    );
     assert!(!r.state().objects[&own].tapped);
 }
 
@@ -1060,7 +1077,7 @@ fn a_frozen_v78_mode_choice_keeps_its_announcement_fold() {
 }
 
 // ---------------------------------------------------------------------------
-// Ledger consumption at placement (M5a, L1, L2).
+// The turn's activation journal, written at placement (M5a, L1, L2).
 // ---------------------------------------------------------------------------
 
 fn once_per_turn_untargeted_reducer() -> StaticDefinition {
@@ -1078,8 +1095,9 @@ fn once_per_turn_untargeted_reducer() -> StaticDefinition {
 }
 
 /// M5a: an untargeted once-per-turn discount that folds `{2}` to `{0}` reaches
-/// the stack through the direct push, which must spend the slot too. Built at
-/// the building-block level: the parser declines this shape (Tezzeret).
+/// the stack through the direct push, which must journal the activation too.
+/// Built at the building-block level: the parser declines this shape
+/// (Tezzeret).
 #[test]
 fn a_once_per_turn_discount_is_spent_by_a_zero_cost_direct_push() {
     let mut s = GameScenario::new();
@@ -1103,8 +1121,9 @@ const LOYALTY_TAP: &str = "+1: Tap target creature.";
 const LOYALTY_GAIN: &str = "+1: You gain 1 life.";
 
 /// L1: a loyalty ability that qualifies for Hojo (it targets a creature you
-/// control) is the first such activation, so it spends the slot even though a
-/// reduction can't touch a bare loyalty cost. One row per loyalty route.
+/// control) is the turn's first such activation, so the next one pays full
+/// even though a reduction can't touch a bare loyalty cost. One row per
+/// loyalty route.
 fn after_loyalty_paid(loyalty: Option<(&str, usize)>) -> usize {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
@@ -1146,7 +1165,19 @@ fn after_loyalty_paid(loyalty: Option<(&str, usize)>) -> usize {
             },
         )
         .expect("loyalty activation");
-        if matches!(r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        if let WaitingFor::TargetSelection { pending_cast, .. } = &r.state().waiting_for {
+            // r5c #1: the loyalty fast path captured the draft before this
+            // prompt and before its counter cost, so settlement only adds
+            // the committed targets to it.
+            let draft = pending_cast
+                .ability
+                .activation_record
+                .as_deref()
+                .expect("the interactive loyalty route carries its draft into the prompt");
+            assert!(
+                draft.is_loyalty_ability && draft.activator == P0 && draft.source == walker,
+                "{draft:?}"
+            );
             act(
                 &mut r,
                 GameAction::SelectTargets {
@@ -1155,10 +1186,30 @@ fn after_loyalty_paid(loyalty: Option<(&str, usize)>) -> usize {
             )
             .expect("loyalty target");
         }
-        assert!(
-            text == LOYALTY_GAIN || !r.state().ability_cost_discount_used.is_empty(),
-            "a qualifying loyalty activation spends Hojo's slot at placement"
+        let rows = r
+            .state()
+            .abilities_activated_this_turn_by_player
+            .get(&P0)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the loyalty activation is journaled at placement"
         );
+        assert!(rows[0].is_loyalty_ability, "{:?}", rows[0]);
+        if text == LOYALTY_GAIN {
+            assert!(rows[0].targets.is_empty(), "{:?}", rows[0]);
+        } else {
+            assert!(
+                matches!(
+                    rows[0].targets.as_slice(),
+                    [ActivationTargetFact::Object { id, lki }] if *id == hojo && lki.controller == P0
+                ),
+                "journaled with its committed target as it was: {:?}",
+                rows[0]
+            );
+        }
         // Resolve the loyalty ability and Hojo's trigger.
         while !r.state().stack.is_empty() {
             act(&mut r, GameAction::PassPriority).unwrap();
@@ -1214,10 +1265,10 @@ fn a_qualifying_loyalty_activation_spends_the_once_per_turn_discount() {
     );
 }
 
-/// L2: two activations of one ability share source and index. Consumption reads
-/// the NEWLY placed entry's targets, not the older entry beneath it: the first
-/// (an opponent's creature) doesn't qualify, the second (your own) does, so the
-/// third pays full price.
+/// L2: two activations of one ability share source and index. Each journal row
+/// holds the targets of the entry it was captured for, not the older entry
+/// beneath it: the first (an opponent's creature) doesn't qualify, the second
+/// (your own) does, so the third pays full price.
 #[test]
 fn consumption_reads_the_entry_just_placed_not_an_older_one_beneath_it() {
     let mut s = GameScenario::new();
@@ -2214,4 +2265,756 @@ fn a_rider_count_reads_the_target_of_a_later_chosen_mode() {
     );
     finish(&mut r, &[]);
     assert_eq!(pool(&r, P0), 0, "paid {{1}}");
+}
+
+// ---------------------------------------------------------------------------
+// Round 5: "first" is the first qualifying activation of the TURN (CR 611.3a;
+// the Zimone / Shadow in the Warp rulings), not the first while this Hojo
+// object exists.
+// ---------------------------------------------------------------------------
+
+const TAPPER: &str = "{2}: Tap target creature.";
+const CLOUDSHIFT: &str =
+    "Exile target creature you control, then return that card to the battlefield under your control.";
+
+fn find_on_battlefield(r: &GameRunner, name: &str) -> ObjectId {
+    r.state()
+        .objects
+        .values()
+        .find(|o| o.name == name && o.zone == Zone::Battlefield)
+        .map(|o| o.id)
+        .unwrap_or_else(|| panic!("{name} on the battlefield"))
+}
+
+fn activate_on(
+    r: &mut GameRunner,
+    src: ObjectId,
+    target: ObjectId,
+    pay_with: &[ObjectId],
+) -> usize {
+    let before = pool(r, P0);
+    let wf = act(
+        r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("the activation starts");
+    if matches!(wf, WaitingFor::TargetSelection { .. }) {
+        act(
+            r,
+            GameAction::SelectTargets {
+                targets: vec![object(target)],
+            },
+        )
+        .expect("the target settles");
+    }
+    finish(r, pay_with);
+    let paid = before - pool(r, P0);
+    // Let it (and Hojo's draw trigger) resolve before the next step.
+    while !r.state().stack.is_empty() {
+        act(r, GameAction::PassPriority).expect("pass");
+        if r.state().stack.is_empty() {
+            break;
+        }
+        act(r, GameAction::PassPriority).expect("pass");
+    }
+    paid
+}
+
+fn cast_and_resolve(r: &mut GameRunner, spell: ObjectId, target: Option<ObjectId>) {
+    let cast = r.cast(spell);
+    let cast = match target {
+        Some(target) => cast.target_object(target),
+        None => cast,
+    };
+    cast.resolve();
+}
+
+/// H1: an activation that targeted your creature BEFORE Hojo entered is the
+/// turn's first qualifying activation, so the next one gets no discount.
+#[test]
+fn an_activation_before_hojo_entered_is_still_the_first_of_the_turn() {
+    for earlier in [true, false] {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        library(&mut s, P0);
+        let own = s.add_creature(P0, "Own", 1, 1).id();
+        s.add_creature(P1, "Theirs", 1, 1);
+        let hojo = s
+            .add_creature_to_hand_from_oracle(P0, "Professor Hojo", 2, 2, HOJO)
+            .with_mana_cost(ManaCost::generic(1))
+            .id();
+        let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+        mana(&mut s, P0, 10);
+        let mut r = s.build();
+        if earlier {
+            assert_eq!(activate_on(&mut r, src, own, &[]), 2, "no Hojo yet");
+        }
+        cast_and_resolve(&mut r, hojo, None);
+        let paid = activate_on(&mut r, src, own, &[]);
+        assert_eq!(
+            paid,
+            if earlier { 2 } else { 0 },
+            "earlier qualifying activation: {earlier}"
+        );
+    }
+}
+
+/// H2: a Hojo that leaves and returns, or another Hojo entering later, is not
+/// a new turn: the second qualifying activation still pays full. The engine's
+/// blink keeps the `ObjectId` and bumps the incarnation (CR 400.7), so the
+/// late second Hojo is the case a source-keyed ledger gets wrong.
+#[test]
+fn hojo_leaving_and_returning_does_not_grant_a_second_first_activation() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature(P1, "Theirs", 1, 1);
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let blink = s
+        .add_spell_to_hand_from_oracle(P0, "Cloudshift", true, CLOUDSHIFT)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    mana(&mut s, P0, 10);
+    let mut r = s.build();
+    let hojo = find_on_battlefield(&r, "Professor Hojo");
+    let incarnation_before = r.state().objects[&hojo].incarnation;
+    assert_eq!(
+        activate_on(&mut r, src, own, &[]),
+        0,
+        "the first qualifying activation"
+    );
+    cast_and_resolve(&mut r, blink, Some(hojo));
+    let hojo_after = find_on_battlefield(&r, "Professor Hojo");
+    assert!(
+        hojo_after != hojo || r.state().objects[&hojo_after].incarnation != incarnation_before,
+        "reach guard: Hojo is a new object (CR 400.7)"
+    );
+    assert_eq!(
+        activate_on(&mut r, src, own, &[]),
+        2,
+        "not a second first activation"
+    );
+}
+
+/// H2b: a second Hojo that enters after the turn's first qualifying activation
+/// grants nothing: that activation was already the first.
+#[test]
+fn a_hojo_entering_after_the_first_qualifying_activation_grants_nothing() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature(P1, "Theirs", 1, 1);
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let late = s
+        .add_creature_to_hand_from_oracle(P0, "Professor Hojo", 2, 2, HOJO)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    mana(&mut s, P0, 10);
+    let mut r = s.build();
+    assert_eq!(
+        activate_on(&mut r, src, own, &[]),
+        0,
+        "the first qualifying activation"
+    );
+    cast_and_resolve(&mut r, late, None);
+    assert_eq!(
+        r.state().objects[&late].zone,
+        Zone::Battlefield,
+        "reach guard: the second Hojo entered"
+    );
+    assert_eq!(
+        activate_on(&mut r, src, own, &[]),
+        2,
+        "not a second first activation"
+    );
+}
+
+/// H7: "targets a creature you control" is judged when the ability is
+/// activated, before its cost is paid. P0's first activation targets the
+/// creature P0 controls through Control Magic and sacrifices Control Magic as
+/// its cost, so the creature reverts to P1 before the ability is placed. It
+/// was still the first qualifying activation.
+#[test]
+fn a_target_that_changes_controller_while_its_cost_is_paid_still_qualified() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    let stolen = s.add_creature(P1, "Stolen", 2, 2).id();
+    let magic = s
+        .add_enchantment_from_oracle(
+            P0,
+            "Control Magic",
+            "Enchant creature\nYou control enchanted creature.",
+        )
+        .with_subtypes(vec!["Aura"])
+        .id();
+    let sacrificer = s
+        .add_artifact_from_oracle(
+            P0,
+            "Altar of Change",
+            "{1}, Sacrifice an enchantment: Tap target creature.",
+        )
+        .id();
+    let hojo = s
+        .add_creature_to_hand_from_oracle(P0, "Professor Hojo", 2, 2, HOJO)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    mana(&mut s, P0, 10);
+    let mut r = s.build();
+    {
+        let state = r.state_mut();
+        state.objects.get_mut(&magic).unwrap().attached_to = Some(stolen.into());
+        state
+            .objects
+            .get_mut(&stolen)
+            .unwrap()
+            .attachments
+            .push(magic);
+        state.layers_dirty.mark_full();
+    }
+    engine::game::layers::flush_layers(r.state_mut());
+    assert_eq!(
+        r.state().objects[&stolen].controller,
+        P0,
+        "reach guard: P0 controls it"
+    );
+    activate_on(&mut r, sacrificer, stolen, &[magic]);
+    assert_eq!(
+        r.state().objects[&stolen].controller,
+        P1,
+        "reach guard: the creature reverted"
+    );
+    cast_and_resolve(&mut r, hojo, None);
+    assert_eq!(
+        activate_on(&mut r, src, own, &[]),
+        2,
+        "the first activation qualified"
+    );
+}
+
+/// Pass priority until the stack is empty (both players pass each object).
+fn drain(r: &mut GameRunner) {
+    while !r.state().stack.is_empty() {
+        act(r, GameAction::PassPriority).expect("pass");
+    }
+}
+
+fn journal(r: &GameRunner, player: PlayerId) -> Vec<AbilityActivationRecord> {
+    r.state()
+        .abilities_activated_this_turn_by_player
+        .get(&player)
+        .map(|rows| rows.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// H4: an earlier activation that doesn't target a creature you control (an
+/// opponent's creature, or no target at all) is not the first QUALIFYING one,
+/// whether it came before or after Hojo entered.
+#[test]
+fn a_non_qualifying_earlier_activation_does_not_consume_the_discount() {
+    for (label, before_hojo) in [("with Hojo out", false), ("before Hojo", true)] {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        library(&mut s, P0);
+        let own = s.add_creature(P0, "Own", 1, 1).id();
+        let theirs = s.add_creature(P1, "Theirs", 1, 1).id();
+        let hojo = if before_hojo {
+            Some(
+                s.add_creature_to_hand_from_oracle(P0, "Professor Hojo", 2, 2, HOJO)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .id(),
+            )
+        } else {
+            s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+            None
+        };
+        let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+        let lifestone = s
+            .add_artifact_from_oracle(P0, "Lifestone", "{2}: You gain 1 life.")
+            .id();
+        mana(&mut s, P0, 12);
+        let mut r = s.build();
+        assert_eq!(activate_on(&mut r, src, theirs, &[]), 2, "{label}: theirs");
+        let before = pool(&r, P0);
+        r.activate(lifestone, 0).resolve();
+        assert_eq!(before - pool(&r, P0), 2, "{label}: untargeted");
+        assert_eq!(
+            journal(&r, P0).len(),
+            2,
+            "{label}: reach guard: both journaled"
+        );
+        if let Some(hojo) = hojo {
+            cast_and_resolve(&mut r, hojo, None);
+        }
+        assert_eq!(
+            activate_on(&mut r, src, own, &[]),
+            0,
+            "{label}: the first qualifying activation"
+        );
+    }
+}
+
+/// H5: an opponent's activation that targets your creature is not an ability
+/// YOU activate, so it doesn't consume your Hojo's discount.
+#[test]
+fn an_opponents_activation_targeting_your_creature_does_not_consume_it() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    let theirs_src = s.add_artifact_from_oracle(P1, "Their Tapper", TAPPER).id();
+    mana(&mut s, P0, 4);
+    mana(&mut s, P1, 4);
+    let mut r = s.build();
+    act(&mut r, GameAction::PassPriority).expect("P0 passes");
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P1),
+        "reach guard: P1 has priority on P0's turn"
+    );
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: theirs_src,
+            ability_index: 0,
+        },
+    )
+    .expect("P1 activates");
+    if matches!(r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        act(
+            &mut r,
+            GameAction::SelectTargets {
+                targets: vec![object(own)],
+            },
+        )
+        .expect("P1 targets P0's creature");
+    }
+    finish(&mut r, &[]);
+    assert_eq!(pool(&r, P1), 2, "reach guard: P1 paid full");
+    assert!(
+        journal(&r, P1)
+            .iter()
+            .any(|row| row.activator == P1 && !row.targets.is_empty()),
+        "reach guard: P1's activation is journaled under P1"
+    );
+    drain(&mut r);
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0),
+        "back to P0 in the same main phase"
+    );
+    assert_eq!(
+        activate_on(&mut r, src, own, &[]),
+        0,
+        "P0's first qualifying activation"
+    );
+}
+
+/// H6: the journal keeps what was true when the ability was activated. The
+/// first activation targeted P0's creature; P1 then gains control of it. It was
+/// still the first qualifying activation.
+#[test]
+fn a_target_that_changes_controller_after_placement_still_qualified() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    let own2 = s.add_creature(P0, "Own Two", 1, 1).id();
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let steal = s
+        .add_artifact_from_oracle(
+            P1,
+            "Steal Rod",
+            "{1}: Gain control of target creature until end of turn.",
+        )
+        .id();
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    mana(&mut s, P0, 10);
+    mana(&mut s, P1, 2);
+    let mut r = s.build();
+    assert_eq!(activate_on(&mut r, src, own, &[]), 0, "the first");
+    act(&mut r, GameAction::PassPriority).expect("P0 passes");
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: steal,
+            ability_index: 0,
+        },
+    )
+    .expect("P1 steals");
+    if matches!(r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        act(
+            &mut r,
+            GameAction::SelectTargets {
+                targets: vec![object(own)],
+            },
+        )
+        .expect("P1 targets the first target");
+    }
+    finish(&mut r, &[]);
+    drain(&mut r);
+    assert_eq!(
+        r.state().objects[&own].controller,
+        P1,
+        "reach guard: P1 now controls the first target"
+    );
+    assert_eq!(
+        activate_on(&mut r, src, own2, &[]),
+        2,
+        "the first activation still qualified"
+    );
+}
+
+const TAPPER_FOUR: &str = "{4}: Tap target creature.";
+
+/// H8: two Hojos each apply their {2} to the SAME first qualifying activation,
+/// and neither applies to the next, whichever entered first.
+#[test]
+fn two_hojos_both_discount_the_first_qualifying_activation_only() {
+    for late_second in [false, true] {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        library(&mut s, P0);
+        let own = s.add_creature(P0, "Own", 1, 1).id();
+        s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+        let second = if late_second {
+            Some(
+                s.add_creature_to_hand_from_oracle(P0, "Professor Hojo", 2, 2, HOJO)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .id(),
+            )
+        } else {
+            s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+            None
+        };
+        let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER_FOUR).id();
+        mana(&mut s, P0, 10);
+        let mut r = s.build();
+        if let Some(second) = second {
+            cast_and_resolve(&mut r, second, None);
+        }
+        let hojos = r
+            .state()
+            .objects
+            .values()
+            .filter(|o| o.name == "Professor Hojo" && o.zone == Zone::Battlefield)
+            .count();
+        assert_eq!(hojos, 2, "reach guard: two Hojos (late: {late_second})");
+        assert_eq!(
+            activate_on(&mut r, src, own, &[]),
+            0,
+            "both reduce the first (late: {late_second})"
+        );
+        assert_eq!(
+            activate_on(&mut r, src, own, &[]),
+            4,
+            "neither reduces the second (late: {late_second})"
+        );
+    }
+}
+
+/// H9: the journal survives the engine's save/restore pipeline, and the
+/// restored game still knows the turn's first qualifying activation happened.
+#[test]
+fn the_activation_journal_survives_save_and_restore() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature_from_oracle(P0, "Professor Hojo", 2, 2, HOJO);
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    mana(&mut s, P0, 10);
+    let mut r = s.build();
+    assert_eq!(activate_on(&mut r, src, own, &[]), 0, "the first");
+    let mut restored = round_trip(&r);
+    assert_eq!(
+        journal(&restored, P0),
+        journal(&r, P0),
+        "reach guard: the rows round-trip"
+    );
+    assert_eq!(
+        activate_on(&mut restored, src, own, &[]),
+        2,
+        "the restored game still counts the first activation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// r5c #3: every viewer projection drops every activation record carrier, while
+// the authoritative state keeps them.
+// ---------------------------------------------------------------------------
+
+fn projection_json(r: &GameRunner, viewer: PlayerId) -> String {
+    serde_json::to_string(&filter_state_for_viewer(r.state(), viewer)).expect("projection")
+}
+
+fn assert_projections_carry_no_records(r: &GameRunner, viewers: &[PlayerId], when: &str) {
+    for viewer in viewers {
+        let json = projection_json(r, *viewer);
+        assert!(
+            !json.contains("activation_record")
+                && !json.contains("abilities_activated_this_turn_by_player"),
+            "{when}: viewer {viewer:?} sees an activation record"
+        );
+    }
+}
+
+fn sacrifice_tapper_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature(P1, "Theirs", 1, 1);
+    let src = s
+        .add_artifact_from_oracle(
+            P0,
+            "Altar",
+            "{1}, Sacrifice an artifact: Tap target creature.",
+        )
+        .id();
+    let fodder = s.add_artifact_from_oracle(P0, "Fodder", "").id();
+    mana(&mut s, P0, 4);
+    (s.build(), src, own, fodder)
+}
+
+#[test]
+fn a_target_or_payment_prompt_projects_no_activation_record() {
+    let (mut r, src, own, fodder) = sacrifice_tapper_board();
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("activation");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &r.state().waiting_for else {
+        panic!(
+            "expected the target prompt, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    assert!(
+        pending_cast.ability.activation_record.is_some(),
+        "authoritative: the draft rides the target prompt"
+    );
+    assert!(
+        serde_json::to_string(r.state())
+            .unwrap()
+            .contains("activation_record"),
+        "reach guard: the authoritative state serializes the draft"
+    );
+    assert_projections_carry_no_records(&r, &[P0, P1], "target prompt");
+
+    act(
+        &mut r,
+        GameAction::SelectTargets {
+            targets: vec![object(own)],
+        },
+    )
+    .expect("target");
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::PayCost { .. }),
+        "reach guard: the sacrifice prompt, got {:?}",
+        r.state().waiting_for
+    );
+    assert!(
+        serde_json::to_string(r.state())
+            .unwrap()
+            .contains("activation_record"),
+        "reach guard: the authoritative state still carries the draft at payment"
+    );
+    assert_projections_carry_no_records(&r, &[P0, P1], "payment prompt");
+    finish(&mut r, &[fodder]);
+    assert_eq!(journal(&r, P0).len(), 1, "the activation still completes");
+}
+
+/// r5c #2: placement never manufactures an activation's facts after its cost
+/// is paid. An activation that reaches placement without its pre-payment draft
+/// can't be completed legally, so it is reversed at the action boundary:
+/// nothing is placed and no journal row is written. Every production route
+/// carries the draft from a capture made before any payment, so this is
+/// reachable only by a fixture that strips it.
+#[test]
+fn an_activation_that_lost_its_draft_is_reversed_not_recorded() {
+    let (mut r, src, own, fodder) = sacrifice_tapper_board();
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("activation");
+    act(
+        &mut r,
+        GameAction::SelectTargets {
+            targets: vec![object(own)],
+        },
+    )
+    .expect("target");
+    let state = r.state_mut();
+    let mut stripped = 0;
+    if let Some(pending) = state.pending_cast.as_deref_mut() {
+        stripped += usize::from(pending.ability.activation_record.take().is_some());
+    }
+    if let Some(pending) = state.waiting_for.pending_cast_mut() {
+        stripped += usize::from(pending.ability.activation_record.take().is_some());
+    }
+    assert!(
+        stripped > 0,
+        "reach guard: the paused payment carried a draft"
+    );
+    let pool_before = pool(&r, P0);
+    let result = r
+        .act(GameAction::SelectCards {
+            cards: vec![fodder],
+        })
+        .expect("the action is answered");
+    assert!(
+        !result.disposition.is_applied(),
+        "a typed reversal: {:?}",
+        result.waiting_for
+    );
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0),
+        "{:?}",
+        r.state().waiting_for
+    );
+    assert_eq!(stack_len(&r), 0, "nothing placed");
+    // The boundary restores the state from before THIS action: the sacrifice
+    // it began is undone. (The mana leg was paid by the earlier target action,
+    // which this unreachable-in-production strip happens after.)
+    assert_eq!(pool(&r, P0), pool_before, "nothing more paid");
+    assert_eq!(
+        r.state().objects[&fodder].zone,
+        Zone::Battlefield,
+        "the sacrifice was not paid"
+    );
+    assert!(journal(&r, P0).is_empty(), "no journal row");
+}
+
+#[test]
+fn a_mana_choice_suspension_projects_no_activation_record() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let prism = s
+        .add_artifact_from_oracle(P0, "Prism", "{T}: Add one mana of any color.")
+        .id();
+    let mut r = s.build();
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: prism,
+            ability_index: 0,
+        },
+    )
+    .expect("mana ability");
+    let WaitingFor::ChooseManaColor {
+        context: ManaChoiceContext::ManaAbility(pending),
+        ..
+    } = &r.state().waiting_for
+    else {
+        panic!("expected the color choice, got {:?}", r.state().waiting_for);
+    };
+    assert!(
+        pending
+            .activation_record
+            .as_deref()
+            .is_some_and(|draft| draft.is_mana_ability && draft.source == prism),
+        "authoritative: the suspended mana ability keeps its draft"
+    );
+    assert_projections_carry_no_records(&r, &[P0, P1], "mana choice");
+    act(
+        &mut r,
+        GameAction::ChooseManaColor {
+            choice: ManaChoice::SingleColor(ManaType::Green),
+            count: 1,
+        },
+    )
+    .expect("color");
+    assert!(
+        journal(&r, P0)
+            .iter()
+            .any(|row| row.is_mana_ability && row.source == prism),
+        "the mana ability is journaled when it completes"
+    );
+}
+
+#[test]
+fn an_activation_on_the_stack_projects_no_activation_record() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    s.add_creature(P1, "Theirs", 1, 1);
+    let src = s.add_artifact_from_oracle(P0, "Tapper", TAPPER).id();
+    mana(&mut s, P0, 4);
+    let mut r = s.build();
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("activation");
+    act(
+        &mut r,
+        GameAction::SelectTargets {
+            targets: vec![object(own)],
+        },
+    )
+    .expect("target");
+    finish(&mut r, &[]);
+    assert_eq!(stack_len(&r), 1, "reach guard: the ability is on the stack");
+    assert_eq!(journal(&r, P0).len(), 1, "authoritative: journaled");
+    assert_projections_carry_no_records(&r, &[P0, P1], "on the stack");
+}
+
+/// A source whose ability was activated and that then moved to a hidden zone:
+/// no viewer of a three-player game, the activator included, gets its journal
+/// row back. (Its name itself stays public knowledge through the bounce's own
+/// last-known information; what is checked is that the journal is no channel.)
+#[test]
+fn a_journaled_source_that_moves_to_a_hidden_zone_is_not_exposed() {
+    let p2 = PlayerId(2);
+    let mut s = GameScenario::new_n_player(3, 11);
+    s.at_phase(Phase::PreCombatMain);
+    library(&mut s, P0);
+    let own = s.add_creature(P0, "Own", 1, 1).id();
+    let src = s.add_artifact_from_oracle(P0, "Secret Tapper", TAPPER).id();
+    let bounce = s
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Disperse",
+            true,
+            "Return target nonland permanent to its owner's hand.",
+        )
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    mana(&mut s, P0, 6);
+    let mut r = s.build();
+    activate_on(&mut r, src, own, &[]);
+    cast_and_resolve(&mut r, bounce, Some(src));
+    assert_eq!(
+        r.state().objects[&src].zone,
+        Zone::Hand,
+        "reach guard: the source is in a hidden zone"
+    );
+    assert_eq!(
+        journal(&r, P0)[0].source_lki.name,
+        "Secret Tapper",
+        "authoritative: the row names its source"
+    );
+    assert_projections_carry_no_records(&r, &[P0, P1, p2], "hidden source");
 }

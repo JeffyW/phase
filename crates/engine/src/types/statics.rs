@@ -1340,8 +1340,10 @@ pub enum StaticMode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         targets: Option<TargetFilter>,
         /// CR 118.7 + CR 602.2b: how often qualifying activations can use this
-        /// adjustment. `None` = unlimited; `Some(OncePerTurn)` tracks one
-        /// qualifying activation per source each turn.
+        /// adjustment. `None` = unlimited; `Some(OncePerTurn)` applies only to
+        /// the turn's first activation that satisfies every gate of this
+        /// modifier, read from the turn's activation journal (CR 611.3a: an
+        /// activation made before the modifier's source existed still counts).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         frequency: Option<CastFrequency>,
     },

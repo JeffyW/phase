@@ -242,14 +242,23 @@ pub(crate) fn split_ability_source_and_target_restriction(
         return Ok((rest, (None, targets)));
     }
     let (subject, _) = tag::<_, _, OracleError<'_>>("of ").parse(residue)?;
+    let (_, source) = parse_ability_source_subject(subject)?;
+    Ok((rest, (Some(source), targets)))
+}
+
+/// CR 602.2: the `<sources>` of an ability-scoped cost modifier ("abilities of
+/// other Equipment", "the first activated ability of an artifact"). A subject
+/// the type-phrase grammar can't consume whole, or reads as "any object", is
+/// refused rather than widened to every ability.
+pub(crate) fn parse_ability_source_subject(subject: &str) -> OracleResult<'_, TargetFilter> {
     let (source, remainder) = parse_type_phrase_folding(subject);
     if !remainder.trim().is_empty() || matches!(source, TargetFilter::Any) {
         return Err(nom::Err::Error(OracleError::new(
-            residue,
+            subject,
             nom::error::ErrorKind::Verify,
         )));
     }
-    Ok((rest, (Some(source), targets)))
+    Ok((remainder, source))
 }
 
 pub(crate) fn parse_activated_cost_reduction_minimum_mana(lower: &str) -> Option<u32> {

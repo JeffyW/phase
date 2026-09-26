@@ -1155,6 +1155,41 @@ pub struct CastOccurrence {
     pub turn_journal_index: u32,
 }
 
+/// CR 602.2 + CR 601.2c: one activated ability that was activated this turn,
+/// with the facts a "the first activated ability you activate each turn that
+/// …" modifier (Professor Hojo) needs, captured when the ability was activated,
+/// before any of its cost was paid. The activation analog of
+/// [`SpellCastRecord`]: characteristics are snapshots, never re-read later, so
+/// a target that afterwards changes controller or leaves still qualified or
+/// didn't exactly as it did when the ability was activated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbilityActivationRecord {
+    pub activator: PlayerId,
+    pub source: ObjectId,
+    /// The source as it was when the ability was activated (for a modifier
+    /// scoped to abilities "of an artifact" and the like).
+    pub source_lki: LKISnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ability_tag: Option<crate::types::ability::AbilityTag>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_mana_ability: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_loyalty_ability: bool,
+    /// CR 115.1: the committed targets of the whole chain, empty for an
+    /// untargeted or mana ability (CR 605.1a).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<ActivationTargetFact>,
+}
+
+/// One committed target of an activation, as it was when the ability was
+/// activated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum ActivationTargetFact {
+    Player(PlayerId),
+    Object { id: ObjectId, lki: Box<LKISnapshot> },
+}
+
 /// Snapshot of a spell's characteristics at cast time for per-turn history queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpellCastRecord {
@@ -8321,6 +8356,17 @@ pub struct PendingManaAbility {
     /// chosen-color resume can resolve from LKI even when `source_id` is gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_snapshot: Option<AbilityDefinition>,
+    /// CR 602.2 + CR 605.3a: this mana ability's journal facts, captured at its
+    /// announcement, before its cost is paid; published when it completes.
+    ///
+    /// Never serialized, so no transport, save, or viewer projection carries
+    /// it: a mana ability's pending state nests inside many payment and resume
+    /// carriers, and this keeps the draft out of all of them structurally. A
+    /// mana ability suspended across a save therefore completes with no draft
+    /// and adds no journal row (see `complete_mana_ability_activation`); no
+    /// supported modifier can read a mana ability's row (CR 605.1a).
+    #[serde(skip)]
+    pub activation_record: Option<Box<AbilityActivationRecord>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_override: Option<ProductionOverride>,
     pub resume: ManaAbilityResume,
@@ -19531,18 +19577,22 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub alt_cost_grant_permissions_used: HashSet<ObjectId>,
-    /// CR 118.7 + CR 602.2b: Tracks which once-per-turn activated-ability cost
-    /// discount sources have been used this turn (Professor Hojo, Tezzeret).
-    /// Keyed by the granting source ObjectId and consumed only when the ability
-    /// reaches the stack.
+    /// CR 602.2 + CR 601.2i: Per-player activated-ability history this turn,
+    /// in activation order: the activation analog of
+    /// `spells_cast_this_turn_by_player`. Each record is captured before the
+    /// activation's cost is paid and appended only when it is placed on the
+    /// stack (or, for a mana ability, completed), so a "the first activated
+    /// ability you activate each turn …" modifier (CR 611.3a: applied to
+    /// whatever its text indicates, including activations made before the
+    /// modifier's source existed) reads the whole turn. Engine authority,
+    /// cleared from every viewer projection.
     ///
     /// Boxed to preserve the `GameState` stack budget (see
-    /// `types/game_state_size.rs`): this ledger is empty on almost every board,
-    /// and inline it measured `GameState` at 13,840 B against a 13,824 B
-    /// ceiling. Same shape as `public_revealed_cards` / `enduring_story`.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
-    pub ability_cost_discount_used: Box<HashSet<ObjectId>>,
+    /// `types/game_state_size.rs`): empty on almost every board.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
+    pub abilities_activated_this_turn_by_player:
+        Box<HashMap<PlayerId, im::Vector<AbilityActivationRecord>>>,
     /// CR 601.2a: Tracks once-per-turn `PlayFromExile` permission sources
     /// consumed this turn. Keyed by the granting source's ObjectId.
     #[serde(default)]
@@ -25644,7 +25694,7 @@ impl GameState {
             pending_permanent_type_slot: None,
             hand_cast_free_permissions_used: HashSet::new(),
             alt_cost_grant_permissions_used: HashSet::new(),
-            ability_cost_discount_used: Box::new(HashSet::new()),
+            abilities_activated_this_turn_by_player: Box::default(),
             exile_play_permissions_used: HashSet::new(),
             exile_play_single_use_consumed: HashSet::new(),
             exile_cast_permissions_used: HashSet::new(),
@@ -27923,7 +27973,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_permanent_type_slot: _,
         hand_cast_free_permissions_used: _,
         alt_cost_grant_permissions_used: _,
-        ability_cost_discount_used: _,
+        abilities_activated_this_turn_by_player: _,
         exile_play_permissions_used: _,
         exile_play_single_use_consumed: _,
         exile_cast_permissions_used: _,
@@ -28262,7 +28312,8 @@ impl PartialEq for GameState {
             && self.pending_permanent_type_slot == other.pending_permanent_type_slot
             && self.hand_cast_free_permissions_used == other.hand_cast_free_permissions_used
             && self.alt_cost_grant_permissions_used == other.alt_cost_grant_permissions_used
-            && self.ability_cost_discount_used == other.ability_cost_discount_used
+            && self.abilities_activated_this_turn_by_player
+                == other.abilities_activated_this_turn_by_player
             && self.exile_play_permissions_used == other.exile_play_permissions_used
             && self.exile_play_single_use_consumed == other.exile_play_single_use_consumed
             && self.exile_cast_permissions_used == other.exile_cast_permissions_used
@@ -33744,6 +33795,7 @@ mod tests {
                         ability_index: None,
                         rules_execution_node: None,
                         ability_snapshot: None,
+                        activation_record: None,
                         color_override: None,
                         resume: ManaAbilityResume::Priority,
                         cost_move_resume: None,
@@ -37533,6 +37585,7 @@ mod tests {
                     ability_index: None,
                     rules_execution_node: None,
                     ability_snapshot: None,
+                    activation_record: None,
                     color_override: None,
                     resume: ManaAbilityResume::Priority,
                     cost_move_resume: None,

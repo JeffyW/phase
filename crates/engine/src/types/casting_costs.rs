@@ -262,12 +262,6 @@ pub struct ActivationCostSnapshot {
     /// then duration-scoped continuous effects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reductions: Vec<CostReductionEntry>,
-    /// CR 602.2b: the once-per-turn modifier sources ("the first activated
-    /// ability you activate ... costs {2} less") this activation qualified for.
-    /// Their slot is spent when the activation reaches the stack, whether or
-    /// not the modifier reduced anything.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub once_per_turn_sources: Vec<ObjectId>,
     /// Which `PendingCast` field holds the activation's unpaid mana while the
     /// lock waits for committed targets.
     #[serde(default, skip_serializing_if = "ManaCarrier::is_whole")]

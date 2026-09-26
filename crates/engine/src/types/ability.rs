@@ -32408,11 +32408,13 @@ pub struct ResolvedAbility {
     /// can be applied after targets are committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_cost_reduction: Option<CostReduction>,
-    /// CR 602.2b: once-per-turn ability-cost discount sources consumed by this
-    /// activation when it reaches the stack. Recorded only after stack placement
-    /// succeeds, so cancelled or failed payment attempts do not spend the slot.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ability_cost_discount_static_sources: Vec<ObjectId>,
+    /// CR 602.2 + CR 601.2c: the facts of this activation captured before any
+    /// of its cost is paid (its activator, source, and committed targets). It
+    /// travels with the activation and is published to the turn's activation
+    /// journal only when the ability is placed on the stack, so a reversed
+    /// activation records nothing. Engine authority: never shown to a viewer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_record: Option<Box<crate::types::game_state::AbilityActivationRecord>>,
     /// CR 608.2b: Declared target slots — numbered as
     /// `ability_utils::flatten_targets_in_chain` numbers this chain — whose
     /// target failed the legality check made as the chain began to resolve.
@@ -32794,7 +32796,7 @@ impl PartialEq for ResolvedAbility {
             target_incarnations: a_target_incarnations,
             selected_target_incarnations: a_selected_target_incarnations,
             activation_cost_reduction: a_activation_cost_reduction,
-            ability_cost_discount_static_sources: a_ability_cost_discount_static_sources,
+            activation_record: a_activation_record,
             illegal_target_slots: a_illegal_target_slots,
             controller: a_controller,
             original_controller: a_original_controller,
@@ -32858,7 +32860,7 @@ impl PartialEq for ResolvedAbility {
             target_incarnations: b_target_incarnations,
             selected_target_incarnations: b_selected_target_incarnations,
             activation_cost_reduction: b_activation_cost_reduction,
-            ability_cost_discount_static_sources: b_ability_cost_discount_static_sources,
+            activation_record: b_activation_record,
             illegal_target_slots: b_illegal_target_slots,
             controller: b_controller,
             original_controller: b_original_controller,
@@ -32922,7 +32924,7 @@ impl PartialEq for ResolvedAbility {
             && a_target_incarnations == b_target_incarnations
             && a_selected_target_incarnations == b_selected_target_incarnations
             && a_activation_cost_reduction == b_activation_cost_reduction
-            && a_ability_cost_discount_static_sources == b_ability_cost_discount_static_sources
+            && a_activation_record == b_activation_record
             && a_illegal_target_slots == b_illegal_target_slots
             && a_controller == b_controller
             && a_original_controller == b_original_controller
@@ -33077,7 +33079,7 @@ impl ResolvedAbility {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             activation_cost_reduction: None,
-            ability_cost_discount_static_sources: Vec::new(),
+            activation_record: None,
             illegal_target_slots: Vec::new(),
             modal: None,
             mode_abilities: Vec::new(),

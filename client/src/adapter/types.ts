@@ -2084,8 +2084,6 @@ export interface ActivationCostSnapshot {
   base_cost: SerializedAbilityCost;
   raise_total?: number;
   reductions?: CostReductionEntry[];
-  // CR 602.2b: once-per-turn discount sources this activation spends.
-  once_per_turn_sources?: ObjectId[];
   // Which pending field holds the unpaid mana while the lock waits for targets.
   mana_carrier?: "Whole" | "Split";
   // Set only while a target-settlement election prompt is outstanding.

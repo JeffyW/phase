@@ -555,9 +555,9 @@ export class NativeEngineVersionMismatchError extends Error {
  *
  * 81 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
  *      Kopala): ReduceAbilityCost statics carry targets and frequency,
- *      GameState records spent once-per-turn discounts, and the activation
- *      cost carrier holds the target-settlement lock. A v79 peer would drop
- *      these silently and price one activation differently.
+ *      GameState journals each turn's activations, and the activation cost
+ *      carrier holds the target-settlement lock. A v80 peer would drop these
+ *      silently and price one activation differently.
  */
 export const PROTOCOL_VERSION = 81;
 

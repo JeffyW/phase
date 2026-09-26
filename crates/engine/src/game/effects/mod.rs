@@ -4286,7 +4286,7 @@ fn instruction_outlives_declined_gate(
         replacement_applied: _,
         parent_target_missing_reason: _,
         activation_cost_reduction: _,
-        ability_cost_discount_static_sources: _,
+        activation_record: _,
     } = node;
     let unbound = condition.is_none()
         && else_ability.is_none()

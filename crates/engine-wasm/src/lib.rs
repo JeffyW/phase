@@ -7122,7 +7122,7 @@ mod deck_list_seat_validation_tests {
 /// trusted envelope, a fresh engine resumes it through
 /// `resume_multiplayer_host_state` (its separate `restore_runtime` hook and
 /// finalization), and the caster's non-default order then locks the same cost,
-/// on the same targets, with the same stack entry and once-per-turn ledger as a
+/// on the same targets, with the same stack entry and activation journal as a
 /// host that was never interrupted.
 #[cfg(test)]
 mod settlement_election_host_resume_tests {
@@ -7207,7 +7207,8 @@ mod settlement_election_host_resume_tests {
         serde_json::json!({
             "pool": state.players[0].mana_pool.total(),
             "stack": serde_json::to_value(&state.stack).unwrap(),
-            "ledger": serde_json::to_value(&state.ability_cost_discount_used).unwrap(),
+            "journal": serde_json::to_value(&state.abilities_activated_this_turn_by_player)
+                .unwrap(),
         })
     }
 

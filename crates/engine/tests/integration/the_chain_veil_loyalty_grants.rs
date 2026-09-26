@@ -207,7 +207,7 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         mode_abilities: vec![],
         parent_target_missing_reason: None,
         activation_cost_reduction: None,
-        ability_cost_discount_static_sources: Vec::new(),
+        activation_record: None,
     }
 }
 

@@ -3318,10 +3318,12 @@ mod tests {
         }
     }
 
-    /// `ExileLinkKind::HideawayLookable` now carries `{ grant, lookers,
-    /// source_incarnation }` in serialized full-game state; a v79 peer cannot
-    /// parse the new look-link shape, so it must be refused before it receives
-    /// v80 state.
+    /// `ReduceAbilityCost` statics now carry a target restriction and a
+    /// once-per-turn frequency, `GameState` journals each turn's activations,
+    /// and the activation cost carrier holds the target-settlement lock, all in
+    /// serialized full-game state; a v80 peer would drop them silently and
+    /// price an activation differently, so it must be refused before it
+    /// receives v81 state.
     ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so

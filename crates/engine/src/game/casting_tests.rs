@@ -59882,7 +59882,6 @@ fn activation_totals_survive_saturated_reduction_amounts() {
         },
         raise_total: 0,
         reductions: vec![entry(u32::MAX, 1, 0), entry(2, 0, 1)],
-        once_per_turn_sources: Vec::new(),
         mana_carrier: crate::types::casting_costs::ManaCarrier::Whole,
         settlement_tail: None,
         lock: crate::types::casting_costs::ActivationCostLock::Open {
@@ -60013,7 +60012,6 @@ fn the_x_lock_passes_through_a_carrier_deferred_to_another_point() {
                 display_name: "reducer".to_string(),
                 minimum_mana: 0,
             }],
-            once_per_turn_sources: Vec::new(),
             mana_carrier: crate::types::casting_costs::ManaCarrier::Whole,
             settlement_tail: None,
             lock: ActivationCostLock::Open { point },
@@ -60101,8 +60099,8 @@ fn an_open_lock_round_trips_its_point() {
 /// Every transport (WASM `to_js`, the WebSocket server, Tauri, the P2P host's
 /// export) carries the activation cost carrier through `serde_json`. This pins
 /// each value #9248 adds through that one layer: both mana carriers, both
-/// settlement tails, the target-settlement lock point on an open and a locked
-/// carrier, and a non-empty once-per-turn source list.
+/// settlement tails, and the target-settlement lock point on an open and a
+/// locked carrier.
 #[test]
 fn activation_cost_snapshot_round_trips_every_target_settlement_value() {
     use crate::types::casting_costs::{ActivationCostLockPoint, ManaCarrier, SettledTail};
@@ -60112,7 +60110,6 @@ fn activation_cost_snapshot_round_trips_every_target_settlement_value() {
         },
         raise_total: 2,
         reductions: Vec::new(),
-        once_per_turn_sources: vec![ObjectId(41), ObjectId(42)],
         mana_carrier: ManaCarrier::Whole,
         settlement_tail: None,
         lock: ActivationCostLock::Open {
@@ -60151,15 +60148,143 @@ fn activation_cost_snapshot_round_trips_every_target_settlement_value() {
         assert_eq!(back, snapshot, "{json}");
     }
     // The defaults are omitted, so a pre-#9248 carrier is byte-identical.
-    let json = serde_json::to_value(ActivationCostSnapshot {
-        once_per_turn_sources: Vec::new(),
-        ..base.clone()
-    })
-    .unwrap();
-    for absent in ["once_per_turn_sources", "mana_carrier", "settlement_tail"] {
+    let json = serde_json::to_value(base.clone()).unwrap();
+    for absent in ["mana_carrier", "settlement_tail"] {
         assert!(
             json.get(absent).is_none(),
             "{absent} omitted when default: {json}"
         );
     }
+}
+
+/// CR 602.2 + CR 601.2c: a journal row round-trips through the shared serde
+/// layer with both target shapes and both ability flags.
+#[test]
+fn an_activation_journal_row_round_trips() {
+    use crate::types::game_state::{AbilityActivationRecord, ActivationTargetFact};
+    let mut state = GameState::new_two_player(42);
+    let source = create_object(
+        &mut state,
+        CardId(1),
+        PlayerId(0),
+        "Journal Source".to_string(),
+        Zone::Battlefield,
+    );
+    let target = create_object(
+        &mut state,
+        CardId(2),
+        PlayerId(1),
+        "Journal Target".to_string(),
+        Zone::Battlefield,
+    );
+    let row = AbilityActivationRecord {
+        activator: PlayerId(0),
+        source,
+        source_lki: state.objects[&source].snapshot_public_characteristics(),
+        ability_tag: Some(crate::types::ability::AbilityTag::Boast),
+        is_mana_ability: true,
+        is_loyalty_ability: true,
+        targets: vec![
+            ActivationTargetFact::Player(PlayerId(1)),
+            ActivationTargetFact::Object {
+                id: target,
+                lki: Box::new(state.objects[&target].snapshot_public_characteristics()),
+            },
+        ],
+    };
+    let json = serde_json::to_string(&row).unwrap();
+    let back: AbilityActivationRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, row, "{json}");
+}
+
+/// CR 102.2 + CR 102.3 + CR 800.4a: "each opponent" is each opponent still in
+/// the game. Both per-opponent evaluators, the target-free one and the one
+/// that prices a rider with the committed targets, skip a player who left.
+#[test]
+fn quantity_vs_each_opponent_skips_a_player_who_left_the_game() {
+    let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 7);
+    for (player, cards) in [(0u8, 2usize), (1, 1), (2, 5)] {
+        for i in 0..cards {
+            create_object(
+                &mut state,
+                CardId(100 + u64::from(player) * 10 + i as u64),
+                PlayerId(player),
+                format!("Card {player}/{i}"),
+                Zone::Hand,
+            );
+        }
+    }
+    let source = create_object(
+        &mut state,
+        CardId(1),
+        PlayerId(0),
+        "Source".to_string(),
+        Zone::Battlefield,
+    );
+    let bear = create_object(
+        &mut state,
+        CardId(2),
+        PlayerId(1),
+        "Bear".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let bear = state.objects.get_mut(&bear).unwrap();
+        bear.card_types.core_types.push(CoreType::Creature);
+        bear.power = Some(3);
+        bear.toughness = Some(3);
+    }
+    let your_hand = QuantityRef::HandSize {
+        player: PlayerScope::Controller,
+    };
+    let their_hand = QuantityRef::HandSize {
+        player: PlayerScope::ScopedPlayer,
+    };
+    let target_free = ParsedCondition::QuantityVsEachOpponent {
+        lhs: your_hand,
+        comparator: Comparator::GT,
+        rhs: their_hand.clone(),
+    };
+    let target_reading = ParsedCondition::QuantityVsEachOpponent {
+        lhs: QuantityRef::Power {
+            scope: ObjectScope::Target,
+        },
+        comparator: Comparator::GT,
+        rhs: their_hand,
+    };
+    let mut ability = ResolvedAbility::new(
+        Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Any,
+            damage_source: None,
+            excess: None,
+        },
+        vec![TargetRef::Object(bear)],
+        source,
+        PlayerId(0),
+    );
+    ability.ability_index = Some(0);
+    let evaluate = |state: &GameState| {
+        (
+            restrictions::evaluate_condition(state, PlayerId(0), source, &target_free),
+            parsed_condition_satisfied_with_committed_targets(
+                state,
+                PlayerId(0),
+                source,
+                &ability,
+                &target_reading,
+            ),
+        )
+    };
+    assert_eq!(
+        evaluate(&state),
+        (false, false),
+        "reach guard: P2's five cards beat both left-hand sides"
+    );
+    state.players[2].is_eliminated = true;
+    assert_eq!(
+        evaluate(&state),
+        (true, true),
+        "P2 left the game, so only P1's one card is compared"
+    );
 }

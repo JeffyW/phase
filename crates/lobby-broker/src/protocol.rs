@@ -62,9 +62,10 @@ pub struct TournamentRequestId(pub u64);
 ///
 /// 81 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
 ///      Kopala): `StaticMode::ReduceAbilityCost` gains `targets` and
-///      `frequency`, `GameState` gains `ability_cost_discount_used`,
-///      `ResolvedAbility` gains `ability_cost_discount_static_sources`, and the
-///      `ActivationCostSnapshot` carrier gains `once_per_turn_sources`,
+///      `frequency`, `GameState` gains the per-turn activation journal
+///      `abilities_activated_this_turn_by_player`, `ResolvedAbility` gains its
+///      pre-payment `activation_record`, the `AbilityActivated` ledger edit
+///      gains its record, and the `ActivationCostSnapshot` carrier gains
 ///      `mana_carrier`, `settlement_tail` and the `TargetSettlement` lock point.
 ///      A v80 peer would drop the new fields silently, which in P2P prices
 ///      one activation differently on host and guest.
