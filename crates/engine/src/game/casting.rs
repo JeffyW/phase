@@ -26331,10 +26331,13 @@ fn parsed_condition_satisfied_with_committed_targets(
             lhs,
             comparator,
             rhs,
-        } if parsed_condition_reads_targets(condition) => comparator.evaluate(
-            super::quantity::resolve_quantity_with_targets(state, lhs, ability),
-            super::quantity::resolve_quantity_with_targets(state, rhs, ability),
-        ),
+        } if parsed_condition_reads_targets(condition) => {
+            let chain = ability_with_chain_targets(ability);
+            comparator.evaluate(
+                super::quantity::resolve_quantity_with_targets(state, lhs, &chain),
+                super::quantity::resolve_quantity_with_targets(state, rhs, &chain),
+            )
+        }
         // The per-opponent comparison binds each opponent as the scoped player
         // for its right-hand side, exactly as the target-free evaluator does,
         // with the committed targets supplied to both sides.
@@ -26362,6 +26365,17 @@ fn parsed_condition_satisfied_with_committed_targets(
         }
         _ => restrictions::evaluate_condition(state, player, source_id, condition),
     }
+}
+
+/// CR 601.2c + CR 115.1: `ability` with its `targets` replaced by the committed
+/// targets of its whole chain. A multi-mode activation carries a later chosen
+/// mode, and that mode's targets, on its `sub_ability`, so a cost that reads
+/// "the target" must read the chain, not only the root mode. Player, chosen X
+/// and every other binding are kept.
+fn ability_with_chain_targets(ability: &ResolvedAbility) -> ResolvedAbility {
+    let mut chain = ability.clone();
+    chain.targets = flatten_targets_in_chain(ability);
+    chain
 }
 
 /// CR 601.2c + CR 601.2f: whether a self cost rider's condition can be decided
@@ -27129,8 +27143,11 @@ fn self_rider_target_gated_delta(
                 )
             });
             condition_met.then(|| {
-                let count =
-                    super::quantity::resolve_quantity_with_targets(state, &rider.count, ability);
+                let count = super::quantity::resolve_quantity_with_targets(
+                    state,
+                    &rider.count,
+                    &ability_with_chain_targets(ability),
+                );
                 (rider.amount_per as i32 * count).max(0) as u32
             })
         }

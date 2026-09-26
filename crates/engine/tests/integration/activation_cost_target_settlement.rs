@@ -2073,3 +2073,145 @@ fn bladehold_war_whip_discounts_other_equipment_only() {
         "War-Whip's own {{3}}{{R}}{{W}} is not discounted"
     );
 }
+
+/// Review round 4 MED: a two-mode activation whose SECOND chosen mode owns the
+/// target. The chained ability carries that target on its `sub_ability`, so the
+/// rider (count and condition) must read the chain's committed targets, not the
+/// root mode's. With exactly {1}, "{2} less if the target's mana value is 3 or
+/// more" on {3} is offered and pays {1}.
+#[test]
+fn a_rider_reads_the_target_of_a_later_chosen_mode() {
+    use engine::types::ability::{
+        CostReduction, ObjectScope, ParsedCondition, QuantityExpr, QuantityRef,
+    };
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let target = s
+        .add_creature(P1, "Target", 2, 2)
+        .with_mana_cost(ManaCost::generic(4))
+        .id();
+    s.add_creature(P1, "Other", 2, 2);
+    let src = s
+        .add_artifact_from_oracle(
+            P0,
+            "Two Modes",
+            "{3}: Choose two \u{2014}\n\u{2022} You gain 1 life.\n\u{2022} Tap target creature.",
+        )
+        .id();
+    mana(&mut s, P0, 1);
+    let mut r = s.build();
+    let comparator: engine::types::ability::Comparator =
+        serde_json::from_str("\"GE\"").expect("the GE comparator");
+    set_cost_rider(
+        &mut r,
+        src,
+        Some(CostReduction {
+            mode: CostModifyMode::Reduce,
+            amount_per: 2,
+            count: QuantityExpr::Fixed { value: 1 },
+            condition: Some(ParsedCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::Target,
+                    },
+                },
+                comparator,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }),
+        }),
+    );
+    assert!(
+        can_activate_ability_now(r.state(), P0, src, 0),
+        "offered: the qualifying target makes {{3}} cost {{1}}"
+    );
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("the activation starts");
+    act(
+        &mut r,
+        GameAction::SelectModes {
+            indices: vec![0, 1],
+        },
+    )
+    .expect("both modes");
+    let result = r
+        .act(GameAction::SelectTargets {
+            targets: vec![object(target)],
+        })
+        .expect("the target settles");
+    assert!(
+        result.disposition.is_applied(),
+        "settlement must price the second mode's target, not reverse"
+    );
+    finish(&mut r, &[]);
+    assert_eq!(pool(&r, P0), 0, "paid {{1}}");
+    assert_eq!(stack_len(&r), 1);
+}
+
+/// The rider COUNT twin: "{1} less for each point of the target's mana value",
+/// with the target on the second chosen mode. Mana value 2 makes {3} cost {1}.
+#[test]
+fn a_rider_count_reads_the_target_of_a_later_chosen_mode() {
+    use engine::types::ability::{CostReduction, ObjectScope, QuantityExpr, QuantityRef};
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let target = s
+        .add_creature(P1, "Target", 2, 2)
+        .with_mana_cost(ManaCost::generic(2))
+        .id();
+    s.add_creature(P1, "Other", 2, 2);
+    let src = s
+        .add_artifact_from_oracle(
+            P0,
+            "Two Modes",
+            "{3}: Choose two \u{2014}\n\u{2022} You gain 1 life.\n\u{2022} Tap target creature.",
+        )
+        .id();
+    mana(&mut s, P0, 1);
+    let mut r = s.build();
+    set_cost_rider(
+        &mut r,
+        src,
+        Some(CostReduction {
+            mode: CostModifyMode::Reduce,
+            amount_per: 1,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Target,
+                },
+            },
+            condition: None,
+        }),
+    );
+    act(
+        &mut r,
+        GameAction::ActivateAbility {
+            source_id: src,
+            ability_index: 0,
+        },
+    )
+    .expect("offered through the best-case bound");
+    act(
+        &mut r,
+        GameAction::SelectModes {
+            indices: vec![0, 1],
+        },
+    )
+    .expect("both modes");
+    let result = r
+        .act(GameAction::SelectTargets {
+            targets: vec![object(target)],
+        })
+        .expect("the target settles");
+    assert!(
+        result.disposition.is_applied(),
+        "priced from the second mode's target"
+    );
+    finish(&mut r, &[]);
+    assert_eq!(pool(&r, P0), 0, "paid {{1}}");
+}
