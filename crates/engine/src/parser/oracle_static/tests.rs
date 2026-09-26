@@ -24167,6 +24167,47 @@ fn parser_shape_evelyn_collection_counter_play_permission_static_is_not_unimplem
     assert_eq!(def.mode, StaticMode::LinkedCollectionCounterPlayPermission);
 }
 
+/// CR 609.4b + CR 118.14: the collection-counter grant carries Evelyn's printed
+/// any-COLOR concession. A broader "mana of any type" spelling is declined and
+/// stays an honest gap — never a grant that would pay `{C}` the card does not
+/// allow. The printed line is the positive half.
+#[test]
+fn evelyn_collection_counter_any_type_variant_remains_an_honest_gap() {
+    let printed = "Once each turn, you may play a card from exile with a collection counter on it if it was exiled by an ability you controlled, and you may spend mana as though it were mana of any color to cast it.";
+    let broader = "Once each turn, you may play a card from exile with a collection counter on it if it was exiled by an ability you controlled, and mana of any type can be spent to cast that spell.";
+    let parse = |text| {
+        crate::parser::oracle::parse_oracle_text(
+            text,
+            "Evelyn, the Covetous",
+            &[],
+            &["Creature".to_string()],
+            &["Vampire".to_string(), "Rogue".to_string()],
+        )
+    };
+    let actual = parse(printed);
+    assert_eq!(actual.statics.len(), 1, "{actual:#?}");
+    assert_eq!(
+        actual.statics[0].mode,
+        StaticMode::LinkedCollectionCounterPlayPermission
+    );
+
+    assert!(parse_static_line(broader).is_none());
+    let unsupported = parse(broader);
+    assert!(unsupported.statics.is_empty(), "{unsupported:#?}");
+    assert!(
+        !unsupported.abilities.is_empty(),
+        "expected an explicit gap: {unsupported:#?}"
+    );
+    for ability in &unsupported.abilities {
+        for node in std::iter::successors(Some(ability), |node| node.sub_ability.as_deref()) {
+            assert!(
+                matches!(node.effect.as_ref(), Effect::Unimplemented { .. }),
+                "the declined concession must not produce another permission: {node:#?}"
+            );
+        }
+    }
+}
+
 // CR 609.4b: Mycosynth Lattice / Mycosynthwave — "Players may spend mana as
 // though it were mana of any color" grants the board-wide any-color concession to
 // every player (affected: TargetFilter::Player, which the runtime scopes to all
@@ -24181,6 +24222,7 @@ fn static_players_may_spend_mana_as_any_color() {
         StaticMode::SpendManaAsAnyColor {
             spell_filter: None,
             activation_source_filter: None,
+            concession: crate::types::ability::ManaSpendPermission::AnyColor,
         }
     );
     assert_eq!(def.affected, Some(TargetFilter::Player));
@@ -24195,6 +24237,7 @@ fn static_you_may_spend_mana_as_any_color_still_parses() {
         StaticMode::SpendManaAsAnyColor {
             spell_filter: None,
             activation_source_filter: None,
+            concession: crate::types::ability::ManaSpendPermission::AnyColor,
         }
     );
 }
