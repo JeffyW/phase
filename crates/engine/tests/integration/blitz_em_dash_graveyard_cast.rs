@@ -2932,3 +2932,69 @@ fn blitz_with_a_required_life_cost_completes_without_the_defiler() {
         "blitz {{2}}{{G}}"
     );
 }
+
+/// Underdog under Underworld Breach, as in `underdog_under_breach`, with its
+/// blitz "Pay N life" amount replaced by `amount`.
+fn underdog_under_breach_paying(
+    amount: engine::types::ability::QuantityExpr,
+) -> (GameRunner, ObjectId) {
+    use engine::types::ability::AbilityCost;
+    use engine::types::keywords::BlitzCost;
+    let (mut runner, dog) = underdog_under_breach(3, 4, 20);
+    let obj = runner.state_mut().objects.get_mut(&dog).unwrap();
+    for keyword in obj.keywords.iter_mut() {
+        if let Keyword::Blitz(BlitzCost::NonMana(AbilityCost::Composite { costs })) = keyword {
+            for cost in costs.iter_mut() {
+                if let AbilityCost::PayLife { amount: life } = cost {
+                    *life = amount.clone();
+                }
+            }
+        }
+    }
+    obj.base_keywords = obj.keywords.clone();
+    engine::game::layers::flush_layers(runner.state_mut());
+    (runner, dog)
+}
+
+/// The Blitz option's displayed non-mana cost, from the production menu builder.
+fn blitz_option_life(runner: &GameRunner, dog: ObjectId) -> engine::types::ability::QuantityExpr {
+    let options =
+        engine::game::casting::current_casting_variant_choice_options(runner.state(), P0, dog);
+    let blitz = options
+        .iter()
+        .find(|option| format!("{:?}", option.variant) == "Blitz")
+        .unwrap_or_else(|| panic!("reach guard: the Blitz option is on the menu, got {options:?}"));
+    match &blitz.additional_cost {
+        Some(engine::types::ability::AbilityCost::PayLife { amount }) => amount.clone(),
+        other => panic!("the Blitz option shows its life payment, got {other:?}"),
+    }
+}
+
+/// CR 601.2f-h: a life amount the engine can already know is shown resolved.
+/// "Pay life equal to your starting life total" (20) shows 20.
+#[test]
+fn menu_resolves_a_previewable_life_amount() {
+    use engine::types::ability::{QuantityExpr, QuantityRef};
+    let (runner, dog) = underdog_under_breach_paying(QuantityExpr::Ref {
+        qty: QuantityRef::StartingLifeTotal,
+    });
+    assert_eq!(
+        blitz_option_life(&runner, dog),
+        QuantityExpr::Fixed { value: 20 }
+    );
+}
+
+/// CR 601.2f-h: an amount that depends on a choice not made yet (an unannounced
+/// X) keeps its expression, so the menu shows the unquantified cost rather than
+/// "+ Pay 0 life".
+#[test]
+fn menu_keeps_an_unresolved_life_amount_as_an_expression() {
+    use engine::types::ability::{QuantityExpr, QuantityRef};
+    let x = QuantityExpr::Ref {
+        qty: QuantityRef::Variable {
+            name: "X".to_string(),
+        },
+    };
+    let (runner, dog) = underdog_under_breach_paying(x.clone());
+    assert_eq!(blitz_option_life(&runner, dog), x);
+}

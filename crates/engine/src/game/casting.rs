@@ -7455,9 +7455,12 @@ fn casting_variant_choice_option(
     }
 }
 
-/// CR 601.2f-h: an option's non-mana cost with every life amount resolved to
-/// the number the player will pay ("pay life equal to its mana value" shows
-/// its value), so the menu displays the engine's figure and computes nothing.
+/// CR 601.2f-h: an option's non-mana cost with each life amount the engine can
+/// already know resolved to the number paid ("pay life equal to its mana
+/// value" shows its value), so the menu displays the engine's figure and
+/// computes nothing. An amount that depends on a choice not made yet (an
+/// unannounced X, the spell's targets) keeps its expression, and the menu
+/// shows the unquantified cost instead of a made-up number.
 fn resolved_cost_for_display(
     state: &GameState,
     player: PlayerId,
@@ -7465,11 +7468,16 @@ fn resolved_cost_for_display(
     cost: AbilityCost,
 ) -> AbilityCost {
     match cost {
-        AbilityCost::PayLife { amount } => AbilityCost::PayLife {
-            amount: QuantityExpr::Fixed {
-                value: super::quantity::resolve_quantity(state, &amount, player, object_id),
-            },
-        },
+        AbilityCost::PayLife { amount } => {
+            let amount = match amount {
+                QuantityExpr::Fixed { .. } => amount,
+                other => super::quantity::try_resolve_quantity_in_source_context(
+                    state, &other, player, object_id,
+                )
+                .map_or(other, |value| QuantityExpr::Fixed { value }),
+            };
+            AbilityCost::PayLife { amount }
+        }
         AbilityCost::Composite { costs } => AbilityCost::Composite {
             costs: costs
                 .into_iter()
