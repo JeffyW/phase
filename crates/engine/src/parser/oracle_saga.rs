@@ -188,10 +188,20 @@ pub(crate) fn parse_saga_chapters(lines: &[&str], _card_name: &str) -> SagaChapt
                     // would execute every bullet sequentially instead of one
                     // chosen mode. Try it before `parse_effect_chain`, mirroring
                     // the vote dispatch directly above.
-                    None => {
-                        crate::parser::oracle_modal::try_parse_inline_modal_ability(effect_text)
-                            .unwrap_or_else(|| parse_effect_chain(effect_text, AbilityKind::Spell))
-                    }
+                    //
+                    // CR 714.2 + CR 714.2b: the modes are a triggered ability's
+                    // body, so they parse in trigger context, as the trigger
+                    // modal path's modes do. The chapter head establishes no
+                    // self-reference host or event-object antecedent, so every
+                    // other context field stays at its default.
+                    None => crate::parser::oracle_modal::try_parse_inline_modal_ability(
+                        effect_text,
+                        &crate::parser::oracle_ir::context::ParseContext {
+                            in_trigger: true,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or_else(|| parse_effect_chain(effect_text, AbilityKind::Spell)),
                 };
             // CR 611.2b + CR 714.2b: A chapter ability that grants an ability with no
             // explicit duration in its Oracle text creates a continuous effect that
@@ -641,6 +651,47 @@ mod tests {
             assert_eq!(execute.optional, optional, "{header}: execute.optional");
             assert_eq!(triggers[0].optional, optional, "{header}: trigger.optional");
         }
+    }
+
+    /// CR 714.2 + CR 714.2b: a modal chapter's modes are the body of a
+    /// triggered ability, so a trigger-only clause in a mode lowers with its
+    /// event referent. Parsed through the full `parse_oracle_text` pipeline.
+    /// No printed modal Saga chapter carries such a clause (the census finds
+    /// only Life of Toshiro Umezawa and Summon: Magus Sisters, neither of which
+    /// does), so the chapter is synthetic; the clause is the trigger-gated
+    /// "that permanent or player" damage recipient.
+    #[test]
+    fn modal_chapter_modes_parse_in_trigger_context() {
+        let oracle = "(As this Saga enters and after your draw step, add a lore counter.)\n\
+            I \u{2014} Choose one \u{2014}\n\
+            \u{2022} This Saga deals 2 damage to that permanent or player.\n\
+            \u{2022} You gain 2 life.";
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            oracle,
+            "Trigger Context Saga",
+            &[],
+            &["Enchantment".to_string()],
+            &["Saga".to_string()],
+        );
+        let execute = parsed
+            .triggers
+            .iter()
+            .find(|trigger| trigger.saga_chapter == Some(1))
+            .and_then(|trigger| trigger.execute.as_deref())
+            .expect("chapter I has an ability");
+        assert!(execute.modal.is_some(), "chapter I must be modal");
+        // Reach guard: the mode really lowered to damage.
+        let Effect::DealDamage { target, .. } = &*execute.mode_abilities[0].effect else {
+            panic!(
+                "mode 1 must deal damage, got {:?}",
+                execute.mode_abilities[0].effect
+            );
+        };
+        assert_eq!(
+            *target,
+            TargetFilter::EventTarget,
+            "the trigger-only recipient must bind the event target"
+        );
     }
 
     /// Walk an ability's effect and its `sub_ability` chain looking for a

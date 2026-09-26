@@ -2224,8 +2224,15 @@ fn split_inline_modal_parts(effect_body: &str) -> Option<(ModalHeaderAst, Vec<Mo
 /// `lower_ability_ir`. Callers that already hold a `ParseContext` and want the
 /// IR should use [`try_parse_inline_modal_ir`] instead; this wrapper exists for
 /// definition-level callers that have no IR pipeline of their own.
-pub(crate) fn try_parse_inline_modal_ability(effect_body: &str) -> Option<AbilityDefinition> {
-    let modal = try_parse_inline_modal_ir(effect_body, &ParseContext::default())?;
+///
+/// `ctx` is the caller's body context, threaded to the marker and every mode
+/// exactly as the trigger modal path threads its live trigger-body context, so
+/// a trigger-only clause in a mode lowers with its event referent.
+pub(crate) fn try_parse_inline_modal_ability(
+    effect_body: &str,
+    ctx: &ParseContext,
+) -> Option<AbilityDefinition> {
+    let modal = try_parse_inline_modal_ir(effect_body, ctx)?;
     let mut ability = crate::parser::oracle_effect::lower_effect_chain_ir(&modal.marker);
     crate::parser::oracle_effect::finalize_effect_chain(&mut ability);
     // CR 603.3c + CR 700.2b: "you may choose one —" lets the controller choose
