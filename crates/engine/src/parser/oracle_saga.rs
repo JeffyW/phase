@@ -91,6 +91,13 @@ fn strip_chapter_title(effect: &str) -> &str {
         return effect;
     };
     let title = title.trim();
+    // CR 700.2: a modal instruction ("Choose one —") is rules text, not a
+    // flavor title. Keep it, so a same-line modal chapter ("I — Choose one —
+    // • … • …") reaches the modal dispatch with its header, as a multi-line one
+    // does. `parse_modal_header_ast` is the authority on what a modal header is.
+    if crate::parser::oracle_modal::parse_modal_header_ast(title).is_some() {
+        return effect;
+    }
     let normalized_title = title.trim_end_matches(['!', '?']).trim_end();
     let looks_like_title = !normalized_title.is_empty()
         && normalized_title.len() < 40
@@ -301,16 +308,27 @@ fn promote_grant_duration_for_chapter(execute: &mut AbilityDefinition, chapter_t
     if let Some(modal) = &execute.modal {
         let mode_texts = modal.mode_descriptions.clone();
         for (mode, mode_text) in execute.mode_abilities.iter_mut().zip(&mode_texts) {
-            if !chapter_has_explicit_duration_suffix(mode_text) {
+            if !grant_clause_states_duration(mode_text) {
                 promote_generic_effect_duration(&mut mode.effect);
             }
         }
         return;
     }
-    if chapter_has_explicit_duration_suffix(chapter_text) {
+    if grant_clause_states_duration(chapter_text) {
         return;
     }
     promote_generic_effect_duration(&mut execute.effect);
+}
+
+/// CR 611.2a: does the clause that lowers to the chapter's (or mode's) top-level
+/// effect state its own duration? A continuous effect "lasts as long as stated
+/// by the spell or ability creating it", so the duration is read from that
+/// clause alone: a later instruction in the same text ("… until end of turn.
+/// Draw a card.") neither hides a stated duration nor lends one to a grant that
+/// states none.
+fn grant_clause_states_duration(text: &str) -> bool {
+    let grant_clause = crate::parser::oracle_effect::first_clause_text(text);
+    chapter_has_explicit_duration_suffix(grant_clause.as_deref().unwrap_or(text))
 }
 
 /// Detect whether the chapter text carries an explicit duration suffix that
@@ -620,6 +638,104 @@ mod tests {
         let (explicit, bare) = modal_chapter_durations([BARE_GRANT_MODE, EXPLICIT_GRANT_MODE], 1);
         assert_eq!(explicit, Some(Duration::UntilEndOfTurn));
         assert_eq!(bare, Some(Duration::UntilHostLeavesPlay));
+    }
+
+    /// CR 611.2a: a grant's stated duration is read from the grant's own clause.
+    /// A later instruction in the same mode ("… until end of turn. Draw a card.")
+    /// must not hide it; a bare grant followed by an instruction that states a
+    /// duration must not borrow it.
+    #[test]
+    fn modal_chapter_reads_the_duration_from_the_grant_clause() {
+        let (explicit, bare) = modal_chapter_durations(
+            [
+                "\u{2022} This Saga gains \"{T}: Add {C}.\" until end of turn. Draw a card.",
+                "\u{2022} This Saga gains \"{T}: Add {R}.\" Target creature gets +1/+1 until end of turn.",
+            ],
+            0,
+        );
+        assert_eq!(
+            explicit,
+            Some(Duration::UntilEndOfTurn),
+            "the grant states until end of turn; the later sentence must not hide it"
+        );
+        assert_eq!(
+            bare,
+            Some(Duration::UntilHostLeavesPlay),
+            "the grant states no duration; a later clause's must not shield it"
+        );
+    }
+
+    /// The non-modal chapter path reads the same grant clause.
+    #[test]
+    fn chapter_reads_the_duration_from_the_grant_clause() {
+        for (body, expected) in [
+            (
+                "I \u{2014} This Saga gains \"{T}: Add {C}.\" until end of turn. Draw a card.",
+                Duration::UntilEndOfTurn,
+            ),
+            (
+                "I \u{2014} This Saga gains \"{T}: Add {C}.\" Target creature gets +1/+1 until end of turn.",
+                Duration::UntilHostLeavesPlay,
+            ),
+        ] {
+            let lines = vec![
+                "(As this Saga enters and after your draw step, add a lore counter.)",
+                body,
+            ];
+            let (triggers, _, _) = saga_test_chapters(&lines, "Duration Saga");
+            let execute = triggers[0]
+                .execute
+                .as_deref()
+                .expect("chapter has an ability");
+            match &*execute.effect {
+                Effect::GenericEffect { duration, .. } => {
+                    assert_eq!(duration.clone(), Some(expected.clone()), "{body}")
+                }
+                other => panic!("{body}: the grant must lower to a GenericEffect, got {other:?}"),
+            }
+        }
+    }
+
+    /// CR 700.2: a modal chapter printed on ONE line ("I — Choose one — • … •
+    /// …") keeps its "Choose one" instruction through chapter-title stripping,
+    /// so it becomes a modal ability exactly as the multi-line form does (the
+    /// control). Parsed through the full `parse_oracle_text` pipeline.
+    #[test]
+    fn same_line_modal_chapter_keeps_its_modal_header() {
+        let reminder = "(As this Saga enters and after your draw step, add a lore counter.)";
+        for (form, chapter) in [
+            (
+                "same line",
+                "I \u{2014} Choose one \u{2014} \u{2022} Draw a card. \u{2022} You gain 2 life.",
+            ),
+            (
+                "multi-line",
+                "I \u{2014} Choose one \u{2014}\n\u{2022} Draw a card.\n\u{2022} You gain 2 life.",
+            ),
+        ] {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                &format!("{reminder}\n{chapter}"),
+                "Header Saga",
+                &[],
+                &["Enchantment".to_string()],
+                &["Saga".to_string()],
+            );
+            let execute = parsed
+                .triggers
+                .iter()
+                .find(|trigger| trigger.saga_chapter == Some(1))
+                .and_then(|trigger| trigger.execute.as_deref())
+                .unwrap_or_else(|| panic!("{form}: chapter I has an ability"));
+            let modal = execute
+                .modal
+                .as_ref()
+                .unwrap_or_else(|| panic!("{form}: the chapter must be modal"));
+            assert_eq!(modal.mode_count, 2, "{form}: two bullets are two modes");
+            assert!(
+                !chain_contains_gain_life(execute),
+                "{form}: the life gain belongs to its mode, not the chapter root"
+            );
+        }
     }
 
     /// CR 603.3c + CR 700.2b: "You may choose one —" lets the controller choose
