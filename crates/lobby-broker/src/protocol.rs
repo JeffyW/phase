@@ -60,14 +60,22 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 80 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
+/// 81 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
 ///      Kopala): `StaticMode::ReduceAbilityCost` gains `targets` and
 ///      `frequency`, `GameState` gains `ability_cost_discount_used`,
 ///      `ResolvedAbility` gains `ability_cost_discount_static_sources`, and the
 ///      `ActivationCostSnapshot` carrier gains `once_per_turn_sources`,
 ///      `mana_carrier`, `settlement_tail` and the `TargetSettlement` lock point.
-///      A v79 peer would drop the new fields silently, which in P2P prices
+///      A v80 peer would drop the new fields silently, which in P2P prices
 ///      one activation differently on host and guest.
+/// 80 — CR 406.3 exile look authority: `ExileLinkKind::HideawayLookable`
+///      changed from a unit variant to `{ grant, lookers, source_incarnation }`
+///      in serialized `GameState`, and `source_incarnation` has no serde
+///      default, so neither side parses the other's look links. A PARSE bump
+///      like 78. `DerivedViews::linked_exile_ids` is new and the client renders
+///      it directly. Full-game peers and P2P move in lockstep (wire 62); lobby
+///      messages are unchanged.
+///
 /// 79 — CR 601.2f + CR 602.2b activated-ability cost-reduction election:
 ///      `ReductionProvenance` gains `AbilityCostRider` and `TransientEffect`,
 ///      new variants on a `#[serde(tag = "type", content = "data")]` enum with
@@ -630,7 +638,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 80;
+pub const PROTOCOL_VERSION: u32 = 81;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -1846,12 +1854,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 80);
+        assert_eq!(PROTOCOL_VERSION, 81);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 79);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 80);
     }
 
     #[test]

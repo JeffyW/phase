@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 80 — ExileLinkKind.HideawayLookable carries { grant, lookers,
+ *      source_incarnation } in serialized GameState, and
+ *      DerivedViews.linked_exile_ids is new and rendered directly. The
+ *      exact-match version check at connect refuses the pairing.
  * 78 — Duration::UntilEvent (the event-deadline duration) and
  *      TransientContinuousEffect's duration_event_source are new in serialized
  *      GameState. This client hands server frames to JSON.parse, so a v77
@@ -549,13 +553,13 @@ export class NativeEngineVersionMismatchError extends Error {
  *      activation_cost_snapshot fields are additive and skipped when empty, so
  *      every spell frame is byte-identical to v78.
  *
- * 80 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
+ * 81 — CR 601.2c + CR 602.2b target-gated activation costs (Professor Hojo,
  *      Kopala): ReduceAbilityCost statics carry targets and frequency,
  *      GameState records spent once-per-turn discounts, and the activation
  *      cost carrier holds the target-settlement lock. A v79 peer would drop
  *      these silently and price one activation differently.
  */
-export const PROTOCOL_VERSION = 80;
+export const PROTOCOL_VERSION = 81;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
