@@ -2608,7 +2608,13 @@ fn breach_with_unpayable_escape_auto_routes_to_blitz() {
 
 /// CR 601.2a + CR 118.9b: a stale or hand-built menu option naming Underdog's
 /// blitz-only permission as a printed-cost `GraveyardPermission` is refused
-/// when chosen, and nothing moves or is paid.
+/// when chosen, and nothing moves or is paid. This pins the menu's
+/// revalidation against a fresh option set. The preparation backstop behind it
+/// (`prepare_spell_cast` refusing a `GraveyardPermission` cast through a
+/// method-restricted source) is reached in production by castability's
+/// default preparation and is pinned by the printed-cost negatives
+/// (`graveyard_blitz_only_permission_does_not_admit_an_affordable_printed_cost`
+/// and its Bestow sibling), which fail without it.
 #[test]
 fn a_printed_option_through_a_blitz_only_permission_is_refused() {
     let (mut runner, dog) = underdog_under_breach(3, 4, 20);
@@ -2808,5 +2814,121 @@ fn bestow_onto_terror_with_a_defiler_is_not_offered_when_its_total_life_is_unpay
     assert!(
         offered_cast(&runner, phoenix).is_none(),
         "4 life can't pay the Defiler's 2 and Terror's 3"
+    );
+}
+
+/// Sabin with Defiler of Instinct, `red` red mana, a card to discard, P0 at
+/// `life`, and a required "pay 2 life" additional cost on Sabin itself. No
+/// printed card combines a graveyard blitz or bestow with a required
+/// additional cost, so the cost is set directly.
+fn sabin_with_defiler_and_a_required_life_cost(
+    red: usize,
+    life: i32,
+) -> (GameRunner, ObjectId, ObjectId) {
+    let (mut runner, sabin, filler) = sabin_with_defiler(red);
+    runner.state_mut().players[0].life = life;
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&sabin)
+        .unwrap()
+        .additional_cost = Some(engine::types::ability::AdditionalCost::Required(
+        engine::types::ability::AbilityCost::PayLife {
+            amount: engine::types::ability::QuantityExpr::Fixed { value: 2 },
+        },
+    ));
+    (runner, sabin, filler)
+}
+
+fn assert_not_offered_and_refused(runner: &mut GameRunner, sabin: ObjectId, why: &str) {
+    assert!(
+        engine::game::casting::current_casting_variant_choice_options(runner.state(), P0, sabin)
+            .is_empty(),
+        "{why}: the engine's casting options must not include the blitz"
+    );
+    assert!(offered_cast(runner, sabin).is_none(), "{why}");
+    assert!(
+        cast_from_graveyard(runner, sabin).is_err(),
+        "{why}: the handler refuses it"
+    );
+    assert_eq!(runner.state().objects[&sabin].zone, Zone::Graveyard);
+}
+
+/// CR 601.2h + CR 119.4: with only the Defiler-reduced blitz mana (three red),
+/// Sabin's own required 2 life and the Defiler's 2 can't both be paid at 3
+/// life, so the blitz is not offered, and the handler refuses it. Before, the
+/// engine's casting options still listed it (measured).
+#[test]
+fn blitz_with_a_defiler_and_a_required_life_cost_is_not_offered_when_unpayable() {
+    let (mut runner, sabin, _) = sabin_with_defiler_and_a_required_life_cost(3, 3);
+    assert_not_offered_and_refused(&mut runner, sabin, "3 life, 3 mana");
+}
+
+/// The limitation, pinned so offer and payment keep agreeing: at 4 life the
+/// rules allow the reduced blitz (2 + 2 life), but the payment pipeline pays an
+/// object's own required additional cost before the Defiler prompt and can't
+/// complete it (measured: "Cannot pay mana cost"). The offer doesn't credit
+/// the Defiler in that case, so the cast isn't offered rather than offered and
+/// refused. No printed card has this combination.
+#[test]
+fn blitz_with_a_defiler_and_a_required_life_cost_is_not_offered_through_the_defiler() {
+    let (mut runner, sabin, _) = sabin_with_defiler_and_a_required_life_cost(3, 4);
+    assert_not_offered_and_refused(&mut runner, sabin, "4 life, 3 mana");
+}
+
+/// Control: the required cost is priced, not refused. Caldaia Guardian (blitz
+/// {2}{G}, no non-mana residual) under Muldrotha with a required "pay 2 life"
+/// additional cost, the full blitz mana and 3 life: the blitz is offered and
+/// completes, paying three mana and the 2 life. (A residual-free blitz keeps
+/// this control off a separate, pre-existing gap: an object's own required
+/// additional cost currently suppresses an alternative cost's non-mana
+/// residual, which no printed card combines.)
+#[test]
+fn blitz_with_a_required_life_cost_completes_without_the_defiler() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let guardian = scenario
+        .add_creature_to_graveyard(P0, "Caldaia Guardian", 4, 3)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Green],
+        })
+        .with_keyword(caldaia_blitz())
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().players[0].life = 3;
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&guardian)
+        .unwrap()
+        .additional_cost = Some(engine::types::ability::AdditionalCost::Required(
+        engine::types::ability::AbilityCost::PayLife {
+            amount: engine::types::ability::QuantityExpr::Fixed { value: 2 },
+        },
+    ));
+    add_mana(&mut runner, ManaType::Green, 3);
+
+    let action = offered_cast(&runner, guardian).expect("three mana and 3 life pay the blitz");
+    runner.act(action).expect("the offered cast is accepted");
+    if let WaitingFor::AlternativeCastChoice { .. } = runner.state().waiting_for {
+        runner
+            .act(GameAction::ChooseAlternativeCast {
+                choice: AlternativeCastDecision::Alternative,
+            })
+            .expect("choosing blitz");
+    }
+    assert_eq!(runner.state().objects[&guardian].zone, Zone::Stack);
+    assert_eq!(runner.state().players[0].life, 1, "the required 2 life");
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "blitz {{2}}{{G}}"
     );
 }

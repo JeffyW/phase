@@ -7443,7 +7443,40 @@ fn casting_variant_choice_option(
             player,
             candidate.prepared.object_id,
             candidate.prepared.casting_variant,
-        ),
+        )
+        .map(|cost| {
+            resolved_cost_for_display(
+                &candidate.transformed_state,
+                player,
+                candidate.prepared.object_id,
+                cost,
+            )
+        }),
+    }
+}
+
+/// CR 601.2f-h: an option's non-mana cost with every life amount resolved to
+/// the number the player will pay ("pay life equal to its mana value" shows
+/// its value), so the menu displays the engine's figure and computes nothing.
+fn resolved_cost_for_display(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    cost: AbilityCost,
+) -> AbilityCost {
+    match cost {
+        AbilityCost::PayLife { amount } => AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed {
+                value: super::quantity::resolve_quantity(state, &amount, player, object_id),
+            },
+        },
+        AbilityCost::Composite { costs } => AbilityCost::Composite {
+            costs: costs
+                .into_iter()
+                .map(|cost| resolved_cost_for_display(state, player, object_id, cost))
+                .collect(),
+        },
+        other => other,
     }
 }
 
@@ -23333,11 +23366,12 @@ fn bestow_offer(
 ///
 /// CR 601.2h + CR 119.4: a Defiler's reduction is credited to the mana only
 /// when its life is payable together with the life the rest of the total pays
-/// (the residual and every imposed cost), the same eligibility the Defiler
-/// payment prompt applies (`committed_life_besides_defiler`). The imposed costs
-/// come from the payment's own `combined_imposed_additional_cast_cost`, read
-/// with no targets chosen yet: a tax that depends on the spell's targets
-/// (Terror of the Peaks) is not in this total.
+/// (the residual and every other required cost), the same eligibility the
+/// Defiler payment prompt applies (`committed_life_besides_defiler`). The
+/// required costs come from `committed_required_cast_cost`, the object's
+/// required additional cost merged with every imposed cost as payment merges
+/// them, read with no targets chosen yet: a tax that depends on the spell's
+/// targets (Terror of the Peaks) is not in this total.
 fn alternative_cost_offer_payable(
     state: &GameState,
     player: PlayerId,
@@ -23346,7 +23380,7 @@ fn alternative_cost_offer_payable(
     mana: &Option<crate::types::mana::ManaCost>,
     residual: &Option<AbilityCost>,
 ) -> bool {
-    let imposed = casting_costs::combined_imposed_additional_cast_cost(
+    let imposed = casting_costs::committed_required_cast_cost(
         state,
         player,
         object_id,
@@ -23361,17 +23395,31 @@ fn alternative_cost_offer_payable(
         residual.as_ref(),
         imposed.as_ref(),
     );
+    // CR 601.2b + CR 601.2h: a cast whose object carries its own REQUIRED
+    // additional cost pays that cost's declaration before the Defiler prompt,
+    // and that declaration can't see a Defiler's reduction, so the payment
+    // pipeline can't complete a cast that needs the reduction. The offer then
+    // doesn't credit it either: offer and payment agree (an honest gap for that
+    // combination, which no printed card has) rather than offering a cast that
+    // payment refuses.
+    let defiler_creditable = !state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| matches!(obj.additional_cost, Some(AdditionalCost::Required(_))));
     // CR 118.3: a zero mana cost is always payable.
     mana.as_ref().is_none_or(|m| {
         can_pay_cost_after_auto_tap(state, player, object_id, m)
-            || casting_costs::defiler_reduced_cost_alongside(
-                state,
-                player,
-                object_id,
-                m,
-                committed_life,
-            )
-            .is_some_and(|reduced| can_pay_cost_after_auto_tap(state, player, object_id, &reduced))
+            || (defiler_creditable
+                && casting_costs::defiler_reduced_cost_alongside(
+                    state,
+                    player,
+                    object_id,
+                    m,
+                    committed_life,
+                )
+                .is_some_and(|reduced| {
+                    can_pay_cost_after_auto_tap(state, player, object_id, &reduced)
+                }))
     }) && residual
         .as_ref()
         .is_none_or(|cost| cost.is_payable(state, player, object_id))
