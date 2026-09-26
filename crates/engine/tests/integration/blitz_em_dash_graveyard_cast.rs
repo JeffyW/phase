@@ -835,6 +835,28 @@ const EXPLORATION_BROODSHIP: &str = "Station (Tap another creature you control: 
 
 const ENCROACHING_MYCOSYNTH: &str = "Nonland permanents you control are artifacts in addition to their other types. The same is true for permanent spells you control and nonland permanent cards you own that aren't on the battlefield.";
 
+/// Put Exploration Broodship on P0's battlefield as the Spacecraft it is, with
+/// `charge` charge counters. CR 721.2a: its graveyard permission is printed in
+/// the 8+ striation, so it functions only with 8 or more charge counters. The
+/// subtype must be set before the Oracle text is parsed, so the parser sees a
+/// Spacecraft and gates the striation. Flush layers after `build()`.
+fn add_exploration_broodship(scenario: &mut GameScenario, charge: u32) -> ObjectId {
+    let broodship = scenario
+        .add_artifact_from_oracle(P0, "Exploration Broodship", EXPLORATION_BROODSHIP)
+        .with_subtypes(vec!["Spacecraft"])
+        .from_oracle_text(EXPLORATION_BROODSHIP)
+        .id();
+    scenario.with_counter(
+        broodship,
+        CounterType::Generic("charge".to_string()),
+        charge,
+    );
+    broodship
+}
+
+/// Charge counters that switch on Exploration Broodship's graveyard permission.
+const BROODSHIP_STATIONED: u32 = 8;
+
 /// Answer every `PayCost` prompt with the first card it offers, until priority
 /// returns or a prompt this helper does not handle comes up.
 fn pay_offered_costs(runner: &mut GameRunner) {
@@ -877,9 +899,7 @@ fn blitz_charges_only_the_elected_permissions_extra_cost() {
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let broodship = scenario
-        .add_artifact_from_oracle(P0, "Exploration Broodship", EXPLORATION_BROODSHIP)
-        .id();
+    let broodship = add_exploration_broodship(&mut scenario, BROODSHIP_STATIONED);
     let land = scenario.add_basic_land(P0, ManaColor::Red);
     let sabin = scenario
         .add_creature_to_graveyard(P0, "Sabin, Master Monk", 4, 3)
@@ -892,6 +912,7 @@ fn blitz_charges_only_the_elected_permissions_extra_cost() {
         .id();
     let filler = scenario.add_card_to_hand(P0, "Filler Card");
     let mut runner = scenario.build();
+    engine::game::layers::flush_layers(runner.state_mut());
     fill_mana(&mut runner, ManaType::Red);
 
     cast_from_graveyard(&mut runner, sabin).expect("graveyard cast must be legal");
@@ -929,9 +950,7 @@ fn blitz_charges_only_the_elected_permissions_extra_cost() {
 fn blitz_under_broodship_alone_charges_its_land_sacrifice() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let broodship = scenario
-        .add_artifact_from_oracle(P0, "Exploration Broodship", EXPLORATION_BROODSHIP)
-        .id();
+    let broodship = add_exploration_broodship(&mut scenario, BROODSHIP_STATIONED);
     let land = scenario.add_basic_land(P0, ManaColor::Green);
     let guardian = scenario
         .add_creature_to_graveyard(P0, "Caldaia Guardian", 4, 3)
@@ -942,6 +961,7 @@ fn blitz_under_broodship_alone_charges_its_land_sacrifice() {
         .with_keyword(caldaia_blitz())
         .id();
     let mut runner = scenario.build();
+    engine::game::layers::flush_layers(runner.state_mut());
     fill_mana(&mut runner, ManaType::Green);
 
     cast_from_graveyard(&mut runner, guardian).expect("graveyard cast must be legal");
@@ -1316,9 +1336,7 @@ const KRARK_CLAN_IRONWORKS: &str = "Sacrifice an artifact: Add {C}{C}.";
 fn blitz_keeps_its_elected_permission_when_the_source_leaves_mid_payment() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let broodship = scenario
-        .add_artifact_from_oracle(P0, "Exploration Broodship", EXPLORATION_BROODSHIP)
-        .id();
+    let broodship = add_exploration_broodship(&mut scenario, BROODSHIP_STATIONED);
     let muldrotha = add_permission_source(
         &mut scenario,
         "Muldrotha, the Gravetide",
@@ -1338,6 +1356,7 @@ fn blitz_keeps_its_elected_permission_when_the_source_leaves_mid_payment() {
         .with_keyword(caldaia_blitz())
         .id();
     let mut runner = scenario.build();
+    engine::game::layers::flush_layers(runner.state_mut());
     // Blitz {2}{G} is affordable from the pool alone, so it is offered; the
     // Ironworks activation below is the mid-payment board change.
     for _ in 0..3 {
@@ -1952,9 +1971,21 @@ fn graveyard_blitz_one_mana_short_is_not_a_legal_action() {
 /// Detective's Phoenix in the graveyard with `red` red mana, a creature to
 /// enchant, and two mana-value-3 cards to collect as evidence.
 fn phoenix_in_graveyard_with(red: usize) -> (GameRunner, ObjectId, Vec<ObjectId>) {
+    phoenix_in_graveyard(red, true, true)
+}
+
+/// Detective's Phoenix in the graveyard with `red` red mana, optionally a
+/// creature to enchant and two mana-value-3 cards to collect as evidence.
+fn phoenix_in_graveyard(
+    red: usize,
+    with_target: bool,
+    with_evidence: bool,
+) -> (GameRunner, ObjectId, Vec<ObjectId>) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.add_creature(P0, "Grizzly Bears", 2, 2);
+    if with_target {
+        scenario.add_creature(P0, "Grizzly Bears", 2, 2);
+    }
     let mut builder = scenario.add_creature_to_graveyard(P0, "Detective's Phoenix", 2, 2);
     builder.with_mana_cost(ManaCost::Cost {
         shards: vec![ManaCostShard::Red],
@@ -1976,7 +2007,7 @@ fn phoenix_in_graveyard_with(red: usize) -> (GameRunner, ObjectId, Vec<ObjectId>
             }
         }
     }
-    let fodder: Vec<ObjectId> = (0..2)
+    let fodder: Vec<ObjectId> = (0..if with_evidence { 2 } else { 0 })
         .map(|i| {
             let card_id = engine::types::identifiers::CardId(runner.state().next_object_id);
             let id = engine::game::zones::create_object(
@@ -2039,4 +2070,212 @@ fn graveyard_bestow_without_its_mana_is_not_a_legal_action() {
         offered_cast(&runner, phoenix).is_none(),
         "no mana cannot pay the bestow {{R}}"
     );
+}
+
+/// Tenacious Underdog in the graveyard under only its own "using its blitz
+/// ability" permission, with `black` black mana and P0 at `life`.
+fn underdog_in_graveyard_with(black: usize, life: i32) -> (GameRunner, ObjectId) {
+    let parsed = parse_oracle_text(
+        UNDERDOG,
+        "Tenacious Underdog",
+        &[],
+        &["Creature".into()],
+        &["Human".into(), "Warrior".into()],
+    );
+    let kw = blitz_keyword(&parsed);
+    let gy_static = parsed
+        .statics
+        .first()
+        .expect("graveyard-cast permission static must parse")
+        .clone();
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let dog = scenario
+        .add_creature_to_graveyard(P0, "Tenacious Underdog", 3, 2)
+        .with_static_definition(gy_static)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Black],
+        })
+        .with_keyword(kw)
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().players[0].life = life;
+    add_mana(&mut runner, ManaType::Black, black);
+    (runner, dog)
+}
+
+/// CR 601.2a + CR 118.9a: a "using its blitz ability" permission admits only the
+/// blitz cast. With two black mana and 1 life, Underdog's printed {1}{B} is
+/// affordable but its blitz ({2}{B}{B}, Pay 2 life) is not, so the card is
+/// neither offered nor castable: castability must not fall back to the printed
+/// cost the permission never granted.
+#[test]
+fn graveyard_blitz_only_permission_does_not_admit_an_affordable_printed_cost() {
+    let (mut runner, dog) = underdog_in_graveyard_with(2, 1);
+    assert!(
+        offered_cast(&runner, dog).is_none(),
+        "only the printed cost is affordable, and the permission doesn't grant it"
+    );
+    assert!(
+        cast_from_graveyard(&mut runner, dog).is_err(),
+        "the cast handler must refuse the same cast"
+    );
+    assert_eq!(runner.state().objects[&dog].zone, Zone::Graveyard);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 2);
+}
+
+/// Control: once blitz itself is payable (four black mana, 3 life), the same
+/// permission offers the cast.
+#[test]
+fn graveyard_blitz_only_permission_offers_a_payable_blitz() {
+    let (runner, dog) = underdog_in_graveyard_with(4, 3);
+    assert!(
+        offered_cast(&runner, dog).is_some(),
+        "a payable blitz is offered"
+    );
+}
+
+/// CR 601.2a + CR 118.9a + CR 702.103a + CR 303.4a: the Bestow sibling. Detective's
+/// Phoenix's "using its bestow ability" permission admits only the bestow cast.
+/// With three red mana its printed {2}{R} is affordable, but bestow needs a
+/// creature to enchant AND evidence to collect. Remove either, and the cast is
+/// neither offered nor accepted.
+#[test]
+fn graveyard_bestow_only_permission_does_not_admit_an_affordable_printed_cost() {
+    for (with_target, with_evidence) in [(false, true), (true, false)] {
+        let (mut runner, phoenix, _) = phoenix_in_graveyard(3, with_target, with_evidence);
+        let case = format!("target={with_target} evidence={with_evidence}");
+        assert!(
+            offered_cast(&runner, phoenix).is_none(),
+            "{case}: bestow is unpayable and the permission doesn't grant the printed cast"
+        );
+        assert!(
+            cast_from_graveyard(&mut runner, phoenix).is_err(),
+            "{case}: the cast handler must refuse the same cast"
+        );
+        assert_eq!(runner.state().objects[&phoenix].zone, Zone::Graveyard);
+    }
+}
+
+/// Control: with both the target and the evidence, the three-mana board offers
+/// the cast (bestow's {R} is payable).
+#[test]
+fn graveyard_bestow_only_permission_offers_a_payable_bestow() {
+    let (runner, phoenix, _) = phoenix_in_graveyard(3, true, true);
+    assert!(offered_cast(&runner, phoenix).is_some());
+}
+
+const BROKKOS: &str = "Mutate {2}{U/B}{G}{G} (If you cast this spell for its mutate cost, put it over or under target non-Human creature you own. They mutate into the creature on top plus all abilities from under it.)\nTrample\nYou may cast this card from your graveyard using its mutate ability.";
+
+const FLORAL_INVOCATIONS: &str = "You may play lands and cast creature spells from your graveyard.";
+
+/// Brokkos, Apex of Forever in the graveyard under its own "using its mutate
+/// ability" permission, with its printed {2}{B}{G}{U} affordable and no creature
+/// to mutate onto. With `unconstrained`, an Advanced Floral Invocations-style
+/// permission that leaves the casting method open is added too.
+fn brokkos_in_graveyard(unconstrained: bool) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    if unconstrained {
+        let enabler = parse_oracle_text(
+            FLORAL_INVOCATIONS,
+            "Advanced Floral Invocations",
+            &[],
+            &["Enchantment".into()],
+            &[],
+        );
+        let permission = enabler
+            .statics
+            .iter()
+            .find(|s| format!("{s:?}").contains("GraveyardCastPermission"))
+            .expect("an unconstrained GraveyardCastPermission must parse")
+            .clone();
+        scenario
+            .add_enchantment_from_oracle(P0, "Advanced Floral Invocations", FLORAL_INVOCATIONS)
+            .with_static_definition(permission);
+    }
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Brokkos, Apex of Forever", 6, 6);
+    builder.with_mana_cost(ManaCost::Cost {
+        shards: vec![
+            ManaCostShard::Black,
+            ManaCostShard::Green,
+            ManaCostShard::Blue,
+        ],
+        generic: 2,
+    });
+    builder.with_subtypes(vec!["Nightmare", "Beast", "Elemental"]);
+    builder.from_oracle_text_with_keywords(&["Mutate", "Trample"], BROKKOS);
+    let brokkos = builder.id();
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Black, 2);
+    add_mana(&mut runner, ManaType::Green, 1);
+    add_mana(&mut runner, ManaType::Blue, 1);
+    add_mana(&mut runner, ManaType::Colorless, 1);
+    (runner, brokkos)
+}
+
+/// CR 601.2a + CR 118.9a: the same authority covers a casting method with no
+/// graveyard offer of its own. Brokkos's permission admits only its mutate cast,
+/// so its affordable printed cost is neither offered nor accepted from the
+/// graveyard. Before, the permission's keyword filter was trivially true for
+/// Brokkos and the card was cast for {2}{B}{G}{U} (measured).
+#[test]
+fn graveyard_mutate_only_permission_does_not_admit_the_printed_cost() {
+    let (mut runner, brokkos) = brokkos_in_graveyard(false);
+    assert!(
+        runner.state().objects[&brokkos]
+            .static_definitions
+            .as_slice()
+            .iter()
+            .any(|s| format!("{s:?}").contains("HasKeywordKind")),
+        "reach guard: Brokkos must carry its keyword-restricted graveyard permission"
+    );
+    assert!(
+        offered_cast(&runner, brokkos).is_none(),
+        "the mutate-only permission must not offer the printed cost"
+    );
+    assert!(
+        cast_from_graveyard(&mut runner, brokkos).is_err(),
+        "the cast handler must refuse the printed cost too"
+    );
+    assert_eq!(runner.state().objects[&brokkos].zone, Zone::Graveyard);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 5);
+}
+
+/// Reach guard: the same board plus a permission that leaves the method open
+/// offers the printed cast and completes it for {2}{B}{G}{U}.
+#[test]
+fn graveyard_printed_cost_is_admitted_by_an_unconstrained_permission() {
+    let (mut runner, brokkos) = brokkos_in_graveyard(true);
+    let action = offered_cast(&runner, brokkos)
+        .expect("an unconstrained permission admits the printed cast");
+    runner
+        .act(action)
+        .expect("the offered printed cast completes");
+    assert_eq!(runner.state().objects[&brokkos].zone, Zone::Stack);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+}
+/// CR 721.2a: Exploration Broodship's graveyard permission is printed in its 8+
+/// striation, so with seven charge counters it grants nothing, and Caldaia
+/// Guardian (no permission of its own) can't be cast from the graveyard.
+#[test]
+fn broodship_below_its_station_threshold_admits_no_graveyard_cast() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_exploration_broodship(&mut scenario, BROODSHIP_STATIONED - 1);
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let guardian = scenario
+        .add_creature_to_graveyard(P0, "Caldaia Guardian", 4, 3)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Green],
+        })
+        .with_keyword(caldaia_blitz())
+        .id();
+    let mut runner = scenario.build();
+    engine::game::layers::flush_layers(runner.state_mut());
+    fill_mana(&mut runner, ManaType::Green);
+    assert!(offered_cast(&runner, guardian).is_none());
+    assert!(cast_from_graveyard(&mut runner, guardian).is_err());
 }

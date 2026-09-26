@@ -5799,42 +5799,62 @@ pub(crate) fn graveyard_static_permission_extra_cost(
         .and_then(|source| source.extra_cost.clone())
 }
 
-fn filter_has_keyword_kind_constraint(filter: &TargetFilter, kind: KeywordKind) -> bool {
-    match filter {
-        TargetFilter::Typed(tf) => tf
-            .properties
-            .iter()
-            .any(|prop| matches!(prop, FilterProp::HasKeywordKind { value } if *value == kind)),
-        TargetFilter::And { filters } => filters
-            .iter()
-            .any(|inner| filter_has_keyword_kind_constraint(inner, kind)),
-        _ => false,
-    }
-}
-
-fn has_graveyard_cast_permission_without_keyword_constraint(
+/// CR 601.2a + CR 118.9a: the casting method a graveyard permission restricts
+/// the cast to ("You may cast this card from your graveyard using its blitz
+/// ability."). Such a permission's filter carries a keyword-kind constraint
+/// naming a keyword that is itself a way of casting the spell
+/// (`Keyword::is_spell_casting_only`), and it admits only that method, never
+/// the printed cost. A constraint naming any other keyword ("creature spells
+/// with flying") only selects cards.
+fn permission_required_cast_method(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
-    kind: KeywordKind,
+    filter: &TargetFilter,
+) -> Option<KeywordKind> {
+    fn constrained_kinds(filter: &TargetFilter, kinds: &mut Vec<KeywordKind>) {
+        match filter {
+            TargetFilter::Typed(tf) => {
+                kinds.extend(tf.properties.iter().filter_map(|prop| match prop {
+                    FilterProp::HasKeywordKind { value } => Some(*value),
+                    _ => None,
+                }))
+            }
+            TargetFilter::And { filters } => filters
+                .iter()
+                .for_each(|inner| constrained_kinds(inner, kinds)),
+            _ => {}
+        }
+    }
+    let mut kinds = Vec::new();
+    constrained_kinds(filter, &mut kinds);
+    if kinds.is_empty() {
+        return None;
+    }
+    let keywords = effective_spell_keywords(state, player, object_id);
+    kinds.into_iter().find(|kind| {
+        keywords
+            .iter()
+            .any(|keyword| keyword.kind() == *kind && keyword.is_spell_casting_only())
+    })
+}
+
+/// CR 601.2a + CR 118.9a: can the card be cast from the graveyard for its
+/// printed cost? Only when some permission that admits it leaves the casting
+/// method open (Muldrotha, Lurrus). A permission restricted to a method
+/// (`permission_required_cast_method`: Sabin, Master Monk; Brokkos, Apex of
+/// Forever) admits that method only. The single authority read by the cast
+/// handler's Blitz and Bestow offers, by its printed-cost path, and by
+/// legal-action castability.
+fn graveyard_printed_cast_allowed(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
 ) -> bool {
-    graveyard_permission_sources(state, player, Some(CardPlayMode::Cast))
-        .into_iter()
+    graveyard_permission_candidates(state, player, object_id)
+        .iter()
         .any(|source| {
-            !filter_has_keyword_kind_constraint(source.filter, kind)
-                && frequency_slot_available(state, source.source_id, object_id, source.frequency)
-                // CR 109.4 + CR 108.4a: owner-scoped, as in the sibling
-                // consumers -- see `graveyard_permission_source`.
-                && super::filter::matches_target_filter_for_zone(
-                    state,
-                    object_id,
-                    Zone::Graveyard,
-                    source.filter,
-                    &super::filter::FilterContext::from_source_with_controller(
-                        source.source_id,
-                        player,
-                    ),
-                )
+            permission_required_cast_method(state, player, object_id, source.filter).is_none()
         })
 }
 
@@ -16221,13 +16241,8 @@ pub fn handle_cast_spell_with_payment_mode(
             // (Sabin, Master Monk / Tenacious Underdog) does NOT: it grants
             // the blitz cast only.
             let from_hand = obj.zone == Zone::Hand;
-            let printed_cost_cast_allowed = from_hand
-                || has_graveyard_cast_permission_without_keyword_constraint(
-                    state,
-                    player,
-                    object_id,
-                    KeywordKind::Blitz,
-                );
+            let printed_cost_cast_allowed =
+                from_hand || graveyard_printed_cast_allowed(state, player, object_id);
             // CR 118.9b: alternative costs are optional, so whenever BOTH the
             // printed and blitz casts are legal and affordable the player must
             // get the choice — including from the graveyard under an
@@ -16574,13 +16589,8 @@ pub fn handle_cast_spell_with_payment_mode(
             // Phoenix's own "using its bestow ability" rider grants the bestow
             // cast only. Bestow twin of the Blitz block's gate.
             let from_hand = obj.zone == Zone::Hand;
-            let printed_cost_cast_allowed = from_hand
-                || has_graveyard_cast_permission_without_keyword_constraint(
-                    state,
-                    player,
-                    object_id,
-                    KeywordKind::Bestow,
-                );
+            let printed_cost_cast_allowed =
+                from_hand || graveyard_printed_cast_allowed(state, player, object_id);
             let (normal_cost, normal_cost_affordable) =
                 normal_cast_choice_cost_and_affordability(state, player, object_id, obj);
             let normal_affordable = printed_cost_cast_allowed && normal_cost_affordable;
@@ -16955,6 +16965,20 @@ fn continue_graveyard_cast_with_slot_choice(
     // the player to choose which permanent type slot to consume when the card
     // has multiple available slots (multi-type permanents like Artifact Creature).
     if let Some(obj) = state.objects.get(&object_id) {
+        // CR 601.2a + CR 118.9a: this is the printed-cost path. A card admitted
+        // to it only by graveyard permissions restricted to a casting method
+        // ("using its mutate ability": Brokkos, Apex of Forever) can't be cast
+        // this way, the same verdict legal-action castability reaches.
+        if obj.zone == Zone::Graveyard
+            && graveyard_permission_source(state, player, object_id).is_some()
+            && !has_effective_graveyard_cast_keyword(state, object_id, obj)
+            && !has_graveyard_timed_alt_cost_permission(state, obj, player)
+            && !graveyard_printed_cast_allowed(state, player, object_id)
+        {
+            return Err(EngineError::InvalidAction(
+                "No graveyard permission allows casting this card for its mana cost".to_string(),
+            ));
+        }
         if obj.zone == Zone::Graveyard {
             if let Some(source) = graveyard_permission_source(state, player, object_id)
                 .filter(|source| source.frequency == CastFrequency::OncePerTurnPerPermanentType)
@@ -19024,6 +19048,21 @@ fn can_cast_prepared_now_with_probe(
         if !branch_is_offerable(preferred) && !branch_is_offerable(fallback) {
             return false;
         }
+    }
+
+    // CR 601.2a + CR 118.9a: a graveyard permission restricted to a casting
+    // method ("using its blitz ability") admits only that method, never the
+    // printed cost. When no admitting permission leaves the method open, the
+    // card is castable only through its own alternative offers, judged exactly
+    // as the cast handler judges them.
+    if matches!(
+        prepared.casting_variant,
+        CastingVariant::GraveyardPermission { .. }
+    ) && !graveyard_printed_cast_allowed(state, player, obj.id)
+    {
+        return (prepared.modal.is_some()
+            || spell_has_legal_targets_with_probe(state, obj.id, player, probe))
+            && graveyard_alternative_cost_castable(state, player, obj);
     }
 
     // CR 702.172: Spree spells must afford at least one mode to be castable.
@@ -23148,7 +23187,14 @@ fn blitz_offer(
     let (mana_part, residual) = split_blitz_cost_components(&blitz_cost);
     let mana = mana_part
         .map(|m| apply_cost_modifiers_to_base(state, player, object_id, m.clone()).unwrap_or(m));
-    let affordable = alternative_cost_offer_payable(state, player, object_id, &mana, &residual);
+    let affordable = alternative_cost_offer_payable(
+        state,
+        player,
+        object_id,
+        CastingVariant::Blitz,
+        &mana,
+        &residual,
+    );
     Some(BlitzOffer {
         mana,
         residual,
@@ -23209,7 +23255,14 @@ fn bestow_offer(
     // commit to, judged on the bestowed form (see
     // `graveyard_bestow_authority_usable`).
     let offerable = has_legal_creature_target
-        && alternative_cost_offer_payable(state, player, object_id, &mana, &residual)
+        && alternative_cost_offer_payable(
+            state,
+            player,
+            object_id,
+            CastingVariant::Bestow,
+            &mana,
+            &residual,
+        )
         && (from_hand || graveyard_bestow_authority_usable(state, player, object_id));
     Some(BestowOffer {
         mana,
@@ -23221,19 +23274,43 @@ fn bestow_offer(
 /// CR 118.3 + CR 601.2h: an alternative cost is on offer only when its mana
 /// sub-cost AND its non-mana residual are each payable now; otherwise the offer
 /// would promise a cost the player can't complete.
+///
+/// CR 601.2h + CR 119.4: a Defiler's reduction is credited to the mana only
+/// when its life is payable together with the life the rest of the total pays
+/// (the residual and the permission's imposed cost), the same eligibility the
+/// Defiler payment prompt applies (`committed_life_besides_defiler`).
 fn alternative_cost_offer_payable(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
+    variant: CastingVariant,
     mana: &Option<crate::types::mana::ManaCost>,
     residual: &Option<AbilityCost>,
 ) -> bool {
+    let imposed = casting_costs::cast_permission_additional_extra_cost(
+        state, player, object_id, variant, None,
+    );
+    let committed_life = casting_costs::committed_life_besides_defiler(
+        state,
+        player,
+        object_id,
+        residual.as_ref(),
+        imposed.as_ref(),
+    );
     // CR 118.3: a zero mana cost is always payable.
-    mana.as_ref()
-        .is_none_or(|m| alternative_cost_mana_affordable(state, player, object_id, m))
-        && residual
-            .as_ref()
-            .is_none_or(|cost| cost.is_payable(state, player, object_id))
+    mana.as_ref().is_none_or(|m| {
+        can_pay_cost_after_auto_tap(state, player, object_id, m)
+            || casting_costs::defiler_reduced_cost_alongside(
+                state,
+                player,
+                object_id,
+                m,
+                committed_life,
+            )
+            .is_some_and(|reduced| can_pay_cost_after_auto_tap(state, player, object_id, &reduced))
+    }) && residual
+        .as_ref()
+        .is_none_or(|cost| cost.is_payable(state, player, object_id))
 }
 
 /// CR 601.2a + CR 601.2f + CR 118.9: the single graveyard-permission casting

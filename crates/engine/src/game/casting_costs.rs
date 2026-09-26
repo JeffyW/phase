@@ -7090,7 +7090,7 @@ fn combined_imposed_additional_cast_cost(
 /// permission (Festival of Embers graveyard pay-life; Dawnhand Dissident exile
 /// remove-counters). Returns `None` for the `Alternative` cost shape (Valgavoth)
 /// — that replaces the mana cost and is paid through the alt-cost block instead.
-fn cast_permission_additional_extra_cost(
+pub(super) fn cast_permission_additional_extra_cost(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
@@ -8018,21 +8018,14 @@ fn pay_alternative_cost_residual(
     // own life payment (Tenacious Underdog's "Pay 2 life") and any imposed
     // required cost's, and partial payments aren't allowed. Offer the Defiler
     // only when the combined life stays payable, so accepting it can't make the
-    // rest of the total unpayable.
-    let committed_life = cost_life_payment(state, player, object_id, &residual)
-        + match &pending.additional_cost_flow {
-            Some(AdditionalCost::Required(imposed)) => {
-                cost_life_payment(state, player, object_id, imposed)
-            }
-            _ => 0,
-        };
-    if let Some(defiler) = find_defiler_reduction(state, player, object_id).filter(|defiler| {
-        super::life_costs::can_pay_life_cast_or_activation_cost(
-            state,
-            player,
-            defiler.life_cost + committed_life,
-        )
-    }) {
+    // rest of the total unpayable. The offer side reads the same sum.
+    let imposed = match &pending.additional_cost_flow {
+        Some(AdditionalCost::Required(imposed)) => Some(imposed),
+        _ => None,
+    };
+    let committed_life =
+        committed_life_besides_defiler(state, player, object_id, Some(&residual), imposed);
+    if let Some(defiler) = defiler_reduction_alongside(state, player, object_id, committed_life) {
         pending.deferred_required_additional_cost = Some(residual);
         return Ok(WaitingFor::DefilerPayment {
             player,
@@ -8064,6 +8057,42 @@ fn cost_life_payment(
             .sum(),
         _ => 0,
     }
+}
+
+/// CR 601.2h + CR 119.4: the life a cast's committed total pays besides a
+/// Defiler's: the alternative cost's own residual plus any imposed required
+/// cost. The single sum that both the alternative-cost offer and the Defiler
+/// payment prompt judge a Defiler against.
+pub(crate) fn committed_life_besides_defiler(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    residual: Option<&AbilityCost>,
+    imposed: Option<&AbilityCost>,
+) -> u32 {
+    [residual, imposed]
+        .into_iter()
+        .flatten()
+        .map(|cost| cost_life_payment(state, player, object_id, cost))
+        .sum()
+}
+
+/// CR 601.2h + CR 119.4: the matching Defiler reduction a cast can take when its
+/// total already pays `committed_life`. Partial payments aren't allowed, so the
+/// Defiler's life and the committed life must be payable together.
+fn defiler_reduction_alongside(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    committed_life: u32,
+) -> Option<DefilerReduction> {
+    find_defiler_reduction(state, caster, spell_id).filter(|defiler| {
+        super::life_costs::can_pay_life_cast_or_activation_cost(
+            state,
+            caster,
+            defiler.life_cost + committed_life,
+        )
+    })
 }
 
 /// CR 118.9 + CR 601.2h: the non-mana residual of a card's OWN compound
@@ -8169,7 +8198,20 @@ pub(crate) fn defiler_reduced_cost(
     spell_id: ObjectId,
     cost: &ManaCost,
 ) -> Option<ManaCost> {
-    let reduction = find_defiler_reduction(state, caster, spell_id)?;
+    defiler_reduced_cost_alongside(state, caster, spell_id, cost, 0)
+}
+
+/// CR 601.2f + CR 601.2h + CR 119.4: `defiler_reduced_cost` for a cast whose
+/// total already pays `committed_life` (see `committed_life_besides_defiler`),
+/// the same eligibility the Defiler payment prompt applies.
+pub(crate) fn defiler_reduced_cost_alongside(
+    state: &GameState,
+    caster: PlayerId,
+    spell_id: ObjectId,
+    cost: &ManaCost,
+    committed_life: u32,
+) -> Option<ManaCost> {
+    let reduction = defiler_reduction_alongside(state, caster, spell_id, committed_life)?;
     let mut reduced = cost.clone();
     apply_defiler_mana_reduction(&mut reduced, &reduction.mana_reduction, reduction.reach);
     Some(reduced)

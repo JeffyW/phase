@@ -159,6 +159,11 @@ const TENACIOUS_UNDERDOG: &str = "Blitz\u{2014}{2}{B}{B}, Pay 2 life. (If you ca
 /// Tenacious Underdog in the graveyard (blitz via its own rider), Defiler of
 /// Flesh out, four black mana, and P0 at `life`.
 fn underdog_with_defiler(life: i32) -> (GameRunner, ObjectId) {
+    underdog_with_defiler_and_mana(life, 4)
+}
+
+/// `underdog_with_defiler` with exactly `black` black mana.
+fn underdog_with_defiler_and_mana(life: i32, black: usize) -> (GameRunner, ObjectId) {
     let parsed = parse_oracle_text(
         TENACIOUS_UNDERDOG,
         "Tenacious Underdog",
@@ -197,7 +202,7 @@ fn underdog_with_defiler(life: i32) -> (GameRunner, ObjectId) {
         .id();
     let mut runner = scenario.build();
     runner.state_mut().players[0].life = life;
-    for _ in 0..4 {
+    for _ in 0..black {
         runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
             ManaType::Black,
             ObjectId(0),
@@ -287,5 +292,70 @@ fn defiler_is_offered_when_its_life_and_the_residuals_are_payable() {
         ),
         "the completed cast leaves P0 at 0 life, got {:?}",
         runner.state().waiting_for
+    );
+}
+
+fn underdog_offered(runner: &GameRunner, underdog: ObjectId) -> bool {
+    engine::ai_support::legal_actions(runner.state())
+        .iter()
+        .any(|action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == underdog))
+}
+
+/// CR 601.2h + CR 119.4: with three black mana, blitz ({2}{B}{B}, Pay 2 life) is
+/// affordable only with Defiler of Flesh's {B} reduction, which costs 2 more
+/// life. At 3 life the combined 4 life can't be paid, so the reduction can't be
+/// taken, the unreduced four mana can't be paid, and the cast must not be
+/// offered or accepted. The offer reads the same combined-life eligibility the
+/// Defiler payment prompt applies.
+#[test]
+fn blitz_affordable_only_with_a_defiler_whose_life_is_unpayable_is_not_offered() {
+    let (mut runner, underdog) = underdog_with_defiler_and_mana(3, 3);
+    assert!(
+        !underdog_offered(&runner, underdog),
+        "3 life can't pay the Defiler's 2 and blitz's 2 together"
+    );
+    let card_id = runner.state().objects[&underdog].card_id;
+    assert!(
+        runner
+            .act(GameAction::CastSpell {
+                object_id: underdog,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .is_err(),
+        "the cast handler must refuse the same cast"
+    );
+    assert_eq!(runner.state().objects[&underdog].zone, Zone::Graveyard);
+    assert_eq!(runner.state().players[0].life, 3);
+}
+
+/// Control: at 4 life the combined 4 life is payable, so the same three-mana
+/// blitz is offered, and the offered action completes through the Defiler: all
+/// three mana spent and both life payments made.
+#[test]
+fn blitz_affordable_only_with_a_payable_defiler_is_offered_and_completes() {
+    let (mut runner, underdog) = underdog_with_defiler_and_mana(4, 3);
+    let action = engine::ai_support::legal_actions(runner.state())
+        .into_iter()
+        .find(|action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == underdog))
+        .expect("4 life pays the Defiler's 2 and blitz's 2, so the cast is offered");
+    runner.act(action).expect("the offered cast is accepted");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::DefilerPayment { .. }
+        ),
+        "the Defiler must be offered, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::DecideOptionalCost { pay: true })
+        .expect("paying the Defiler's life must be legal");
+    assert_eq!(runner.state().players[0].life, 0, "both life payments made");
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "the reduced {{2}}{{B}} took all three mana"
     );
 }
