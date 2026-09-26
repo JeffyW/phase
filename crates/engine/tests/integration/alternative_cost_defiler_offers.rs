@@ -359,3 +359,102 @@ fn blitz_affordable_only_with_a_payable_defiler_is_offered_and_completes() {
         "the reduced {{2}}{{B}} took all three mana"
     );
 }
+
+/// Tenacious Underdog with Defiler of Flesh, `black` black mana, P0 at `life`,
+/// and an opponent's unconditional "pay 2 life" casting tax. No printed card
+/// imposes one (the only life-tax imposer, Terror of the Peaks, is
+/// target-gated), so the tax is Terror's own parsed static with its target
+/// condition cleared.
+fn underdog_with_defiler_and_a_life_tax(life: i32, black: usize) -> (GameRunner, ObjectId) {
+    let (mut runner, underdog) = underdog_with_defiler_and_mana(life, black);
+    let mut parsed = parse_oracle_text(
+        "Spells your opponents cast that target Tax Source cost an additional 3 life to cast.",
+        "Tax Source",
+        &[],
+        &["Creature".into()],
+        &[],
+    );
+    for s in parsed.statics.iter_mut() {
+        if let engine::types::statics::StaticMode::ImposeAdditionalCost {
+            cost, spell_filter, ..
+        } = &mut s.mode
+        {
+            *spell_filter = None;
+            *cost = engine::types::ability::AbilityCost::PayLife {
+                amount: engine::types::ability::QuantityExpr::Fixed { value: 2 },
+            };
+        }
+    }
+    assert!(
+        parsed
+            .statics
+            .iter()
+            .any(|s| format!("{s:?}").contains("ImposeAdditionalCost")),
+        "reach guard: the tax static parses"
+    );
+    let card_id = engine::types::identifiers::CardId(runner.state().next_object_id);
+    let tax = engine::game::zones::create_object(
+        runner.state_mut(),
+        card_id,
+        engine::game::scenario::P1,
+        "Tax Source".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = runner.state_mut().objects.get_mut(&tax).unwrap();
+        obj.card_types
+            .core_types
+            .push(engine::types::card_type::CoreType::Creature);
+        obj.base_card_types = obj.card_types.clone();
+        for s in parsed.statics {
+            obj.static_definitions.push(s.clone());
+            std::sync::Arc::make_mut(&mut obj.base_static_definitions).push(s);
+        }
+    }
+    engine::game::layers::flush_layers(runner.state_mut());
+    (runner, underdog)
+}
+
+/// CR 601.2h + CR 119.4: the offer prices every imposed cost the payment does.
+/// At 4 life with three black mana, the reduced blitz needs the Defiler's 2,
+/// blitz's 2 and the tax's 2 (6 life): not payable, so not offered, and the
+/// handler refuses the same cast. Before, the offer left the tax out.
+#[test]
+fn blitz_with_a_defiler_and_an_imposed_life_tax_is_not_offered_when_unpayable() {
+    let (mut runner, underdog) = underdog_with_defiler_and_a_life_tax(4, 3);
+    assert!(!underdog_offered(&runner, underdog));
+    assert!(
+        engine::game::casting::current_casting_variant_choice_options(runner.state(), P0, underdog)
+            .is_empty(),
+        "the engine's casting options must not include the unpayable blitz"
+    );
+    let card_id = runner.state().objects[&underdog].card_id;
+    assert!(runner
+        .act(GameAction::CastSpell {
+            object_id: underdog,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .is_err());
+    assert_eq!(runner.state().objects[&underdog].zone, Zone::Graveyard);
+}
+
+/// Control: at 6 life the 6 life is payable, so the cast is offered and the
+/// offered action completes through the Defiler (three mana, all 6 life).
+#[test]
+fn blitz_with_a_defiler_and_an_imposed_life_tax_completes_when_payable() {
+    let (mut runner, underdog) = underdog_with_defiler_and_a_life_tax(6, 3);
+    let action = engine::ai_support::legal_actions(runner.state())
+        .into_iter()
+        .find(|action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == underdog))
+        .expect("6 life pays the Defiler, blitz and the tax");
+    runner.act(action).expect("the offered cast is accepted");
+    if let WaitingFor::DefilerPayment { .. } = runner.state().waiting_for {
+        runner
+            .act(GameAction::DecideOptionalCost { pay: true })
+            .expect("paying the Defiler's life");
+    }
+    assert_eq!(runner.state().players[0].life, 0, "all 6 life paid");
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+}

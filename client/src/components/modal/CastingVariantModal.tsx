@@ -5,6 +5,7 @@ import type { CastingVariant, CastingVariantFace, GameAction, WaitingFor } from 
 import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { ManaCostSymbols } from "../mana/ManaCostSymbols.tsx";
+import { describeAdditionalCost } from "./describeAdditionalCost.ts";
 import { DialogShell } from "./DialogShell.tsx";
 
 type CastingVariantChoice = Extract<
@@ -99,6 +100,11 @@ function CastingVariantContent({
             <span className="ml-2">
               <ManaCostSymbols cost={option.mana_cost} />
             </span>
+            {option.additional_cost && (
+              <span className="ml-2 text-xs text-slate-300">
+                {describeAdditionalCost(option.additional_cost, t)}
+              </span>
+            )}
           </button>;
         })}
       </div>

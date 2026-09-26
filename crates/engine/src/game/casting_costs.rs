@@ -7047,7 +7047,7 @@ fn record_graveyard_rider_authority(
     Ok(())
 }
 
-fn combined_imposed_additional_cast_cost(
+pub(super) fn combined_imposed_additional_cast_cost(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
@@ -7090,7 +7090,7 @@ fn combined_imposed_additional_cast_cost(
 /// permission (Festival of Embers graveyard pay-life; Dawnhand Dissident exile
 /// remove-counters). Returns `None` for the `Alternative` cost shape (Valgavoth)
 /// — that replaces the mana cost and is paid through the alt-cost block instead.
-pub(super) fn cast_permission_additional_extra_cost(
+fn cast_permission_additional_extra_cost(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
@@ -8109,7 +8109,7 @@ fn defiler_reduction_alongside(
 ///
 /// CR 702.102b: each arm requires its own casting variant, which Fuse never
 /// equals, so a fused split cast never reaches these reads.
-fn alternative_cost_residual(
+pub(super) fn alternative_cost_residual(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
@@ -15770,6 +15770,7 @@ mod tests {
                         graveyard_destination_replacement: None,
                         extra_cost: None,
                         enters_with_counter: None,
+                        required_cast_keyword: None,
                     },
                 )
                 .affected(crate::types::ability::TargetFilter::Typed(

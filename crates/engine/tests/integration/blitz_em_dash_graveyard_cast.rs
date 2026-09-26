@@ -2215,25 +2215,25 @@ fn brokkos_in_graveyard(unconstrained: bool) -> (GameRunner, ObjectId) {
     (runner, brokkos)
 }
 
-/// CR 601.2a + CR 118.9a: the same authority covers a casting method with no
-/// graveyard offer of its own. Brokkos's permission admits only its mutate cast,
-/// so its affordable printed cost is neither offered nor accepted from the
-/// graveyard. Before, the permission's keyword filter was trivially true for
-/// Brokkos and the card was cast for {2}{B}{G}{U} (measured).
+/// CR 118.9b: Brokkos's graveyard permission requires its mutate cast, and the
+/// engine has no graveyard mutate route, so the permission is an honest gap:
+/// the clause is not modeled as a graveyard permission, and Brokkos is neither
+/// offered nor cast from the graveyard (before, it was cast for its printed
+/// {2}{B}{G}{U}, measured).
 #[test]
-fn graveyard_mutate_only_permission_does_not_admit_the_printed_cost() {
+fn graveyard_mutate_only_permission_is_an_honest_gap() {
     let (mut runner, brokkos) = brokkos_in_graveyard(false);
     assert!(
-        runner.state().objects[&brokkos]
+        !runner.state().objects[&brokkos]
             .static_definitions
             .as_slice()
             .iter()
-            .any(|s| format!("{s:?}").contains("HasKeywordKind")),
-        "reach guard: Brokkos must carry its keyword-restricted graveyard permission"
+            .any(|s| format!("{s:?}").contains("GraveyardCastPermission")),
+        "the mutate-only permission must not be modeled"
     );
     assert!(
         offered_cast(&runner, brokkos).is_none(),
-        "the mutate-only permission must not offer the printed cost"
+        "no modeled permission, so no graveyard cast is offered"
     );
     assert!(
         cast_from_graveyard(&mut runner, brokkos).is_err(),
@@ -2278,4 +2278,535 @@ fn broodship_below_its_station_threshold_admits_no_graveyard_cast() {
     fill_mana(&mut runner, ManaType::Green);
     assert!(offered_cast(&runner, guardian).is_none());
     assert!(cast_from_graveyard(&mut runner, guardian).is_err());
+}
+
+// --- CR 118.9b: the permission's required casting method -----------------
+
+use engine::types::ability::{
+    CardPlayMode, FilterProp, StaticDefinition, TargetFilter, TypedFilter,
+};
+use engine::types::keywords::KeywordKind;
+use engine::types::statics::{CastFrequency, StaticMode};
+
+const UNDERWORLD_BREACH: &str = "Each nonland card in your graveyard has escape. The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard. (You may cast cards from your graveyard for their escape cost.)\nAt the beginning of the end step, sacrifice this enchantment.";
+
+const LURRUS: &str = "Lifelink\nOnce during each of your turns, you may cast a permanent spell with mana value 2 or less from your graveyard.";
+
+/// A creature-card graveyard permission built directly: `frequency`, the
+/// casting method it requires, and any extra card-selection properties.
+fn creature_permission(
+    frequency: CastFrequency,
+    required_cast_keyword: Option<KeywordKind>,
+    selection: Vec<FilterProp>,
+) -> StaticDefinition {
+    let mut filter = TypedFilter::creature();
+    filter.properties.extend(selection);
+    StaticDefinition::new(StaticMode::GraveyardCastPermission {
+        frequency,
+        play_mode: CardPlayMode::Cast,
+        graveyard_destination_replacement: None,
+        extra_cost: None,
+        enters_with_counter: None,
+        required_cast_keyword,
+    })
+    .affected(TargetFilter::Typed(filter))
+}
+
+fn add_permission_host(scenario: &mut GameScenario, name: &str, def: StaticDefinition) -> ObjectId {
+    scenario
+        .add_creature(P0, name, 1, 1)
+        .with_static_definition(def)
+        .id()
+}
+
+fn add_bears_to_graveyard(scenario: &mut GameScenario, name: &str) -> ObjectId {
+    scenario
+        .add_creature_to_graveyard(P0, name, 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Green],
+        })
+        .id()
+}
+
+/// CR 601.2a + CR 118.9b: a printed-cost graveyard cast commits to a permission
+/// that leaves the method open, even when a method-restricted one is scanned
+/// first. A sneak-only permission (Ninja Teen's shape, built directly because
+/// the parser declines Ninja Teen) sits before Muldrotha; the printed Grizzly
+/// Bears cast spends Muldrotha's creature slot, so a second creature is refused.
+#[test]
+fn printed_cast_commits_to_an_open_permission_scanned_after_a_restricted_one() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_host(
+        &mut scenario,
+        "Sneak Permission",
+        creature_permission(CastFrequency::Unlimited, Some(KeywordKind::Sneak), vec![]),
+    );
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let bears = add_bears_to_graveyard(&mut scenario, "Grizzly Bears");
+    let second = add_bears_to_graveyard(&mut scenario, "Second Bears");
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Green, 4);
+
+    cast_from_graveyard(&mut runner, bears).expect("the printed cast is legal under Muldrotha");
+    assert_eq!(runner.state().objects[&bears].zone, Zone::Stack);
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "the printed cast must spend Muldrotha's creature slot, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+    runner.resolve_top();
+    assert!(
+        cast_from_graveyard(&mut runner, second).is_err(),
+        "Muldrotha's creature slot is spent, and the sneak-only permission can't \
+         authorize a printed cast"
+    );
+}
+
+/// CR 118.9b: a permission that requires one method can't authorize another.
+/// Sabin, with no permission of its own, beside a sneak-only permission: its
+/// payable blitz is neither offered nor cast through that permission, and
+/// neither is its printed cost.
+#[test]
+fn blitz_is_not_cast_through_a_permission_requiring_another_method() {
+    let parsed = parse_oracle_text(
+        SABIN,
+        "Sabin, Master Monk",
+        &[],
+        &["Legendary".into(), "Creature".into()],
+        &["Human".into(), "Noble".into(), "Monk".into()],
+    );
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_host(
+        &mut scenario,
+        "Sneak Permission",
+        creature_permission(CastFrequency::Unlimited, Some(KeywordKind::Sneak), vec![]),
+    );
+    let sabin = scenario
+        .add_creature_to_graveyard(P0, "Sabin, Master Monk", 4, 3)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 4,
+            shards: vec![ManaCostShard::Red],
+        })
+        .with_keyword(blitz_keyword(&parsed))
+        .id();
+    scenario.add_card_to_hand(P0, "Filler Card");
+    let mut runner = scenario.build();
+    fill_mana(&mut runner, ManaType::Red);
+
+    assert!(
+        offered_cast(&runner, sabin).is_none(),
+        "a sneak-only permission must not offer Sabin's blitz or printed cast"
+    );
+    assert!(cast_from_graveyard(&mut runner, sabin).is_err());
+    assert_eq!(runner.state().objects[&sabin].zone, Zone::Graveyard);
+}
+
+/// CR 601.2a: between method-open permissions, the printed cast prefers a
+/// strictly dominant one (unlimited, no rider). Muldrotha is scanned before an
+/// unlimited creature permission, and the printed cast spends no Muldrotha slot.
+#[test]
+fn printed_cast_prefers_a_strictly_dominant_open_permission() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    add_permission_host(
+        &mut scenario,
+        "Open Permission",
+        creature_permission(CastFrequency::Unlimited, None, vec![]),
+    );
+    let bears = add_bears_to_graveyard(&mut scenario, "Grizzly Bears");
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Green, 2);
+
+    cast_from_graveyard(&mut runner, bears).expect("the printed cast is legal");
+    assert_eq!(runner.state().objects[&bears].zone, Zone::Stack);
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .is_empty(),
+        "the unlimited permission authorizes it, so Muldrotha's slot stays free, used: {:?}",
+        runner.state().graveyard_cast_permissions_used_per_type
+    );
+}
+
+/// CR 601.2a: two bounded open permissions (Muldrotha and Lurrus) are a real
+/// choice the player would announce, which the engine does not model. The
+/// printed cast takes the first in source order, a documented policy: this test
+/// pins it rather than claiming it is the rules result.
+#[test]
+fn competing_bounded_open_permissions_follow_source_order() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let muldrotha = add_permission_source(
+        &mut scenario,
+        "Muldrotha, the Gravetide",
+        MULDROTHA,
+        &["Elemental", "Avatar"],
+    );
+    let lurrus = add_permission_source(
+        &mut scenario,
+        "Lurrus of the Dream-Den",
+        LURRUS,
+        &["Cat", "Nightmare"],
+    );
+    let bears = add_bears_to_graveyard(&mut scenario, "Grizzly Bears");
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Green, 2);
+
+    cast_from_graveyard(&mut runner, bears).expect("the printed cast is legal");
+    assert!(
+        runner
+            .state()
+            .graveyard_cast_permissions_used_per_type
+            .contains(&(muldrotha, CoreType::Creature)),
+        "the first bounded permission (Muldrotha) is spent"
+    );
+    assert!(
+        !runner
+            .state()
+            .graveyard_cast_permissions_used
+            .contains(&lurrus),
+        "Lurrus's once-per-turn slot is left unspent"
+    );
+}
+
+/// Negative control: a keyword that only SELECTS cards stays a selector. A
+/// method-open permission for creature cards with flying admits a flier's
+/// printed cast; `required_cast_keyword` is what restricts a method, not a
+/// `HasKeywordKind` in the filter.
+#[test]
+fn a_keyword_selector_permission_admits_the_printed_cast() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    add_permission_host(
+        &mut scenario,
+        "Flier Permission",
+        creature_permission(
+            CastFrequency::Unlimited,
+            None,
+            vec![FilterProp::HasKeywordKind {
+                value: KeywordKind::Flying,
+            }],
+        ),
+    );
+    let crow = scenario
+        .add_creature_to_graveyard(P0, "Storm Crow", 1, 2)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Blue],
+        })
+        .with_keyword(Keyword::Flying)
+        .id();
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Blue, 2);
+
+    let action = offered_cast(&runner, crow).expect("the selector admits the flier's printed cast");
+    runner.act(action).expect("the printed cast completes");
+    assert_eq!(runner.state().objects[&crow].zone, Zone::Stack);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+}
+
+/// Tenacious Underdog in the graveyard under its own blitz-only permission and
+/// Underworld Breach, with `fodder` other cards in the graveyard, `black` mana
+/// and `life`.
+fn underdog_under_breach(fodder: usize, black: usize, life: i32) -> (GameRunner, ObjectId) {
+    let parsed = parse_oracle_text(
+        UNDERDOG,
+        "Tenacious Underdog",
+        &[],
+        &["Creature".into()],
+        &["Human".into(), "Warrior".into()],
+    );
+    let own_rider = parsed.statics.first().expect("the rider parses").clone();
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Underworld Breach", UNDERWORLD_BREACH);
+    let dog = scenario
+        .add_creature_to_graveyard(P0, "Tenacious Underdog", 3, 2)
+        .with_static_definition(own_rider)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Black],
+        })
+        .with_keyword(blitz_keyword(&parsed))
+        .id();
+    for i in 0..fodder {
+        scenario.add_creature_to_graveyard(P0, &format!("Fodder {i}"), 1, 1);
+    }
+    let mut runner = scenario.build();
+    runner.state_mut().players[0].life = life;
+    add_mana(&mut runner, ManaType::Black, black);
+    (runner, dog)
+}
+
+/// CR 601.2b + CR 118.9b: under Underworld Breach, Underdog's options are its
+/// escape cast and its blitz cast. Its blitz-only permission contributes the
+/// Blitz option, never a printed-cost `GraveyardPermission` one, and choosing
+/// Blitz pays {2}{B}{B} and 2 life.
+#[test]
+fn breach_offers_escape_and_blitz_but_no_printed_permission_option() {
+    let (mut runner, dog) = underdog_under_breach(3, 4, 20);
+    let waiting = cast_from_graveyard(&mut runner, dog).expect("the cast starts");
+    let WaitingFor::CastingVariantChoice { options, .. } = waiting else {
+        panic!("expected the casting menu, got {waiting:?}");
+    };
+    let variants: Vec<String> = options.iter().map(|o| format!("{:?}", o.variant)).collect();
+    assert_eq!(
+        variants,
+        vec!["Escape".to_string(), "Blitz".to_string()],
+        "{options:?}"
+    );
+    assert!(
+        options[1].additional_cost.is_some(),
+        "the Blitz option carries its 2-life residual for display: {options:?}"
+    );
+    runner
+        .act(GameAction::ChooseCastingVariant { index: 1 })
+        .expect("choosing blitz is legal");
+    pay_offered_costs(&mut runner);
+    assert_eq!(runner.state().objects[&dog].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "{{2}}{{B}}{{B}} paid"
+    );
+    assert_eq!(runner.state().players[0].life, 18, "blitz's 2 life paid");
+}
+
+/// With escape unpayable (no other cards to exile) the menu has one option, so
+/// it is taken directly: the blitz, never the printed cost.
+#[test]
+fn breach_with_unpayable_escape_auto_routes_to_blitz() {
+    let (mut runner, dog) = underdog_under_breach(0, 4, 20);
+    cast_from_graveyard(&mut runner, dog).expect("the cast starts");
+    pay_offered_costs(&mut runner);
+    assert_eq!(runner.state().objects[&dog].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "{{2}}{{B}}{{B}} paid"
+    );
+    assert_eq!(runner.state().players[0].life, 18, "blitz's 2 life paid");
+}
+
+/// CR 601.2a + CR 118.9b: a stale or hand-built menu option naming Underdog's
+/// blitz-only permission as a printed-cost `GraveyardPermission` is refused
+/// when chosen, and nothing moves or is paid.
+#[test]
+fn a_printed_option_through_a_blitz_only_permission_is_refused() {
+    let (mut runner, dog) = underdog_under_breach(3, 4, 20);
+    let waiting = cast_from_graveyard(&mut runner, dog).expect("the cast starts");
+    let WaitingFor::CastingVariantChoice {
+        player,
+        object_id,
+        card_id,
+        payment_mode,
+        mut options,
+    } = waiting
+    else {
+        panic!("expected the casting menu, got {waiting:?}");
+    };
+    options.push(engine::types::game_state::CastingVariantChoiceOption {
+        variant: engine::types::game_state::CastingVariant::GraveyardPermission {
+            source: dog,
+            frequency: CastFrequency::Unlimited,
+            slot_type: None,
+            graveyard_destination_replacement: None,
+        },
+        face: engine::types::game_state::CastingVariantFace::Current,
+        mana_cost: ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::Black],
+        },
+        additional_cost: None,
+    });
+    let stale = options.len() - 1;
+    runner.state_mut().waiting_for = WaitingFor::CastingVariantChoice {
+        player,
+        object_id,
+        card_id,
+        payment_mode,
+        options,
+    };
+    assert!(
+        runner
+            .act(GameAction::ChooseCastingVariant { index: stale })
+            .is_err(),
+        "a printed-cost option through a blitz-only permission must be refused"
+    );
+    assert_eq!(runner.state().objects[&dog].zone, Zone::Graveyard);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 4);
+}
+
+/// CR 118.9b: Timeline Culler ("using its warp ability") and Ninja Teen
+/// ("using their sneak abilities") require methods the engine can't cast from
+/// the graveyard, so their permissions are honest gaps: not modeled as a
+/// graveyard permission, and left unimplemented.
+#[test]
+fn warp_and_sneak_graveyard_permissions_are_honest_gaps() {
+    let culler = parse_oracle_text(
+        "Haste\nYou may cast this card from your graveyard using its warp ability.\nWarp\u{2014}{B}, Pay 2 life. (You may cast this card from your hand or graveyard for its warp cost. If you do, exile this creature at the beginning of the next end step, then you may cast it from exile on a later turn.)",
+        "Timeline Culler",
+        &["Haste".into(), "Warp".into()],
+        &["Creature".into()],
+        &["Drix".into(), "Warlock".into()],
+    );
+    let teen = parse_oracle_text(
+        "(Gain the next level as a sorcery to add its ability.)\nWhenever a creature you control leaves the battlefield, each opponent loses 1 life.\n{1}{B}: Level 2\nCreatures you control get +1/+0 and have menace.\n{B}: Level 3\nCreature cards in your graveyard have sneak {3}{B}.\nYou may cast creature spells from your graveyard using their sneak abilities.",
+        "Ninja Teen",
+        &[],
+        &["Enchantment".into()],
+        &["Class".into()],
+    );
+    for (name, parsed) in [("Timeline Culler", &culler), ("Ninja Teen", &teen)] {
+        let rendered = format!("{parsed:?}");
+        assert!(
+            !rendered.contains("GraveyardCastPermission"),
+            "{name}: the method-restricted permission must not be modeled"
+        );
+        assert!(
+            rendered.contains("Unimplemented"),
+            "{name}: the declined clause must stay an explicit gap"
+        );
+    }
+}
+
+/// CR 118.9b: the method survives persistence. Underdog's blitz-only permission
+/// round-trips through the persisted-state chokepoint with
+/// `required_cast_keyword == Some(Blitz)`, and the restored game still refuses
+/// its affordable printed cost.
+#[test]
+fn a_required_cast_method_survives_persistence() {
+    let (runner, dog) = underdog_in_graveyard_with(2, 1);
+    let saved = serde_json::to_string(&engine::types::game_state::PersistedGameState::capture(
+        runner.state().clone(),
+    ))
+    .expect("the state serializes");
+    let restored: engine::types::game_state::PersistedGameState =
+        serde_json::from_str(&saved).expect("the state deserializes");
+    let mut runner = GameRunner::from_state(
+        restored
+            .into_game_state()
+            .expect("the persisted state satisfies the restore contract"),
+    );
+    let required = runner.state().objects[&dog]
+        .static_definitions
+        .as_slice()
+        .iter()
+        .find_map(|def| match def.mode {
+            StaticMode::GraveyardCastPermission {
+                required_cast_keyword,
+                ..
+            } => Some(required_cast_keyword),
+            _ => None,
+        });
+    assert_eq!(required, Some(Some(KeywordKind::Blitz)));
+    assert!(offered_cast(&runner, dog).is_none());
+    assert!(cast_from_graveyard(&mut runner, dog).is_err());
+}
+const TERROR_OF_THE_PEAKS: &str = "Flying\nSpells your opponents cast that target this creature cost an additional 3 life to cast.\nWhenever another creature you control enters, this creature deals damage equal to that creature's power to any target.";
+
+/// Detective's Phoenix in the graveyard with evidence and no red mana; Defiler
+/// of Instinct (given shroud, so it is not an Aura target itself); the
+/// opponent's Terror of the Peaks as the only legal creature to enchant; P0 at
+/// `life`.
+fn phoenix_with_only_terror_to_enchant(life: i32) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let defiler_statics = parse_oracle_text(
+        DEFILER_OF_INSTINCT,
+        "Defiler of Instinct",
+        &["First strike".into()],
+        &["Creature".into()],
+        &["Phyrexian".into(), "Kavu".into()],
+    )
+    .statics;
+    let mut defiler = scenario.add_creature(P0, "Defiler of Instinct", 3, 3);
+    for s in defiler_statics {
+        defiler.with_static_definition(s);
+    }
+    defiler.with_keyword(Keyword::Shroud);
+    let terror = scenario
+        .add_creature(engine::game::scenario::P1, "Terror of the Peaks", 5, 4)
+        .from_oracle_text_with_keywords(&["Flying"], TERROR_OF_THE_PEAKS)
+        .id();
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Detective's Phoenix", 2, 2);
+    builder.with_mana_cost(ManaCost::Cost {
+        shards: vec![ManaCostShard::Red],
+        generic: 2,
+    });
+    builder.with_subtypes(vec!["Phoenix"]);
+    builder.with_color(vec![ManaColor::Red]);
+    builder.from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE);
+    let phoenix = builder.id();
+    let mut runner = scenario.build();
+    {
+        let obj = runner.state_mut().objects.get_mut(&phoenix).unwrap();
+        for types in [
+            &mut obj.card_types.core_types,
+            &mut obj.base_card_types.core_types,
+        ] {
+            if !types.contains(&CoreType::Enchantment) {
+                types.push(CoreType::Enchantment);
+            }
+        }
+    }
+    for i in 0..2 {
+        let card_id = engine::types::identifiers::CardId(runner.state().next_object_id);
+        let id = engine::game::zones::create_object(
+            runner.state_mut(),
+            card_id,
+            P0,
+            format!("Evidence {i}"),
+            Zone::Graveyard,
+        );
+        runner.state_mut().objects.get_mut(&id).unwrap().mana_cost = ManaCost::generic(3);
+    }
+    engine::game::layers::flush_layers(runner.state_mut());
+    runner.state_mut().players[0].life = life;
+    (runner, phoenix, terror)
+}
+
+/// Reach guard for the deferred case below: at 5 life the board reaches the
+/// offer, because the Defiler's 2 life and Terror's 3-life tax (5) are payable.
+#[test]
+fn bestow_onto_terror_with_a_defiler_is_offered_when_its_total_life_is_payable() {
+    let (runner, phoenix, _terror) = phoenix_with_only_terror_to_enchant(5);
+    assert!(offered_cast(&runner, phoenix).is_some());
+}
+
+/// CR 601.2h + CR 119.4: the REQUIRED behavior, not today's. At 4 life the only
+/// Aura target is Terror of the Peaks, whose tax ("cost an additional 3 life")
+/// applies to a spell targeting it; with no red mana the bestow {R} needs the
+/// Defiler's 2 life too, and 5 life can't be paid from 4, so the cast must not
+/// be offered.
+///
+/// Currently fails: the offer reads imposed taxes with no targets chosen, so a
+/// target-dependent tax is not in its life total (a stated limitation of this
+/// change; follow-up logged).
+#[test]
+#[ignore = "target-dependent imposed tax (Terror of the Peaks) is not in the alternative-cost offer's life total; follow-up"]
+fn bestow_onto_terror_with_a_defiler_is_not_offered_when_its_total_life_is_unpayable() {
+    let (runner, phoenix, _terror) = phoenix_with_only_terror_to_enchant(4);
+    assert!(
+        offered_cast(&runner, phoenix).is_none(),
+        "4 life can't pay the Defiler's 2 and Terror's 3"
+    );
 }

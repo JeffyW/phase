@@ -68,6 +68,7 @@ fn printed_graveyard_permission(
         graveyard_destination_replacement: None,
         extra_cost: None,
         enters_with_counter: None,
+        required_cast_keyword: None,
     })
     .affected(TargetFilter::Typed(TypedFilter {
         type_filters: types,

@@ -113,4 +113,56 @@ describe("CastingVariantModal", () => {
 
     expect(screen.queryByRole("heading", { name: "Choose Cast" })).not.toBeInTheDocument();
   });
+
+  // CR 601.2f-h: a menu option that pays an alternative cost with a non-mana
+  // part (Tenacious Underdog's Blitz: "{2}{B}{B}, Pay 2 life") shows that part,
+  // exactly as the engine provides it; an option without one shows none.
+  it("renders the engine-provided non-mana part of an option's cost", () => {
+    const underdog = gameObjectFactory
+      .creature()
+      .inGraveyard()
+      .withId(42)
+      .named("Tenacious Underdog")
+      .withCost(["Black"])
+      .build();
+    const waitingFor: WaitingFor = {
+      type: "CastingVariantChoice",
+      data: {
+        player: 0,
+        object_id: underdog.id,
+        card_id: underdog.card_id,
+        options: [
+          {
+            variant: { type: "Escape" },
+            face: "Current",
+            mana_cost: { type: "Cost", shards: ["Black"], generic: 1 },
+          },
+          {
+            variant: { type: "Blitz" },
+            face: "Current",
+            mana_cost: { type: "Cost", shards: ["Black", "Black"], generic: 2 },
+            additional_cost: { type: "PayLife", amount: { type: "Fixed", value: 2 } },
+          },
+        ],
+      },
+    };
+    setGameStoreForTest({
+      gameState: gameStateFactory
+        .withPlayers(0, 1)
+        .withObjects(underdog)
+        .waitingFor(waitingFor)
+        .build(),
+      legalActions: [
+        { type: "ChooseCastingVariant", data: { index: 0 } },
+        { type: "ChooseCastingVariant", data: { index: 1 } },
+      ],
+    });
+
+    render(<CastingVariantModal />);
+
+    const blitz = screen.getByRole("button", { name: /Blitz/ });
+    expect(blitz).toHaveTextContent("+ Pay life");
+    const escape = screen.getByRole("button", { name: /Escape/ });
+    expect(escape).not.toHaveTextContent("+ Pay life");
+  });
 });

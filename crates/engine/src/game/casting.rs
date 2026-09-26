@@ -4856,9 +4856,22 @@ struct GraveyardPermissionSource<'a> {
     /// the `finalize_cast` seam by `selected_static_permission_enters_with_counter`;
     /// carried here so permission selection can see every rider a choice brings.
     enters_with_counter: &'a Option<crate::types::counter::CounterType>,
+    /// CR 118.9b: the casting method this permission requires ("using its
+    /// blitz ability"), or `None` when it leaves the method open, including the
+    /// printed cost.
+    required_cast_keyword: Option<KeywordKind>,
 }
 
 impl GraveyardPermissionSource<'_> {
+    /// CR 118.9b: can a cast made by `method` (`None` = the printed cost; else
+    /// the alternative cost's keyword, see `CastingVariant::cast_keyword`) be
+    /// authorized by this permission? A permission that requires a method
+    /// authorizes only that method.
+    fn admits_cast_method(&self, method: Option<KeywordKind>) -> bool {
+        self.required_cast_keyword
+            .is_none_or(|required| Some(required) == method)
+    }
+
     /// CR 601.2a: true when using this permission is a choice no player would
     /// make differently. It is `Unlimited`, so it spends no per-turn slot, and it
     /// carries no rider: no enters-with counter, no graveyard redirect and no
@@ -5396,6 +5409,7 @@ fn graveyard_permission_sources(
                     // `selected_static_permission_enters_with_counter`; carried
                     // here so permission selection can see the rider.
                     ref enters_with_counter,
+                    required_cast_keyword,
                 } if graveyard_permission_play_mode_matches(play_mode, play_mode_filter) => {
                     definition
                         .affected
@@ -5407,6 +5421,7 @@ fn graveyard_permission_sources(
                             graveyard_destination_replacement,
                             extra_cost,
                             enters_with_counter,
+                            required_cast_keyword,
                         })
                 }
                 _ => None,
@@ -5495,6 +5510,7 @@ fn transient_graveyard_permission_sources(
                     graveyard_destination_replacement,
                     ref extra_cost,
                     ref enters_with_counter,
+                    required_cast_keyword,
                 } = definition.mode
                 else {
                     return None;
@@ -5516,6 +5532,7 @@ fn transient_graveyard_permission_sources(
                         graveyard_destination_replacement,
                         extra_cost,
                         enters_with_counter,
+                        required_cast_keyword,
                     })
             })
         })
@@ -5705,7 +5722,7 @@ fn graveyard_permission_variant(
 ///   `CastingVariant::is_independent_alternative_cost_rider`): the rider is what
 ///   `casting_variant` records, so the permission that let the card be cast from
 ///   the graveyard is elected here. See "Choosing a permission" below.
-/// - Anything else: the source-order first match, as before.
+/// - Anything else: the printed-cost election (`printed_graveyard_permission_election`).
 ///
 /// Choosing a permission. CR 601.2a: when several permissions admit the cast,
 /// the player announces which one they are using (Muldrotha, 2020-11-10
@@ -5715,9 +5732,14 @@ fn graveyard_permission_variant(
 /// adds nothing, so a bounded slot is not spent when such a permission also
 /// admits the cast (Sabin, Master Monk's own "using its blitz ability" rider
 /// beside Muldrotha or Exploration Broodship). Otherwise it falls back to source
-/// order, the same first match a printed-cost cast gets. An unlimited
-/// permission WITH a rider is a real trade-off: Leonardo's finality counter
-/// against Muldrotha's slot is the player's call, not the engine's.
+/// order. That fallback is a policy, not a rules result: between two bounded
+/// permissions (Muldrotha and Lurrus) the player's announcement decides, and an
+/// unlimited permission WITH a rider is a real trade-off (Leonardo's finality
+/// counter against Muldrotha's slot).
+///
+/// CR 118.9b: a permission that requires a casting method ("using its blitz
+/// ability") authorizes only that method, so each arm considers only the
+/// permissions that admit the method being cast (`admits_cast_method`).
 ///
 /// CR 110.4: a `OncePerTurnPerPermanentType` permission (Muldrotha) is not
 /// usable for an alternative-cost cast when the spell, as it will be cast, has
@@ -5738,13 +5760,19 @@ fn elected_graveyard_permission_source(
             .into_iter()
             .find(|candidate| candidate.source_id == source),
         variant if variant.is_independent_alternative_cost_rider() => {
+            let method = variant.cast_keyword();
             let usable: Vec<_> = candidates
                 .into_iter()
                 .filter(|candidate| {
-                    candidate.frequency != CastFrequency::OncePerTurnPerPermanentType
-                        || available_permanent_type_slots(state, candidate.source_id, object_id)
+                    candidate.admits_cast_method(method)
+                        && (candidate.frequency != CastFrequency::OncePerTurnPerPermanentType
+                            || available_permanent_type_slots(
+                                state,
+                                candidate.source_id,
+                                object_id,
+                            )
                             .len()
-                            == 1
+                                == 1)
                 })
                 .collect();
             usable
@@ -5753,8 +5781,36 @@ fn elected_graveyard_permission_source(
                 .or_else(|| usable.first())
                 .copied()
         }
-        _ => candidates.into_iter().next(),
+        _ => printed_graveyard_permission_election(candidates),
     }
+}
+
+/// CR 601.2a + CR 118.9b: the permission a printed-cost graveyard cast commits
+/// to: among the permissions that leave the casting method open, the strictly
+/// dominant one when there is one, else the first in source order (a policy;
+/// see `elected_graveyard_permission_source`). `None` when every admitting
+/// permission requires a casting method.
+fn printed_graveyard_permission_election(
+    candidates: Vec<GraveyardPermissionSource<'_>>,
+) -> Option<GraveyardPermissionSource<'_>> {
+    let open: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| candidate.admits_cast_method(None))
+        .collect();
+    open.iter()
+        .find(|candidate| candidate.is_strictly_dominant())
+        .or_else(|| open.first())
+        .copied()
+}
+
+/// CR 601.2a + CR 118.9b: `printed_graveyard_permission_election` for
+/// `object_id`.
+fn printed_graveyard_permission_source(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Option<GraveyardPermissionSource<'_>> {
+    printed_graveyard_permission_election(graveyard_permission_candidates(state, player, object_id))
 }
 
 /// CR 601.2a + CR 118.9a: The `GraveyardPermission` authority for a graveyard
@@ -5799,63 +5855,18 @@ pub(crate) fn graveyard_static_permission_extra_cost(
         .and_then(|source| source.extra_cost.clone())
 }
 
-/// CR 601.2a + CR 118.9a: the casting method a graveyard permission restricts
-/// the cast to ("You may cast this card from your graveyard using its blitz
-/// ability."). Such a permission's filter carries a keyword-kind constraint
-/// naming a keyword that is itself a way of casting the spell
-/// (`Keyword::is_spell_casting_only`), and it admits only that method, never
-/// the printed cost. A constraint naming any other keyword ("creature spells
-/// with flying") only selects cards.
-fn permission_required_cast_method(
-    state: &GameState,
-    player: PlayerId,
-    object_id: ObjectId,
-    filter: &TargetFilter,
-) -> Option<KeywordKind> {
-    fn constrained_kinds(filter: &TargetFilter, kinds: &mut Vec<KeywordKind>) {
-        match filter {
-            TargetFilter::Typed(tf) => {
-                kinds.extend(tf.properties.iter().filter_map(|prop| match prop {
-                    FilterProp::HasKeywordKind { value } => Some(*value),
-                    _ => None,
-                }))
-            }
-            TargetFilter::And { filters } => filters
-                .iter()
-                .for_each(|inner| constrained_kinds(inner, kinds)),
-            _ => {}
-        }
-    }
-    let mut kinds = Vec::new();
-    constrained_kinds(filter, &mut kinds);
-    if kinds.is_empty() {
-        return None;
-    }
-    let keywords = effective_spell_keywords(state, player, object_id);
-    kinds.into_iter().find(|kind| {
-        keywords
-            .iter()
-            .any(|keyword| keyword.kind() == *kind && keyword.is_spell_casting_only())
-    })
-}
-
-/// CR 601.2a + CR 118.9a: can the card be cast from the graveyard for its
+/// CR 601.2a + CR 118.9b: can the card be cast from the graveyard for its
 /// printed cost? Only when some permission that admits it leaves the casting
-/// method open (Muldrotha, Lurrus). A permission restricted to a method
-/// (`permission_required_cast_method`: Sabin, Master Monk; Brokkos, Apex of
-/// Forever) admits that method only. The single authority read by the cast
-/// handler's Blitz and Bestow offers, by its printed-cost path, and by
-/// legal-action castability.
+/// method open (Muldrotha, Lurrus). A permission that requires a method
+/// (`required_cast_keyword`: Sabin, Master Monk) admits that method only. The
+/// single authority read by the cast handler's Blitz and Bestow offers, by its
+/// printed-cost path, by the graveyard casting candidates, and by castability.
 fn graveyard_printed_cast_allowed(
     state: &GameState,
     player: PlayerId,
     object_id: ObjectId,
 ) -> bool {
-    graveyard_permission_candidates(state, player, object_id)
-        .iter()
-        .any(|source| {
-            permission_required_cast_method(state, player, object_id, source.filter).is_none()
-        })
+    printed_graveyard_permission_source(state, player, object_id).is_some()
 }
 
 /// CR 401.5 + CR 118.9 + CR 601.2a: Find the (single) top card of `player`'s
@@ -7403,17 +7414,36 @@ fn casting_variant_choice_set(
             ) {
                 continue;
             }
-            options.push(CastingVariantChoiceOption {
-                variant: candidate.prepared.casting_variant,
-                face,
-                mana_cost: candidate.prepared.mana_cost,
-            });
+            options.push(casting_variant_choice_option(player, &candidate, face));
         }
     }
 
     CastingVariantChoiceSet {
         options,
         had_multiple_candidates,
+    }
+}
+
+/// CR 601.2b + CR 601.2f-h: the menu entry for a prepared casting option: its
+/// method, face and mana cost, and the non-mana part of an alternative cost the
+/// option pays (Blitz's "Discard a card", Bestow's "Collect evidence 6"), read
+/// from the same authority payment charges (`alternative_cost_residual`), so the
+/// menu shows what the option will actually cost.
+fn casting_variant_choice_option(
+    player: PlayerId,
+    candidate: &PreparedCastingVariant,
+    face: CastingVariantFace,
+) -> CastingVariantChoiceOption {
+    CastingVariantChoiceOption {
+        variant: candidate.prepared.casting_variant,
+        face,
+        mana_cost: candidate.prepared.mana_cost.clone(),
+        additional_cost: casting_costs::alternative_cost_residual(
+            &candidate.transformed_state,
+            player,
+            candidate.prepared.object_id,
+            candidate.prepared.casting_variant,
+        ),
     }
 }
 
@@ -7537,25 +7567,32 @@ fn casting_variant_candidates(
         if super::keywords::effective_disturb_cost(state, object_id).is_some() {
             candidates.push(CastingVariant::Disturb);
         }
-        if let Some(source) = graveyard_permission_source(state, player, object_id) {
-            let slot_type = if source.frequency == CastFrequency::OncePerTurnPerPermanentType {
-                let slots = available_permanent_type_slots(state, source.source_id, object_id);
-                if slots.len() == 1 {
-                    Some(slots[0])
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            candidates.push(CastingVariant::GraveyardPermission {
-                source: source.source_id,
-                frequency: source.frequency,
-                slot_type,
-                graveyard_destination_replacement: source.graveyard_destination_replacement,
-            });
+        // CR 601.2b + CR 118.9b: a graveyard permission contributes one option
+        // per casting method it authorizes. The printed-cost option commits to
+        // a permission that leaves the method open (`GraveyardPermission`), and
+        // exists only when one does. The card's own Blitz / Bestow cast from the
+        // graveyard is its own option, authenticated by the same offer the
+        // cast handler reads, so an option can't be offered as one method and
+        // cast as another (a "using its blitz ability" permission never yields
+        // a printed-cost option).
+        //
+        // When the choice is only the printed cost against one alternative, the
+        // alternative is not added as a second option: the cast handler's
+        // two-way `AlternativeCastChoice` makes that choice and shows the
+        // alternative's non-mana cost. The printed option then stands for both,
+        // and castability judges it by either route
+        // (`graveyard_permission_option_folds_rider`).
+        let printed = printed_graveyard_permission_source(state, player, object_id)
+            .map(|source| graveyard_permission_variant(state, object_id, &source));
+        let riders = graveyard_rider_candidates(state, player, object_id, obj);
+        let timed_alt_cost = has_graveyard_timed_alt_cost_permission(state, obj, player);
+        let fold_rider =
+            printed.is_some() && riders.len() == 1 && candidates.is_empty() && !timed_alt_cost;
+        candidates.extend(printed);
+        if !fold_rider {
+            candidates.extend(riders);
         }
-        if has_graveyard_timed_alt_cost_permission(state, obj, player) {
+        if timed_alt_cost {
             candidates.push(CastingVariant::Normal);
         }
     }
@@ -7940,7 +7977,12 @@ fn prepare_spell_cast_with_variant_override_inner(
     let has_mayhem = mayhem_castable_from_graveyard(state, player, object_id);
     // CR 601.2a + CR 117.1c: Graveyard cast via static permission (Lurrus, etc.).
     let graveyard_permission_src = if obj.zone == Zone::Graveyard && state.active_player == player {
-        graveyard_permission_source(state, player, object_id)
+        // CR 118.9b: a default (printed-cost) graveyard cast commits to a
+        // permission that leaves the method open when one admits it; the
+        // first admitting permission is kept otherwise, so the committed-method
+        // check below refuses the printed cast by name.
+        printed_graveyard_permission_source(state, player, object_id)
+            .or_else(|| graveyard_permission_source(state, player, object_id))
     } else {
         None
     };
@@ -8458,6 +8500,24 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::Normal
         }
     });
+    // CR 601.2a + CR 118.9b: a `GraveyardPermission` cast is a printed-cost cast
+    // committed to that permission. A permission that requires a casting method
+    // ("using its blitz ability") can't authorize it, so a stale or hand-built
+    // option naming such a source is refused here, before any cost is paid; the
+    // method's own variant (Blitz, Bestow) is the option that casts through it.
+    if let CastingVariant::GraveyardPermission { source, .. } = casting_variant {
+        if obj.zone == Zone::Graveyard
+            && !graveyard_permission_candidates(state, player, object_id)
+                .iter()
+                .any(|candidate| {
+                    candidate.source_id == source && candidate.admits_cast_method(None)
+                })
+        {
+            return Err(EngineError::ActionNotAllowed(
+                "This graveyard permission allows only its own casting method".to_string(),
+            ));
+        }
+    }
     // CR 702.96a + CR 604.1: read the overload cost from effective keywords so a
     // granted Overload (CastWithKeyword) substitutes its cost, mirroring the
     // Evoke/Emerge effective-keyword cost reads below.
@@ -14766,11 +14826,7 @@ pub fn handle_casting_variant_choice_with_payment_mode(
         option.face,
         CastingMode::Actual,
     )?;
-    let fresh = CastingVariantChoiceOption {
-        variant: candidate.prepared.casting_variant,
-        face: option.face,
-        mana_cost: candidate.prepared.mana_cost.clone(),
-    };
+    let fresh = casting_variant_choice_option(player, &candidate, option.face);
     if fresh != *option
         || !can_cast_prepared_now_with_probe(
             &candidate.transformed_state,
@@ -16980,7 +17036,7 @@ fn continue_graveyard_cast_with_slot_choice(
             ));
         }
         if obj.zone == Zone::Graveyard {
-            if let Some(source) = graveyard_permission_source(state, player, object_id)
+            if let Some(source) = printed_graveyard_permission_source(state, player, object_id)
                 .filter(|source| source.frequency == CastFrequency::OncePerTurnPerPermanentType)
             {
                 let slots = available_permanent_type_slots(state, source.source_id, object_id);
@@ -17036,9 +17092,11 @@ pub fn handle_permanent_type_slot_choice_with_payment_mode(
     payment_mode: CastPaymentMode,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let graveyard_destination_replacement = graveyard_permission_source(state, player, object_id)
-        .filter(|permission| permission.source_id == source)
-        .and_then(|permission| permission.graveyard_destination_replacement);
+    let graveyard_destination_replacement =
+        graveyard_permission_candidates(state, player, object_id)
+            .into_iter()
+            .find(|permission| permission.source_id == source)
+            .and_then(|permission| permission.graveyard_destination_replacement);
     let mut prepared = prepare_spell_cast_with_variant_override(
         state,
         player,
@@ -19050,19 +19108,15 @@ fn can_cast_prepared_now_with_probe(
         }
     }
 
-    // CR 601.2a + CR 118.9a: a graveyard permission restricted to a casting
-    // method ("using its blitz ability") admits only that method, never the
-    // printed cost. When no admitting permission leaves the method open, the
-    // card is castable only through its own alternative offers, judged exactly
-    // as the cast handler judges them.
-    if matches!(
-        prepared.casting_variant,
-        CastingVariant::GraveyardPermission { .. }
-    ) && !graveyard_printed_cast_allowed(state, player, obj.id)
+    // CR 601.2b + CR 118.9: the card's own Blitz / Bestow option from the
+    // graveyard is castable exactly when the cast handler's offer for it is:
+    // one authority for the menu, the single-option auto-route and the handler.
+    if let Some(castable) =
+        graveyard_rider_option_castable(state, player, obj, prepared.casting_variant)
     {
-        return (prepared.modal.is_some()
-            || spell_has_legal_targets_with_probe(state, obj.id, player, probe))
-            && graveyard_alternative_cost_castable(state, player, obj);
+        return castable
+            && (prepared.modal.is_some()
+                || spell_has_legal_targets_with_probe(state, obj.id, player, probe));
     }
 
     // CR 702.172: Spree spells must afford at least one mode to be castable.
@@ -19118,14 +19172,16 @@ fn can_cast_prepared_now_with_probe(
         return true;
     }
 
-    // CR 601.2a + CR 601.2f: the graveyard-permission candidate carries the
-    // printed cost, but the cast handler takes it for the card's own Blitz or
-    // Bestow cost from the graveyard. Judge that path by the same offers.
+    // CR 601.2a + CR 601.2f: when the graveyard's printed-cost option also
+    // stands for the card's one Blitz / Bestow alternative (no separate option
+    // was added; the cast handler's two-way choice makes it), that option is
+    // castable by either route, judged by the same offer the handler reads.
     if targets_ok
         && matches!(
             prepared.casting_variant,
             CastingVariant::GraveyardPermission { .. }
         )
+        && graveyard_permission_option_folds_rider(state, player, obj.id)
         && graveyard_alternative_cost_castable(state, player, obj)
     {
         return true;
@@ -23277,8 +23333,11 @@ fn bestow_offer(
 ///
 /// CR 601.2h + CR 119.4: a Defiler's reduction is credited to the mana only
 /// when its life is payable together with the life the rest of the total pays
-/// (the residual and the permission's imposed cost), the same eligibility the
-/// Defiler payment prompt applies (`committed_life_besides_defiler`).
+/// (the residual and every imposed cost), the same eligibility the Defiler
+/// payment prompt applies (`committed_life_besides_defiler`). The imposed costs
+/// come from the payment's own `combined_imposed_additional_cast_cost`, read
+/// with no targets chosen yet: a tax that depends on the spell's targets
+/// (Terror of the Peaks) is not in this total.
 fn alternative_cost_offer_payable(
     state: &GameState,
     player: PlayerId,
@@ -23287,8 +23346,13 @@ fn alternative_cost_offer_payable(
     mana: &Option<crate::types::mana::ManaCost>,
     residual: &Option<AbilityCost>,
 ) -> bool {
-    let imposed = casting_costs::cast_permission_additional_extra_cost(
-        state, player, object_id, variant, None,
+    let imposed = casting_costs::combined_imposed_additional_cast_cost(
+        state,
+        player,
+        object_id,
+        &ResolvedAbility::new(Effect::NoOp, Vec::new(), object_id, player),
+        variant,
+        None,
     );
     let committed_life = casting_costs::committed_life_besides_defiler(
         state,
@@ -23328,6 +23392,65 @@ fn graveyard_alternative_cost_castable(
     }
     blitz_offer(state, player, obj.id, obj).is_some_and(|offer| offer.affordable)
         || bestow_offer(state, player, obj.id, obj).is_some_and(|offer| offer.offerable)
+}
+
+/// CR 601.2b + CR 118.9b: the card's own alternative-cost casts from the
+/// graveyard, one casting option each: Blitz and Bestow, when their offer exists
+/// (a permission that admits that method; see `blitz_offer` / `bestow_offer`).
+/// Whether each is payable is castability's question, judged by the same offer.
+fn graveyard_rider_candidates(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    obj: &GameObject,
+) -> Vec<CastingVariant> {
+    let mut riders = Vec::new();
+    if blitz_offer(state, player, object_id, obj).is_some() {
+        riders.push(CastingVariant::Blitz);
+    }
+    if bestow_offer(state, player, object_id, obj).is_some() {
+        riders.push(CastingVariant::Bestow);
+    }
+    riders
+}
+
+/// CR 601.2b: is the graveyard's printed-cost option also standing for the
+/// card's one alternative (see the fold in `casting_variant_candidates`)? True
+/// when no Blitz / Bestow option was added beside it, so the cast handler's
+/// two-way `AlternativeCastChoice` makes that choice.
+fn graveyard_permission_option_folds_rider(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> bool {
+    !casting_variant_candidates(state, player, object_id)
+        .iter()
+        .any(|variant| matches!(variant, CastingVariant::Blitz | CastingVariant::Bestow))
+}
+
+/// CR 601.2f + CR 118.9: castability of the card's own Blitz / Bestow option
+/// from the graveyard is the offer the cast handler reads: mana with any
+/// Defiler reduction and its combined life, the non-mana residual, and for
+/// Bestow a creature to enchant and a permission the bestowed form can commit
+/// to. `None` for any other variant or zone.
+fn graveyard_rider_option_castable(
+    state: &GameState,
+    player: PlayerId,
+    obj: &GameObject,
+    variant: CastingVariant,
+) -> Option<bool> {
+    if obj.zone != Zone::Graveyard {
+        return None;
+    }
+    match variant {
+        CastingVariant::Blitz => {
+            Some(blitz_offer(state, player, obj.id, obj).is_some_and(|offer| offer.affordable))
+        }
+        CastingVariant::Bestow => {
+            Some(bestow_offer(state, player, obj.id, obj).is_some_and(|offer| offer.offerable))
+        }
+        _ => None,
+    }
 }
 
 /// CR 702.152a + CR 601.2f-h: Blitz twin of `split_bestow_cost_components`.
