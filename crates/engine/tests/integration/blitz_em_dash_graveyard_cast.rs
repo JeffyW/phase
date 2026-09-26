@@ -1861,3 +1861,182 @@ fn a_resolution_created_permission_without_a_rider_adds_no_counter() {
         "no rider, so no counter, counters: {counters:?}"
     );
 }
+
+/// Put exactly `count` mana of one color in the active player's pool.
+fn add_mana(runner: &mut GameRunner, mana: ManaType, count: usize) {
+    let dummy = ObjectId(0);
+    let pool = &mut runner.state_mut().players[0].mana_pool;
+    for _ in 0..count {
+        pool.add(ManaUnit::new(mana, dummy, false, vec![]));
+    }
+}
+
+/// The `CastSpell` action `legal_actions` offers for `id`, if any.
+fn offered_cast(runner: &GameRunner, id: ObjectId) -> Option<GameAction> {
+    engine::ai_support::legal_actions(runner.state())
+        .into_iter()
+        .find(
+            |action| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == id),
+        )
+}
+
+/// Sabin in the graveyard with its own "using its blitz ability" permission, a
+/// card in hand to discard, and exactly `red` red mana.
+fn sabin_in_graveyard_with(red: usize) -> (GameRunner, ObjectId) {
+    let parsed = parse_oracle_text(
+        SABIN,
+        "Sabin, Master Monk",
+        &[],
+        &["Legendary".into(), "Creature".into()],
+        &["Human".into(), "Noble".into(), "Monk".into()],
+    );
+    let kw = blitz_keyword(&parsed);
+    let gy_static = parsed
+        .statics
+        .first()
+        .expect("graveyard-cast permission static must parse")
+        .clone();
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let sabin = scenario
+        .add_creature_to_graveyard(P0, "Sabin, Master Monk", 4, 3)
+        .with_static_definition(gy_static)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 4,
+            shards: vec![ManaCostShard::Red],
+        })
+        .with_keyword(kw)
+        .id();
+    scenario.add_card_to_hand(P0, "Filler Card");
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Red, red);
+    (runner, sabin)
+}
+
+/// CR 702.152a + CR 601.2f + CR 601.2a: with exactly the four mana Sabin's
+/// blitz costs ({2}{R}{R}) and a card to discard, the graveyard blitz cast is a
+/// legal action even though the printed {4}{R} is unaffordable, and the offered
+/// action completes. `legal_actions` and the cast handler must agree.
+#[test]
+fn graveyard_blitz_affordable_only_for_its_blitz_cost_is_a_legal_action() {
+    let (mut runner, sabin) = sabin_in_graveyard_with(4);
+    let action = offered_cast(&runner, sabin)
+        .expect("the graveyard blitz cast must be offered with exactly its blitz mana");
+    runner
+        .act(action)
+        .expect("the offered graveyard blitz cast must be accepted");
+    let filler = runner.state().players[0].hand[0];
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![filler],
+        })
+        .expect("paying the blitz discard must succeed");
+    assert_eq!(runner.state().objects[&sabin].zone, Zone::Stack);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "the whole blitz cost was paid"
+    );
+}
+
+/// Control: one mana short of the blitz cost, the cast is not offered.
+#[test]
+fn graveyard_blitz_one_mana_short_is_not_a_legal_action() {
+    let (runner, sabin) = sabin_in_graveyard_with(3);
+    assert!(
+        offered_cast(&runner, sabin).is_none(),
+        "three mana cannot pay {{2}}{{R}}{{R}}"
+    );
+}
+
+/// Detective's Phoenix in the graveyard with `red` red mana, a creature to
+/// enchant, and two mana-value-3 cards to collect as evidence.
+fn phoenix_in_graveyard_with(red: usize) -> (GameRunner, ObjectId, Vec<ObjectId>) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature(P0, "Grizzly Bears", 2, 2);
+    let mut builder = scenario.add_creature_to_graveyard(P0, "Detective's Phoenix", 2, 2);
+    builder.with_mana_cost(ManaCost::Cost {
+        shards: vec![ManaCostShard::Red],
+        generic: 2,
+    });
+    builder.with_subtypes(vec!["Phoenix"]);
+    builder.with_color(vec![ManaColor::Red]);
+    builder.from_oracle_text_with_keywords(&["Flying", "Haste"], PHOENIX_ORACLE);
+    let phoenix = builder.id();
+    let mut runner = scenario.build();
+    {
+        let obj = runner.state_mut().objects.get_mut(&phoenix).unwrap();
+        for types in [
+            &mut obj.card_types.core_types,
+            &mut obj.base_card_types.core_types,
+        ] {
+            if !types.contains(&CoreType::Enchantment) {
+                types.push(CoreType::Enchantment);
+            }
+        }
+    }
+    let fodder: Vec<ObjectId> = (0..2)
+        .map(|i| {
+            let card_id = engine::types::identifiers::CardId(runner.state().next_object_id);
+            let id = engine::game::zones::create_object(
+                runner.state_mut(),
+                card_id,
+                P0,
+                format!("Evidence {i}"),
+                Zone::Graveyard,
+            );
+            runner.state_mut().objects.get_mut(&id).unwrap().mana_cost = ManaCost::generic(3);
+            id
+        })
+        .collect();
+    add_mana(&mut runner, ManaType::Red, red);
+    (runner, phoenix, fodder)
+}
+
+/// CR 702.103a + CR 601.2f + CR 601.2a: the Bestow sibling. With only the {R}
+/// of Detective's Phoenix's bestow cost (its printed {2}{R} is unaffordable), a
+/// legal creature to enchant and evidence to collect, the graveyard bestow cast
+/// is a legal action, and the offered action completes.
+#[test]
+fn graveyard_bestow_affordable_only_for_its_bestow_cost_is_a_legal_action() {
+    let (mut runner, phoenix, fodder) = phoenix_in_graveyard_with(1);
+    let action = offered_cast(&runner, phoenix)
+        .expect("the graveyard bestow cast must be offered with only its bestow mana");
+    runner
+        .act(action)
+        .expect("the offered graveyard bestow cast must be accepted");
+    for _ in 0..3 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TargetSelection { .. } => {
+                runner
+                    .choose_first_legal_target()
+                    .expect("Grizzly Bears is a legal creature to enchant");
+            }
+            WaitingFor::CollectEvidenceChoice { .. } => {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: fodder.clone(),
+                    })
+                    .expect("collecting evidence with two MV-3 cards must be legal");
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(runner.state().objects[&phoenix].zone, Zone::Stack);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+    for id in &fodder {
+        assert_eq!(runner.state().objects[id].zone, Zone::Exile);
+    }
+}
+
+/// Control: with no mana at all the bestow {R} is unaffordable, so the cast is
+/// not offered.
+#[test]
+fn graveyard_bestow_without_its_mana_is_not_a_legal_action() {
+    let (runner, phoenix, _) = phoenix_in_graveyard_with(0);
+    assert!(
+        offered_cast(&runner, phoenix).is_none(),
+        "no mana cannot pay the bestow {{R}}"
+    );
+}

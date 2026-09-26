@@ -245,7 +245,8 @@ fn defiler_is_not_offered_when_its_life_and_the_residuals_exceed_the_life_total(
 }
 
 /// Positive control: at 4 life the combined 4 life is payable, so the Defiler
-/// is offered.
+/// is offered, and accepting it completes the cast: both life payments are
+/// made and the Defiler removes one {B} of the blitz mana.
 #[test]
 fn defiler_is_offered_when_its_life_and_the_residuals_are_payable() {
     let (mut runner, underdog) = underdog_with_defiler(4);
@@ -257,6 +258,34 @@ fn defiler_is_offered_when_its_life_and_the_residuals_are_payable() {
             WaitingFor::DefilerPayment { .. }
         ),
         "4 life is payable from 4, so the Defiler must be offered, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::DecideOptionalCost { pay: true })
+        .expect("paying the Defiler's life must be legal");
+
+    // The cast completed: both life payments were made (4 - 2 - 2) and the
+    // Defiler removed one {B}, so 3 of the 4 mana was spent. Paying down to 0
+    // life is legal (CR 119.4); CR 704.5a then ends the game at the next
+    // state-based-action check, which is how the completion is observed.
+    assert_eq!(
+        runner.state().players[0].life,
+        0,
+        "the Defiler's 2 life and blitz's 2 life are both paid"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        1,
+        "{{2}}{{B}}{{B}} less the Defiler's {{B}} is 3 of the 4 mana"
+    );
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::GameOver {
+                winner: Some(engine::types::player::PlayerId(1))
+            }
+        ),
+        "the completed cast leaves P0 at 0 life, got {:?}",
         runner.state().waiting_for
     );
 }
