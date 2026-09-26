@@ -654,12 +654,14 @@ mod tests {
     }
 
     /// CR 714.2 + CR 714.2b: a modal chapter's modes are the body of a
-    /// triggered ability, so a trigger-only clause in a mode lowers with its
-    /// event referent. Parsed through the full `parse_oracle_text` pipeline.
+    /// triggered ability, so a trigger-only clause in a mode parses in trigger
+    /// context. Parsed through the full `parse_oracle_text` pipeline.
     /// No printed modal Saga chapter carries such a clause (the census finds
     /// only Life of Toshiro Umezawa and Summon: Magus Sisters, neither of which
     /// does), so the chapter is synthetic; the clause is the trigger-gated
-    /// "that permanent or player" damage recipient.
+    /// "that permanent or player" damage recipient. This is a parse-level
+    /// witness only: a chapter's lore-counter event supplies no event target, so
+    /// at runtime this synthetic mode deals no damage (measured).
     #[test]
     fn modal_chapter_modes_parse_in_trigger_context() {
         let oracle = "(As this Saga enters and after your draw step, add a lore counter.)\n\
