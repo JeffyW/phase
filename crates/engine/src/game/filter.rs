@@ -19096,12 +19096,16 @@ mod characteristic_read_classification_tests {
             FilterProp::NameMatchesAnyPermanent {
                 controller: Some(ControllerRef::You),
             },
-            FilterProp::AttachedTo {
-                to: AttachmentReferent::Player {
-                    player: ControllerRef::You,
-                },
-            },
         ];
+        // Indirect carriers (the `ControllerRef` sits inside a nested type, past
+        // the textual scan's CEILING) are classified by hand here: CR 701.3a +
+        // CR 303.4b — `AttachmentReferent::Player { player }` scopes "attached to
+        // <player>" by a `ControllerRef`.
+        let indirect = [FilterProp::AttachedTo {
+            to: AttachmentReferent::Player {
+                player: ControllerRef::You,
+            },
+        }];
         let mut sampled: Vec<String> = props.iter().map(variant_name).collect();
         sampled.sort_unstable();
         sampled.dedup();
@@ -19112,6 +19116,7 @@ mod characteristic_read_classification_tests {
              in `types/ability.rs` have diverged — add a sample for every new \
              carrier so the CR 613.1b invariant below stays fully covered"
         );
+        let props: Vec<FilterProp> = props.into_iter().chain(indirect).collect();
         for prop in &props {
             assert!(
                 carries_controller_ref(prop),
