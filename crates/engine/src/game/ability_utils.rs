@@ -5001,7 +5001,7 @@ fn union_over_prior_object_candidates(
 
 /// CR 601.2c + CR 701.3a: the declared slots a filter's
 /// `AttachedTo { to: DeclaredTarget { slot } }` referents name, deduplicated.
-fn declared_slots_read_by(filter: &TargetFilter) -> Vec<usize> {
+pub(crate) fn declared_slots_read_by(filter: &TargetFilter) -> Vec<usize> {
     let slots = std::cell::RefCell::new(Vec::new());
     crate::game::filter::filter_contains_filter_prop(filter, &|prop| {
         if let FilterProp::AttachedTo {
@@ -11034,6 +11034,94 @@ pub(crate) fn node_at<'a>(
     Some(node)
 }
 
+/// CR 707.10c + CR 601.2c: the copy's chain as it would stand with its root
+/// targets set to `targets` — the exact write [`engine::finalize_copy_retarget`]
+/// commits: an additional-cost "instead choose" branch owns the declared slots
+/// (the root is only its mirror), changed objects get a fresh selected-target
+/// pin, and the derived chain targets are re-stamped. Built on a clone so a
+/// tentative edit can be checked before anything is written.
+pub(crate) fn copy_retarget_post_chain(
+    state: &GameState,
+    pre: &ResolvedAbility,
+    targets: &[TargetRef],
+) -> ResolvedAbility {
+    let changed_pins = pre
+        .targets
+        .iter()
+        .zip(targets.iter())
+        .filter(|(old, new)| pre.retarget_target_requires_pin_refresh(old, new, state))
+        .filter_map(|(_, target)| match target {
+            TargetRef::Object(id) => state.objects.get(id).map(ObjectIncarnationRef::from_object),
+            TargetRef::Player(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut ability = pre.clone();
+    // CR 707.10c + CR 601.2c: An additional-cost "instead choose" branch owns
+    // the declared slots. The root is only its mirror. Update the child before
+    // re-deriving the mirror and selected-group readers, including the
+    // unchanged members of a variable target set.
+    if ability.context.additional_cost_paid {
+        if let Some(sub) = ability.sub_ability.as_deref_mut().filter(|sub| {
+            matches!(
+                sub.condition,
+                Some(AbilityCondition::AdditionalCostPaidInstead)
+            )
+        }) {
+            sub.targets = targets.to_vec();
+            for pin in &changed_pins {
+                sub.update_selected_target_incarnation(*pin);
+            }
+        }
+    }
+    ability.targets = targets.to_vec();
+    for pin in changed_pins {
+        ability.update_selected_target_incarnation(pin);
+    }
+    restamp_derived_chain_targets(&mut ability);
+    ability
+}
+
+/// CR 707.10c + CR 115.7d + CR 115.7e: whether choosing `targets` as the
+/// copy's root targets is a legal final set — every changed position is legal
+/// for the edited selection, and no unchanged position that was legal becomes
+/// illegal (an already-illegal unchanged target may stay). `changed` is read by
+/// VALUE at each addressed position of the pre- and post-edit chains, so every
+/// accepted edit of the pending choice counts, not only the latest one.
+pub(crate) fn copy_retarget_edit_is_legal(
+    state: &GameState,
+    pre: &ResolvedAbility,
+    targets: &[TargetRef],
+    pool_controller: PlayerId,
+) -> Result<ResolvedAbility, EngineError> {
+    let post = copy_retarget_post_chain(state, pre, targets);
+    // Root-only copy retargeting (CR 707.10c) gates the positions whose filter
+    // reads a declared slot — the only positions a root edit can newly make
+    // illegal through this relation. Other filters keep the copy path's
+    // existing per-slot behavior.
+    let bindings: Vec<RetargetSlotBinding> = chain_retarget_slots(pre)
+        .into_iter()
+        .filter(|binding| match &binding.enforcement {
+            SlotEnforcement::Filtered(filter) => {
+                crate::game::filter::filter_reads_declared_slot(filter)
+            }
+            SlotEnforcement::Legacy => false,
+        })
+        .collect();
+    if bindings.is_empty() {
+        return Ok(post);
+    }
+    let changed = |i: usize| {
+        let address = &bindings[i].address;
+        let at = |chain: &ResolvedAbility| {
+            node_at(chain, &address.path).and_then(|node| node.targets.get(address.slot).cloned())
+        };
+        at(pre) != at(&post)
+    };
+    unchanged_targets_stay_legal(state, pre, &post, &bindings, &changed, pool_controller)?;
+    changed_dependent_targets_are_legal(state, pre, &post, &bindings, &changed, pool_controller)?;
+    Ok(post)
+}
+
 pub(crate) fn node_at_mut<'a>(
     root: &'a mut ResolvedAbility,
     path: &[ChainStep],
@@ -11046,6 +11134,286 @@ pub(crate) fn node_at_mut<'a>(
         };
     }
     Some(node)
+}
+
+/// CR 601.2c + CR 115.7: the declared-target view of `chain` for a legality
+/// check during retargeting. A declared position whose target equals the
+/// announcement (`announced`, the chain as it stood before any edit) is
+/// `Announced` with its declaring node's pin, so an unchanged reference is
+/// never rebound to a later object that reuses its storage id (CR 400.7); a
+/// position the edit changed is `Elected` (the live object being chosen now).
+pub(crate) fn retarget_declared_view(
+    announced: &ResolvedAbility,
+    chain: &ResolvedAbility,
+) -> Vec<Option<targeting::DeclaredSlotBinding>> {
+    let before = declared_target_entries_in_chain(announced);
+    declared_target_entries_in_chain(chain)
+        .into_iter()
+        .enumerate()
+        .map(|(position, entry)| {
+            Some(match before.get(position) {
+                Some(original) if original.target == entry.target => {
+                    targeting::DeclaredSlotBinding::Announced {
+                        target: original.target.clone(),
+                        pin: original.pin,
+                    }
+                }
+                _ => targeting::DeclaredSlotBinding::Elected(entry.target),
+            })
+        })
+        .collect()
+}
+
+/// CR 115.7d (second clause) + CR 115.7e ("only the final set of targets is
+/// evaluated"): every UNCHANGED addressed slot that was LEGAL in `pre` must
+/// still be legal in `post`. A slot that was ALREADY illegal stays accepted —
+/// CR 115.7d's FIRST clause. `Legacy` bindings are skipped (no filter).
+/// Legality uses the slot's addressed node and `pool_controller` (the
+/// retarget pool's controller authority); a filter that reads another declared
+/// slot is evaluated against [`retarget_declared_view`] of the respective chain.
+///
+/// Extracted from `engine::apply_retarget`'s unchanged-position pass so that
+/// copy retargeting (CR 707.10c, which "chooses new targets") applies the same
+/// rule; filters that read no declared slot take the original call unchanged.
+pub(crate) fn unchanged_targets_stay_legal(
+    state: &GameState,
+    pre: &ResolvedAbility,
+    post: &ResolvedAbility,
+    bindings: &[RetargetSlotBinding],
+    changed: &dyn Fn(usize) -> bool,
+    pool_controller: PlayerId,
+) -> Result<(), EngineError> {
+    let slot_is_legal = |chain: &ResolvedAbility,
+                         node: &ResolvedAbility,
+                         filter: &TargetFilter,
+                         current: &TargetRef| {
+        if crate::game::filter::filter_reads_declared_slot(filter) {
+            let view = retarget_declared_view(pre, chain);
+            targeting::find_legal_targets_for_ability_with_view(
+                state,
+                filter,
+                node,
+                pool_controller,
+                &view,
+            )
+            .contains(current)
+        } else {
+            targeting::find_legal_targets_for_ability_with_controller(
+                state,
+                filter,
+                node,
+                pool_controller,
+            )
+            .contains(current)
+        }
+    };
+    for (i, binding) in bindings.iter().enumerate() {
+        // A position this submission itself addressed and changed is already
+        // validated by the per-slot check (CR 115.7d's FIRST clause); this pass
+        // is only for positions the submission left UNCHANGED, including every
+        // position beyond the exposed prefix.
+        if changed(i) {
+            continue;
+        }
+        let SlotEnforcement::Filtered(filter) = &binding.enforcement else {
+            continue;
+        };
+        let Some(pre_node) = node_at(pre, &binding.address.path) else {
+            continue;
+        };
+        let Some(pre_current) = pre_node.targets.get(binding.address.slot) else {
+            continue;
+        };
+        if !slot_is_legal(pre, pre_node, filter, pre_current) {
+            // CR 115.7d FIRST clause: an already-illegal unchanged target
+            // stays accepted.
+            continue;
+        }
+        let Some(post_node) = node_at(post, &binding.address.path) else {
+            continue;
+        };
+        let Some(post_current) = post_node.targets.get(binding.address.slot) else {
+            continue;
+        };
+        if !slot_is_legal(post, post_node, filter, post_current) {
+            return Err(EngineError::InvalidAction(
+                "Retarget: the change would make an unchanged target illegal".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CR 115.7a + CR 115.7d + CR 115.7e: every CHANGED addressed slot whose
+/// filter reads another declared slot must be legal for the EDITED referent —
+/// the final set is what is evaluated. A dependent slot's stored candidate
+/// pool over-approximates (it cannot know which referent the same submission
+/// elects), so this is the exact check for those slots. Slots whose filter
+/// reads no declared slot are untouched (the stored pool is already exact).
+pub(crate) fn changed_dependent_targets_are_legal(
+    state: &GameState,
+    pre: &ResolvedAbility,
+    post: &ResolvedAbility,
+    bindings: &[RetargetSlotBinding],
+    changed: &dyn Fn(usize) -> bool,
+    pool_controller: PlayerId,
+) -> Result<(), EngineError> {
+    let view = retarget_declared_view(pre, post);
+    for (i, binding) in bindings.iter().enumerate() {
+        if !changed(i) {
+            continue;
+        }
+        let SlotEnforcement::Filtered(filter) = &binding.enforcement else {
+            continue;
+        };
+        if !crate::game::filter::filter_reads_declared_slot(filter) {
+            continue;
+        }
+        let Some(post_node) = node_at(post, &binding.address.path) else {
+            continue;
+        };
+        let Some(post_current) = post_node.targets.get(binding.address.slot) else {
+            continue;
+        };
+        if !targeting::find_legal_targets_for_ability_with_view(
+            state,
+            filter,
+            post_node,
+            pool_controller,
+            &view,
+        )
+        .contains(post_current)
+        {
+            return Err(EngineError::InvalidAction(
+                "Retarget: a new target is illegal for the edited selection".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// CR 601.2c: the retarget address (`chain_retarget_slots` addressing) of each
+/// position of [`declared_target_entries_in_chain`], in that numbering. `None`
+/// for a per-opponent fanout's object entry (its numbering compacts the node's
+/// slots, so no address is exact).
+pub(crate) fn declared_position_addresses(
+    ability: &ResolvedAbility,
+) -> Vec<Option<RetargetSlotAddress>> {
+    fn visit(
+        ability: &ResolvedAbility,
+        path: &mut Vec<ChainStep>,
+        targets_are_inherited: bool,
+        out: &mut Vec<Option<RetargetSlotAddress>>,
+    ) {
+        if let Some(sub_ability) = paid_instead_delegate(ability) {
+            path.push(ChainStep::SubAbility);
+            visit(sub_ability, path, targets_are_inherited, out);
+            path.pop();
+            return;
+        }
+        if !targets_are_inherited {
+            let fanout = is_per_opponent_target_fanout(ability);
+            let count = chain_node_targets(ability).len();
+            out.extend((0..count).map(|slot| {
+                (!fanout).then(|| RetargetSlotAddress {
+                    path: path.clone(),
+                    slot,
+                })
+            }));
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_deref() {
+            path.push(ChainStep::SubAbility);
+            visit(
+                sub_ability,
+                path,
+                rider_entries_are_inherited(ability, sub_ability),
+                out,
+            );
+            path.pop();
+        }
+        if let Some(else_ability) = ability.else_ability.as_deref() {
+            path.push(ChainStep::ElseAbility);
+            visit(else_ability, path, false, out);
+            path.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    visit(ability, &mut Vec::new(), false, &mut out);
+    out
+}
+
+/// CR 115.7d + CR 601.2c: the candidate pool of an addressed retarget
+/// position whose filter reads ONE other declared slot is the union, over
+/// every referent that slot may hold after the edit — its own addressed pool
+/// (when exposed) plus its current, unchanged referent — of the position's
+/// legal set with that referent in the declared view. A pool cannot know
+/// which referent the same submission elects, so it over-approximates;
+/// [`changed_dependent_targets_are_legal`] and [`unchanged_targets_stay_legal`]
+/// are the exact checks on the final set (CR 115.7e). Pools of positions whose
+/// filter reads no declared slot, or reads several, are left untouched.
+pub(crate) fn widen_dependent_retarget_pools(
+    state: &GameState,
+    stack_ability: &ResolvedAbility,
+    bindings: &[RetargetSlotBinding],
+    pools: &mut [Vec<TargetRef>],
+    pool_controller: PlayerId,
+) {
+    let addresses = declared_position_addresses(stack_ability);
+    let announced = retarget_declared_view(stack_ability, stack_ability);
+    for i in 0..bindings.len().min(pools.len()) {
+        let SlotEnforcement::Filtered(filter) = &bindings[i].enforcement else {
+            continue;
+        };
+        let [slot] = declared_slots_read_by(filter)[..] else {
+            continue;
+        };
+        let Some(Some(address)) = addresses.get(slot) else {
+            continue;
+        };
+        let Some(node) = node_at(stack_ability, &bindings[i].address.path) else {
+            continue;
+        };
+        let referent_pool = bindings
+            .iter()
+            .position(|b| &b.address == address)
+            .and_then(|j| pools.get(j).cloned())
+            .unwrap_or_default();
+        let mut views = vec![announced.clone()];
+        for referent in referent_pool {
+            if announced
+                .get(slot)
+                .cloned()
+                .flatten()
+                .is_some_and(|binding| match binding {
+                    targeting::DeclaredSlotBinding::Announced { target, .. } => target == referent,
+                    targeting::DeclaredSlotBinding::Elected(_) => false,
+                })
+            {
+                continue;
+            }
+            let mut view = announced.clone();
+            if let Some(position) = view.get_mut(slot) {
+                *position = Some(targeting::DeclaredSlotBinding::Elected(referent));
+            }
+            views.push(view);
+        }
+        let mut widened = Vec::new();
+        for view in &views {
+            for target in targeting::find_legal_targets_for_ability_with_view(
+                state,
+                filter,
+                node,
+                pool_controller,
+                view,
+            ) {
+                if !widened.contains(&target) {
+                    widened.push(target);
+                }
+            }
+        }
+        pools[i] = widened;
+    }
 }
 
 /// CR 601.2c: re-derive the chain's NON-DECLARED targets after a write to its

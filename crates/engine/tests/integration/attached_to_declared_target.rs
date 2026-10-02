@@ -442,7 +442,7 @@ fn loj_board(oracle: &str, name: &str, victim_toughness: i32) -> LojBoard {
 }
 
 /// R1 (CR 115.10a + CR 608.2d): the choice is made while the spell resolves and
-/// offers exactly the Equipment attached to the targeted creature ? not its
+/// offers exactly the Equipment attached to the targeted creature — not its
 /// Aura, not Equipment on another creature, not unattached Equipment.
 #[test]
 fn light_of_judgment_offers_only_the_targets_equipment_and_destroys_the_choice() {
@@ -553,7 +553,7 @@ fn light_of_judgment_lethal_damage_still_offers_the_equipment() {
 }
 
 /// R6 (CR 701.8b): indestructible Equipment can be chosen but is not destroyed.
-/// R7: the Equipment's controller is irrelevant ? the caster's own Equipment on
+/// R7: the Equipment's controller is irrelevant — the caster's own Equipment on
 /// the opponent's creature is offered too.
 #[test]
 fn light_of_judgment_indestructible_and_foreign_controller_equipment() {
@@ -616,7 +616,7 @@ fn turn_to_slag_destroys_all_equipment_on_the_target_only() {
 
 /// T9 (CR 608.2h): the referent was moved by a LEGAL earlier instruction of the
 /// same resolution, so "Equipment attached to that creature" reads the exact
-/// exit record of that creature ? its former Equipment is destroyed, Equipment
+/// exit record of that creature — its former Equipment is destroyed, Equipment
 /// elsewhere is not.
 #[test]
 fn referent_moved_by_an_earlier_instruction_reads_its_exit_record() {
@@ -639,7 +639,7 @@ fn referent_moved_by_an_earlier_instruction_reads_its_exit_record() {
 
 /// C1 (CR 601.2c): the creature is declared slot 1 behind a player slot; the
 /// referent reads slot 1. Control: the player slot stays legal while the
-/// creature becomes illegal ? the spell resolves, but the Equipment part needs
+/// creature becomes illegal — the spell resolves, but the Equipment part needs
 /// information about the illegal creature and does nothing (CR 608.2b).
 #[test]
 fn mixed_player_object_chain_reads_slot_one_and_illegal_later_slot_supplies_nothing() {
@@ -758,7 +758,7 @@ fn drive_to_turn(runner: &mut GameRunner, turn: u32) {
 }
 
 /// F7 (CR 601.2c): once the creature is chosen, the Equipment slot offers only
-/// Equipment attached to THAT creature ? not the caster's own unattached
+/// Equipment attached to THAT creature — not the caster's own unattached
 /// Equipment, not Equipment on a different creature.
 #[test]
 fn fiery_annihilation_equipment_slot_offers_only_the_chosen_creatures_equipment() {
@@ -822,7 +822,7 @@ fn fiery_annihilation_equipment_slot_offers_only_the_chosen_creatures_equipment(
 
 /// F1 + F5 + F2 (CR 614.1a): with the Equipment chosen and still attached, it
 /// is exiled; lethal damage then exiles the CREATURE instead of putting it into
-/// the graveyard ? the rider is bound to the creature's slot, not the
+/// the graveyard — the rider is bound to the creature's slot, not the
 /// Equipment node it follows.
 #[test]
 fn fiery_annihilation_exiles_equipment_and_rider_exiles_the_creature() {
@@ -844,7 +844,7 @@ fn fiery_annihilation_exiles_equipment_and_rider_exiles_the_creature() {
     );
     assert_eq!(outcome.zone_of(b.eq_c), Zone::Battlefield);
 
-    // F1: no Equipment chosen ? damage and the rider still apply.
+    // F1: no Equipment chosen — damage and the rider still apply.
     let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 2);
     let outcome = b.runner.cast(b.spell).target_objects(&[b.victim]).resolve();
     assert_eq!(outcome.zone_of(b.victim), Zone::Exile);
@@ -911,7 +911,7 @@ fn fiery_annihilation_illegal_creature_exiles_nothing_and_installs_no_rider() {
 }
 
 /// F6 (ruling 4): the rider applies if the creature would die this turn FOR
-/// ANY REASON ? a later, independent destruction exiles it; the Equipment
+/// ANY REASON — a later, independent destruction exiles it; the Equipment
 /// stays. F8: after the turn ends, the "this turn" rider has expired.
 #[test]
 fn fiery_annihilation_rider_applies_to_any_death_this_turn_and_expires() {
@@ -933,4 +933,528 @@ fn fiery_annihilation_rider_applies_to_any_death_this_turn_and_expires() {
         Zone::Graveyard,
         "the rider expired with the turn"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Copies and "choose new targets" (CR 707.10c, CR 115.7d, CR 115.7e)
+// ---------------------------------------------------------------------------
+
+const TWINCAST: &str =
+    "Copy target instant or sorcery spell. You may choose new targets for the copy.";
+const REDIRECT: &str = "You may choose new targets for target spell.";
+
+/// Fiery Annihilation's opponent board: creature A (2/7) carries Equipment 1;
+/// creature B (2/2, dies to 5 damage) carries Equipment 2; creature C (2/7)
+/// carries nothing; Equipment 3 is unattached. Twincast and Redirect are in
+/// hand alongside Fiery Annihilation, all free.
+struct CopyBoard {
+    runner: GameRunner,
+    fiery: ObjectId,
+    twincast: ObjectId,
+    redirect: ObjectId,
+    a: ObjectId,
+    b: ObjectId,
+    c: ObjectId,
+    eq1: ObjectId,
+    eq2: ObjectId,
+    eq3: ObjectId,
+}
+
+fn copy_board() -> CopyBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+    let b = scenario.add_creature(P1, "Creature B", 2, 2).id();
+    let c = scenario.add_creature(P1, "Creature C", 2, 7).id();
+    let eq1 = equipment(&mut scenario, P1, "Equipment 1");
+    let eq2 = equipment(&mut scenario, P1, "Equipment 2");
+    let eq3 = equipment(&mut scenario, P1, "Equipment 3");
+    let fiery = free_spell(
+        &mut scenario,
+        "Fiery Annihilation",
+        true,
+        FIERY_ANNIHILATION,
+    );
+    let twincast = free_spell(&mut scenario, "Twincast", true, TWINCAST);
+    let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq1, a);
+    attach::attach_to(runner.state_mut(), eq2, b);
+    CopyBoard {
+        runner,
+        fiery,
+        twincast,
+        redirect,
+        a,
+        b,
+        c,
+        eq1,
+        eq2,
+        eq3,
+    }
+}
+
+/// Pass priority and accept "you may" until the stack-object choice the test
+/// is about (`CopyRetarget` / `RetargetChoice`) is open.
+fn drive_to_retarget_prompt(runner: &mut GameRunner) {
+    for _ in 0..12 {
+        match runner.state().waiting_for {
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accept");
+            }
+            WaitingFor::CopyRetarget { .. } | WaitingFor::RetargetChoice { .. } => return,
+            ref other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+    panic!("no retarget prompt opened");
+}
+
+/// Cast Fiery Annihilation at `targets`, then cast `responder` targeting it and
+/// drive to the responder's retarget prompt.
+fn fiery_then<R>(
+    board: &mut CopyBoard,
+    targets: &[ObjectId],
+    before_response: impl FnOnce(&mut engine::types::game_state::GameState) -> R,
+    responder: ObjectId,
+) {
+    board
+        .runner
+        .cast(board.fiery)
+        .target_objects(targets)
+        .commit();
+    let _ = before_response(board.runner.state_mut());
+    board
+        .runner
+        .cast(responder)
+        .target_objects(&[board.fiery])
+        .commit();
+    drive_to_retarget_prompt(&mut board.runner);
+}
+
+fn copy_alternatives(runner: &GameRunner) -> Vec<TargetRef> {
+    let WaitingFor::CopyRetarget {
+        target_slots,
+        current_slot,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "expected CopyRetarget, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(
+        target_slots.len(),
+        1,
+        "copy retargeting exposes the root (creature) slot only"
+    );
+    target_slots[*current_slot].legal_alternatives.clone()
+}
+
+/// H1 safe positive (CR 707.10c + CR 115.7d): Equipment 1 was moved onto C
+/// before the copy's new-target choice, so it is already an illegal target and
+/// stays unchanged; changing the copy's creature A -> B is legal. The copy
+/// damages B, which would die and is exiled instead (the rider follows the
+/// copy's creature); Equipment 1 is untouched.
+#[test]
+fn copy_may_change_the_creature_when_its_equipment_target_is_already_illegal() {
+    let mut board = copy_board();
+    let (a, b, c, eq1) = (board.a, board.b, board.c, board.eq1);
+    let twincast = board.twincast;
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| attach::attach_to(state, eq1, c),
+        twincast,
+    );
+    assert!(
+        copy_alternatives(&board.runner).contains(&TargetRef::Object(b)),
+        "B is offered: Equipment 1 is no longer legal either way"
+    );
+    board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b)),
+        })
+        .expect("A -> B accepted");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&b].zone, Zone::Exile, "copy's rider is on B");
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+    assert_eq!(
+        state.objects[&eq1].attached_to,
+        Some(AttachTarget::Object(c))
+    );
+    assert_eq!(state.objects[&a].damage_marked, 5, "the original hit A");
+}
+
+/// H1 (no Equipment target): a copy whose original chose no Equipment may
+/// change its creature freely; the copy's damage and rider follow B.
+#[test]
+fn copy_without_an_equipment_target_changes_the_creature() {
+    let mut board = copy_board();
+    let (a, b, eq2) = (board.a, board.b, board.eq2);
+    let twincast = board.twincast;
+    fiery_then(&mut board, &[a], |_| {}, twincast);
+    assert!(copy_alternatives(&board.runner).contains(&TargetRef::Object(b)));
+    board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b)),
+        })
+        .expect("A -> B accepted");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&b].zone, Zone::Exile);
+    assert_eq!(state.objects[&eq2].zone, Zone::Battlefield, "not chosen");
+    assert_eq!(state.objects[&a].damage_marked, 5);
+}
+
+/// H1 negative (CR 115.7d: new targets "must not cause any unchanged targets to
+/// become illegal"): with Equipment 1 still attached to A, changing the copy's
+/// creature to B would make the unchanged Equipment target illegal, so B is
+/// not offered and a direct submission is rejected; keeping the targets works.
+#[test]
+fn copy_may_not_change_the_creature_away_from_its_legal_equipment_target() {
+    let mut board = copy_board();
+    let (a, b, c, eq1) = (board.a, board.b, board.c, board.eq1);
+    let twincast = board.twincast;
+    fiery_then(&mut board, &[a, eq1], |_| {}, twincast);
+    let offered = copy_alternatives(&board.runner);
+    assert!(
+        offered.contains(&TargetRef::Object(a)),
+        "reach guard: the slot's pool is populated"
+    );
+    assert!(!offered.contains(&TargetRef::Object(b)));
+    assert!(!offered.contains(&TargetRef::Object(c)));
+    assert!(board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b)),
+        })
+        .is_err());
+    board
+        .runner
+        .act(GameAction::KeepAllCopyTargets)
+        .expect("keeping the targets is legal");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&eq1].zone, Zone::Exile, "the copy exiled it");
+    assert_eq!(state.objects[&a].damage_marked, 10, "both hit A");
+    assert_eq!(state.objects[&b].damage_marked, 0);
+}
+
+/// Move `id` to exile and back (a blink). The engine keeps the storage id and
+/// bumps the incarnation (CR 400.7: it is a new object).
+fn blink(state: &mut engine::types::game_state::GameState, id: ObjectId) {
+    let before = state.objects[&id].incarnation;
+    let mut events: Vec<GameEvent> = Vec::new();
+    move_object_for_test(
+        state,
+        ZoneMoveRequest::effect(id, Zone::Exile, id),
+        &mut events,
+    );
+    move_object_for_test(
+        state,
+        ZoneMoveRequest::effect(id, Zone::Battlefield, id),
+        &mut events,
+    );
+    assert_eq!(state.objects[&id].zone, Zone::Battlefield, "blinked back");
+    assert!(
+        state.objects[&id].incarnation > before,
+        "reach guard: same id, new incarnation"
+    );
+}
+
+/// Stale-referent probe (CR 400.7 + CR 115.7d): A is blinked after Fiery
+/// Annihilation was announced and Equipment 1 is attached to the NEW A before
+/// the copy's choice. The copy's unchanged A reference names the OLD object,
+/// so Equipment 1 was not a legal target "attached to that creature" — it is
+/// already illegal, and changing the creature to B is allowed. (Control: the
+/// fresh, current A of `copy_may_not_change_the_creature_away_from_its_legal_equipment_target`
+/// refuses B.)
+#[test]
+fn copy_stale_announced_referent_is_not_rebound_to_a_new_same_id_object() {
+    let mut board = copy_board();
+    let (a, b, eq1) = (board.a, board.b, board.eq1);
+    let twincast = board.twincast;
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| {
+            blink(state, a);
+            attach::attach_to(state, eq1, a);
+        },
+        twincast,
+    );
+    assert_eq!(
+        board.runner.state().objects[&eq1].attached_to,
+        Some(AttachTarget::Object(a)),
+        "reach guard: Equipment 1 is on the new A"
+    );
+    assert!(
+        copy_alternatives(&board.runner).contains(&TargetRef::Object(b)),
+        "the old-A announcement is not rebound to the new A"
+    );
+    board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b)),
+        })
+        .expect("A -> B accepted");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&b].zone, Zone::Exile);
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+}
+
+fn retarget_pools(runner: &GameRunner) -> Vec<Vec<TargetRef>> {
+    let WaitingFor::RetargetChoice { slot_pools, .. } = &runner.state().waiting_for else {
+        panic!(
+            "expected RetargetChoice, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    slot_pools.clone()
+}
+
+fn objects(ids: &[ObjectId]) -> Vec<TargetRef> {
+    ids.iter().map(|id| TargetRef::Object(*id)).collect()
+}
+
+/// RetargetChoice (CR 115.7d + CR 115.7e): the Equipment position's pool spans
+/// every creature the same submission may elect, and the final set is checked
+/// exactly — A -> B keeping Equipment 1 is refused; A -> B with Equipment 1 ->
+/// Equipment 2 is accepted; A kept with Equipment 1 -> Equipment 3 (moved onto
+/// A) is accepted.
+#[test]
+fn choose_new_targets_checks_the_edited_selection_as_a_whole() {
+    // (a) refused, then (b) accepted on the same prompt.
+    let mut board = copy_board();
+    let (a, b, eq1, eq2) = (board.a, board.b, board.eq1, board.eq2);
+    let redirect = board.redirect;
+    fiery_then(&mut board, &[a, eq1], |_| {}, redirect);
+    let pools = retarget_pools(&board.runner);
+    assert_eq!(pools.len(), 2, "creature and Equipment positions");
+    assert!(pools[1].contains(&TargetRef::Object(eq2)), "B's Equipment");
+    assert!(pools[1].contains(&TargetRef::Object(eq1)), "A's Equipment");
+    assert!(
+        board
+            .runner
+            .act(GameAction::RetargetSpell {
+                new_targets: objects(&[b, eq1]),
+            })
+            .is_err(),
+        "Equipment 1 would become illegal"
+    );
+    board
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[b, eq2]),
+        })
+        .expect("A -> B with B's Equipment");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&eq2].zone, Zone::Exile);
+    assert_eq!(state.objects[&b].zone, Zone::Exile, "rider on B");
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&a].damage_marked, 0);
+
+    // (c) A kept, Equipment 1 -> Equipment 3 (also on A).
+    let mut board = copy_board();
+    let (a, eq1, eq3) = (board.a, board.eq1, board.eq3);
+    let redirect = board.redirect;
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| attach::attach_to(state, eq3, a),
+        redirect,
+    );
+    board
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[a, eq3]),
+        })
+        .expect("Equipment 1 -> Equipment 3 on A");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&eq3].zone, Zone::Exile);
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&a].damage_marked, 5);
+}
+
+/// RetargetChoice (CR 115.7d first clause): Equipment 1 was detached before
+/// the prompt, so it is already illegal and may stay unchanged while A -> B.
+#[test]
+fn choose_new_targets_keeps_an_already_illegal_equipment_target() {
+    let mut board = copy_board();
+    let (a, b, c, eq1) = (board.a, board.b, board.c, board.eq1);
+    let redirect = board.redirect;
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| attach::attach_to(state, eq1, c),
+        redirect,
+    );
+    board
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[b, eq1]),
+        })
+        .expect("an already-illegal unchanged target may stay");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&b].zone, Zone::Exile);
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+}
+
+// ---------------------------------------------------------------------------
+// Pins and chain-wide numbering
+// ---------------------------------------------------------------------------
+
+/// H2 (CR 115.3 + CR 115.7d): one two-target node selects artifact creature A
+/// and creature B; choosing new targets puts A in the creature slot too. The
+/// node's pins are id-keyed (one A pin for both positions), and the creature
+/// slot still reads A — A's Equipment is destroyed, B's is not.
+#[test]
+fn two_target_head_retargeted_onto_one_object_reads_its_pin() {
+    const TEXT: &str =
+        "Choose target artifact and target creature. Destroy all Equipment attached to that creature.";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario
+        .add_creature(P1, "Artifact Creature A", 2, 7)
+        .as_artifact()
+        .as_creature()
+        .id();
+    let bee = scenario.add_creature(P1, "Creature B", 2, 7).id();
+    let eq_a = equipment(&mut scenario, P1, "On A");
+    let eq_b = equipment(&mut scenario, P1, "On B");
+    let spell = free_spell(&mut scenario, "Probe", true, TEXT);
+    let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq_a, a);
+    attach::attach_to(runner.state_mut(), eq_b, bee);
+    runner.cast(spell).target_objects(&[a, bee]).commit();
+    runner.cast(redirect).target_objects(&[spell]).commit();
+    drive_to_retarget_prompt(&mut runner);
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[a, a]),
+        })
+        .expect("B -> A in the creature slot");
+    let pins = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == spell)
+        .and_then(|entry| entry.ability())
+        .map(|ability| ability.selected_target_incarnations.clone())
+        .expect("probe on the stack");
+    assert_eq!(
+        pins.iter().filter(|pin| pin.object_id == a).count(),
+        1,
+        "reach guard: one id-keyed A pin serves both positions"
+    );
+    runner.advance_until_stack_empty();
+    let state = runner.state();
+    assert_eq!(state.objects[&eq_a].zone, Zone::Graveyard);
+    assert_eq!(state.objects[&eq_b].zone, Zone::Battlefield);
+}
+
+/// H2 negative (CR 400.7): a declared slot whose declaring node holds no pin,
+/// or a stale pin, names nothing — the pin is never recovered from the live
+/// row, so no Equipment is destroyed though the damage is dealt.
+#[test]
+fn missing_or_stale_pin_names_no_referent() {
+    const TEXT: &str =
+        "Target player loses 1 life. ~ deals 2 damage to target creature. Destroy all Equipment attached to that creature.";
+    for stale in [false, true] {
+        let mut b = loj_board(TEXT, "Probe", 7);
+        let mut commit = b
+            .runner
+            .cast(b.spell)
+            .target_player(P1)
+            .target_objects(&[b.victim])
+            .commit();
+        {
+            let state = commit.state_mut();
+            let entry = state
+                .stack
+                .iter_mut()
+                .find(|entry| entry.id == b.spell)
+                .expect("probe on the stack");
+            let ability = entry.ability_mut().expect("spell ability");
+            let node = ability.sub_ability.as_deref_mut().expect("damage node");
+            if stale {
+                for pin in &mut node.selected_target_incarnations {
+                    pin.incarnation += 100;
+                }
+            } else {
+                node.selected_target_incarnations.clear();
+            }
+        }
+        let outcome = commit.resolve();
+        outcome.assert_life_delta(P1, -1);
+        assert_eq!(
+            outcome.zone_of(b.eq_a),
+            Zone::Battlefield,
+            "stale={stale}: no referent"
+        );
+    }
+}
+
+/// H2 (CR 608.2b + CR 400.7): the creature is blinked before resolution and its
+/// new incarnation picks up Equipment. The initial legality check marks the old
+/// incarnation's slot illegal, so the reader returns None before either live or
+/// LKI matching — the player part still resolves; nothing is destroyed.
+#[test]
+fn blinked_referent_is_illegal_and_supplies_no_attachments() {
+    const TEXT: &str =
+        "Target player loses 1 life. ~ deals 2 damage to target creature. Destroy all Equipment attached to that creature.";
+    let mut b = loj_board(TEXT, "Probe", 7);
+    let mut commit = b
+        .runner
+        .cast(b.spell)
+        .target_player(P1)
+        .target_objects(&[b.victim])
+        .commit();
+    blink(commit.state_mut(), b.victim);
+    attach::attach_to(commit.state_mut(), b.eq_d, b.victim);
+    let outcome = commit.resolve();
+    outcome.assert_life_delta(P1, -1);
+    assert_eq!(outcome.state().objects[&b.victim].damage_marked, 0);
+    assert_eq!(outcome.zone_of(b.eq_d), Zone::Battlefield);
+}
+
+/// H3 (CR 601.2c): a two-target head after a fixed one-target prefix. "that
+/// creature" is chain slot 1 (the creature), not the head's local index 0
+/// (which in the whole chain is the land). The creature's Equipment is
+/// destroyed; Equipment on another creature survives.
+#[test]
+fn two_target_head_after_a_prefix_destroys_the_creatures_equipment() {
+    const TEXT: &str = "Tap target land. Choose target creature and target artifact. Destroy all Equipment attached to that creature.";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let land = scenario.add_basic_land(P1, engine::types::mana::ManaColor::Red);
+    let x = scenario.add_creature(P1, "Creature X", 2, 7).id();
+    let other = scenario.add_creature(P1, "Other", 2, 7).id();
+    let eq_x = equipment(&mut scenario, P1, "On X");
+    let eq_other = equipment(&mut scenario, P1, "On Other");
+    let art = scenario
+        .add_artifact_from_oracle(P1, "Plain Artifact", "")
+        .id();
+    let spell = free_spell(&mut scenario, "Probe", false, TEXT);
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq_x, x);
+    attach::attach_to(runner.state_mut(), eq_other, other);
+    let outcome = runner.cast(spell).target_objects(&[land, x, art]).resolve();
+    assert!(outcome.state().objects[&land].tapped, "reach guard: slot 0");
+    assert_eq!(outcome.zone_of(eq_x), Zone::Graveyard);
+    assert_eq!(outcome.zone_of(eq_other), Zone::Battlefield);
 }

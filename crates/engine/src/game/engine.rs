@@ -2,9 +2,7 @@ use rand::Rng;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use thiserror::Error;
 
-use crate::types::ability::{
-    AbilityCondition, DurationEvent, EffectKind, KeywordAction, TargetRef,
-};
+use crate::types::ability::{DurationEvent, EffectKind, KeywordAction, TargetRef};
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::action_rejection::{ActionRejection, ActionRejectionCode};
@@ -9982,50 +9980,34 @@ fn finalize_copy_retarget(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let changed_pins = state
+    // CR 707.10c + CR 115.7d + CR 115.7e: the final set is checked as a whole
+    // on a tentative chain (every accepted edit, with its pin refresh) before
+    // anything is written; a violation rejects the submission atomically.
+    let post = state
         .stack
         .iter()
         .find(|entry| entry.id == copy_id)
-        .and_then(|entry| entry.ability())
-        .map(|ability| {
-            ability
-                .targets
-                .iter()
-                .zip(targets.iter())
-                .filter(|(old, new)| ability.retarget_target_requires_pin_refresh(old, new, state))
-                .filter_map(|(_, target)| match target {
-                    TargetRef::Object(id) => {
-                        state.objects.get(id).map(ObjectIncarnationRef::from_object)
-                    }
-                    TargetRef::Player(_) => None,
-                })
-                .collect::<Vec<_>>()
+        .and_then(|entry| {
+            let ability = entry.ability()?;
+            let pool_controller = crate::game::effects::change_targets::retarget_pool_controller(
+                state, entry, ability,
+            );
+            Some(crate::game::ability_utils::copy_retarget_edit_is_legal(
+                state,
+                ability,
+                &targets,
+                pool_controller,
+            ))
         })
-        .unwrap_or_default();
-    if let Some(entry) = state.stack.iter_mut().find(|e| e.id == copy_id) {
-        if let Some(ability) = entry.ability_mut() {
-            // CR 707.10c + CR 601.2c: An additional-cost "instead choose"
-            // branch owns the declared slots. The root is only its mirror.
-            // Update the child before re-deriving the mirror and selected-group
-            // readers, including the unchanged members of a variable target set.
-            if ability.context.additional_cost_paid {
-                if let Some(sub) = ability.sub_ability.as_deref_mut().filter(|sub| {
-                    matches!(
-                        sub.condition,
-                        Some(AbilityCondition::AdditionalCostPaidInstead)
-                    )
-                }) {
-                    sub.targets = targets.clone();
-                    for pin in &changed_pins {
-                        sub.update_selected_target_incarnation(*pin);
-                    }
-                }
-            }
-            ability.targets = targets;
-            for pin in changed_pins {
-                ability.update_selected_target_incarnation(pin);
-            }
-            crate::game::ability_utils::restamp_derived_chain_targets(ability);
+        .transpose()?;
+    if let Some(post) = post {
+        if let Some(ability) = state
+            .stack
+            .iter_mut()
+            .find(|e| e.id == copy_id)
+            .and_then(|entry| entry.ability_mut())
+        {
+            *ability = post;
         }
     }
     events.push(GameEvent::EffectResolved {
@@ -15306,6 +15288,14 @@ fn apply_non_priority_pass_action(
             }
             let next_slot = slot_idx + 1;
             if next_slot < updated_slots.len() {
+                // CR 707.10c + CR 115.7d: the next slot's alternatives are
+                // re-checked against every edit accepted so far.
+                crate::game::effects::copy_spell::restrict_copy_retarget_alternatives(
+                    state,
+                    cid,
+                    &mut updated_slots,
+                    next_slot,
+                );
                 state.waiting_for = WaitingFor::CopyRetarget {
                     player: p,
                     copy_id: cid,
@@ -16286,59 +16276,25 @@ fn apply_retarget(
     // `state.stack[stack_entry_index]` has not been overwritten yet (that
     // happens below, only once this whole pass succeeds).
     let pre_write = state.stack[stack_entry_index].ability().cloned();
-    for (i, binding) in derived.iter().enumerate() {
-        // A position this submission itself addressed and changed is already
-        // validated by the per-slot check above (CR 115.7d's FIRST clause);
-        // this pass is only for positions the submission left UNCHANGED,
-        // including every position beyond the exposed prefix.
-        let changed = i < new_targets.len() && current_targets.get(i) != new_targets.get(i);
-        if changed {
-            continue;
-        }
-        let crate::game::ability_utils::SlotEnforcement::Filtered(filter) = &binding.enforcement
-        else {
-            continue;
-        };
-        let Some(pre_node) = pre_write
-            .as_ref()
-            .and_then(|a| crate::game::ability_utils::node_at(a, &binding.address.path))
-        else {
-            continue;
-        };
-        let Some(pre_current) = pre_node.targets.get(binding.address.slot) else {
-            continue;
-        };
-        let was_legal = crate::game::targeting::find_legal_targets_for_ability_with_controller(
+    if let Some(pre_write) = pre_write.as_ref() {
+        let changed =
+            |i: usize| i < new_targets.len() && current_targets.get(i) != new_targets.get(i);
+        crate::game::ability_utils::unchanged_targets_stay_legal(
             state,
-            filter,
-            pre_node,
+            pre_write,
+            &mutated,
+            &derived,
+            &changed,
             pool_controller,
-        )
-        .contains(pre_current);
-        if !was_legal {
-            // CR 115.7d FIRST clause: an already-illegal unchanged target
-            // stays accepted.
-            continue;
-        }
-        let Some(post_node) = crate::game::ability_utils::node_at(&mutated, &binding.address.path)
-        else {
-            continue;
-        };
-        let Some(post_current) = post_node.targets.get(binding.address.slot) else {
-            continue;
-        };
-        let still_legal = crate::game::targeting::find_legal_targets_for_ability_with_controller(
+        )?;
+        crate::game::ability_utils::changed_dependent_targets_are_legal(
             state,
-            filter,
-            post_node,
+            pre_write,
+            &mutated,
+            &derived,
+            &changed,
             pool_controller,
-        )
-        .contains(post_current);
-        if !still_legal {
-            return Err(EngineError::InvalidAction(
-                "Retarget: the change would make an unchanged target illegal".to_string(),
-            ));
-        }
+        )?;
     }
 
     if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
