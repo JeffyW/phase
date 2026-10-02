@@ -4999,6 +4999,72 @@ fn union_over_prior_object_candidates(
     legal_targets
 }
 
+/// CR 601.2c + CR 701.3a: the declared slots a filter's
+/// `AttachedTo { to: DeclaredTarget { slot } }` referents name, deduplicated.
+fn declared_slots_read_by(filter: &TargetFilter) -> Vec<usize> {
+    let slots = std::cell::RefCell::new(Vec::new());
+    crate::game::filter::filter_contains_filter_prop(filter, &|prop| {
+        if let FilterProp::AttachedTo {
+            to: AttachmentReferent::DeclaredTarget { slot },
+        } = prop
+        {
+            let mut slots = slots.borrow_mut();
+            if !slots.contains(slot) {
+                slots.push(*slot);
+            }
+        }
+        false
+    });
+    slots.into_inner()
+}
+
+/// CR 601.2c + CR 603.3d: the static (pre-selection) legal set of a slot whose
+/// filter reads another declared slot — the union, over every candidate of the
+/// named slot (`existing_slots` is indexed by declared position), of the
+/// enumeration with that candidate elected into the declared-slot view. Exact
+/// for a single referent (the slot's legality depends only on that object), so
+/// the CR 603.3d "no legal target" decision stays correct; the interactive walk
+/// (`legal_targets_for_selected_slot`) then binds the actual choice. A filter
+/// naming several slots, or a slot not yet built, has no static candidates.
+fn union_over_declared_slot_candidates(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+    existing_slots: &[TargetSelectionSlot],
+) -> Vec<TargetRef> {
+    let [slot] = declared_slots_read_by(filter)[..] else {
+        return Vec::new();
+    };
+    // Without the referent slot (a spec-sizing pass that builds no prior slots),
+    // every battlefield object is a candidate referent: an over-approximation
+    // that only sizes the slot run; the interactive walk binds the real choice.
+    let candidates: Vec<TargetRef> = match existing_slots.get(slot) {
+        Some(referent_slot) => referent_slot.legal_targets.clone(),
+        None => state
+            .battlefield
+            .iter()
+            .map(|id| TargetRef::Object(*id))
+            .collect(),
+    };
+    let mut legal_targets = Vec::new();
+    for candidate in &candidates {
+        let mut view: Vec<Option<targeting::DeclaredSlotBinding>> = vec![None; slot + 1];
+        view[slot] = Some(targeting::DeclaredSlotBinding::Elected(candidate.clone()));
+        for target in targeting::find_legal_targets_for_ability_with_view(
+            state,
+            filter,
+            ability,
+            ability.controller,
+            &view,
+        ) {
+            if !legal_targets.contains(&target) {
+                legal_targets.push(target);
+            }
+        }
+    }
+    legal_targets
+}
+
 fn target_filter_needs_ability_context(filter: &TargetFilter) -> bool {
     target_filter_contains_chosen_x_ref(filter)
         || target_filter_contains_quantity_scope(filter, ObjectScope::AmassedArmy)
@@ -6995,6 +7061,12 @@ fn legal_targets_for_ability_filter_uncapped(
             if let Some(prior) = first_prior_object_slot(existing_slots) {
                 return union_over_prior_object_candidates(state, ability, filter, prior);
             }
+        }
+        // CR 601.2c + CR 701.3a: a declared-slot attachment referent is unioned
+        // over every candidate of the slot it names (no selection exists yet);
+        // the interactive walk narrows it to the object actually chosen.
+        if crate::game::filter::filter_reads_declared_slot(filter) {
+            return union_over_declared_slot_candidates(state, ability, filter, existing_slots);
         }
         if needs_ability_context {
             return targeting::find_legal_targets_for_ability(state, filter, ability);

@@ -24,6 +24,7 @@
 //!
 //! Oracle text is verbatim from Scryfall.
 
+use engine::game::combat::AttackTarget;
 use engine::game::effects::attach;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
@@ -33,6 +34,7 @@ use engine::types::ability::{
     AbilityDefinition, AttachmentReferent, Effect, FilterProp, TargetFilter, TargetRef,
 };
 use engine::types::actions::GameAction;
+use engine::types::events::GameEvent;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -715,5 +717,220 @@ fn same_object_in_two_slots_and_split_slots_read_slot_one() {
         outcome.zone_of(eq_a),
         Zone::Battlefield,
         "not the first object's"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fiery Annihilation (whole card)
+// ---------------------------------------------------------------------------
+
+/// Move `id` from the battlefield to its owner's graveyard ("would die",
+/// CR 700.4) through the zone pipeline, so replacement effects apply.
+fn kill(runner: &mut GameRunner, id: ObjectId) {
+    let mut events: Vec<GameEvent> = Vec::new();
+    move_object_for_test(
+        runner.state_mut(),
+        ZoneMoveRequest::effect(id, Zone::Graveyard, id),
+        &mut events,
+    );
+}
+
+/// Pass priority (declaring no attackers or blockers) until `turn` begins.
+fn drive_to_turn(runner: &mut GameRunner, turn: u32) {
+    for _ in 0..300 {
+        if runner.state().turn_number >= turn {
+            return;
+        }
+        let action = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::DeclareAttackers { .. } => GameAction::DeclareAttackers {
+                attacks: Vec::<(ObjectId, AttackTarget)>::new(),
+                bands: vec![],
+            },
+            WaitingFor::DeclareBlockers { .. } => GameAction::DeclareBlockers {
+                assignments: Vec::new(),
+            },
+            other => panic!("unexpected prompt while driving: {other:?}"),
+        };
+        runner.act(action).expect("driver action accepted");
+    }
+    panic!("turn {turn} never began");
+}
+
+/// F7 (CR 601.2c): once the creature is chosen, the Equipment slot offers only
+/// Equipment attached to THAT creature ? not the caster's own unattached
+/// Equipment, not Equipment on a different creature.
+#[test]
+fn fiery_annihilation_equipment_slot_offers_only_the_chosen_creatures_equipment() {
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 7);
+    let mine = b.eq_d;
+    // The caster's own unattached Equipment.
+    {
+        let state = b.runner.state_mut();
+        let obj = state.objects.get_mut(&mine).unwrap();
+        obj.controller = P0;
+        obj.owner = P0;
+    }
+    let card_id = b.runner.state().objects[&b.spell].card_id;
+    b.runner
+        .act(GameAction::CastSpell {
+            object_id: b.spell,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("cast");
+    b.runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b.victim)),
+        })
+        .expect("choose the creature");
+    let WaitingFor::TargetSelection {
+        target_slots,
+        selection,
+        ..
+    } = &b.runner.state().waiting_for
+    else {
+        panic!(
+            "expected the Equipment slot, got {:?}",
+            b.runner.state().waiting_for
+        );
+    };
+    let offered = &selection.current_legal_targets;
+    assert!(
+        target_slots[selection.current_slot]
+            .legal_targets
+            .contains(&TargetRef::Object(b.eq_a)),
+        "reach guard: the static slot admits the Equipment"
+    );
+    assert_eq!(
+        offered,
+        &vec![TargetRef::Object(b.eq_a)],
+        "only the chosen creature's Equipment"
+    );
+    assert!(!offered.contains(&TargetRef::Object(mine)));
+    assert!(!offered.contains(&TargetRef::Object(b.eq_c)));
+    assert!(
+        b.runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(b.eq_c)),
+            })
+            .is_err(),
+        "submitting another creature's Equipment is rejected"
+    );
+}
+
+/// F1 + F5 + F2 (CR 614.1a): with the Equipment chosen and still attached, it
+/// is exiled; lethal damage then exiles the CREATURE instead of putting it into
+/// the graveyard ? the rider is bound to the creature's slot, not the
+/// Equipment node it follows.
+#[test]
+fn fiery_annihilation_exiles_equipment_and_rider_exiles_the_creature() {
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 2);
+    let outcome = b
+        .runner
+        .cast(b.spell)
+        .target_objects(&[b.victim, b.eq_a])
+        .resolve();
+    assert_eq!(
+        outcome.zone_of(b.eq_a),
+        Zone::Exile,
+        "the Equipment is exiled"
+    );
+    assert_eq!(
+        outcome.zone_of(b.victim),
+        Zone::Exile,
+        "the creature would die to lethal damage and is exiled instead"
+    );
+    assert_eq!(outcome.zone_of(b.eq_c), Zone::Battlefield);
+
+    // F1: no Equipment chosen ? damage and the rider still apply.
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 2);
+    let outcome = b.runner.cast(b.spell).target_objects(&[b.victim]).resolve();
+    assert_eq!(outcome.zone_of(b.victim), Zone::Exile);
+    assert_eq!(
+        outcome.zone_of(b.eq_a),
+        Zone::Battlefield,
+        "not chosen, not exiled"
+    );
+}
+
+/// F3 (CR 608.2b, ruling 3): the Equipment moved to another creature in
+/// response is no longer attached to the target, so it is an illegal target and
+/// is not exiled; the creature is still dealt damage and the rider still
+/// applies to it.
+#[test]
+fn fiery_annihilation_moved_equipment_is_not_exiled_but_damage_and_rider_apply() {
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 2);
+    let mut commit = b
+        .runner
+        .cast(b.spell)
+        .target_objects(&[b.victim, b.eq_a])
+        .commit();
+    attach::attach_to(commit.state_mut(), b.eq_a, b.other);
+    let outcome = commit.resolve();
+    assert_eq!(outcome.zone_of(b.eq_a), Zone::Battlefield);
+    assert_eq!(
+        outcome.state().objects[&b.eq_a].attached_to,
+        Some(AttachTarget::Object(b.other))
+    );
+    assert_eq!(
+        outcome.zone_of(b.victim),
+        Zone::Exile,
+        "damage + rider applied"
+    );
+}
+
+/// F4 (CR 608.2b, ruling 2): the creature becomes an illegal target while the
+/// Equipment is otherwise selectable. The Equipment part needs information
+/// about the illegal creature, so nothing is exiled, no damage is dealt, and no
+/// rider is installed.
+#[test]
+fn fiery_annihilation_illegal_creature_exiles_nothing_and_installs_no_rider() {
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 7);
+    let mut commit = b
+        .runner
+        .cast(b.spell)
+        .target_objects(&[b.victim, b.eq_a])
+        .commit();
+    give_hexproof(commit.state_mut(), b.victim);
+    let outcome = commit.resolve();
+    assert_eq!(outcome.state().objects[&b.victim].damage_marked, 0);
+    assert_eq!(outcome.zone_of(b.eq_a), Zone::Battlefield);
+    assert_eq!(
+        outcome.zone_of(b.spell),
+        Zone::Graveyard,
+        "reach guard: cast"
+    );
+    kill(&mut b.runner, b.victim);
+    assert_eq!(
+        b.runner.state().objects[&b.victim].zone,
+        Zone::Graveyard,
+        "no rider was installed"
+    );
+}
+
+/// F6 (ruling 4): the rider applies if the creature would die this turn FOR
+/// ANY REASON ? a later, independent destruction exiles it; the Equipment
+/// stays. F8: after the turn ends, the "this turn" rider has expired.
+#[test]
+fn fiery_annihilation_rider_applies_to_any_death_this_turn_and_expires() {
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 7);
+    let outcome = b.runner.cast(b.spell).target_objects(&[b.victim]).resolve();
+    assert_eq!(outcome.state().objects[&b.victim].damage_marked, 5);
+    kill(&mut b.runner, b.victim);
+    assert_eq!(b.runner.state().objects[&b.victim].zone, Zone::Exile);
+    assert_eq!(b.runner.state().objects[&b.eq_a].zone, Zone::Battlefield);
+
+    let mut b = loj_board(FIERY_ANNIHILATION, "Fiery Annihilation", 7);
+    let outcome = b.runner.cast(b.spell).target_objects(&[b.victim]).resolve();
+    assert_eq!(outcome.state().objects[&b.victim].damage_marked, 5);
+    let next = b.runner.state().turn_number + 1;
+    drive_to_turn(&mut b.runner, next);
+    kill(&mut b.runner, b.victim);
+    assert_eq!(
+        b.runner.state().objects[&b.victim].zone,
+        Zone::Graveyard,
+        "the rider expired with the turn"
     );
 }
