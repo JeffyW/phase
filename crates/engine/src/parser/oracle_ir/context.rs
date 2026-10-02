@@ -196,6 +196,15 @@ pub(crate) struct DeclaredSlotEntry {
     pub filter: TargetFilter,
 }
 
+/// CR 700.2: the body a [`ParseContext`] parses — a whole ability, or one mode
+/// of a modal spell or ability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BodyScope {
+    #[default]
+    WholeAbility,
+    ModalMode,
+}
+
 /// Unified parsing context — threaded through all parser branches for
 /// pronoun/reference resolution ("it", "that creature", "that many").
 ///
@@ -591,12 +600,12 @@ pub(crate) struct ParseContext {
     /// function of the pushed clauses, restored after. Empty on every standalone
     /// parse. Never serialized.
     pub chain_declared_slots: DeclaredSlotRegistry,
-    /// CR 700.2: the text being parsed is one mode of a modal spell or ability.
-    /// Declared-slot numbering is mode-local at runtime
+    /// CR 700.2: whether the text being parsed is one mode of a modal spell or
+    /// ability. Declared-slot numbering is mode-local at runtime
     /// (`targeting::parent_slot_base`), so declared-slot referents are not
-    /// admitted inside a mode. Set on each mode's context by
-    /// `parse_modal_mode_irs`; `false` everywhere else.
-    pub in_modal_mode: bool,
+    /// admitted inside a mode. Set to `ModalMode` on each mode's context by
+    /// `parse_modal_mode_irs`; `WholeAbility` everywhere else.
+    pub body_scope: BodyScope,
     /// CR 608.2c + CR 400.7: Source zone of the tracked set that a downstream
     /// "put those cards / put them onto the battlefield" anaphor (a
     /// `TargetFilter::TrackedSet`) must scan. Set by a producer clause that

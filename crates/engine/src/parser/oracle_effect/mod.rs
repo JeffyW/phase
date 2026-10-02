@@ -25183,7 +25183,7 @@ pub(super) fn resolve_declared_slot_anaphor<'a>(
     phrase_lower: &'a str,
     ctx: &ParseContext,
 ) -> Option<(usize, &'a str)> {
-    if ctx.in_modal_mode {
+    if ctx.body_scope == crate::parser::oracle_ir::context::BodyScope::ModalMode {
         return None;
     }
     let DeclaredSlotRegistry::Known(entries) = &ctx.chain_declared_slots else {
@@ -41856,7 +41856,7 @@ fn parse_effect_chain_ir_body(
             // with the same lifecycle as `chain_declared_object_target`.
             chain_declared_slots: ctx.chain_declared_slots.clone(),
             // CR 700.2: a mode's chunks stay inside the mode.
-            in_modal_mode: ctx.in_modal_mode,
+            body_scope: ctx.body_scope,
             // CR 116.2b + CR 708.7: a granted activated-ability body context is a
             // property of the whole ability, not of an individual chunk, so all
             // chunks inside it share the flag — the head "turn this creature face

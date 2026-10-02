@@ -1597,11 +1597,11 @@ fn effective_controller(
 ///
 /// The referent comes in three shapes ([`AttachmentReferentObject`]):
 /// * `ById` — the source / recipient referents, answered exactly as described above.
-/// * `Elected` / `Pinned { .., legality: true }` — a declared target slot evaluated for TARGET
+/// * `Elected` / `Pinned { .., reading: TargetLegality }` — a declared target slot evaluated for TARGET
 ///   LEGALITY (announcement, CR 608.2b validation, CR 115.7 / CR 707.10c retargeting). Live
 ///   only: a referent that is not the pinned object on the battlefield answers "no" (a
 ///   dependent target is legal only while its referent is that object, CR 115.1).
-/// * `Pinned { .., legality: false }` — a declared target slot read while the effect is
+/// * `Pinned { .., reading: EffectApplication }` — a declared target slot read while the effect is
 ///   applied. Live when the pin is current; otherwise CR 608.2h's look-back reads the exact
 ///   exit record of THAT incarnation (the `ZoneChangeRecord` whose pre-change identity is the
 ///   pin), matching each candidate by its own incarnation rather than by a reusable id. A
@@ -1631,12 +1631,16 @@ fn attached_to_referent(
         AttachmentReferentObject::Elected(referent) => {
             attached_to_live_referent(state, referent, None, candidate)
         }
-        AttachmentReferentObject::Pinned { referent, legality } => {
+        AttachmentReferentObject::Pinned { referent, reading } => {
             if attached_to_live_referent(state, referent.id, Some(referent.pin), candidate) {
                 return true;
             }
-            if legality || referent.pin.is_current(state) {
-                return false;
+            match reading {
+                ReferentReading::TargetLegality => return false,
+                ReferentReading::EffectApplication if referent.pin.is_current(state) => {
+                    return false;
+                }
+                ReferentReading::EffectApplication => {}
             }
             // CR 608.2h: the referent left the battlefield during this resolution. Read the
             // exit record of exactly the pinned incarnation.
@@ -1678,12 +1682,22 @@ enum AttachmentReferentObject {
     ById(ObjectId),
     /// A target chosen in the current choice — live by definition (CR 601.2c).
     Elected(ObjectId),
-    /// A declared target slot with its announcement pin. `legality` selects the
-    /// live-only target-legality reading over the CR 608.2h effect reading.
+    /// A declared target slot with its announcement pin, read per `reading`.
     Pinned {
         referent: crate::game::targeting::SlotReferent,
-        legality: bool,
+        reading: ReferentReading,
     },
+}
+
+/// Which question a pinned declared-slot referent answers.
+#[derive(Clone, Copy)]
+enum ReferentReading {
+    /// CR 115.1 + CR 608.2b: target legality (announcement, validation,
+    /// retargeting) — live only.
+    TargetLegality,
+    /// CR 608.2h: applying the effect — live, else the pinned incarnation's
+    /// exit record when it left the battlefield during this resolution.
+    EffectApplication,
 }
 
 /// CR 601.2c + CR 608.2b + CR 608.2h: `FilterProp::AttachedTo { to: DeclaredTarget { slot } }`.
@@ -1708,7 +1722,7 @@ fn attached_to_declared_slot(
                 pin: Some(pin),
             }) => AttachmentReferentObject::Pinned {
                 referent: SlotReferent { id, pin },
-                legality: true,
+                reading: ReferentReading::TargetLegality,
             },
             _ => return false,
         };
@@ -1724,7 +1738,7 @@ fn attached_to_declared_slot(
         state,
         AttachmentReferentObject::Pinned {
             referent,
-            legality: false,
+            reading: ReferentReading::EffectApplication,
         },
         candidate,
         candidate_id,

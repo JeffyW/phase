@@ -8885,6 +8885,21 @@ mod tests {
 
     #[test]
     fn parse_for_each_attached_to_them_not_source_bound() {
+        // Positive control: the same combinator on the same type, with the
+        // source referent, does bind to the source — so the negative below is
+        // a real discrimination, not an unreachable parser.
+        let (rest, source_bound) = parse_for_each_attached_to_source("curse attached to ~")
+            .expect("\"attached to ~\" binds to the source");
+        assert_eq!(rest, "");
+        assert!(
+            matches!(
+                &source_bound,
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(TypedFilter { properties, .. }),
+                } if properties.contains(&FilterProp::AttachedTo { to: AttachmentReferent::Source })
+            ),
+            "got {source_bound:?}"
+        );
         // CR 301.5a + CR 303.4: the singular-they "them" is recipient-anaphoric for
         // player-enchanting Auras (Curse of Thirst: "Curses attached to them" = the
         // enchanted player), so it must NOT bind to the source. The gendered arm

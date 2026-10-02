@@ -18,8 +18,8 @@
 //! CR 608.2b (illegal targets; information about an illegal target is not
 //! determined), CR 608.2c (instructions in order), CR 608.2d (choices made
 //! while applying the effect), CR 608.2h (last known information), CR 614.1a
-//! (replacement effects), CR 701.3a (attach), CR 701.8a/b (destroy;
-//! indestructible), CR 704.3 (no state-based actions during resolution),
+//! (replacement effects), CR 701.3a (attach), CR 701.8a (destroy),
+//! CR 702.12b (indestructible), CR 704.3 (no state-based actions during resolution),
 //! CR 400.7 (a moved object is a new object).
 //!
 //! Oracle text is verbatim from Scryfall.
@@ -552,7 +552,7 @@ fn light_of_judgment_lethal_damage_still_offers_the_equipment() {
     );
 }
 
-/// R6 (CR 701.8b): indestructible Equipment can be chosen but is not destroyed.
+/// R6 (CR 702.12b): indestructible Equipment can be chosen but is not destroyed.
 /// R7: the Equipment's controller is irrelevant — the caster's own Equipment on
 /// the opponent's creature is offered too.
 #[test]
@@ -582,7 +582,7 @@ fn light_of_judgment_indestructible_and_foreign_controller_equipment() {
     assert_eq!(
         runner.state().objects[&sturdy].zone,
         Zone::Battlefield,
-        "indestructible Equipment survives (CR 701.8b)"
+        "indestructible Equipment survives (CR 702.12b)"
     );
     assert_eq!(runner.state().objects[&mine].zone, Zone::Battlefield);
 }
@@ -1787,4 +1787,114 @@ fn compound_subject_rider_with_an_intervening_declarer_fails_closed() {
         "got {:?}",
         chain(&parsed.abilities[0])
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 2: stale Equipment target; controller-qualified dependent target
+// ---------------------------------------------------------------------------
+
+/// Fiery Annihilation announced at A / Equipment 1; then Equipment 1 is
+/// blinked (a new object, CR 400.7) and attached to A again. The copy's or
+/// spell's unchanged Equipment target names the OLD Equipment 1, so it is
+/// already illegal and may stay while the creature changes (CR 115.7d first
+/// clause). Returns the board with the responder's prompt open.
+fn stale_equipment_board(responder: fn(&CopyBoard) -> ObjectId) -> CopyBoard {
+    let mut board = copy_board();
+    let (a, eq1) = (board.a, board.eq1);
+    let who = responder(&board);
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| {
+            blink(state, eq1);
+            attach::attach_to(state, eq1, a);
+        },
+        who,
+    );
+    assert_eq!(
+        board.runner.state().objects[&eq1].attached_to,
+        Some(AttachTarget::Object(a)),
+        "reach guard: the new Equipment 1 is on A"
+    );
+    board
+}
+
+/// Copy (CR 707.10c + CR 115.7d): B is offered and accepted; the copy hits B
+/// (rider: exiled) and the new Equipment 1 is untouched by either spell.
+#[test]
+fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
+    let mut board = stale_equipment_board(|b| b.twincast);
+    let (a, b, eq1) = (board.a, board.b, board.eq1);
+    assert!(
+        copy_alternatives(&board.runner).contains(&TargetRef::Object(b)),
+        "the stale Equipment target does not block B"
+    );
+    board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b)),
+        })
+        .expect("A -> B accepted");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&b].zone, Zone::Exile);
+    assert_eq!(state.objects[&a].damage_marked, 5, "the original hit A");
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+}
+
+/// Choose new targets (CR 115.7d): A -> B keeping the stale Equipment target is
+/// accepted; B is hit and exiled, Equipment 1 stays.
+#[test]
+fn choose_new_targets_may_change_the_creature_when_its_equipment_target_was_blinked() {
+    let mut board = stale_equipment_board(|b| b.redirect);
+    let (a, b, eq1) = (board.a, board.b, board.eq1);
+    board
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[b, eq1]),
+        })
+        .expect("a stale unchanged target may stay");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&b].zone, Zone::Exile);
+    assert_eq!(state.objects[&a].damage_marked, 0);
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
+}
+
+/// CR 115.1a + CR 601.2c: a controller-qualified dependent target ("target
+/// Equipment you control / an opponent controls attached to that creature") is
+/// not supported — its slot is built through per-player construction, which
+/// does not compose with the declared-slot referent — so it keeps a gap. The
+/// unqualified shape is the supported control.
+#[test]
+fn controller_qualified_dependent_target_keeps_its_gap() {
+    for qualifier in ["you control ", "an opponent controls "] {
+        let text = format!(
+            "~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier}attached to that creature."
+        );
+        let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+        let effects = chain(&parsed.abilities[0]);
+        assert!(
+            !unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+            "{qualifier}: must keep a gap, got {effects:?}"
+        );
+        assert!(
+            !serde_json::to_string(&parsed.abilities[0])
+                .unwrap()
+                .contains("DeclaredTarget"),
+            "{qualifier}: no declared-slot referent may be emitted"
+        );
+    }
+    let parsed = parse_oracle_text(
+        "~ deals 5 damage to target creature. Exile up to one target Equipment attached to that creature.",
+        "Probe",
+        &[],
+        &types("Instant"),
+        &[],
+    );
+    assert!(unimplemented_names(&[&parsed.abilities[0]]).is_empty());
+    let Effect::ChangeZone { target, .. } = chain(&parsed.abilities[0])[1] else {
+        panic!("expected the Equipment exile");
+    };
+    assert_eq!(declared_slots(target), vec![0]);
 }

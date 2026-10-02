@@ -11166,7 +11166,9 @@ pub(crate) fn retarget_declared_view(
 
 /// CR 115.7d (second clause) + CR 115.7e ("only the final set of targets is
 /// evaluated"): every UNCHANGED addressed slot that was LEGAL in `pre` must
-/// still be legal in `post`. A slot that was ALREADY illegal stays accepted —
+/// still be legal in `post`. A slot that was ALREADY illegal — not in the
+/// legal set, or holding an incarnation that is no longer current
+/// (`target_is_current`, the CR 608.2b validator's authority) — stays accepted:
 /// CR 115.7d's FIRST clause. `Legacy` bindings are skipped (no filter).
 /// Legality uses the slot's addressed node and `pool_controller` (the
 /// retarget pool's controller authority); a filter that reads another declared
@@ -11187,6 +11189,13 @@ pub(crate) fn unchanged_targets_stay_legal(
                          node: &ResolvedAbility,
                          filter: &TargetFilter,
                          current: &TargetRef| {
+        // CR 400.7 + CR 608.2b: an unchanged target whose announced
+        // incarnation is gone names a new object — it is already illegal, so
+        // the CR 115.7d first clause lets it stay, whatever the live board
+        // holds under its id.
+        if !target_is_current(node, current, state) {
+            return false;
+        }
         if crate::game::filter::filter_reads_declared_slot(filter) {
             let view = retarget_declared_view(pre, chain);
             targeting::find_legal_targets_for_ability_with_view(

@@ -10295,10 +10295,11 @@ pub(super) fn parse_destroy_ast(
 /// CR 701.3a + CR 601.2c: when a parsed target phrase leaves an " attached to
 /// <referent>" qualifier unconsumed, bind it as a declared-slot attachment
 /// referent (`FilterProp::AttachedTo { to: DeclaredTarget { slot } }`) on every
-/// typed leg of `target`. `None` — the caller's fail-closed
-/// `attached_to_qualifier` gap — when the referent is not exactly one numbered
-/// declared slot ([`parse_attached_to_declared_referent`]) or a leg cannot carry
-/// the prop. A remainder with no attachment qualifier passes through unchanged.
+/// typed leg of `target` through the shared `distribute_shared_properties`. `None` — the
+/// caller's fail-closed `attached_to_qualifier` gap — when the referent is not
+/// exactly one numbered declared slot ([`parse_attached_to_declared_referent`]),
+/// `target` is outside the admissible shape ([`legs_admit_declared_referent`]),
+/// or a leg did not receive the prop. A remainder with no attachment qualifier passes through unchanged.
 pub(super) fn bind_attachment_qualifier<'a>(
     target: TargetFilter,
     rem: &'a str,
@@ -10308,7 +10309,43 @@ pub(super) fn bind_attachment_qualifier<'a>(
         return Some((target, rem));
     }
     let (prop, after) = parse_attached_to_declared_referent(rem, ctx)?;
-    Some((add_prop_to_each_typed_leg(target, &prop)?, after))
+    if !legs_admit_declared_referent(&target) {
+        return None;
+    }
+    let bound = crate::parser::oracle_target::distribute_shared_properties(
+        target,
+        std::slice::from_ref(&prop),
+    );
+    legs_carry(&bound, &prop).then_some((bound, after))
+}
+
+/// The strict admissible shape for a declared-slot attachment referent: a
+/// `Typed` filter or an `Or` of them, with no controller or owner scope. A
+/// controller-relative leg ("target Equipment you control attached to that
+/// creature") is built through the per-player slot construction, which does not
+/// compose with the declared-slot union, so it stays a gap.
+fn legs_admit_declared_referent(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            typed.controller.is_none()
+                && !typed
+                    .properties
+                    .iter()
+                    .any(|prop| matches!(prop, FilterProp::Owned { .. }))
+        }
+        TargetFilter::Or { filters } => filters.iter().all(legs_admit_declared_referent),
+        _ => false,
+    }
+}
+
+/// Every typed leg of `filter` carries `prop` — distribution skips a leg that
+/// already holds a prop of the same kind, which must not pass silently.
+fn legs_carry(filter: &TargetFilter, prop: &FilterProp) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed.properties.contains(prop),
+        TargetFilter::Or { filters } => filters.iter().all(|leg| legs_carry(leg, prop)),
+        _ => false,
+    }
 }
 
 /// CR 701.3a + CR 601.2c: " attached to <demonstrative>" naming exactly one
@@ -10334,25 +10371,6 @@ pub(super) fn parse_attached_to_declared_referent<'a>(
         },
         &remainder[remainder.len() - rest.len()..],
     ))
-}
-
-/// Push `prop` onto every `Typed` leg of `filter` ("all Auras and Equipment
-/// attached to …" lowers to an `Or` of typed legs). `None` for any other
-/// shape, which cannot carry a property.
-fn add_prop_to_each_typed_leg(filter: TargetFilter, prop: &FilterProp) -> Option<TargetFilter> {
-    match filter {
-        TargetFilter::Typed(mut typed) => {
-            typed.properties.push(prop.clone());
-            Some(TargetFilter::Typed(typed))
-        }
-        TargetFilter::Or { filters } => Some(TargetFilter::Or {
-            filters: filters
-                .into_iter()
-                .map(|leg| add_prop_to_each_typed_leg(leg, prop))
-                .collect::<Option<Vec<_>>>()?,
-        }),
-        _ => None,
-    }
 }
 
 /// Detect "target {player,opponent}'s {graveyard,library,hand}" prefixes.
