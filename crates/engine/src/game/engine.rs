@@ -16369,7 +16369,8 @@ pub(crate) fn validate_retarget_submission(
             };
             let retained_pin_lost = written.iter().enumerate().any(|(i, address)| {
                 !positions_changed.get(i).copied().unwrap_or(false)
-                    && pin_at(pre, address) != pin_at(&mutated, address)
+                    && pin_at(pre, address)
+                        .is_some_and(|announced| pin_at(&mutated, address) != Some(announced))
             });
             if retained_pin_lost {
                 return Err(EngineError::InvalidAction(
