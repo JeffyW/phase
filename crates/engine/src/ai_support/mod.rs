@@ -1056,6 +1056,7 @@ fn resolve_mana_option_for_trigger_probe(
     option: &mana_sources::ManaSourceOption,
 ) -> bool {
     let mut probe = state.clone();
+    let deferred_before = probe.deferred_triggers.len();
     let mut events = Vec::new();
 
     for (trigger_ref, override_value) in &option.taps_for_mana_overrides {
@@ -1118,7 +1119,7 @@ fn resolve_mana_option_for_trigger_probe(
         });
     }
 
-    triggers::events_would_queue_non_mana_trigger(&mut probe, &events)
+    triggers::simulated_action_would_queue_non_mana_trigger(&mut probe, deferred_before, &events)
 }
 
 fn activate_mana_action_would_queue_non_mana_trigger(
@@ -1156,6 +1157,7 @@ fn activate_mana_action_would_queue_non_mana_trigger(
         return false;
     };
     let mut probe = state.clone();
+    let deferred_before = probe.deferred_triggers.len();
     let mut events = Vec::new();
     if mana_abilities::resolve_mana_ability(
         &mut probe,
@@ -1169,7 +1171,7 @@ fn activate_mana_action_would_queue_non_mana_trigger(
     {
         return false;
     }
-    triggers::events_would_queue_non_mana_trigger(&mut probe, &events)
+    triggers::simulated_action_would_queue_non_mana_trigger(&mut probe, deferred_before, &events)
 }
 
 fn tap_land_action_would_queue_non_mana_trigger(

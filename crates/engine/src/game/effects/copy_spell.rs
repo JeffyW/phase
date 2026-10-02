@@ -760,6 +760,22 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
                 .map(|entry| Box::new(CopySource::on_stack(entry)))
                 .map_or(CopySourceLookup::Absent, CopySourceLookup::Source);
         }
+        // CR 605.3b: "copy that ability" anaphoric to a mana ability's
+        // activation names nothing on the stack — a mana ability never uses
+        // it. Every lookup below (the anaphoric target's same-source entry,
+        // the triggering-entry fallback, the top of the stack) would otherwise
+        // bind an unrelated stack object. A declared target is still honoured.
+        if target.is_context_ref()
+            && matches!(
+                state.current_trigger_event,
+                Some(GameEvent::AbilityActivated {
+                    kind: crate::types::events::ActivatedAbilityKind::Mana,
+                    ..
+                })
+            )
+        {
+            return CopySourceLookup::Absent;
+        }
     }
     // CR 400.7 + CR 603.7c: covers the partial-stale case, and is defence in
     // depth for any future caller of `copy_source_entry` that does not pass
@@ -980,6 +996,18 @@ fn spell_ability_definition(abilities: &[AbilityDefinition]) -> Option<AbilityDe
 /// points at the wrong entry — bind from the triggering event's spell instead.
 fn triggering_spell_stack_entry(state: &GameState) -> Option<StackEntry> {
     let event = state.current_trigger_event.as_ref()?;
+    // CR 605.3b: a mana ability never uses the stack, so there is no stack
+    // entry for "that ability" to copy; the same-source fallback below would
+    // otherwise bind an unrelated activation of the same permanent.
+    if matches!(
+        event,
+        GameEvent::AbilityActivated {
+            kind: crate::types::events::ActivatedAbilityKind::Mana,
+            ..
+        }
+    ) {
+        return None;
+    }
     let object_id = crate::game::targeting::extract_source_from_event(event)?;
     if matches!(event, GameEvent::AbilityActivated { .. }) {
         if let Some(entry) = state.stack.iter().rev().find(|entry| {
@@ -3064,6 +3092,8 @@ mod tests {
             player_id: PlayerId(0),
             source_id: source_creature,
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3216,6 +3246,8 @@ mod tests {
             player_id: PlayerId(0),
             source_id: basalt,
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3289,6 +3321,8 @@ mod tests {
             player_id: PlayerId(0),
             source_id: source_creature,
             kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
         });
 
         let copy_effect = ResolvedAbility::new(

@@ -106,12 +106,20 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  83 — game_setup and state_update carry GameState, whose attachment filters
+ *  85 — game_setup and state_update carry GameState, whose attachment filters
  *       are now one AttachedTo prop with a tagged `to` referent in place of the
  *       AttachedToSource / AttachedToRecipient / AttachedToPlayer tags. Both
- *       peers are browsers and neither validates the shape, so a v82 peer
+ *       peers are browsers and neither validates the shape, so a v84 peer
  *       would take the new shape with no decode error; first contact rejects
- *       the skew instead. Bumped in lockstep with full-game protocol 101.
+ *       the skew instead. Bumped in lockstep with full-game protocol 103.
+ *  84 — full-game protocol 102 adds the SharedCardTypes quantity tag in
+ *       serialized ability definitions. Keep the existing P2P handshake in
+ *       lockstep with full-game protocol 102.
+ *  83 — game_setup and state_update carry GameState, whose events now include
+ *       mana-ability activations (AbilityActivated kind "Mana") and a
+ *       departed-source LKI. A v82 peer would not recognize the kind; first
+ *       contact rejects the skew instead. Bumped in lockstep with full-game
+ *       protocol 101.
  *  82 — game_setup and state_update carry GameState, whose additional-phase
  *       abilities now name what they add as a TurnSegment (segment, and
  *       followed_by's elements) in place of a Phase, and who gets it as an
@@ -525,7 +533,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 83 as const;
+export const WIRE_PROTOCOL_VERSION = 85 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

@@ -5025,6 +5025,7 @@ fn counters_on_source_provably_excludes_class(
         scoped_player: None,
         damage_source: None,
         event_amount: None,
+        spell: None,
     };
     crate::game::quantity::object_id_for_scope(state, ObjectScope::Source, ctx, &[])
         .is_some_and(|read_id| read_id != class_member)
@@ -27203,6 +27204,7 @@ mod tests {
             scoped_player: None,
             damage_source: None,
             event_amount: None,
+            spell: None,
         };
         assert_eq!(
             crate::game::quantity::object_id_for_scope(
@@ -27229,6 +27231,7 @@ mod tests {
             scoped_player: None,
             damage_source: None,
             event_amount: None,
+            spell: None,
         };
         assert_eq!(
             crate::game::quantity::object_id_for_scope(
