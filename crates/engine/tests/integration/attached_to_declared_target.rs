@@ -1794,36 +1794,58 @@ fn compound_subject_rider_with_an_intervening_declarer_fails_closed() {
 // ---------------------------------------------------------------------------
 
 /// Fiery Annihilation announced at A / Equipment 1; then Equipment 1 is
-/// blinked (a new object, CR 400.7) and attached to A again. The copy's or
-/// spell's unchanged Equipment target names the OLD Equipment 1, so it is
-/// already illegal and may stay while the creature changes (CR 115.7d first
-/// clause). Returns the board with the responder's prompt open.
-fn stale_equipment_board(responder: fn(&CopyBoard) -> ObjectId) -> CopyBoard {
+/// blinked (a new object, CR 400.7) and the new Equipment 1 is attached to
+/// `host`. Returns the board with the responder's prompt open.
+fn stale_equipment_board(
+    responder: fn(&CopyBoard) -> ObjectId,
+    host: fn(&CopyBoard) -> ObjectId,
+) -> CopyBoard {
     let mut board = copy_board();
     let (a, eq1) = (board.a, board.eq1);
     let who = responder(&board);
+    let host = host(&board);
     fiery_then(
         &mut board,
         &[a, eq1],
         |state| {
             blink(state, eq1);
-            attach::attach_to(state, eq1, a);
+            attach::attach_to(state, eq1, host);
         },
         who,
     );
     assert_eq!(
         board.runner.state().objects[&eq1].attached_to,
-        Some(AttachTarget::Object(a)),
-        "reach guard: the new Equipment 1 is on A"
+        Some(AttachTarget::Object(host)),
+        "reach guard: the new Equipment 1 is on its host"
     );
     board
 }
 
-/// Copy (CR 707.10c + CR 115.7d): B is offered and accepted; the copy hits B
+/// The incarnation the spell `spell`'s Equipment node pins for `eq`.
+fn equipment_pin(runner: &GameRunner, spell: ObjectId, eq: ObjectId) -> u64 {
+    runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == spell)
+        .and_then(|entry| entry.ability())
+        .and_then(|ability| ability.sub_ability.as_deref())
+        .and_then(|node| {
+            node.selected_target_incarnations
+                .iter()
+                .find(|pin| pin.object_id == eq)
+        })
+        .map(|pin| pin.incarnation)
+        .expect("the Equipment node pins Equipment 1")
+}
+
+/// Copy (CR 707.10c + CR 115.7d): the root-only copy choice never writes the
+/// Equipment position, so the stale Equipment target stays unchanged (its pin
+/// is kept) and is already illegal; B is offered and accepted. The copy hits B
 /// (rider: exiled) and the new Equipment 1 is untouched by either spell.
 #[test]
 fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
-    let mut board = stale_equipment_board(|b| b.twincast);
+    let mut board = stale_equipment_board(|b| b.twincast, |b| b.a);
     let (a, b, eq1) = (board.a, board.b, board.eq1);
     assert!(
         copy_alternatives(&board.runner).contains(&TargetRef::Object(b)),
@@ -1835,6 +1857,18 @@ fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
             target: Some(TargetRef::Object(b)),
         })
         .expect("A -> B accepted");
+    let copy_id = board
+        .runner
+        .state()
+        .stack
+        .back()
+        .map(|entry| entry.id)
+        .expect("the copy is on the stack");
+    assert_eq!(
+        equipment_pin(&board.runner, copy_id, eq1),
+        0,
+        "the copy keeps the announced Equipment pin"
+    );
     board.runner.advance_until_stack_empty();
     let state = board.runner.state();
     assert_eq!(state.objects[&b].zone, Zone::Exile);
@@ -1842,23 +1876,50 @@ fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
     assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
 }
 
-/// Choose new targets (CR 115.7d): A -> B keeping the stale Equipment target is
-/// accepted; B is hit and exiled, Equipment 1 stays.
+/// Choose new targets (CR 115.7a + CR 115.7e + CR 400.7): resubmitting the
+/// same id for a target whose announced object is gone ELECTS the new object
+/// (phase-rs/phase#8355 H2), so it is validated as a changed target against
+/// the final selection. With the new Equipment 1 on A and the creature moved
+/// to B it is illegal: the submission is refused and nothing is re-pinned.
 #[test]
-fn choose_new_targets_may_change_the_creature_when_its_equipment_target_was_blinked() {
-    let mut board = stale_equipment_board(|b| b.redirect);
-    let (a, b, eq1) = (board.a, board.b, board.eq1);
+fn choose_new_targets_refuses_a_same_id_re_election_illegal_for_the_new_creature() {
+    let mut board = stale_equipment_board(|b| b.redirect, |b| b.a);
+    let (b, eq1, fiery) = (board.b, board.eq1, board.fiery);
+    assert_eq!(equipment_pin(&board.runner, fiery, eq1), 0, "reach guard");
+    assert!(
+        board
+            .runner
+            .act(GameAction::RetargetSpell {
+                new_targets: objects(&[b, eq1]),
+            })
+            .is_err(),
+        "the new Equipment 1 is not attached to B"
+    );
+    assert_eq!(
+        equipment_pin(&board.runner, fiery, eq1),
+        0,
+        "no pin revival on a refused submission"
+    );
+}
+
+/// Discriminator for the test above: with the new Equipment 1 on B, the same
+/// submission is a legal election of the new object — accepted, re-pinned,
+/// and Fiery Annihilation exiles it along with B.
+#[test]
+fn choose_new_targets_accepts_a_same_id_re_election_legal_for_the_new_creature() {
+    let mut board = stale_equipment_board(|b| b.redirect, |b| b.b);
+    let (b, eq1, fiery) = (board.b, board.eq1, board.fiery);
     board
         .runner
         .act(GameAction::RetargetSpell {
             new_targets: objects(&[b, eq1]),
         })
-        .expect("a stale unchanged target may stay");
+        .expect("electing the new Equipment 1 on B is legal");
+    assert_ne!(equipment_pin(&board.runner, fiery, eq1), 0, "re-pinned");
     board.runner.advance_until_stack_empty();
     let state = board.runner.state();
+    assert_eq!(state.objects[&eq1].zone, Zone::Exile);
     assert_eq!(state.objects[&b].zone, Zone::Exile);
-    assert_eq!(state.objects[&a].damage_marked, 0);
-    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
 }
 
 /// CR 115.1a + CR 601.2c: a controller-qualified dependent target ("target
@@ -1875,8 +1936,19 @@ fn controller_qualified_dependent_target_keeps_its_gap() {
         let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
         let effects = chain(&parsed.abilities[0]);
         assert!(
-            !unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
-            "{qualifier}: must keep a gap, got {effects:?}"
+            matches!(effects[0], Effect::DealDamage { .. }),
+            "{qualifier}: reach guard, the damage head parses, got {effects:?}"
+        );
+        // The exile path's fail-closed gap (`parse_exile_ast` declines the
+        // whole clause), carrying the qualified fragment.
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Unimplemented { name, description: Some(text), .. }
+                    if name == "unparsed_verb_arguments"
+                        && text.contains(&format!("Equipment {qualifier}attached to that creature"))
+            )),
+            "{qualifier}: must keep the qualified-clause gap, got {effects:?}"
         );
         assert!(
             !serde_json::to_string(&parsed.abilities[0])

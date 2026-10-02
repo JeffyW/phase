@@ -16164,6 +16164,34 @@ fn apply_retarget(
         ));
     }
 
+    // CR 115.7d + CR 400.7: which positions this submission CHANGES, by the
+    // write loop's own predicate (`retarget_positions_changed`). A same-ID
+    // entry whose announced incarnation is gone is written as a NEW target
+    // (phase-rs/phase#8355 H2), so it is not exempt as unchanged: CR 115.7a
+    // requires it to be a legal alternative, which `retarget_slot_violation`'s
+    // raw-equality exemption above did not check.
+    let positions_changed = state.stack[stack_entry_index]
+        .ability()
+        .map(|pre| {
+            crate::game::ability_utils::retarget_positions_changed(
+                state,
+                pre,
+                &derived,
+                &new_targets,
+            )
+        })
+        .unwrap_or_default();
+    for (i, changed) in positions_changed.iter().enumerate() {
+        if *changed
+            && current_targets.get(i) == new_targets.get(i)
+            && !pool_for(i).contains(&new_targets[i])
+        {
+            return Err(EngineError::InvalidAction(format!(
+                "Retarget: chosen target is not legal for target slot {i}"
+            )));
+        }
+    }
+
     // CR 115.7d: "choose new targets" is an operation on the SPELL, so it
     // writes every chain node that owns an addressed slot, not only the root
     // — and the target-incarnation pin refresh follows the same address,
@@ -16239,7 +16267,12 @@ fn apply_retarget(
             let Some(old) = node.targets.get(address.slot).cloned() else {
                 continue;
             };
-            let refresh = node.retarget_target_requires_pin_refresh(&old, new_target, state);
+            // The same verdict validation used (`positions_changed`); computed
+            // on the pre-write chain, so an earlier position's pin refresh on
+            // this node cannot change it.
+            let refresh = positions_changed.get(i).copied().unwrap_or_else(|| {
+                node.retarget_target_requires_pin_refresh(&old, new_target, state)
+            });
             node.targets[address.slot] = new_target.clone();
             if refresh {
                 let pin = match new_target {
@@ -16277,8 +16310,7 @@ fn apply_retarget(
     // happens below, only once this whole pass succeeds).
     let pre_write = state.stack[stack_entry_index].ability().cloned();
     if let Some(pre_write) = pre_write.as_ref() {
-        let changed =
-            |i: usize| i < new_targets.len() && current_targets.get(i) != new_targets.get(i);
+        let changed = |i: usize| positions_changed.get(i).copied().unwrap_or(false);
         crate::game::ability_utils::unchanged_targets_stay_legal(
             state,
             pre_write,

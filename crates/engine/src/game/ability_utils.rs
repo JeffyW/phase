@@ -11113,16 +11113,60 @@ pub(crate) fn copy_retarget_edit_is_legal(
     if bindings.is_empty() {
         return Ok(post);
     }
+    // The copy write's own verdict (`copy_retarget_post_chain`): a position
+    // changed when its target or its selected-target pin differs — so an
+    // explicit same-ID election of a returned object (phase-rs/phase#7235) is
+    // validated as a changed target, while a position the root-only write
+    // never touches (a sub-node's target) stays unchanged.
     let changed = |i: usize| {
         let address = &bindings[i].address;
         let at = |chain: &ResolvedAbility| {
-            node_at(chain, &address.path).and_then(|node| node.targets.get(address.slot).cloned())
+            node_at(chain, &address.path).and_then(|node| {
+                let target = node.targets.get(address.slot).cloned()?;
+                let pin = match &target {
+                    TargetRef::Object(id) => node
+                        .selected_target_incarnations
+                        .iter()
+                        .find(|pin| pin.object_id == *id)
+                        .copied(),
+                    TargetRef::Player(_) => None,
+                };
+                Some((target, pin))
+            })
         };
         at(pre) != at(&post)
     };
     unchanged_targets_stay_legal(state, pre, &post, &bindings, &changed, pool_controller)?;
     changed_dependent_targets_are_legal(state, pre, &post, &bindings, &changed, pool_controller)?;
     Ok(post)
+}
+
+/// CR 115.7d + CR 400.7: for each addressed position of `bindings`, whether
+/// submitting `new_targets[i]` CHANGES that position — the write path's own
+/// predicate (`ResolvedAbility::retarget_target_requires_pin_refresh` on the
+/// addressed node of `pre`): a different target, or the same id whose
+/// announced incarnation is gone (electing the new object, phase-rs/phase#8355
+/// H2). `apply_retarget`'s write loop and its validation both read this one
+/// vector, so an entry the write re-pins is never validated as unchanged.
+pub(crate) fn retarget_positions_changed(
+    state: &GameState,
+    pre: &ResolvedAbility,
+    bindings: &[RetargetSlotBinding],
+    new_targets: &[TargetRef],
+) -> Vec<bool> {
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(i, binding)| {
+            let (Some(new), Some(node)) = (new_targets.get(i), node_at(pre, &binding.address.path))
+            else {
+                return false;
+            };
+            node.targets
+                .get(binding.address.slot)
+                .is_some_and(|old| node.retarget_target_requires_pin_refresh(old, new, state))
+        })
+        .collect()
 }
 
 pub(crate) fn node_at_mut<'a>(
@@ -11140,11 +11184,12 @@ pub(crate) fn node_at_mut<'a>(
 }
 
 /// CR 601.2c + CR 115.7: the declared-target view of `chain` for a legality
-/// check during retargeting. A declared position whose target equals the
-/// announcement (`announced`, the chain as it stood before any edit) is
+/// check during retargeting. A declared position whose target AND pin equal
+/// the announcement (`announced`, the chain as it stood before any edit) is
 /// `Announced` with its declaring node's pin, so an unchanged reference is
 /// never rebound to a later object that reuses its storage id (CR 400.7); a
-/// position the edit changed is `Elected` (the live object being chosen now).
+/// position the edit changed — including a same-id re-election, whose pin the
+/// write refreshed — is `Elected` (the live object being chosen now).
 pub(crate) fn retarget_declared_view(
     announced: &ResolvedAbility,
     chain: &ResolvedAbility,
@@ -11155,7 +11200,7 @@ pub(crate) fn retarget_declared_view(
         .enumerate()
         .map(|(position, entry)| {
             Some(match before.get(position) {
-                Some(original) if original.target == entry.target => {
+                Some(original) if original.target == entry.target && original.pin == entry.pin => {
                     targeting::DeclaredSlotBinding::Announced {
                         target: original.target.clone(),
                         pin: original.pin,
