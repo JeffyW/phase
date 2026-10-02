@@ -2373,3 +2373,110 @@ fn four_target_prompt_opens_and_accepts_the_anchor_and_the_full_election() {
     assert_eq!(state.objects[&ft].zone, Zone::Exile);
     assert!(state.objects[&c].tapped && state.objects[&l2].tapped);
 }
+
+// ---------------------------------------------------------------------------
+// Round 6: one object in two positions of one node (id-keyed pins)
+// ---------------------------------------------------------------------------
+
+/// Exchange-style spell targeting artifact creature A in BOTH positions of one
+/// node; A then leaves and returns (a new object) and loses the artifact type,
+/// so the new A is a legal choice for the creature position only. Returns the
+/// runner with "choose new targets" open, plus `(spell, a)`.
+fn same_object_two_positions_board(
+    text: &str,
+    with_player: bool,
+) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario
+        .add_creature(P1, "Artifact Creature A", 2, 7)
+        .as_artifact()
+        .as_creature()
+        .id();
+    let spell = free_spell(&mut scenario, "Probe", true, text);
+    let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+    let mut runner = scenario.build();
+    let commit = runner.cast(spell).target_objects(&[a, a]);
+    let commit = if with_player {
+        commit.target_player(P1)
+    } else {
+        commit
+    };
+    commit.commit();
+    blink(runner.state_mut(), a);
+    runner.state_mut().add_transient_continuous_effect(
+        a,
+        P1,
+        engine::types::ability::Duration::UntilEndOfTurn,
+        TargetFilter::SpecificObject { id: a },
+        vec![engine::types::ability::ContinuousModification::RemoveType {
+            core_type: engine::types::CoreType::Artifact,
+        }],
+        None,
+    );
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    assert!(!runner.state().objects[&a]
+        .card_types
+        .core_types
+        .contains(&engine::types::CoreType::Artifact));
+    runner.cast(redirect).target_objects(&[spell]).commit();
+    drive_to_retarget_prompt(&mut runner);
+    let WaitingFor::RetargetChoice { slot_pools, .. } = &runner.state().waiting_for else {
+        panic!("expected RetargetChoice");
+    };
+    assert!(
+        !slot_pools[0].contains(&TargetRef::Object(a))
+            && slot_pools[1].contains(&TargetRef::Object(a)),
+        "reach guard: the new A is legal for the creature position only"
+    );
+    (runner, spell, a)
+}
+
+/// CR 115.3 + CR 115.7d + CR 400.7: resubmitting `[A, A]` would elect the new
+/// A in the creature position, which (pins being keyed by object id) would
+/// re-pin the artifact position the verdict retains — that reading cannot be
+/// realized, so the exact resubmission is read as leaving every target
+/// unchanged: accepted, the announced pin kept.
+#[test]
+fn same_object_in_two_positions_anchor_keeps_its_announced_pin() {
+    const EXCHANGE: &str = "Exchange control of target artifact and target creature.";
+    let (mut runner, spell, a) = same_object_two_positions_board(EXCHANGE, false);
+    assert_eq!(root_pin(&runner, spell, a), 0, "reach guard");
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[a, a]),
+        })
+        .expect("leaving every target unchanged is accepted");
+    assert_eq!(root_pin(&runner, spell, a), 0, "the retained pin is kept");
+}
+
+/// A partial change cannot carry the same unrealizable reading: changing the
+/// player while resubmitting `[A, A]` is refused, and nothing is re-pinned.
+/// Control: the exact resubmission on the same board is accepted.
+#[test]
+fn same_object_in_two_positions_partial_change_is_refused() {
+    const TEXT: &str =
+        "Exchange control of target artifact and target creature. Target player loses 1 life.";
+    let parsed = parse_oracle_text(TEXT, "Probe", &[], &types("Instant"), &[]);
+    assert!(
+        unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+        "reach guard"
+    );
+    let (mut runner, spell, a) = same_object_two_positions_board(TEXT, true);
+    let mut changed = objects(&[a, a]);
+    changed.push(TargetRef::Player(P0));
+    assert!(runner
+        .act(GameAction::RetargetSpell {
+            new_targets: changed,
+        })
+        .is_err());
+    assert_eq!(root_pin(&runner, spell, a), 0);
+    let mut anchor = objects(&[a, a]);
+    anchor.push(TargetRef::Player(P1));
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: anchor,
+        })
+        .expect("the exact resubmission is accepted");
+    assert_eq!(root_pin(&runner, spell, a), 0);
+}

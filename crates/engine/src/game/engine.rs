@@ -16348,6 +16348,37 @@ pub(crate) fn validate_retarget_submission(
         }
         crate::game::ability_utils::restamp_derived_chain_targets(&mut mutated);
 
+        // CR 115.7d + CR 400.7: a position this reading RETAINS must still name
+        // its announced incarnation. Pins are keyed by object id per node, so
+        // electing a new incarnation at one position re-pins every position on
+        // that node holding the same id; a reading that cannot keep a retained
+        // position's pin cannot be realized and is refused (an exact
+        // resubmission then falls back to leaving every target unchanged).
+        if let Some(pre) = state.stack[stack_entry_index].ability() {
+            let pin_at = |chain: &crate::types::ability::ResolvedAbility,
+                          address: &RetargetSlotAddress| {
+                let node = crate::game::ability_utils::node_at(chain, &address.path)?;
+                match node.targets.get(address.slot)? {
+                    TargetRef::Object(id) => node
+                        .selected_target_incarnations
+                        .iter()
+                        .find(|pin| pin.object_id == *id)
+                        .copied(),
+                    TargetRef::Player(_) => None,
+                }
+            };
+            let retained_pin_lost = written.iter().enumerate().any(|(i, address)| {
+                !positions_changed.get(i).copied().unwrap_or(false)
+                    && pin_at(pre, address) != pin_at(&mutated, address)
+            });
+            if retained_pin_lost {
+                return Err(EngineError::InvalidAction(
+                    "Retarget: a retained target would lose its announced incarnation"
+                        .to_string(),
+                ));
+            }
+        }
+
         // CR 115.7d (second clause) + CR 115.7e ("only the final set of targets is
         // evaluated"): after the write, every UNCHANGED addressed slot that was
         // LEGAL before the change must still be legal. A slot that was ALREADY
