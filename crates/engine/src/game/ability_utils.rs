@@ -2,12 +2,13 @@
 use crate::types::ability::TapStateChange;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost, AttachSelection,
-    CardTypeSetSource, CastManaSpentMetric, CombatRelationSubject, ControllerRef, CountBinding,
-    CounterMoveSelection, DamageSource, EachDamageRecipient, Effect, EffectKind, EffectScope,
-    FilterProp, GameRestriction, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
-    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    ResolvedAbility, RestrictionPlayerScope, SpellContext, SubAbilityLink, TargetChoiceTiming,
-    TargetFilter, TargetReadOrigin, TargetRef, TriggerDefinition, TypeFilter, TypedFilter,
+    AttachmentReferent, CardTypeSetSource, CastManaSpentMetric, CombatRelationSubject,
+    ControllerRef, CountBinding, CounterMoveSelection, DamageSource, EachDamageRecipient, Effect,
+    EffectKind, EffectScope, FilterProp, GameRestriction, ModalChoice, ModalSelectionCondition,
+    ModalSelectionConstraint, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue,
+    QuantityExpr, QuantityRef, ResolvedAbility, RestrictionPlayerScope, SpellContext,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TargetReadOrigin, TargetRef,
+    TriggerDefinition, TypeFilter, TypedFilter,
 };
 // CR 601.2c: mana recipient / count-source role slot gate.
 use crate::types::ability::mana_multi_role;
@@ -2057,13 +2058,51 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
 /// on what an inherited entry is. Genuinely distinct printed target words keep
 /// their multiplicity.
 pub fn declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    fn visit(ability: &ResolvedAbility, targets_are_inherited: bool, out: &mut Vec<TargetRef>) {
+    declared_target_entries_in_chain(ability)
+        .into_iter()
+        .map(|entry| entry.target)
+        .collect()
+}
+
+/// CR 601.2c + CR 400.7: one declared target slot, with the announcement pin
+/// recorded for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeclaredTargetEntry {
+    pub(crate) target: TargetRef,
+    /// The selected-target pin of `target`, read from the DECLARING node's own
+    /// `selected_target_incarnations` by object id — the contract
+    /// `ResolvedAbility::update_selected_target_incarnation` writes. Two declared
+    /// positions holding the same object on one node share that node's pin.
+    /// `None` for a player target, or when the declaring node holds no pin.
+    pub(crate) pin: Option<ObjectIncarnationRef>,
+}
+
+/// CR 601.2c: [`declared_targets_in_chain`] with each slot's pin. The single
+/// walker both share, so slot numbering is identical by construction.
+pub(crate) fn declared_target_entries_in_chain(
+    ability: &ResolvedAbility,
+) -> Vec<DeclaredTargetEntry> {
+    fn visit(
+        ability: &ResolvedAbility,
+        targets_are_inherited: bool,
+        out: &mut Vec<DeclaredTargetEntry>,
+    ) {
         if let Some(sub_ability) = paid_instead_delegate(ability) {
             visit(sub_ability, targets_are_inherited, out);
             return;
         }
         if !targets_are_inherited {
-            out.extend(chain_node_targets(ability));
+            out.extend(chain_node_targets(ability).into_iter().map(|target| {
+                let pin = match &target {
+                    TargetRef::Object(id) => ability
+                        .selected_target_incarnations
+                        .iter()
+                        .find(|pin| pin.object_id == *id)
+                        .copied(),
+                    TargetRef::Player(_) => None,
+                };
+                DeclaredTargetEntry { target, pin }
+            }));
         }
         if let Some(sub_ability) = ability.sub_ability.as_deref() {
             visit(
@@ -2077,9 +2116,9 @@ pub fn declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
         }
     }
 
-    let mut targets = Vec::new();
-    visit(ability, false, &mut targets);
-    targets
+    let mut entries = Vec::new();
+    visit(ability, false, &mut entries);
+    entries
 }
 
 /// CR 115.10a: whether `sub`'s own `targets` are a carried snapshot of
@@ -2492,12 +2531,14 @@ fn target_is_current(ability: &ResolvedAbility, target: &TargetRef, state: &Game
 }
 
 fn validate_pinned_targets(
+    view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
     state: &GameState,
     targets: &[TargetRef],
     filter: &TargetFilter,
     ability: &ResolvedAbility,
 ) -> Vec<TargetRef> {
     validate_pinned_targets_for_slot(
+        view,
         state,
         targets,
         AbilityTargetSlot::Unpositioned(filter),
@@ -2506,6 +2547,7 @@ fn validate_pinned_targets(
 }
 
 fn validate_pinned_targets_for_slot(
+    view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
     state: &GameState,
     targets: &[TargetRef],
     slot: AbilityTargetSlot<'_>,
@@ -2514,7 +2556,30 @@ fn validate_pinned_targets_for_slot(
     // CR 608.2b + CR 115.4: a damage "any target" is rechecked against the same
     // creature/player/planeswalker/battle domain it was chosen from, in addition
     // to the ordinary ability-context legality check (narrowing only).
-    let mut legal = targeting::validate_targets_for_ability(state, targets, slot.filter(), ability);
+    //
+    // CR 608.2b + CR 601.2c: a filter whose legality depends on another declared
+    // target slot ("Equipment attached to that creature") is rechecked against
+    // the VALIDATED declared view, so an illegal referent makes the dependent
+    // target illegal too ("If part of the effect requires information about an
+    // illegal target, it fails to determine any such information"). Every other
+    // filter keeps the unchanged ability-context check.
+    let mut legal = match view {
+        Some(view) if crate::game::filter::filter_reads_declared_slot(slot.filter()) => {
+            let legal = targeting::find_legal_targets_for_ability_with_view(
+                state,
+                slot.filter(),
+                ability,
+                ability.controller,
+                view,
+            );
+            targets
+                .iter()
+                .filter(|target| legal.contains(target))
+                .cloned()
+                .collect()
+        }
+        _ => targeting::validate_targets_for_ability(state, targets, slot.filter(), ability),
+    };
     if let Some(domain) = damage_any_target_legal_targets(state, ability, slot) {
         legal.retain(|t| domain.contains(t));
     }
@@ -2525,7 +2590,58 @@ fn validate_pinned_targets_for_slot(
 }
 
 pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> ResolvedAbility {
+    let mut view = Vec::new();
+    validate_targets_in_chain_with_view(state, ability, &mut view, false)
+}
+
+/// CR 608.2b: append the declared target positions `declared` (the node as
+/// announced) contributes to the validated declared view, in the
+/// `declared_targets_in_chain` order and with the same exclusions — an inherited
+/// rider's snapshot and a paid-"instead" delegator's mirror contribute nothing.
+/// A position whose target did not survive validation becomes a hole (`None`).
+/// Survivors are matched to declared positions by multiset, exactly as
+/// `visit_illegal_declared_target_slots` does, so holes come from the original
+/// declared positions rather than from the compacted survivor list.
+fn append_validated_declared_positions(
+    declared: &ResolvedAbility,
+    validated: &ResolvedAbility,
+    targets_are_inherited: bool,
+    view: &mut Vec<Option<targeting::DeclaredSlotBinding>>,
+) {
+    if targets_are_inherited || paid_instead_delegate(declared).is_some() {
+        return;
+    }
+    let mut survivors = validated.targets.clone();
+    for target in chain_node_targets(declared) {
+        let survived = survivors
+            .iter()
+            .position(|survivor| *survivor == target)
+            .map(|found| survivors.swap_remove(found));
+        view.push(survived.map(|target| {
+            let pin = match &target {
+                TargetRef::Object(id) => declared
+                    .selected_target_incarnations
+                    .iter()
+                    .find(|pin| pin.object_id == *id)
+                    .copied(),
+                TargetRef::Player(_) => None,
+            };
+            targeting::DeclaredSlotBinding::Announced { target, pin }
+        }));
+    }
+}
+
+fn validate_targets_in_chain_with_view(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    view_out: &mut Vec<Option<targeting::DeclaredSlotBinding>>,
+    targets_are_inherited: bool,
+) -> ResolvedAbility {
     let mut validated = ability.clone();
+    // The declared positions of every EARLIER node, as validated; read only by
+    // filters that depend on another declared slot.
+    let view_snapshot = view_out.clone();
+    let view: Option<&[Option<targeting::DeclaredSlotBinding>]> = Some(&view_snapshot);
     validated.targets = if is_per_opponent_target_fanout(&validated) {
         validate_per_opponent_target_fanout_targets(state, &validated)
     } else if let Effect::MoveCounters {
@@ -2541,6 +2657,7 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             .zip(validated.targets.iter())
             .filter_map(|(filter, target_ref)| {
                 let legal = validate_pinned_targets(
+                    view,
                     state,
                     std::slice::from_ref(target_ref),
                     filter,
@@ -2574,10 +2691,15 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             let Some(target_ref) = target_iter.next() else {
                 continue;
             };
-            if let Some(legal) =
-                validate_pinned_targets(state, std::slice::from_ref(target_ref), filter, &validated)
-                    .into_iter()
-                    .next()
+            if let Some(legal) = validate_pinned_targets(
+                view,
+                state,
+                std::slice::from_ref(target_ref),
+                filter,
+                &validated,
+            )
+            .into_iter()
+            .next()
             {
                 kept.push(legal);
             }
@@ -2678,10 +2800,15 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             let Some(target_ref) = target_iter.next() else {
                 continue;
             };
-            if let Some(legal) =
-                validate_pinned_targets(state, std::slice::from_ref(target_ref), filter, &validated)
-                    .into_iter()
-                    .next()
+            if let Some(legal) = validate_pinned_targets(
+                view,
+                state,
+                std::slice::from_ref(target_ref),
+                filter,
+                &validated,
+            )
+            .into_iter()
+            .next()
             {
                 kept.push(legal);
             }
@@ -2765,8 +2892,14 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             let Some(target_ref) = target_iter.next() else {
                 break;
             };
-            if !validate_pinned_targets(state, std::slice::from_ref(target_ref), filter, &validated)
-                .is_empty()
+            if !validate_pinned_targets(
+                view,
+                state,
+                std::slice::from_ref(target_ref),
+                filter,
+                &validated,
+            )
+            .is_empty()
             {
                 any_legal = true;
             }
@@ -2792,6 +2925,7 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                     continue;
                 };
                 if let Some(legal) = validate_pinned_targets(
+                    view,
                     state,
                     std::slice::from_ref(target_ref),
                     filter,
@@ -2836,10 +2970,16 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             let explicit: Vec<TargetRef> = candidate_targets
                 .iter()
                 .filter(|t| {
-                    validate_pinned_targets(state, std::slice::from_ref(t), target, &validated)
-                        .into_iter()
-                        .next()
-                        .is_some()
+                    validate_pinned_targets(
+                        view,
+                        state,
+                        std::slice::from_ref(t),
+                        target,
+                        &validated,
+                    )
+                    .into_iter()
+                    .next()
+                    .is_some()
                 })
                 .cloned()
                 .collect();
@@ -2887,7 +3027,7 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // would fizzle-filter the spell to battlefield presence and drop it
         // (the spell lives on the STACK). Re-validate against the source leaf
         // (`InZone Stack`-aware) instead, preserving the spell target.
-        validate_pinned_targets(state, &validated.targets, &src_leaf, &validated)
+        validate_pinned_targets(view, state, &validated.targets, &src_leaf, &validated)
     } else if crate::game::effects::mass_population_target(&validated.effect)
         .is_some_and(crate::game::effects::filter_refs_parent_or_event_subject)
     {
@@ -2923,7 +3063,13 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // population scan, so it has no `target_filter()` entry; validate this
         // exceptional declared target against the same legal-player set used
         // to build the slot.
-        validate_pinned_targets(state, &validated.targets, &TargetFilter::Player, &validated)
+        validate_pinned_targets(
+            view,
+            state,
+            &validated.targets,
+            &TargetFilter::Player,
+            &validated,
+        )
     } else {
         match triggers::extract_target_filter_from_effect(&validated.effect) {
             Some(filter) if matches!(validated.effect, Effect::PairWith { .. }) => {
@@ -2957,6 +3103,7 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                     }
                 }
                 kept.extend(validate_pinned_targets(
+                    view,
                     state,
                     primary_targets,
                     filter,
@@ -2964,7 +3111,9 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                 ));
                 kept
             }
-            Some(filter) => validate_pinned_targets(state, &validated.targets, filter, &validated),
+            Some(filter) => {
+                validate_pinned_targets(view, state, &validated.targets, filter, &validated)
+            }
             // CR 608.2b: A context-ref filter (`ParentTarget`,
             // `TriggeringSource`, etc.) carries a resolution-time *snapshot*,
             // not a player-chosen target. `extract_target_filter_from_effect`
@@ -3009,9 +3158,13 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                     state,
                     validated.source_id,
                 ) {
-                    Some(filter) => {
-                        validate_pinned_targets(state, &validated.targets, &filter, &validated)
-                    }
+                    Some(filter) => validate_pinned_targets(
+                        view,
+                        state,
+                        &validated.targets,
+                        &filter,
+                        &validated,
+                    ),
                     None => validated
                         .targets
                         .iter()
@@ -3040,8 +3193,23 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                 .collect(),
         }
     };
+    // CR 608.2b: this node's declared positions join the view BEFORE its
+    // continuations are validated, so a later node's dependent filter reads them.
+    append_validated_declared_positions(ability, &validated, targets_are_inherited, view_out);
     if let Some(sub_ability) = validated.sub_ability.as_mut() {
-        **sub_ability = validate_targets_in_chain(state, sub_ability);
+        // Mirrors `declared_targets_in_chain`: a paid-"instead" delegate carries
+        // its delegator's inheritance; any other sub inherits per
+        // `rider_entries_are_inherited`.
+        let sub_inherited = if paid_instead_delegate(ability).is_some() {
+            targets_are_inherited
+        } else {
+            ability
+                .sub_ability
+                .as_deref()
+                .is_some_and(|declared_sub| rider_entries_are_inherited(ability, declared_sub))
+        };
+        **sub_ability =
+            validate_targets_in_chain_with_view(state, sub_ability, view_out, sub_inherited);
     }
     // CR 608.2b: an inheriting rider's entry is a snapshot of its immediate
     // parent's object target, not a target it specified, so the context-ref keep
@@ -3051,7 +3219,7 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
     // determine any information instead of reading a stale object.
     restamp_inherited_rider_target(&mut validated);
     if let Some(else_ability) = validated.else_ability.as_mut() {
-        **else_ability = validate_targets_in_chain(state, else_ability);
+        **else_ability = validate_targets_in_chain_with_view(state, else_ability, view_out, false);
     }
     restamp_chosen_group_targets(&mut validated);
     validated
@@ -3243,6 +3411,7 @@ pub(crate) fn damage_replacement_target_role_legality(
         .filter(|(index, role)| {
             ability.targets.get(*index).is_some_and(|target| {
                 !validate_pinned_targets_for_slot(
+                    None,
                     state,
                     std::slice::from_ref(target),
                     AbilityTargetSlot::Declared {
@@ -4491,9 +4660,12 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
-        | FilterProp::AttachedToSource
-        | FilterProp::AttachedToRecipient
-        | FilterProp::AttachedToPlayer { .. }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Source }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
+        // CR 601.2c: carries no quantity threshold, and its declared-slot read is
+        // bound through `FilterContext::declared_slot_view`, not first-object binding.
+        | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -4639,9 +4811,12 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
-        | FilterProp::AttachedToSource
-        | FilterProp::AttachedToRecipient
-        | FilterProp::AttachedToPlayer { .. }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Source }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Recipient }
+        | FilterProp::AttachedTo { to: AttachmentReferent::Player { .. } }
+        // CR 601.2c: carries no quantity threshold, and its declared-slot read is
+        // bound through `FilterContext::declared_slot_view`, not first-object binding.
+        | FilterProp::AttachedTo { to: AttachmentReferent::DeclaredTarget { .. } }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -5276,10 +5451,14 @@ pub(crate) fn rewrite_chosen_player_to_you(filter: &TargetFilter) -> TargetFilte
 pub(crate) fn attach_attachment_filter_needs_target_slot(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Any => true,
-        TargetFilter::Typed(tf) => !tf
-            .properties
-            .iter()
-            .any(|p| matches!(p, FilterProp::AttachedToSource)),
+        TargetFilter::Typed(tf) => !tf.properties.iter().any(|p| {
+            matches!(
+                p,
+                FilterProp::AttachedTo {
+                    to: AttachmentReferent::Source
+                }
+            )
+        }),
         TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
             .iter()
             .any(attach_attachment_filter_needs_target_slot),
@@ -7543,31 +7722,55 @@ fn legal_targets_for_selected_slot(
         // still empty mid-walk), different axis. The door widens ONLY when a
         // prior object selection existed and was bound, so
         // `target_filter_needs_ability_context` stays untouched.
-        let bound = target_filter_binds_prior_target(&enumeration_filter)
-            .then(|| bind_prior_object_targets(ability, selected_slots))
-            .flatten();
-        #[cfg(feature = "test-support")]
-        if bound.is_some() {
-            crate::game::perf_counters::record_prior_target_binding_selection();
-        }
-        let enumeration_ability = bound.as_ref().unwrap_or(ability);
-        if bound.is_some() || target_filter_needs_ability_context(&enumeration_filter) {
-            if controller == ability.controller {
-                targeting::find_legal_targets_for_ability(
-                    state,
-                    &enumeration_filter,
-                    enumeration_ability,
-                )
+        //
+        // CR 601.2c + CR 701.3a: a declared-slot attachment referent ("Equipment
+        // attached to that creature") names its antecedent by declared slot, so
+        // it reads the whole selected-slot view by position — each prior choice
+        // as an `Elected` (live) binding — rather than the first prior object.
+        if crate::game::filter::filter_reads_declared_slot(&enumeration_filter) {
+            let view: Vec<Option<targeting::DeclaredSlotBinding>> = selected_slots
+                .iter()
+                .map(|slot| slot.clone().map(targeting::DeclaredSlotBinding::Elected))
+                .collect();
+            targeting::find_legal_targets_for_ability_with_view(
+                state,
+                &enumeration_filter,
+                ability,
+                controller,
+                &view,
+            )
+        } else {
+            let bound = target_filter_binds_prior_target(&enumeration_filter)
+                .then(|| bind_prior_object_targets(ability, selected_slots))
+                .flatten();
+            #[cfg(feature = "test-support")]
+            if bound.is_some() {
+                crate::game::perf_counters::record_prior_target_binding_selection();
+            }
+            let enumeration_ability = bound.as_ref().unwrap_or(ability);
+            if bound.is_some() || target_filter_needs_ability_context(&enumeration_filter) {
+                if controller == ability.controller {
+                    targeting::find_legal_targets_for_ability(
+                        state,
+                        &enumeration_filter,
+                        enumeration_ability,
+                    )
+                } else {
+                    targeting::find_legal_targets_for_ability_with_controller(
+                        state,
+                        &enumeration_filter,
+                        enumeration_ability,
+                        controller,
+                    )
+                }
             } else {
-                targeting::find_legal_targets_for_ability_with_controller(
+                targeting::find_legal_targets(
                     state,
                     &enumeration_filter,
-                    enumeration_ability,
                     controller,
+                    ability.source_id,
                 )
             }
-        } else {
-            targeting::find_legal_targets(state, &enumeration_filter, controller, ability.source_id)
         }
     };
 
