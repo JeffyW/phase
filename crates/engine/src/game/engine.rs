@@ -16206,7 +16206,7 @@ pub(crate) fn validate_retarget_submission(
         effective_pools,
         legal_new_targets,
         current_targets,
-        &new_targets,
+        new_targets,
     ) {
         return Err(EngineError::InvalidAction(format!(
             "Retarget: chosen target is not legal for target slot {slot}"
