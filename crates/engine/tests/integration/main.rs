@@ -1722,6 +1722,7 @@ mod sheriff_base_plus_additional_counters_runtime;
 mod shiko_reflexive_copy_draw_1370;
 mod shilgengar_return_each_to_battlefield;
 mod shuffle_that_pile_manifest;
+mod silumgar_scavenger_exploit_haste;
 mod skullspore_nexus_dynamic_pt;
 mod slime_molding_x_token_pt;
 mod solitude_up_to_one_exile_lifegain_rider;
@@ -1769,6 +1770,7 @@ mod trigger_index_stale_entry_panics;
 mod triple_triad_owned_plus_lesser_mv_impulse;
 mod triumphant_chomp;
 mod tromokratis;
+mod twinned_vision_cast_origin;
 mod umbra_stalker_graveyard_chroma_4066;
 mod undying_malice_edict_sacrifice_5942;
 mod unless_pay_routes_through_authority;
@@ -1826,3 +1828,6 @@ mod siphon_insight_mana_rider;
 mod uba_mask_draw_to_exile_play;
 mod ultimate_magic_meteor_per_opponent_destroy;
 mod untap_upkeep_draw_created_steps;
+
+#[cfg(feature = "test-support")]
+mod owned_you_target_authority;

@@ -4560,6 +4560,9 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
         AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn => {
             "trigger event target was damaged by source this turn".into()
         }
+        AbilityCondition::TriggerEventTargetExploitedBySource => {
+            "trigger event target was exploited by source".into()
+        }
         AbilityCondition::AdditionalCostPaid { .. } => "additional cost was paid".into(),
         AbilityCondition::AdditionalCostPaidInstead => "additional cost was paid (instead)".into(),
         AbilityCondition::AlternativeManaCostPaid => "alternative mana cost was paid".into(),
@@ -9682,6 +9685,9 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         // (crates/engine/src/game/effects/mod.rs).
         AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn => {
             ("TriggerEventTargetDamagedBySourceThisTurn", Handled)
+        }
+        AbilityCondition::TriggerEventTargetExploitedBySource => {
+            ("TriggerEventTargetExploitedBySource", Handled)
         }
         AbilityCondition::AdditionalCostPaid { .. } => ("AdditionalCostPaid", Handled),
         AbilityCondition::AdditionalCostPaidInstead => ("AdditionalCostPaidInstead", Handled),
