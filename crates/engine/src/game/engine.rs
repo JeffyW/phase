@@ -15932,6 +15932,19 @@ fn check_debug_action_access(state: &GameState, actor: PlayerId) -> Result<(), E
     Ok(())
 }
 
+/// The parts of a `RetargetChoice` response the reducer validates
+/// (`validate_retarget_submission`), independent of who submits it.
+#[derive(Clone, Copy)]
+pub(crate) struct RetargetProposal<'a> {
+    pub(crate) stack_entry_index: usize,
+    pub(crate) scope: &'a RetargetScope,
+    pub(crate) current_targets: &'a [TargetRef],
+    pub(crate) slots: &'a [RetargetSlotAddress],
+    pub(crate) slot_pools: &'a [Vec<TargetRef>],
+    pub(crate) legal_new_targets: &'a [TargetRef],
+    pub(crate) new_targets: &'a [TargetRef],
+}
+
 struct RetargetSubmission<'a> {
     player: PlayerId,
     stack_entry_index: usize,
@@ -15952,8 +15965,50 @@ fn apply_retarget(
     events: &mut Vec<GameEvent>,
     submission: RetargetSubmission<'_>,
 ) -> Result<WaitingFor, EngineError> {
-    let RetargetSubmission {
-        player,
+    let player = submission.player;
+    let stack_entry_index = submission.stack_entry_index;
+    let mutated = validate_retarget_submission(
+        state,
+        &RetargetProposal {
+            stack_entry_index,
+            scope: submission.scope,
+            current_targets: submission.current_targets,
+            slots: submission.slots,
+            slot_pools: submission.slot_pools,
+            legal_new_targets: submission.legal_new_targets,
+            new_targets: &submission.new_targets,
+        },
+    )?;
+    if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
+        *stack_ability_mut = mutated;
+    }
+
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::ChangeTargets,
+        source_id: state
+            .stack
+            .get(stack_entry_index)
+            .map(|e| e.source_id)
+            .unwrap_or(ObjectId(0)),
+        subject: None,
+    });
+    state.waiting_for = WaitingFor::Priority { player };
+    state.priority_player = player;
+    resume_pending_continuation_if_priority(state, events)?;
+    Ok(state.waiting_for.clone())
+}
+
+/// CR 115.7a + CR 115.7d + CR 115.7e: the reducer's whole acceptance test for a
+/// retarget submission, without writing anything: `Ok` carries the stack
+/// entry's ability as it would stand after the write. `apply_retarget` commits
+/// exactly this value; the prompt-parking test and the AI's proposal
+/// enumeration (`ai_support::candidates::retarget_actions`) call it too, so no
+/// response is offered that the reducer would reject.
+pub(crate) fn validate_retarget_submission(
+    state: &GameState,
+    proposal: &RetargetProposal<'_>,
+) -> Result<crate::types::ability::ResolvedAbility, EngineError> {
+    let RetargetProposal {
         stack_entry_index,
         scope,
         current_targets,
@@ -15961,7 +16016,7 @@ fn apply_retarget(
         slot_pools,
         legal_new_targets,
         new_targets,
-    } = submission;
+    } = *proposal;
 
     // CR 115.7d + CR 601.2c: derived here (rather than only after the match
     // below) because H3's outer-empty re-derivation needs it before
@@ -16164,12 +16219,12 @@ fn apply_retarget(
         ));
     }
 
-    // CR 115.7d + CR 400.7: which positions this submission CHANGES, by the
-    // write loop's own predicate (`retarget_positions_changed`). A same-ID
-    // entry whose announced incarnation is gone is written as a NEW target
-    // (phase-rs/phase#8355 H2), so it is not exempt as unchanged: CR 115.7a
-    // requires it to be a legal alternative, which `retarget_slot_violation`'s
-    // raw-equality exemption above did not check.
+    // CR 115.7a + CR 115.7d + CR 400.7: which positions this submission
+    // CHANGES (`retarget_positions_changed`, the one verdict the write loop
+    // and every check below read). A same-ID entry whose announced object is
+    // gone ELECTS the new object only when that object is a legal choice for
+    // the position (a member of its slot pool, Invariant SC); otherwise it is
+    // retained unchanged with its announced pin (CR 115.7d first clause).
     let positions_changed = state.stack[stack_entry_index]
         .ability()
         .map(|pre| {
@@ -16177,20 +16232,11 @@ fn apply_retarget(
                 state,
                 pre,
                 &derived,
-                &new_targets,
+                new_targets,
+                &|i, target| pool_for(i).contains(target),
             )
         })
         .unwrap_or_default();
-    for (i, changed) in positions_changed.iter().enumerate() {
-        if *changed
-            && current_targets.get(i) == new_targets.get(i)
-            && !pool_for(i).contains(&new_targets[i])
-        {
-            return Err(EngineError::InvalidAction(format!(
-                "Retarget: chosen target is not legal for target slot {i}"
-            )));
-        }
-    }
 
     // CR 115.7d: "choose new targets" is an operation on the SPELL, so it
     // writes every chain node that owns an addressed slot, not only the root
@@ -16239,7 +16285,7 @@ fn apply_retarget(
                 TargetRef::Player(_) => None,
             })
             .collect();
-        mutated.targets = new_targets.clone();
+        mutated.targets = new_targets.to_vec();
         for pin in target_pins {
             mutated.update_selected_target_incarnation(pin);
         }
@@ -16329,23 +16375,7 @@ fn apply_retarget(
         )?;
     }
 
-    if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
-        *stack_ability_mut = mutated;
-    }
-
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::ChangeTargets,
-        source_id: state
-            .stack
-            .get(stack_entry_index)
-            .map(|e| e.source_id)
-            .unwrap_or(ObjectId(0)),
-        subject: None,
-    });
-    state.waiting_for = WaitingFor::Priority { player };
-    state.priority_player = player;
-    resume_pending_continuation_if_priority(state, events)?;
-    Ok(state.waiting_for.clone())
+    Ok(mutated)
 }
 
 /// CR 603.3c + CR 603.3d + CR 608.2c: Single authority for dropping a

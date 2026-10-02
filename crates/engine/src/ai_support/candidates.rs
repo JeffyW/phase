@@ -4025,23 +4025,26 @@ pub fn retarget_actions(
             .map_or(legal_new_targets, Vec::as_slice)
     };
 
-    // CR 115.7a: the pool is FLAT for a multi-role mana node — it `flat_map`s
-    // every surfaced role filter together, so it is a per-slot SUPERSET
-    // (`change_targets.rs`, multi-role branch). `apply_retarget` re-checks each
-    // changed submission positionally via `retarget_slot_violation`, so a
-    // proposal built from a pool member legal only for another slot would be
-    // rejected. Consult the same authority here rather than re-deriving
-    // legality, so every proposed action is accepted by construction —
-    // including CR 115.7d's unchanged submissions, which that authority exempts.
+    // CR 115.7a + CR 115.7d + CR 115.7e: every proposal goes through the
+    // reducer's own acceptance test (`engine::validate_retarget_submission`) —
+    // the per-slot pools, the incarnation-aware changed verdict, and the
+    // unchanged/dependent final-set checks — so no proposal is issued that
+    // `apply_retarget` would reject (raw generation, the decision contract and
+    // `phase-ai`'s fallback all read this list).
     let slot_legal = |new_targets: &[TargetRef]| {
-        crate::game::ability_utils::retarget_slot_violation(
-            &bindings,
-            effective_pools,
-            legal_new_targets,
-            current_targets,
-            new_targets,
+        crate::game::engine::validate_retarget_submission(
+            state,
+            &crate::game::engine::RetargetProposal {
+                stack_entry_index,
+                scope,
+                current_targets,
+                slots,
+                slot_pools,
+                legal_new_targets,
+                new_targets,
+            },
         )
-        .is_none()
+        .is_ok()
     };
 
     match scope {
@@ -4111,9 +4114,7 @@ pub fn retarget_actions(
         // even if those targets would be illegal." Leaving every target
         // unchanged anchors the list; each single-slot substitution to another
         // legal target is offered on top of it. The anchor goes through the same
-        // `slot_legal` filter as every other proposal and passes unconditionally,
-        // because `retarget_slot_violation` exempts unchanged positions — no
-        // carve-out is needed, and none is made.
+        // `slot_legal` reducer check as every other proposal — no carve-out.
         //
         // ENUMERATION BOUND, stated rather than left silent: this emits the
         // unchanged anchor plus every SINGLE-slot substitution. CR 115.7d permits

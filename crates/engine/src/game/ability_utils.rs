@@ -11141,18 +11141,24 @@ pub(crate) fn copy_retarget_edit_is_legal(
     Ok(post)
 }
 
-/// CR 115.7d + CR 400.7: for each addressed position of `bindings`, whether
-/// submitting `new_targets[i]` CHANGES that position — the write path's own
-/// predicate (`ResolvedAbility::retarget_target_requires_pin_refresh` on the
-/// addressed node of `pre`): a different target, or the same id whose
-/// announced incarnation is gone (electing the new object, phase-rs/phase#8355
-/// H2). `apply_retarget`'s write loop and its validation both read this one
-/// vector, so an entry the write re-pins is never validated as unchanged.
+/// CR 115.7a + CR 115.7d + CR 400.7: for each addressed position of
+/// `bindings`, whether submitting `new_targets[i]` CHANGES that position. Built
+/// on the write path's own predicate
+/// (`ResolvedAbility::retarget_target_requires_pin_refresh` on the addressed
+/// node of `pre`): a different target, or the same id whose announced
+/// incarnation is gone. A same-id entry ELECTS the new object
+/// (phase-rs/phase#8355 H2) only when that object is a legal choice for the
+/// position — `pool_contains(i, target)`, the position's slot pool (Invariant
+/// SC) — because a target can be changed only to a legal one (CR 115.7a);
+/// otherwise it is the retained target, unchanged, keeping its announced pin
+/// (CR 115.7d first clause). `apply_retarget`'s write loop and its validation
+/// read this one vector.
 pub(crate) fn retarget_positions_changed(
     state: &GameState,
     pre: &ResolvedAbility,
     bindings: &[RetargetSlotBinding],
     new_targets: &[TargetRef],
+    pool_contains: &dyn Fn(usize, &TargetRef) -> bool,
 ) -> Vec<bool> {
     bindings
         .iter()
@@ -11162,9 +11168,10 @@ pub(crate) fn retarget_positions_changed(
             else {
                 return false;
             };
-            node.targets
-                .get(binding.address.slot)
-                .is_some_and(|old| node.retarget_target_requires_pin_refresh(old, new, state))
+            node.targets.get(binding.address.slot).is_some_and(|old| {
+                node.retarget_target_requires_pin_refresh(old, new, state)
+                    && (old != new || pool_contains(i, new))
+            })
         })
         .collect()
 }
@@ -11431,22 +11438,30 @@ pub(crate) fn widen_dependent_retarget_pools(
         let Some(node) = node_at(stack_ability, &bindings[i].address.path) else {
             continue;
         };
-        let referent_pool = bindings
-            .iter()
-            .position(|b| &b.address == address)
+        let referent_position = bindings.iter().position(|b| &b.address == address);
+        let referent_pool = referent_position
             .and_then(|j| pools.get(j).cloned())
             .unwrap_or_default();
         let mut views = vec![announced.clone()];
         for referent in referent_pool {
-            if announced
-                .get(slot)
-                .cloned()
-                .flatten()
-                .is_some_and(|binding| match binding {
-                    targeting::DeclaredSlotBinding::Announced { target, .. } => target == referent,
-                    targeting::DeclaredSlotBinding::Elected(_) => false,
-                })
-            {
+            // Electing `referent` at the referent position is a change exactly
+            // when `retarget_positions_changed` says so — a different object,
+            // or the same id returned as a new, legal object (it is drawn from
+            // that position's own pool) — so a same-id re-election gets its
+            // own view (CR 115.7e).
+            let elects = referent_position.is_some_and(|j| {
+                retarget_positions_changed(
+                    state,
+                    stack_ability,
+                    &bindings[j..=j],
+                    std::slice::from_ref(&referent),
+                    &|_, _| true,
+                )
+                .first()
+                .copied()
+                .unwrap_or(false)
+            });
+            if !elects {
                 continue;
             }
             let mut view = announced.clone();

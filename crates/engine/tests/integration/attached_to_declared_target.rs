@@ -1970,3 +1970,192 @@ fn controller_qualified_dependent_target_keeps_its_gap() {
     };
     assert_eq!(declared_slots(target), vec![0]);
 }
+
+// ---------------------------------------------------------------------------
+// Round 4: incarnation-aware retarget authority (prompt admission, dependent
+// pools, AI issuance)
+// ---------------------------------------------------------------------------
+
+/// Every `RetargetSpell` the AI's raw candidate generation issues for the open
+/// prompt, each applied to a clone of the state: `(proposal, accepted)`.
+fn ai_retarget_proposals(runner: &GameRunner) -> Vec<(Vec<TargetRef>, bool)> {
+    engine::ai_support::candidate_actions(runner.state())
+        .into_iter()
+        .filter_map(|candidate| match candidate.action {
+            GameAction::RetargetSpell { new_targets } => Some(new_targets),
+            _ => None,
+        })
+        .map(|new_targets| {
+            let mut probe = GameRunner::from_state(runner.state().clone());
+            let accepted = probe
+                .act(GameAction::RetargetSpell {
+                    new_targets: new_targets.clone(),
+                })
+                .is_ok();
+            (new_targets, accepted)
+        })
+        .collect()
+}
+
+/// The incarnation the root of `spell` pins for `id`.
+fn root_pin(runner: &GameRunner, spell: ObjectId, id: ObjectId) -> u64 {
+    runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == spell)
+        .and_then(|entry| entry.ability())
+        .and_then(|ability| {
+            ability
+                .selected_target_incarnations
+                .iter()
+                .find(|pin| pin.object_id == id)
+        })
+        .map(|pin| pin.incarnation)
+        .expect("the root pins the object")
+}
+
+/// CR 115.7a + CR 115.7d + CR 400.7: the only artifact was blinked and its new
+/// object has hexproof, so it is no legal choice — resubmitting its id is the
+/// RETAINED target, unchanged with its announced pin. "Choose new targets"
+/// therefore accepts leaving every target as it is: the prompt discharges, the
+/// old artifact pin stays, and the spell resolves with the artifact illegal.
+#[test]
+fn choose_new_targets_retains_a_target_whose_new_object_is_not_a_legal_choice() {
+    const TEXT: &str = "Tap target artifact. Target player loses 1 life.";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let artifact = scenario
+        .add_artifact_from_oracle(P1, "Only Artifact", "")
+        .id();
+    let spell = free_spell(&mut scenario, "Probe", true, TEXT);
+    let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+    let mut runner = scenario.build();
+    runner
+        .cast(spell)
+        .target_objects(&[artifact])
+        .target_player(P1)
+        .commit();
+    let announced = root_pin(&runner, spell, artifact);
+    blink(runner.state_mut(), artifact);
+    give_hexproof(runner.state_mut(), artifact);
+    runner.cast(redirect).target_objects(&[spell]).commit();
+    drive_to_retarget_prompt(&mut runner);
+    let current = match &runner.state().waiting_for {
+        WaitingFor::RetargetChoice {
+            current_targets, ..
+        } => current_targets.clone(),
+        other => panic!("expected RetargetChoice, got {other:?}"),
+    };
+    let proposals = ai_retarget_proposals(&runner);
+    assert!(
+        proposals.iter().any(|(targets, _)| *targets == current),
+        "the unchanged anchor is offered"
+    );
+    assert!(proposals.iter().all(|(_, accepted)| *accepted));
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: current,
+        })
+        .expect("leaving every target unchanged is accepted");
+    assert_eq!(root_pin(&runner, spell, artifact), announced, "pin kept");
+    runner.advance_until_stack_empty();
+    assert!(!runner.state().objects[&artifact].tapped);
+    assert_eq!(runner.life(P1), 19);
+}
+
+/// CR 115.7e: both the creature and its Equipment left and returned, and the
+/// new Equipment is on the new creature. Resubmitting both ids elects both new
+/// objects — the Equipment is offered in its position's pool and the final
+/// selection is legal, so it is accepted and both are affected.
+#[test]
+fn choose_new_targets_offers_and_accepts_a_same_id_re_election_of_both_targets() {
+    let mut board = copy_board();
+    let (a, eq1, redirect, fiery) = (board.a, board.eq1, board.redirect, board.fiery);
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| {
+            blink(state, a);
+            blink(state, eq1);
+            attach::attach_to(state, eq1, a);
+        },
+        redirect,
+    );
+    let pools = retarget_pools(&board.runner);
+    assert!(
+        pools[1].contains(&TargetRef::Object(eq1)),
+        "the new Equipment 1 is offered"
+    );
+    board
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[a, eq1]),
+        })
+        .expect("electing both new objects is legal");
+    assert_ne!(equipment_pin(&board.runner, fiery, eq1), 0, "re-pinned");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(state.objects[&a].damage_marked, 5);
+    assert_eq!(state.objects[&eq1].zone, Zone::Exile);
+}
+
+/// The AI never issues a retarget the reducer rejects. Lightning-Bolt-like
+/// spell at A; A blinked and its new object given hexproof; then "choose new
+/// targets": every raw proposal (the anchor included) is accepted. Control: the
+/// same board without the blink.
+#[test]
+fn ai_retarget_proposals_are_all_accepted_after_a_blink() {
+    const BOLT: &str = "~ deals 3 damage to any target.";
+    for blinked in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+        let b = scenario.add_creature(P1, "Creature B", 2, 7).id();
+        let bolt = free_spell(&mut scenario, "Bolt", true, BOLT);
+        let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+        let mut runner = scenario.build();
+        runner.cast(bolt).target_objects(&[a]).commit();
+        if blinked {
+            blink(runner.state_mut(), a);
+            give_hexproof(runner.state_mut(), a);
+        }
+        runner.cast(redirect).target_objects(&[bolt]).commit();
+        drive_to_retarget_prompt(&mut runner);
+        let proposals = ai_retarget_proposals(&runner);
+        assert!(
+            proposals
+                .iter()
+                .any(|(targets, _)| *targets == vec![TargetRef::Object(b)]),
+            "blinked={blinked}: reach guard, [B] is proposed"
+        );
+        assert!(
+            proposals.iter().all(|(_, accepted)| *accepted),
+            "blinked={blinked}: every proposal is accepted, got {proposals:?}"
+        );
+    }
+}
+
+/// The AI never issues a combination the final-set check rejects: with
+/// Equipment 1 still on A, `[B, Equipment 1]` would make the unchanged
+/// Equipment target illegal (CR 115.7d), so it is not proposed.
+#[test]
+fn ai_retarget_proposals_respect_the_dependent_final_set_check() {
+    let mut board = copy_board();
+    let (a, b, eq1, redirect) = (board.a, board.b, board.eq1, board.redirect);
+    fiery_then(&mut board, &[a, eq1], |_| {}, redirect);
+    let proposals = ai_retarget_proposals(&board.runner);
+    assert!(
+        proposals
+            .iter()
+            .any(|(targets, _)| *targets == objects(&[a, eq1])),
+        "reach guard: the anchor is proposed"
+    );
+    assert!(
+        !proposals
+            .iter()
+            .any(|(targets, _)| *targets == objects(&[b, eq1])),
+        "[B, Equipment 1] is not proposed"
+    );
+    assert!(proposals.iter().all(|(_, accepted)| *accepted));
+}
