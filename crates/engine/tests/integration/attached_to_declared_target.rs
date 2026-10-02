@@ -35,7 +35,7 @@ use engine::types::ability::{
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
@@ -1275,6 +1275,20 @@ fn choose_new_targets_checks_the_edited_selection_as_a_whole() {
         |state| attach::attach_to(state, eq3, a),
         redirect,
     );
+    let b = board.b;
+    assert!(
+        retarget_pools(&board.runner)[1].contains(&TargetRef::Object(eq3)),
+        "reach guard: Equipment 3 is in the widened pool"
+    );
+    assert!(
+        board
+            .runner
+            .act(GameAction::RetargetSpell {
+                new_targets: objects(&[b, eq3]),
+            })
+            .is_err(),
+        "Equipment 3 is attached to A, not to the newly chosen B"
+    );
     board
         .runner
         .act(GameAction::RetargetSpell {
@@ -1429,7 +1443,12 @@ fn blinked_referent_is_illegal_and_supplies_no_attachments() {
     let outcome = commit.resolve();
     outcome.assert_life_delta(P1, -1);
     assert_eq!(outcome.state().objects[&b.victim].damage_marked, 0);
-    assert_eq!(outcome.zone_of(b.eq_d), Zone::Battlefield);
+    assert_eq!(outcome.zone_of(b.eq_d), Zone::Battlefield, "new attachment");
+    assert_eq!(
+        outcome.zone_of(b.eq_a),
+        Zone::Battlefield,
+        "the old incarnation's attachment (its exit record) is not read either"
+    );
 }
 
 /// H3 (CR 601.2c): a two-target head after a fixed one-target prefix. "that
@@ -1457,4 +1476,255 @@ fn two_target_head_after_a_prefix_destroys_the_creatures_equipment() {
     assert!(outcome.state().objects[&land].tapped, "reach guard: slot 0");
     assert_eq!(outcome.zone_of(eq_x), Zone::Graveyard);
     assert_eq!(outcome.zone_of(eq_other), Zone::Battlefield);
+}
+
+// ---------------------------------------------------------------------------
+// Saved-game compatibility (legacy `AttachedToSource` / `AttachedToRecipient` /
+// `AttachedToPlayer` tags inside stored abilities and statics)
+// ---------------------------------------------------------------------------
+
+/// Rewrite every canonical `{"type":"AttachedTo","to":{..}}` in a serialized
+/// state into the pre-refactor tag it replaced, returning the rewrite count.
+fn legacyize(value: &mut serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            // `FilterProp::AttachedTo { to }` ? not the unit `TargetFilter::AttachedTo`.
+            if map.get("type").and_then(|t| t.as_str()) == Some("AttachedTo")
+                && map.contains_key("to")
+            {
+                let to = map.get("to").cloned().expect("checked above");
+                let legacy = match to.get("type").and_then(|t| t.as_str()) {
+                    Some("Source") => serde_json::json!({ "type": "AttachedToSource" }),
+                    Some("Recipient") => serde_json::json!({ "type": "AttachedToRecipient" }),
+                    Some("Player") => serde_json::json!({
+                        "type": "AttachedToPlayer",
+                        "player": to.get("player").cloned().expect("player"),
+                    }),
+                    other => panic!("no legacy form for {other:?}"),
+                };
+                *value = legacy;
+                return 1;
+            }
+            map.values_mut().map(legacyize).sum()
+        }
+        serde_json::Value::Array(items) => items.iter_mut().map(legacyize).sum(),
+        _ => 0,
+    }
+}
+
+fn count_tag(value: &serde_json::Value, tag: &str) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let hit = map.get("type").and_then(|t| t.as_str()) == Some(tag)
+                && (tag != "AttachedTo" || map.contains_key("to"));
+            usize::from(hit) + map.values().map(|v| count_tag(v, tag)).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(|v| count_tag(v, tag)).sum(),
+        _ => 0,
+    }
+}
+
+/// Restore through the engine's own save/undo/P2P pipeline.
+fn restore(json: &str) -> GameRunner {
+    let state = serde_json::from_str::<PersistedGameState>(json)
+        .expect("persisted state decodes")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("persisted state is admissible")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("restored state is publishable");
+    GameRunner::from_state(state)
+}
+
+fn persisted(runner: &GameRunner) -> serde_json::Value {
+    serde_json::to_value(PersistedGameState::capture(runner.state().clone()))
+        .expect("state serializes")
+}
+
+/// Save `runner` in the pre-refactor encoding and load it back. Asserts the
+/// fixture really carries `legacy_tag`, and that the loaded state serializes
+/// canonical-new (no legacy tag survives a save).
+fn reload_legacy(runner: &GameRunner, legacy_tag: &str) -> GameRunner {
+    let mut value = persisted(runner);
+    let canonical = count_tag(&value, "AttachedTo");
+    assert!(canonical > 0, "reach guard: the state stores the relation");
+    assert_eq!(legacyize(&mut value), canonical);
+    assert!(
+        count_tag(&value, legacy_tag) > 0,
+        "fixture carries {legacy_tag}"
+    );
+    assert_eq!(count_tag(&value, "AttachedTo"), 0, "fixture is all-legacy");
+    let reloaded = restore(&value.to_string());
+    let saved = persisted(&reloaded);
+    assert_eq!(
+        count_tag(&saved, "AttachedTo"),
+        canonical,
+        "saved canonical"
+    );
+    for old in [
+        "AttachedToSource",
+        "AttachedToRecipient",
+        "AttachedToPlayer",
+    ] {
+        assert_eq!(count_tag(&saved, old), 0, "no {old} is written");
+    }
+    reloaded
+}
+
+fn power_toughness(runner: &mut GameRunner, id: ObjectId) -> (i32, i32) {
+    let state = runner.state_mut();
+    state.layers_dirty.mark_full();
+    engine::game::layers::evaluate_layers(state);
+    let obj = &state.objects[&id];
+    (
+        obj.power.unwrap_or_default(),
+        obj.toughness.unwrap_or_default(),
+    )
+}
+
+/// Source (CR 701.3a + CR 613.4c): a 1/1 that "gets +2/+2 for each Aura and
+/// Equipment attached to" itself, carrying one Equipment (+1/+0) and one Aura
+/// (+1/+1): 1 + 2*2 + 1 + 1 = 7 power, 1 + 2*2 + 1 = 6 toughness. A legacy save
+/// loads and computes the same.
+#[test]
+fn legacy_attached_to_source_save_loads_and_counts_the_same() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let champ = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Probe Champion",
+            1,
+            1,
+            "Probe Champion gets +2/+2 for each Aura and Equipment attached to Probe Champion.",
+        )
+        .id();
+    let eq = equipment(&mut scenario, P0, "Gear");
+    let au = aura(&mut scenario, P0, "Blessing");
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq, champ);
+    attach::attach_to(runner.state_mut(), au, champ);
+    assert_eq!(power_toughness(&mut runner, champ), (7, 6), "baseline");
+    let mut reloaded = reload_legacy(&runner, "AttachedToSource");
+    assert_eq!(power_toughness(&mut reloaded, champ), (7, 6));
+    // The relation stays live after the load: one fewer attachment, -2/-2 and
+    // the Equipment's own +1/+0.
+    let mut events: Vec<GameEvent> = Vec::new();
+    move_object_for_test(
+        reloaded.state_mut(),
+        ZoneMoveRequest::effect(eq, Zone::Graveyard, eq),
+        &mut events,
+    );
+    assert_eq!(power_toughness(&mut reloaded, champ), (4, 4));
+}
+
+/// Recipient (CR 303.4b + CR 613.4c): Strong Back-style "Enchanted creature
+/// gets +2/+2 for each Aura and Equipment attached to it" on a 1/1 that also
+/// carries one Equipment (+1/+0): 1 + 2*2 + 1 = 6 power, 1 + 2*2 = 5 toughness.
+#[test]
+fn legacy_attached_to_recipient_save_loads_and_counts_the_same() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let host = scenario.add_creature(P0, "Host", 1, 1).id();
+    let back = scenario
+        .add_enchantment_from_oracle(
+            P0,
+            "Probe Back",
+            "Enchant creature\nEnchanted creature gets +2/+2 for each Aura and Equipment attached to it.",
+        )
+        .with_subtypes(vec!["Aura"])
+        .id();
+    let eq = equipment(&mut scenario, P0, "Gear");
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), back, host);
+    attach::attach_to(runner.state_mut(), eq, host);
+    assert_eq!(power_toughness(&mut runner, host), (6, 5), "baseline");
+    let mut reloaded = reload_legacy(&runner, "AttachedToRecipient");
+    assert_eq!(power_toughness(&mut reloaded, host), (6, 5));
+}
+
+/// Player (CR 303.4b + CR 701.3a): Curse of Thirst on P1 with a second Curse
+/// attached to P1 — at P1's upkeep it deals damage equal to the number of
+/// Curses attached to that player (2).
+#[test]
+fn legacy_attached_to_player_save_loads_and_counts_the_same() {
+    let build = || {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let thirst = scenario
+            .add_enchantment_from_oracle(
+                P0,
+                "Curse of Thirst",
+                "Enchant player\nAt the beginning of enchanted player's upkeep, Curse of Thirst deals damage to that player equal to the number of Curses attached to them.",
+            )
+            .with_subtypes(vec!["Aura", "Curse"])
+            .id();
+        let other = scenario
+            .add_enchantment_from_oracle(P0, "Curse of Probing", "Enchant player")
+            .with_subtypes(vec!["Aura", "Curse"])
+            .id();
+        let mut runner = scenario.build();
+        attach::attach_to_player(runner.state_mut(), thirst, P1);
+        attach::attach_to_player(runner.state_mut(), other, P1);
+        runner
+    };
+    let through_upkeep = |runner: &mut GameRunner| {
+        let before = runner.life(P1);
+        let next = runner.state().turn_number + 1;
+        drive_to_turn(runner, next);
+        assert_eq!(runner.state().active_player, P1, "P1's turn");
+        for _ in 0..20 {
+            // Stop once the upkeep is over (P1's library is empty).
+            if runner.state().phase == Phase::Draw {
+                break;
+            }
+            runner.act(GameAction::PassPriority).expect("pass");
+        }
+        before - runner.life(P1)
+    };
+    let mut baseline = build();
+    assert_eq!(through_upkeep(&mut baseline), 2, "baseline");
+    let mut reloaded = reload_legacy(&build(), "AttachedToPlayer");
+    assert_eq!(through_upkeep(&mut reloaded), 2);
+}
+
+/// Nested legacy tags (inside `Not` and `AnyOf`) decode to the canonical form,
+/// and a canonical-new filter round-trips unchanged.
+#[test]
+fn legacy_attachment_tags_decode_at_any_depth_and_new_form_round_trips() {
+    let legacy = serde_json::json!({
+        "type": "Typed",
+        "type_filters": [{ "Subtype": "Equipment" }],
+        "controller": null,
+        "properties": [
+            { "type": "Not", "prop": { "type": "AttachedToSource" } },
+            { "type": "AnyOf", "props": [
+                { "type": "AttachedToRecipient" },
+                { "type": "AttachedToPlayer", "player": "EnchantedPlayer" }
+            ] }
+        ]
+    });
+    let decoded: TargetFilter = serde_json::from_value(legacy).expect("legacy decodes");
+    let canonical = serde_json::to_value(&decoded).unwrap();
+    assert_eq!(count_tag(&canonical, "AttachedTo"), 3);
+    for old in [
+        "AttachedToSource",
+        "AttachedToRecipient",
+        "AttachedToPlayer",
+    ] {
+        assert_eq!(count_tag(&canonical, old), 0);
+    }
+    let again: TargetFilter = serde_json::from_value(canonical.clone()).expect("new decodes");
+    assert_eq!(again, decoded);
+    assert_eq!(serde_json::to_value(&again).unwrap(), canonical);
+    let declared = serde_json::json!({
+        "type": "AttachedTo", "to": { "type": "DeclaredTarget", "slot": 1 }
+    });
+    let prop: FilterProp = serde_json::from_value(declared.clone()).expect("decodes");
+    assert_eq!(
+        prop,
+        FilterProp::AttachedTo {
+            to: AttachmentReferent::DeclaredTarget { slot: 1 }
+        }
+    );
+    assert_eq!(serde_json::to_value(&prop).unwrap(), declared);
 }
