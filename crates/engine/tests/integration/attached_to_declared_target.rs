@@ -1728,3 +1728,63 @@ fn legacy_attachment_tags_decode_at_any_depth_and_new_form_round_trips() {
     );
     assert_eq!(serde_json::to_value(&prop).unwrap(), declared);
 }
+
+// ---------------------------------------------------------------------------
+// Die-exile rider with a compound subject ("that creature or planeswalker")
+// ---------------------------------------------------------------------------
+
+const SCORCHING_DRAGONFIRE: &str = "Scorching Dragonfire deals 3 damage to target creature or planeswalker. If that creature or planeswalker would die this turn, exile it instead.";
+
+/// CR 614.1a + CR 608.2c: the subject "that creature or planeswalker" names no
+/// unique slot noun, but the damage clause holds the chain's only declared
+/// slot, so the rider keeps its `Any` route (no other antecedent exists) and
+/// a creature dealt lethal damage is exiled.
+#[test]
+fn single_declarer_compound_subject_rider_keeps_its_route_and_exiles() {
+    let parsed = parse_oracle_text(
+        SCORCHING_DRAGONFIRE,
+        "Scorching Dragonfire",
+        &[],
+        &types("Instant"),
+        &[],
+    );
+    let effects = chain(&parsed.abilities[0]);
+    assert!(
+        matches!(
+            effects[1],
+            Effect::AddTargetReplacement {
+                target: TargetFilter::Any,
+                ..
+            }
+        ),
+        "rider stays on the damage target, got {effects:?}"
+    );
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Bear", 2, 2).id();
+    let spell = free_spell(
+        &mut scenario,
+        "Scorching Dragonfire",
+        true,
+        SCORCHING_DRAGONFIRE,
+    );
+    let mut runner = scenario.build();
+    let outcome = runner.cast(spell).target_objects(&[bear]).resolve();
+    assert_eq!(outcome.zone_of(bear), Zone::Exile);
+}
+
+/// Control: an unresolvable subject with ANOTHER declared slot before the
+/// preceding clause stays a strict gap — the `Any` route would install the
+/// replacement on the artifact the preceding clause tapped.
+#[test]
+fn compound_subject_rider_with_an_intervening_declarer_fails_closed() {
+    const TEXT: &str = "~ deals 2 damage to target creature or planeswalker. Tap target artifact. If that creature or planeswalker would die this turn, exile it instead.";
+    let parsed = parse_oracle_text(TEXT, "Probe", &[], &types("Instant"), &[]);
+    assert!(
+        unimplemented_names(&[&parsed.abilities[0]])
+            .contains(&"die_exile_rider_antecedent".to_string()),
+        "got {:?}",
+        chain(&parsed.abilities[0])
+    );
+}

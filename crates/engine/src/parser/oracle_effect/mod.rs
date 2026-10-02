@@ -25301,11 +25301,12 @@ fn lift_untargeted_declared_slot_destroy(
 /// registry ([`resolve_declared_slot_anaphor`]); the rider then targets
 /// `TargetFilter::ParentTargetSlot { index }`.
 ///
-/// Unchanged (`Any`) when the preceding clause announces no target or its last
-/// declared slot is the antecedent. Fails closed when the subject cannot be
-/// resolved while the preceding clause announces a target its noun does not
-/// name — binding the intervening node's target would install the replacement
-/// on the wrong object.
+/// Unchanged (`Any`) when the preceding clause announces no target, its last
+/// declared slot is the antecedent, or it holds the chain's only declared slot
+/// (no other antecedent exists). Fails closed when the subject cannot be
+/// resolved while another declared slot could be its antecedent and the
+/// preceding clause announces a target its noun does not name — binding the
+/// intervening node's target would install the replacement on the wrong object.
 fn bind_die_exile_rider_antecedent(
     mut rider: AbilityDefinition,
     rider_lower: &str,
@@ -25340,6 +25341,13 @@ fn bind_die_exile_rider_antecedent(
             rider
         }
         None => {
+            // With a single declared slot in the whole chain so far, the
+            // preceding clause's target is the only possible antecedent, so the
+            // `Any` route cannot bind the wrong object (Scorching Dragonfire:
+            // "that creature or planeswalker").
+            if before.is_empty() && previous_clause_slots.len() == 1 {
+                return rider;
+            }
             let previous_filters: Vec<TargetFilter> = previous_clause_slots
                 .iter()
                 .map(|entry| entry.filter.clone())
