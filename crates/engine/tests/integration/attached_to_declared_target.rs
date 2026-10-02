@@ -2159,3 +2159,217 @@ fn ai_retarget_proposals_respect_the_dependent_final_set_check() {
     );
     assert!(proposals.iter().all(|(_, accepted)| *accepted));
 }
+
+// ---------------------------------------------------------------------------
+// Round 5: compatibility encoding; the all-unchanged response (CR 115.7d)
+// ---------------------------------------------------------------------------
+
+/// The incarnation node `depth` (0 = root, following `sub_ability`) of
+/// `spell` pins for `id`.
+fn node_pin(runner: &GameRunner, spell: ObjectId, depth: usize, id: ObjectId) -> u64 {
+    let mut node = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == spell)
+        .and_then(|entry| entry.ability())
+        .expect("spell on the stack");
+    for _ in 0..depth {
+        node = node.sub_ability.as_deref().expect("chain node");
+    }
+    node.selected_target_incarnations
+        .iter()
+        .find(|pin| pin.object_id == id)
+        .map(|pin| pin.incarnation)
+        .expect("node pins the object")
+}
+
+/// R4-P1 (CR 115.7a + CR 115.7d): the same "choose new targets" answer means
+/// the same thing whether the prompt carries its per-position addresses or is
+/// a compatibility payload without them. Bolt at A; A blinked; with hexproof
+/// the new A is no legal choice, so resubmitting `[A]` keeps the announced pin;
+/// without hexproof it elects the new A and re-pins it.
+#[test]
+fn compatibility_and_full_retarget_prompts_share_one_changed_verdict() {
+    const BOLT: &str = "~ deals 3 damage to any target.";
+    for hexproof in [true, false] {
+        for compat in [false, true] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+            scenario.add_creature(P1, "Creature B", 2, 7);
+            let bolt = free_spell(&mut scenario, "Bolt", true, BOLT);
+            let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+            let mut runner = scenario.build();
+            runner.cast(bolt).target_objects(&[a]).commit();
+            let announced = root_pin(&runner, bolt, a);
+            blink(runner.state_mut(), a);
+            if hexproof {
+                give_hexproof(runner.state_mut(), a);
+            }
+            runner.cast(redirect).target_objects(&[bolt]).commit();
+            drive_to_retarget_prompt(&mut runner);
+            if compat {
+                // A payload predating the per-position fields: both default
+                // to empty (`#[serde(default)]`).
+                let mut value = serde_json::to_value(&runner.state().waiting_for).unwrap();
+                let fields = value
+                    .as_object_mut()
+                    .and_then(|outer| outer.values_mut().find_map(|v| v.as_object_mut()))
+                    .filter(|inner| inner.contains_key("slots"))
+                    .or(None);
+                let fields = match fields {
+                    Some(fields) => fields,
+                    None => value.as_object_mut().expect("tagged object"),
+                };
+                assert!(fields.remove("slots").is_some(), "reach guard: slots field");
+                assert!(fields.remove("slot_pools").is_some());
+                runner.state_mut().waiting_for = serde_json::from_value(value).unwrap();
+                let WaitingFor::RetargetChoice {
+                    slots, slot_pools, ..
+                } = &runner.state().waiting_for
+                else {
+                    panic!("restored prompt");
+                };
+                assert!(slots.is_empty() && slot_pools.is_empty());
+            }
+            runner
+                .act(GameAction::RetargetSpell {
+                    new_targets: vec![TargetRef::Object(a)],
+                })
+                .expect("resubmitting A is accepted");
+            let pin = root_pin(&runner, bolt, a);
+            if hexproof {
+                assert_eq!(pin, announced, "compat={compat}: retained, pin kept");
+            } else {
+                assert_ne!(pin, announced, "compat={compat}: elected, re-pinned");
+            }
+        }
+    }
+}
+
+const EQUIPMENT_AND_AURA: &str = "Tap target creature. Exile target Equipment attached to that creature. Exile target Aura attached to that creature.";
+
+/// CR 115.7d: two dependents on one creature. Equipment 1 was blinked onto C;
+/// the Aura is still on A and C has no Aura. Electing the new Equipment 1 is
+/// illegal with A, and moving to C would make the unchanged Aura illegal — but
+/// leaving every target unchanged is always legal: the all-unchanged response
+/// is accepted, every pin is kept, and the spell resolves with the stale
+/// Equipment target illegal.
+#[test]
+fn leaving_every_target_unchanged_is_always_accepted() {
+    let parsed = parse_oracle_text(EQUIPMENT_AND_AURA, "Probe", &[], &types("Instant"), &[]);
+    assert!(
+        unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+        "reach guard: supported, got {:?}",
+        chain(&parsed.abilities[0])
+    );
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+    let c = scenario.add_creature(P1, "Creature C", 2, 7).id();
+    let eq1 = equipment(&mut scenario, P1, "Equipment 1");
+    let aura1 = aura(&mut scenario, P1, "Aura 1");
+    let spell = free_spell(&mut scenario, "Probe", true, EQUIPMENT_AND_AURA);
+    let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq1, a);
+    attach::attach_to(runner.state_mut(), aura1, a);
+    runner.cast(spell).target_objects(&[a, eq1, aura1]).commit();
+    blink(runner.state_mut(), eq1);
+    attach::attach_to(runner.state_mut(), eq1, c);
+    runner.cast(redirect).target_objects(&[spell]).commit();
+    drive_to_retarget_prompt(&mut runner);
+    let anchor = objects(&[a, eq1, aura1]);
+    let proposals = ai_retarget_proposals(&runner);
+    assert!(
+        proposals.iter().any(|(t, ok)| *t == anchor && *ok),
+        "the AI's list holds the accepted anchor, got {proposals:?}"
+    );
+    assert!(proposals.iter().all(|(_, ok)| *ok));
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: anchor,
+        })
+        .expect("leaving every target unchanged is accepted");
+    assert_eq!(node_pin(&runner, spell, 1, eq1), 0, "stale pin kept");
+    runner.advance_until_stack_empty();
+    let state = runner.state();
+    assert!(state.objects[&a].tapped);
+    assert_eq!(
+        state.objects[&eq1].zone,
+        Zone::Battlefield,
+        "stale: illegal"
+    );
+    assert_eq!(state.objects[&aura1].zone, Zone::Exile);
+}
+
+const CREATURE_AND_LAND: &str = "Tap target creature. Exile target Equipment attached to that creature. Tap target land. Exile target Fortification attached to that land.";
+
+/// The verifier's four-target board: Equipment and Fortification blinked onto
+/// C and L2. Returns the runner with the "choose new targets" prompt open and
+/// `(spell, a, c, eq, l1, l2, ft)`.
+fn four_target_board() -> (GameRunner, [ObjectId; 7]) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+    let c = scenario.add_creature(P1, "Creature C", 2, 7).id();
+    let l1 = scenario.add_basic_land(P1, engine::types::mana::ManaColor::Red);
+    let l2 = scenario.add_basic_land(P1, engine::types::mana::ManaColor::Red);
+    let eq = equipment(&mut scenario, P1, "Equipment");
+    let ft = scenario
+        .add_artifact_from_oracle(P1, "Fortification", "")
+        .with_subtypes(vec!["Fortification"])
+        .id();
+    let spell = free_spell(&mut scenario, "Probe", true, CREATURE_AND_LAND);
+    let redirect = free_spell(&mut scenario, "Redirect", true, REDIRECT);
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq, a);
+    attach::attach_to(runner.state_mut(), ft, l1);
+    runner.cast(spell).target_objects(&[a, eq, l1, ft]).commit();
+    blink(runner.state_mut(), eq);
+    blink(runner.state_mut(), ft);
+    attach::attach_to(runner.state_mut(), eq, c);
+    attach::attach_to(runner.state_mut(), ft, l2);
+    assert_eq!(
+        runner.state().objects[&ft].attached_to,
+        Some(AttachTarget::Object(l2)),
+        "reach guard: the new Fortification is on L2"
+    );
+    runner.cast(redirect).target_objects(&[spell]).commit();
+    drive_to_retarget_prompt(&mut runner);
+    (runner, [spell, a, c, eq, l1, l2, ft])
+}
+
+/// R4-P2 (CR 115.7d + CR 115.7e): the prompt opens; the all-unchanged response
+/// is accepted with every pin kept, and the AI holds it; the complete election
+/// `[C, Equipment, L2, Fortification]` is accepted too.
+#[test]
+fn four_target_prompt_opens_and_accepts_the_anchor_and_the_full_election() {
+    let (mut runner, [spell, a, _c, eq, l1, _l2, ft]) = four_target_board();
+    let anchor = objects(&[a, eq, l1, ft]);
+    let proposals = ai_retarget_proposals(&runner);
+    assert!(proposals.iter().any(|(t, ok)| *t == anchor && *ok));
+    assert!(proposals.iter().all(|(_, ok)| *ok));
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: anchor,
+        })
+        .expect("the anchor is accepted");
+    assert_eq!(node_pin(&runner, spell, 1, eq), 0);
+    assert_eq!(node_pin(&runner, spell, 3, ft), 0);
+
+    let (mut runner, [spell, _a, c, eq, _l1, l2, ft]) = four_target_board();
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: objects(&[c, eq, l2, ft]),
+        })
+        .expect("the complete election is accepted");
+    assert_ne!(node_pin(&runner, spell, 1, eq), 0);
+    assert_ne!(node_pin(&runner, spell, 3, ft), 0);
+    runner.advance_until_stack_empty();
+    let state = runner.state();
+    assert_eq!(state.objects[&eq].zone, Zone::Exile);
+    assert_eq!(state.objects[&ft].zone, Zone::Exile);
+    assert!(state.objects[&c].tapped && state.objects[&l2].tapped);
+}

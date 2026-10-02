@@ -11141,8 +11141,9 @@ pub(crate) fn copy_retarget_edit_is_legal(
     Ok(post)
 }
 
-/// CR 115.7a + CR 115.7d + CR 400.7: for each addressed position of
-/// `bindings`, whether submitting `new_targets[i]` CHANGES that position. Built
+/// CR 115.7a + CR 115.7d + CR 400.7: for each written address (`addresses`,
+/// aligned with `new_targets`), whether submitting `new_targets[i]` CHANGES
+/// that position. Built
 /// on the write path's own predicate
 /// (`ResolvedAbility::retarget_target_requires_pin_refresh` on the addressed
 /// node of `pre`): a different target, or the same id whose announced
@@ -11156,19 +11157,18 @@ pub(crate) fn copy_retarget_edit_is_legal(
 pub(crate) fn retarget_positions_changed(
     state: &GameState,
     pre: &ResolvedAbility,
-    bindings: &[RetargetSlotBinding],
+    addresses: &[RetargetSlotAddress],
     new_targets: &[TargetRef],
     pool_contains: &dyn Fn(usize, &TargetRef) -> bool,
 ) -> Vec<bool> {
-    bindings
+    addresses
         .iter()
         .enumerate()
-        .map(|(i, binding)| {
-            let (Some(new), Some(node)) = (new_targets.get(i), node_at(pre, &binding.address.path))
-            else {
+        .map(|(i, address)| {
+            let (Some(new), Some(node)) = (new_targets.get(i), node_at(pre, &address.path)) else {
                 return false;
             };
-            node.targets.get(binding.address.slot).is_some_and(|old| {
+            node.targets.get(address.slot).is_some_and(|old| {
                 node.retarget_target_requires_pin_refresh(old, new, state)
                     && (old != new || pool_contains(i, new))
             })
@@ -11453,7 +11453,7 @@ pub(crate) fn widen_dependent_retarget_pools(
                 retarget_positions_changed(
                     state,
                     stack_ability,
-                    &bindings[j..=j],
+                    std::slice::from_ref(&bindings[j].address),
                     std::slice::from_ref(&referent),
                     &|_, _| true,
                 )

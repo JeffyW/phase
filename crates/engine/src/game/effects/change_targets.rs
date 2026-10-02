@@ -236,10 +236,10 @@ pub fn resolve(
     // the no-change submission (CR 115.7d).
     if !retarget_prompt_is_dischargeable(scope, &slot_pools, &legal_new_targets)
         // CR 115.7d: park only when the reducer accepts at least one response
-        // (`ai_support::retarget_actions` enumerates them through
+        // (`ai_support::retarget_response_exists`, through
         // `engine::validate_retarget_submission`). Otherwise every target is
         // left unchanged, with its announced pin.
-        || crate::ai_support::retarget_actions(
+        || !crate::ai_support::retarget_response_exists(
             state,
             stack_entry_index,
             scope,
@@ -248,7 +248,6 @@ pub fn resolve(
             &current_targets,
             &legal_new_targets,
         )
-        .is_empty()
     {
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::from(&ability.effect),
