@@ -1967,16 +1967,23 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // present, the duration was supplied as a consumed PREFIX ("Until end of
     // turn, whenever <trigger>, <effect>" — The Sea Devils III). The clause then
     // reaches here as a bare "whenever <trigger>, <effect>" with the duration
-    // already applied to the surrounding clause. Split the trigger condition from
-    // the effect on the FIRST top-level comma — the comma that terminates the
-    // trigger clause.
+    // already applied to the surrounding clause. CR 603.1: split the trigger
+    // condition from the effect at the comma that terminates the trigger
+    // clause — the same `find_effect_boundary` authority printed triggers use,
+    // so a comma inside the condition ("whenever a Kraken, Leviathan, Merfolk,
+    // Octopus, or Serpent attacks" — Summon: Leviathan) is not the boundary.
     let (before, after) = match window_split {
         Some(split) => split,
         // CR 603.7b: The phase form is a delayed trigger ONLY when scoped by an
         // explicit "this turn"/"this combat" window. Without it, "at the beginning
         // of [phase]" is a printed trigger and must not be intercepted here.
         None if is_phase_form => return None,
-        None => tp.split_around(", ")?,
+        None => {
+            let boundary = crate::parser::oracle_trigger::find_effect_boundary(tp.lower)?;
+            let (before, _) = tp.split_at(boundary);
+            let (_, after) = tp.split_at(boundary + ", ".len());
+            (before, after)
+        }
     };
 
     // Condition spans the keyword through the split boundary. The "whenever "
@@ -2020,25 +2027,21 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // is already lowercase (`before.lower`).
     inner_ctx.relative_player_scope =
         crate::parser::oracle_trigger::relative_player_scope_for_condition(condition_text);
-    // CR 608.2k + CR 120.1: In a delayed combat/noncombat-damage trigger whose
-    // subject is a set/other object (not the source permanent), an untargeted
-    // object anaphor ("it"/"them") in the effect body names the per-firing damage
-    // dealer — the `TriggeringSource` — e.g. Love on the Battlefield's "put a +1/+1
-    // counter on it" (the creature that dealt combat damage, not the enchantment).
-    // Seed the trigger subject so `resolve_it_pronoun` binds "it" → TriggeringSource
-    // (via the non-self-subject arm) instead of defaulting to `SelfRef`. Mirrors the
-    // printed-trigger effect context (`parse_trigger_line`), which likewise seeds
-    // `subject`. Scoped to `DamageDone`; a `SelfRef`/`Any` subject ("he", Human
-    // Torch) is left unset so its body keeps the source binding.
-    if matches!(trigger_def.mode, TriggerMode::DamageDone) {
-        if let Some(subject) = trigger_def
-            .valid_source
-            .clone()
-            .filter(|f| !matches!(f, TargetFilter::SelfRef | TargetFilter::Any))
-        {
-            inner_ctx.subject = Some(subject);
-        }
-    }
+    // CR 608.2k: an untargeted object anaphor ("it") in the delayed effect body
+    // names the object the trigger condition referred to — the per-firing
+    // attacker, blocker, or damage dealer (`TriggeringSource`) when the subject
+    // is another object (Battle Cry's "it gets +0/+1", Love on the Battlefield's
+    // "put a +1/+1 counter on it"). Seeded by the same authority the printed
+    // trigger body uses (`parse_trigger_line`), so delayed and printed triggers
+    // bind "it" identically. A self subject ("he" in the `Delayed` scope — Human
+    // Torch) or a subjectless condition yields `SelfRef`/`Any`, which
+    // `resolve_it_pronoun` keeps bound to the ability's source.
+    inner_ctx.subject = Some(
+        crate::parser::oracle_trigger::extract_trigger_subject_for_context(
+            condition_text,
+            &mut inner_ctx,
+        ),
+    );
     let inner = parse_effect_chain_with_context(effect_text, AbilityKind::Spell, &mut inner_ctx);
 
     Some(ParsedEffectClause {

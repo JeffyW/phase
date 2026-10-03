@@ -1336,6 +1336,7 @@ mod strategic_betrayal_6505;
 mod strefan_maurer_progenitor;
 mod subject_anchored_optional_announcer;
 mod summer_bloom_5979;
+mod summon_leviathan_subtype_list_triggers;
 mod sun_droplet_remove_counter_infeasible_4776;
 mod superlative_player_subject_control;
 mod support;

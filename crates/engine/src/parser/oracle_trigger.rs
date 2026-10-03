@@ -11006,12 +11006,13 @@ fn continues_spell_color_disjunction(after_comma: &str) -> bool {
     rest.is_empty() || tag::<_, _, OracleError<'_>>(",").parse(rest).is_ok()
 }
 
-fn find_effect_boundary(lower: &str) -> Option<usize> {
+pub(crate) fn find_effect_boundary(lower: &str) -> Option<usize> {
     use super::oracle_nom::primitives::split_once_on;
     let mut search_start = 0;
     while let Ok((_, (before, after))) = split_once_on(&lower[search_start..], ", ") {
         let comma_pos = search_start + before.len();
-        if !continues_player_action_list(after)
+        if !continues_type_list_final_leg(after)
+            && !continues_player_action_list(after)
             && !continues_disjunctive_zone_change_condition(after)
             && !continues_serial_event_condition(after)
             && !continues_spell_quality_disjunction(after)
@@ -11022,6 +11023,20 @@ fn find_effect_boundary(lower: &str) -> Option<usize> {
         search_start = comma_pos + 2;
     }
     None
+}
+
+/// CR 603.1 + CR 205.3a: the comma before the CLOSING leg of an Oxford-comma
+/// type list ("an Insect, Leech, Slug, or Worm you control attacks" — Fumulus,
+/// the Infestation) is a list separator, never the condition/effect boundary.
+/// CR 603.1's template puts the effect after the comma as its own clause, and
+/// an effect clause cannot open with the list conjunction "or". Checked first:
+/// the closing leg is followed by the condition's own event verb ("attacks",
+/// "deals"), which [`is_new_sentence_not_type_continuation`]'s legacy pass would
+/// read as an effect predicate and split the list before its last leg.
+fn continues_type_list_final_leg(after_comma: &str) -> bool {
+    tag::<_, _, OracleError<'_>>("or ")
+        .parse(after_comma.trim_start())
+        .is_ok_and(|(leg, _)| starts_with_type_list_continuation(leg))
 }
 
 /// CR 603.1 + CR 603.2: Parser-as-detector — returns `true` when the text after
@@ -11946,7 +11961,7 @@ fn execute_references_opponent_player(effect: &crate::types::ability::Effect) ->
 /// Warnings from `parse_trigger_subject` are discarded — this function is a best-effort
 /// subject extraction for pronoun resolution, not a diagnostic site. Warnings for
 /// degraded subjects are emitted by the main trigger condition path instead.
-fn extract_trigger_subject_for_context(
+pub(crate) fn extract_trigger_subject_for_context(
     condition_text: &str,
     ctx: &mut ParseContext,
 ) -> TargetFilter {
