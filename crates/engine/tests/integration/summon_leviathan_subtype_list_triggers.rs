@@ -593,7 +593,7 @@ fn search_with_an_unrecognized_zone_leg_fails_closed() {
         .find(|t| t.destination == Some(Zone::Battlefield))
         .expect("ETB trigger");
     let json = serde_json::to_string(trigger).expect("serialize");
-    assert!(json.contains("\"Unimplemented\""), "{json}");
+    assert!(json.contains("\"search_zone_list\""), "{json}");
     assert!(
         !json.contains("\"SearchLibrary\""),
         "no partial search of only the recognized zones: {json}"
@@ -612,4 +612,300 @@ fn search_with_a_recognized_zone_list_keeps_every_zone() {
         json.contains("\"source_zones\":[\"Graveyard\",\"Hand\",\"Library\"]"),
         "{json}"
     );
+}
+
+fn printed_trigger_json(oracle: &str, name: &str, types: &[&str], subtypes: &[&str]) -> String {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let parsed =
+        engine::parser::oracle::parse_oracle_text(oracle, name, &[], &s(types), &s(subtypes));
+    serde_json::to_string(&parsed.triggers).expect("serialize")
+}
+
+/// D7 rows: "it" as a damage source under a bare "becomes blocked" fails
+/// closed — in a conditional sub-clause (Ib Halfheart) and in "have it deal"
+/// (Laccolith Rig). Reach guard: each parses a `BecomesBlocked` trigger.
+#[test]
+fn blocked_attacker_damage_source_fails_closed_in_subclause_and_have_it_deal() {
+    for (name, oracle, types, subtypes) in [
+        (
+            "Ib Halfheart, Goblin Tactician",
+            "Whenever another Goblin you control becomes blocked, sacrifice it. If you do, it deals 4 damage to each creature blocking it.\nSacrifice two Mountains: Create two 1/1 red Goblin creature tokens.",
+            &["Creature"][..],
+            &["Goblin", "Advisor"][..],
+        ),
+        (
+            "Laccolith Rig",
+            "Enchant creature\nWhenever enchanted creature becomes blocked, you may have it deal damage equal to its power to target creature. If you do, the first creature assigns no combat damage this turn.",
+            &["Enchantment"][..],
+            &["Aura"][..],
+        ),
+    ] {
+        let json = printed_trigger_json(oracle, name, types, subtypes);
+        assert!(json.contains("\"BecomesBlocked\""), "{name}: {json}");
+        assert!(
+            json.contains("\"blocked_attacker_damage_source\""),
+            "{name}: {json}"
+        );
+    }
+}
+
+/// D7, delayed-synthetic row (labelled synthetic: no printed card has this
+/// shape): the same predicate fails a delayed body closed.
+#[test]
+fn synthetic_delayed_blocked_attacker_damage_source_fails_closed() {
+    let body = delayed_body(
+        "Until end of turn, whenever a creature becomes blocked, it deals 1 damage to defending player.",
+    );
+    assert!(
+        has_unimplemented(&body, "blocked_attacker_damage_source"),
+        "{body:?}"
+    );
+}
+
+/// D7 controls under the same bare "becomes blocked" condition: a self
+/// source (Close Quarters' enchantment), a self subject, and an explicitly
+/// targeted source all stay supported.
+#[test]
+fn blocked_attacker_damage_source_controls_stay_supported() {
+    for (name, oracle, types) in [
+        (
+            "Close Quarters",
+            "Whenever a creature you control becomes blocked, this enchantment deals 1 damage to any target.",
+            &["Enchantment"][..],
+        ),
+        (
+            "Self Subject Probe",
+            "Whenever this creature becomes blocked, it deals 1 damage to defending player.",
+            &["Creature"][..],
+        ),
+        (
+            "Targeted Source Probe",
+            "Whenever a creature you control becomes blocked, target creature you control deals 1 damage to any target.",
+            &["Enchantment"][..],
+        ),
+    ] {
+        let json = printed_trigger_json(oracle, name, types, &[]);
+        assert!(json.contains("\"DealDamage\""), "{name}: {json}");
+        assert!(!json.contains("\"Unimplemented\""), "{name}: {json}");
+    }
+}
+
+/// D8: Turtles Forever ("search your library and/or outside the game") and a
+/// non-library-leading list with an unreadable leg both fail closed with the
+/// typed gap; a valid single-zone search stays library-only.
+#[test]
+fn search_zone_list_controls() {
+    for text in [
+        "Search your library and/or outside the game for exactly four legendary creature cards you own with different names, then reveal those cards. An opponent chooses two of them. Put the chosen cards into your hand and shuffle the rest into your library.",
+        "Search your graveyard and/or outside the game for a creature card, reveal it, and put it into your hand.",
+        "When this Siege enters, search your library, graveyard, and/or outside the game for an instant or sorcery card you own, reveal it, and put it into your hand. If you search your library this way, shuffle.",
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(has_unimplemented(&def, "search_zone_list"), "{text}: {def:?}");
+    }
+    let single = parse_effect_chain(
+        "Search your library for a creature card, reveal it, put it into your hand, then shuffle.",
+        AbilityKind::Spell,
+    );
+    let json = serde_json::to_string(&single).expect("serialize");
+    // `source_zones` is skipped when it is the library-only default.
+    assert!(json.contains("\"SearchLibrary\""), "{json}");
+    assert!(!json.contains("\"source_zones\""), "{json}");
+    assert!(!json.contains("\"Unimplemented\""), "{json}");
+}
+
+/// Item 4 (CR 603.1): a completed condition disjunction ("you scry or
+/// surveil") followed by a bare action effect ends the condition at the comma.
+#[test]
+fn completed_action_disjunction_then_action_effect_splits() {
+    let body = delayed_body("Until end of turn, whenever you scry or surveil, investigate.");
+    assert!(matches!(&*body.effect, Effect::Investigate), "{body:?}");
+}
+
+/// Control: a genuine condition-side action list keeps its commas.
+#[test]
+fn condition_side_action_list_keeps_its_commas() {
+    let json = printed_trigger_json(
+        "Whenever you waterbend, earthbend, firebend, or airbend, draw a card.",
+        "Bending Probe",
+        &["Enchantment"],
+        &[],
+    );
+    assert!(json.contains("\"Draw\""), "{json}");
+    assert!(!json.contains("\"Unimplemented\""), "{json}");
+}
+
+/// D5 boundary controls: a delayed body whose "if" is not leading isn't
+/// touched; a printed trigger's recognized intervening "if" is kept.
+#[test]
+fn intervening_if_strict_fail_boundary_controls() {
+    let body = delayed_body(
+        "Until end of turn, whenever a creature dies, draw a card if you control a Human.",
+    );
+    assert!(
+        !has_unimplemented(&body, "delayed_intervening_if_dropped"),
+        "{body:?}"
+    );
+    let parsed = engine::parser::oracle::parse_oracle_text(
+        "Whenever you cast a spell, if you control an artifact, draw a card.",
+        "Printed Conditional Probe",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let trigger = &parsed.triggers[0];
+    let execute = trigger.execute.as_deref().expect("execute");
+    assert!(
+        trigger.condition.is_some() || execute.condition.is_some(),
+        "{trigger:?}"
+    );
+    let json = serde_json::to_string(trigger).expect("serialize");
+    assert!(!json.contains("\"Unimplemented\""), "{json}");
+}
+
+/// Resolve the stack answering ordering, optional "you may" (accept), target
+/// prompts (first legal) and proliferate choices (`proliferate_pick`).
+fn resolve_stack_accepting(runner: &mut GameRunner, proliferate_pick: &[ObjectId]) {
+    use engine::types::ability::TargetRef;
+    for _ in 0..64 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accept the optional effect");
+            }
+            WaitingFor::ProliferateChoice { .. } => {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: proliferate_pick
+                            .iter()
+                            .map(|id| TargetRef::Object(*id))
+                            .collect(),
+                    })
+                    .expect("proliferate choice");
+            }
+            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .choose_first_legal_target()
+                    .expect("choose the first legal target");
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => return,
+        }
+    }
+    panic!("stack did not empty: {:?}", runner.state().waiting_for);
+}
+
+/// Declare `attacker` at P1 and have P1 block it with `blocker`.
+fn attack_and_block(runner: &mut GameRunner, attacker: ObjectId, blocker: ObjectId) {
+    attack(runner, &[attacker]);
+    drive_until(runner, |r| {
+        matches!(r.state().waiting_for, WaitingFor::DeclareBlockers { .. })
+    });
+    runner
+        .act(GameAction::DeclareBlockers {
+            assignments: vec![(blocker, attacker)],
+        })
+        .expect("declare the block");
+}
+
+/// CR 509.3c + CR 608.2k: Cunning Evasion returns the BLOCKED attacker, not
+/// its blocker.
+#[test]
+fn cunning_evasion_returns_the_blocked_attacker() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(
+        P0,
+        "Cunning Evasion",
+        "Whenever a creature you control becomes blocked, you may return it to its owner's hand.",
+    );
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let mut runner = scenario.build();
+
+    attack_and_block(&mut runner, attacker, blocker);
+    resolve_stack_accepting(&mut runner, &[]);
+
+    assert_eq!(zone(&runner, attacker), Zone::Hand, "the attacker returns");
+    assert_eq!(
+        zone(&runner, blocker),
+        Zone::Battlefield,
+        "the blocker stays"
+    );
+}
+
+/// CR 701.34a + CR 603.1: "When Roalesk dies, proliferate, then proliferate
+/// again" proliferates twice.
+#[test]
+fn roalesk_proliferates_twice() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let roalesk = scenario
+        .add_creature(P0, "Roalesk, Apex Hybrid", 4, 5)
+        .as_legendary()
+        .with_subtypes(vec!["Human", "Mutant"])
+        .from_oracle_text_with_keywords(
+            &["Flying", "Trample"],
+            "Flying, trample\nWhen Roalesk enters, put two +1/+1 counters on another target creature you control.\nWhen Roalesk dies, proliferate, then proliferate again.",
+        )
+        .id();
+    let grower = scenario.add_creature(P0, "Grower", 1, 1).id();
+    scenario.with_counter(grower, CounterType::Plus1Plus1, 1);
+    let kill = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder", true, "Destroy target creature.")
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(kill).target_object(roalesk).resolve();
+    resolve_stack_accepting(&mut runner, &[grower]);
+
+    // Positive reach guard: Roalesk died.
+    assert_eq!(zone(&runner, roalesk), Zone::Graveyard);
+    assert_eq!(
+        runner.state().objects[&grower].counters[&CounterType::Plus1Plus1],
+        3,
+        "1 counter + two proliferates"
+    );
+}
+
+/// CR 603.7b + CR 603.1: production witness for the delayed boundary. A spell
+/// installs "Until end of turn, whenever a Kraken, or Serpent attacks,
+/// investigate."; a Serpent attacking investigates once (a Clue). Synthetic
+/// Oracle text (the list-plus-action-tail shape the boundary fix covers).
+#[test]
+fn delayed_list_then_action_tail_investigates_at_runtime() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let serpent = add_typed(&mut scenario, P0, "Serpent", "Serpent");
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Tidal Omen",
+            false,
+            "Until end of turn, whenever a Kraken, or Serpent attacks, investigate.",
+        )
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(spell).resolve();
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "the spell installs its delayed trigger"
+    );
+    let clues = |r: &GameRunner| {
+        r.state()
+            .objects
+            .values()
+            .filter(|o| o.zone == Zone::Battlefield && o.name == "Clue")
+            .count()
+    };
+    attack(&mut runner, &[serpent]);
+    assert_eq!(clues(&runner), 1, "the Serpent's attack investigates once");
 }

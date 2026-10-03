@@ -11030,57 +11030,61 @@ pub(crate) fn find_effect_boundary(lower: &str) -> Option<usize> {
     None
 }
 
-/// A player-action or bending verb, as one whole list item ("investigate",
-/// "waterbend").
-fn is_action_verb_item(item: &str) -> bool {
-    all_consuming(parse_player_action_phrase_nom)
-        .parse(item)
-        .is_ok()
-        || all_consuming(parse_bend_verb).parse(item).is_ok()
+/// A player-action or bending verb ("investigate", "waterbend").
+fn parse_action_verb(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        value((), parse_player_action_phrase_nom),
+        value((), parse_bend_verb),
+    ))
+    .parse(input)
+}
+
+/// One whole action-verb list item, with its list position: `true` for the
+/// CLOSING leg ("or airbend" / "and/or airbend"), `false` for an open leg.
+fn parse_action_list_item(input: &str) -> OracleResult<'_, bool> {
+    all_consuming(map(
+        pair(
+            opt(alt((
+                tag::<_, _, OracleError<'_>>("and/or "),
+                tag::<_, _, OracleError<'_>>("or "),
+            ))),
+            parse_action_verb,
+        ),
+        |(conjunction, ())| conjunction.is_some(),
+    ))
+    .parse(input)
 }
 
 /// CR 603.1: a comma inside a list of player actions ("whenever you
 /// waterbend, earthbend, firebend, or airbend") separates items of ONE trigger
-/// event, so it is not the condition/effect boundary. A list is homogeneous:
-/// the item BEFORE the comma must be such an action too. Without that left
-/// check, an effect that happens to be a bare action verb ("whenever a Kraken,
-/// or Serpent attacks, investigate") read as a list continuation and the line
-/// had no boundary at all.
+/// event, so it is not the condition/effect boundary. Decided from the list's
+/// structure on both sides of the comma:
+/// - the item AFTER the comma is a list item (an action verb, or the closing
+///   "or <action>" leg);
+/// - the item BEFORE it ends in an OPEN action leg. A left item that ends in
+///   the closing leg ("whenever you scry or surveil") has completed its list,
+///   so the next comma ends the condition; one that ends in no action at all
+///   ("whenever a Kraken, or Serpent attacks") was never an action list.
 fn continues_action_verb_list(before_comma: &str, after_comma: &str) -> bool {
-    let trimmed = after_comma.trim_start();
-    let candidate = value((), tag::<_, _, OracleError<'_>>("or "))
-        .parse(trimmed)
-        .map(|(rest, _)| rest)
-        .unwrap_or(trimmed);
-    let candidate = match nom_primitives::split_once_on(candidate, ", ") {
+    let right = after_comma.trim_start();
+    let right_item = match nom_primitives::split_once_on(right, ", ") {
         Ok((_, (item, _))) => item,
-        Err(_) => candidate,
+        Err(_) => right,
     }
     .trim();
-    if !is_action_verb_item(candidate) {
+    if parse_action_list_item(right_item).is_err() {
         return false;
     }
-    // The left item is the text after the previous list comma; its action verb
-    // ends it ("whenever you waterbend" → "waterbend"). Try every word-boundary
-    // suffix of the item, so the subject ("you", "a player") is skipped.
+    // The left item is the text after the previous list comma.
     let mut left_item = before_comma.trim();
     while let Ok((_, (_, rest))) = nom_primitives::split_once_on(left_item, ", ") {
         left_item = rest.trim();
     }
-    let left_item = value((), tag::<_, _, OracleError<'_>>("or "))
-        .parse(left_item)
-        .map(|(rest, _)| rest)
-        .unwrap_or(left_item);
-    let mut tail = left_item;
-    loop {
-        if is_action_verb_item(tail) {
-            return true;
-        }
-        match nom_primitives::split_once_on(tail, " ") {
-            Ok((_, (_, rest))) => tail = rest,
-            Err(_) => return false,
-        }
-    }
+    // Its action verb ends it ("whenever you waterbend" → "waterbend"): the
+    // first word boundary where the rest is one whole list item skips the
+    // subject.
+    nom_primitives::scan_at_word_boundaries(left_item, parse_action_list_item)
+        .is_some_and(|closing| !closing)
 }
 
 /// CR 603.1 + CR 205.3a: the comma before the CLOSING leg of an Oxford-comma

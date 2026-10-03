@@ -21,7 +21,7 @@ use super::super::oracle_util::{
 };
 use super::sequence::{parse_choice_partition_destination, parse_rest_cards_reference};
 use super::{capitalize, scan_contains_phrase, ParseContext};
-use crate::parser::oracle_ir::ast::{SearchLibraryDetails, SeekDetails};
+use crate::parser::oracle_ir::ast::{SearchLibraryDetails, SearchZoneList, SeekDetails};
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
     AggregateFunction, Comparator, ControllerRef, FilterProp, ObjectProperty, ObjectScope,
@@ -224,7 +224,7 @@ pub(super) fn parse_search_library_details(
         split,
         // CR 701.23a: Library-only unless the text names a multi-zone set
         // ("graveyard, hand, and/or library").
-        source_zones: parse_multi_search_zones(lower).unwrap_or_else(|| vec![Zone::Library]),
+        source_zones: classify_search_zone_list(lower),
     }
 }
 
@@ -940,9 +940,7 @@ fn parse_search_zone_separator(input: &str) -> Result<(&str, ()), nom::Err<Oracl
 }
 
 /// CR 701.23a: The zone list of a "search <possessive> <zones> for …" clause:
-/// the zones parsed, and the text left after the last recognized zone. A
-/// non-empty remainder is a leg the zone vocabulary doesn't know
-/// ("library, graveyard, and/or outside the game").
+/// the zones parsed, and the text left after the last recognized zone.
 fn search_zone_list(lower: &str) -> Option<(Vec<Zone>, &str)> {
     fn run(input: &str) -> Result<(Vec<Zone>, &str), nom::Err<OracleError<'_>>> {
         let (input, _) = take_until::<_, _, OracleError<'_>>("search ").parse(input)?;
@@ -962,8 +960,7 @@ fn search_zone_list(lower: &str) -> Option<(Vec<Zone>, &str)> {
         // the consumed-before output, not the remainder.
         let (_, region) = take_until(" for ").parse(input)?;
         // Reuse the canonical zone-word combinator (handles plurals + the full
-        // zone vocabulary); the canonicalize step below keeps only the three
-        // tutoring zones.
+        // zone vocabulary).
         let (rest, zones) =
             separated_list1(parse_search_zone_separator, parse_zone_word).parse(region)?;
         Ok((zones, rest))
@@ -971,31 +968,33 @@ fn search_zone_list(lower: &str) -> Option<(Vec<Zone>, &str)> {
     run(lower).ok()
 }
 
-/// CR 701.23a: true when a search names a zone list with a leg outside the
-/// zone vocabulary. Such a search can't be represented, so callers fail it
-/// closed rather than search only the zones they recognized.
-pub(super) fn search_zone_list_has_unrecognized_leg(lower: &str) -> bool {
-    search_zone_list(lower).is_some_and(|(_, rest)| !rest.is_empty())
-}
-
-/// CR 701.23a: Detect a multi-zone search ("search your graveyard, hand, and/or
-/// library for ...") and return the deduplicated zone set in canonical order
-/// (Graveyard, Hand, Library). Returns `None` for the ordinary single-zone
-/// library search so the caller falls back to the library-only default, and for
-/// a zone list with an unrecognized leg (see
-/// [`search_zone_list_has_unrecognized_leg`]).
-pub(super) fn parse_multi_search_zones(lower: &str) -> Option<Vec<Zone>> {
-    let (zones, rest) = search_zone_list(lower)?;
-    if !rest.is_empty() {
-        return None;
+/// CR 701.23a: Classify a search clause's zone list. The single authority for
+/// both the multi-zone admission in `parse_search_and_creation_ast` and the
+/// searched zones in [`parse_search_library_details`].
+pub(super) fn classify_search_zone_list(lower: &str) -> SearchZoneList {
+    const SEARCHABLE: [Zone; 3] = [Zone::Graveyard, Zone::Hand, Zone::Library];
+    let Some((zones, rest)) = search_zone_list(lower) else {
+        return SearchZoneList::Unlisted;
+    };
+    // A further list leg that the zone vocabulary doesn't read.
+    if parse_search_zone_separator(rest).is_ok() {
+        return SearchZoneList::Unrepresentable;
     }
-    // CR 701.23a: Canonicalize and dedupe; only treat as multi-zone when 2+
-    // distinct zones are named (a lone "library" is the ordinary tutor).
-    let set: Vec<Zone> = [Zone::Graveyard, Zone::Hand, Zone::Library]
+    if zones.len() < 2 {
+        return SearchZoneList::Unlisted;
+    }
+    if zones.iter().any(|zone| !SEARCHABLE.contains(zone)) {
+        return SearchZoneList::Unrepresentable;
+    }
+    let set: Vec<Zone> = SEARCHABLE
         .into_iter()
         .filter(|z| zones.contains(z))
         .collect();
-    (set.len() >= 2).then_some(set)
+    if set.len() >= 2 {
+        SearchZoneList::Zones(set)
+    } else {
+        SearchZoneList::Unlisted
+    }
 }
 
 fn parse_search_filter_color_disjunction(
@@ -2995,7 +2994,7 @@ mod tests {
             let details = parse_search_library_details(lower, &mut ctx);
             assert_eq!(
                 details.source_zones,
-                vec![Zone::Graveyard, Zone::Hand, Zone::Library],
+                SearchZoneList::Zones(vec![Zone::Graveyard, Zone::Hand, Zone::Library]),
                 "multi-zone detection failed for {lower:?}"
             );
         }
@@ -3014,7 +3013,7 @@ mod tests {
         // Ordinary single-zone library tutor stays library-only.
         let single =
             parse_search_library_details("search your library for a creature card", &mut ctx);
-        assert_eq!(single.source_zones, vec![Zone::Library]);
+        assert_eq!(single.source_zones, SearchZoneList::Unlisted);
     }
 
     #[test]
@@ -3029,7 +3028,7 @@ mod tests {
 
         assert_eq!(
             details.source_zones,
-            vec![Zone::Graveyard, Zone::Hand, Zone::Library]
+            SearchZoneList::Zones(vec![Zone::Graveyard, Zone::Hand, Zone::Library])
         );
         assert!(details.up_to);
         assert_eq!(details.count, QuantityExpr::Fixed { value: 4 });

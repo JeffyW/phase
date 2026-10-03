@@ -166,8 +166,8 @@ use self::imperative::{
 };
 use self::search::parse_search_filter;
 use self::search::{
-    parse_multi_search_zones, parse_search_destination, parse_search_library_details,
-    parse_seek_details, parse_total_mana_value_comparator, search_zone_list_has_unrecognized_leg,
+    classify_search_zone_list, parse_search_destination, parse_search_library_details,
+    parse_seek_details, parse_total_mana_value_comparator,
 };
 use self::sequence::{
     apply_clause_continuation, clause_is_dig_lookback_transparent, continuation_absorbs_current,
