@@ -19,12 +19,17 @@
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
+use engine::parser::oracle_effect::parse_effect_chain;
+use engine::types::ability::{
+    AbilityDefinition, AbilityKind, DelayedTriggerCondition, Effect, TargetFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 const SUMMON_LEVIATHAN: &str = "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)\n\
@@ -409,4 +414,130 @@ fn swarmyard_massacre_reads_both_lists_whole() {
             "{name} is a listed type and is unaffected"
         );
     }
+}
+
+/// The delayed trigger's effect: the `CreateDelayedTrigger` inner ability of a
+/// one-line spell.
+fn delayed_body(text: &str) -> AbilityDefinition {
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let mut cur = &def;
+    loop {
+        if let Effect::CreateDelayedTrigger { effect, .. } = &*cur.effect {
+            return (**effect).clone();
+        }
+        cur = cur
+            .sub_ability
+            .as_deref()
+            .unwrap_or_else(|| panic!("no CreateDelayedTrigger in {def:?}"));
+    }
+}
+
+/// CR 509.3c + CR 608.2k: in a bare "becomes blocked" condition, "it" names the
+/// blocked attacker. The (blocker, attacker) event's `TriggeringSource` is the
+/// blocker, so the body binds `ParentTarget`, which resolves the attacker.
+#[test]
+fn bare_becomes_blocked_it_binds_the_attacker_not_the_blocker() {
+    let body = delayed_body(
+        "Until end of turn, whenever a creature becomes blocked, it gets +1/+1 until end of turn.",
+    );
+    let Effect::Pump { target, .. } = &*body.effect else {
+        panic!("expected Pump, got {:?}", body.effect);
+    };
+    assert_eq!(*target, TargetFilter::ParentTarget);
+}
+
+/// Runtime: a single blocker. The attacker gets +1/+1 and the blocker doesn't.
+#[test]
+fn bare_becomes_blocked_pumps_the_attacker_on_a_printed_trigger() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Somberwald Alpha", 3, 2)
+        .with_subtypes(vec!["Wolf"])
+        .with_summoning_sickness()
+        .from_oracle_text(
+            "Whenever a creature you control becomes blocked, it gets +1/+1 until end of turn.",
+        );
+    let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
+    let blocker = scenario.add_creature(P1, "Blocker", 2, 2).id();
+    let mut runner = scenario.build();
+
+    attack(&mut runner, &[attacker]);
+    drive_until(&mut runner, |r| {
+        matches!(r.state().waiting_for, WaitingFor::DeclareBlockers { .. })
+    });
+    runner
+        .act(GameAction::DeclareBlockers {
+            assignments: vec![(blocker, attacker)],
+        })
+        .expect("declare the block");
+    resolve_stack(&mut runner);
+
+    runner.state_mut().layers_dirty.mark_full();
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    let pt = |id: ObjectId| {
+        let o = &runner.state().objects[&id];
+        (o.power, o.toughness)
+    };
+    assert_eq!(
+        pt(attacker),
+        (Some(3), Some(3)),
+        "the blocked attacker is pumped"
+    );
+    assert_eq!(pt(blocker), (Some(2), Some(2)), "the blocker is not");
+}
+
+/// CR 603.1: a type list followed by a bare action-verb effect. "investigate"
+/// is not another list item, so the boundary is the comma before it.
+#[test]
+fn type_list_then_action_verb_effect_splits_before_the_action() {
+    let def = parse_effect_chain(
+        "Until end of turn, whenever a Kraken, or Serpent attacks, investigate.",
+        AbilityKind::Spell,
+    );
+    let Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::WheneverEvent { trigger, .. },
+        effect,
+        ..
+    } = &*def.effect
+    else {
+        panic!(
+            "expected a WheneverEvent delayed trigger, got {:?}",
+            def.effect
+        );
+    };
+    assert_eq!(trigger.mode, TriggerMode::Attacks);
+    assert!(matches!(&*effect.effect, Effect::Investigate));
+}
+
+/// Control: Mistway Spy's delayed trigger still splits before "investigate".
+#[test]
+fn mistway_spy_delayed_trigger_still_investigates() {
+    let body = delayed_body(
+        "Until end of turn, whenever a creature you control deals combat damage to a player, investigate.",
+    );
+    assert!(matches!(&*body.effect, Effect::Investigate), "{body:?}");
+}
+
+/// CR 603.4: a delayed body whose leading intervening "if" the parser drops
+/// fails closed. Reach guard: the delayed trigger itself still parses.
+#[test]
+fn delayed_body_with_a_dropped_intervening_if_is_unimplemented() {
+    let body = delayed_body(
+        "Whenever you cast a spell this turn, if this card is suspended, remove a time counter from it.",
+    );
+    assert!(
+        matches!(&*body.effect, Effect::Unimplemented { name, .. } if name == "delayed_intervening_if_dropped"),
+        "{body:?}"
+    );
+}
+
+/// Control: a recognized intervening "if" is kept on the delayed body's root.
+#[test]
+fn delayed_body_with_a_recognized_intervening_if_keeps_it() {
+    let body = delayed_body(
+        "Until end of turn, whenever a creature dies, if you control a Human, draw a card.",
+    );
+    assert!(body.condition.is_some(), "{body:?}");
+    assert!(matches!(&*body.effect, Effect::Draw { .. }), "{body:?}");
 }

@@ -15591,23 +15591,23 @@ fn widened_boundary_window_is_monotone_over_effect_verbs() {
 /// (`that `/`which `/`with `) rather than reading into it. Without this bound,
 /// **Immolation Shaman**'s "an ability of an artifact, creature, or land THAT
 /// ISN'T a mana ability" would let the widened window reach "isn't", which
-/// `is_negated_auxiliary_predicate_token` classifies as an effect predicate,
-/// moving the boundary from the card's second comma to its first and
-/// narrowing `valid_card` from `AnyOf[Artifact, Creature]` to `Artifact`.
-/// Revert-failing against the round-2 variant (sentence bound only), under
-/// which row 1 moves to the first comma and row 3 returns
-/// `"creature, or land that isn't a mana ability"`.
+/// `is_negated_auxiliary_predicate_token` classifies as an effect predicate.
+/// The window bound itself is pinned by the `type_list_clause_window` row
+/// below. The Immolation Shaman boundary row is now decided earlier, by
+/// `continues_type_list_final_leg` (an effect cannot open with "or"), so the
+/// boundary is the CR 603.1 one after the whole list — #7451 pinned it at the
+/// closing leg, which kept "land" out of `valid_card`.
 #[test]
 fn widened_window_stops_at_a_restrictive_postmodifier() {
     let immolation_shaman = "whenever an opponent activates an ability of an artifact, creature, or land that isn't a mana ability, this creature deals 1 damage to that player.";
     let lower = immolation_shaman.to_lowercase();
     let boundary = find_effect_boundary(&lower).expect("effect boundary");
     let suffix = &lower[boundary..];
-    let expected = ", or land that isn't";
+    let expected = ", this creature deals";
     assert_eq!(
         &suffix[..expected.len()],
         expected,
-        "boundary must stay at the card's second comma, got {suffix:?}"
+        "boundary must follow the whole type list, got {suffix:?}"
     );
 
     let harsh_mentor = "whenever an opponent activates an ability of an artifact, creature, or land on the battlefield, if it isn't a mana ability, this creature deals 2 damage to that player.";
@@ -15750,30 +15750,30 @@ fn comma_terminated_bare_event_verb_is_an_event_head_not_a_predicate() {
 }
 
 /// Issue #7451: a condition-side Oxford type list — the trigger's SUBJECT, not
-/// its effect — must stay exactly where it is today. These cards remain
-/// `TriggerMode::Unknown`; turning them green is out of scope for #7451.
-/// Revert-failing against `naive-B` (the two-pass design with the widened
-/// window but WITHOUT the event-head exclusion): under `naive-B` the boundary
-/// jumps to the FIRST comma. **Not** revert-failing against `naive-A` — under
-/// `naive-A` the widened window still contains the event head ("attacks" /
-/// "becomes"), so `naive-A`'s whole-window veto also leaves the boundary at
-/// comma 2.
+/// its effect — stays whole in the condition. #7451 pinned the boundary at the
+/// list's closing "or" leg and left these cards `TriggerMode::Unknown`; that
+/// split was wrong under CR 603.1 (an effect clause cannot open with the list
+/// conjunction "or"), and `continues_type_list_final_leg` now keeps the whole
+/// list. Still revert-failing against `naive-B` (the two-pass design without
+/// the event-head exclusion), which jumps to the FIRST comma.
 #[test]
-fn condition_side_type_list_boundary_is_unchanged() {
-    let bird_frog_otter = "whenever a bird, frog, or otter you control attacks, draw a card";
-    let lower = bird_frog_otter.to_lowercase();
-    let boundary = find_effect_boundary(&lower).expect("effect boundary");
-    let suffix = &lower[boundary..];
-    let expected = ", or otter";
-    assert_eq!(&suffix[..expected.len()], expected, "got {suffix:?}");
-
-    let forest_island_swamp =
-        "whenever a forest, island, or swamp you control becomes tapped, draw a card";
-    let lower = forest_island_swamp.to_lowercase();
-    let boundary = find_effect_boundary(&lower).expect("effect boundary");
-    let suffix = &lower[boundary..];
-    let expected = ", or swamp";
-    assert_eq!(&suffix[..expected.len()], expected, "got {suffix:?}");
+fn condition_side_type_list_stays_whole() {
+    for (text, first_leg) in [
+        (
+            "whenever a bird, frog, or otter you control attacks, draw a card",
+            ", frog",
+        ),
+        (
+            "whenever a forest, island, or swamp you control becomes tapped, draw a card",
+            ", island",
+        ),
+    ] {
+        let lower = text.to_lowercase();
+        let boundary = find_effect_boundary(&lower).expect("effect boundary");
+        let suffix = &lower[boundary..];
+        assert!(suffix.starts_with(", draw a card"), "got {suffix:?}");
+        assert!(!suffix.starts_with(first_leg), "got {suffix:?}");
+    }
 }
 
 /// `type_list_clause_window` bounds: extended across every list comma when

@@ -1979,15 +1979,7 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
         // of [phase]" is a printed trigger and must not be intercepted here.
         None if is_phase_form => return None,
         None => {
-            // A condition the shared authority cannot bound (its list guards
-            // read the whole tail as a continuation — "…, investigate") keeps
-            // the first comma, as before.
-            let boundary =
-                crate::parser::oracle_trigger::find_effect_boundary(tp.lower).or_else(|| {
-                    nom_primitives::split_once_on(tp.lower, ", ")
-                        .ok()
-                        .map(|(_, (before, _))| before.len())
-                })?;
+            let boundary = crate::parser::oracle_trigger::find_effect_boundary(tp.lower)?;
             let (before, _) = tp.split_at(boundary);
             let (_, after) = tp.split_at(boundary + ", ".len());
             (before, after)
@@ -2049,6 +2041,23 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     inner_ctx.object_pronoun_ref = anaphors.object_pronoun_ref;
     inner_ctx.demonstrative_object_ref = anaphors.demonstrative_object_ref;
     let inner = parse_effect_chain_with_context(effect_text, AbilityKind::Spell, &mut inner_ctx);
+    // CR 603.4: a delayed body that opens with an intervening "if" clause must
+    // carry that condition on its root ability. When the shared conditional
+    // splitter finds a leading "if …," but the parsed root carries no
+    // condition, the gate was lost and the ability would fire unconditionally
+    // (17-Year Cicadas' printed suspend trigger, read here as a delayed one).
+    // Fail it closed rather than claim an ungated trigger.
+    let inner = if inner.condition.is_none()
+        && crate::parser::oracle_effect::conditions::split_leading_conditional(effect_text)
+            .is_some()
+    {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::unimplemented("delayed_intervening_if_dropped", effect_text),
+        )
+    } else {
+        inner
+    };
 
     Some(ParsedEffectClause {
         unlowered_guard: None,

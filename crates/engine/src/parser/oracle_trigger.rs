@@ -11010,6 +11010,7 @@ pub(crate) fn find_effect_boundary(lower: &str) -> Option<usize> {
     while let Ok((_, (before, after))) = split_once_on(&lower[search_start..], ", ") {
         let comma_pos = search_start + before.len();
         if !continues_type_list_final_leg(after)
+            && !continues_action_verb_list(&lower[..comma_pos], after)
             && !continues_player_action_list(after)
             && !continues_disjunctive_zone_change_condition(after)
             && !continues_serial_event_condition(after)
@@ -11021,6 +11022,59 @@ pub(crate) fn find_effect_boundary(lower: &str) -> Option<usize> {
         search_start = comma_pos + 2;
     }
     None
+}
+
+/// A player-action or bending verb, as one whole list item ("investigate",
+/// "waterbend").
+fn is_action_verb_item(item: &str) -> bool {
+    all_consuming(parse_player_action_phrase_nom)
+        .parse(item)
+        .is_ok()
+        || all_consuming(parse_bend_verb).parse(item).is_ok()
+}
+
+/// CR 603.1: a comma inside a list of player actions ("whenever you
+/// waterbend, earthbend, firebend, or airbend") separates items of ONE trigger
+/// event, so it is not the condition/effect boundary. A list is homogeneous:
+/// the item BEFORE the comma must be such an action too. Without that left
+/// check, an effect that happens to be a bare action verb ("whenever a Kraken,
+/// or Serpent attacks, investigate") read as a list continuation and the line
+/// had no boundary at all.
+fn continues_action_verb_list(before_comma: &str, after_comma: &str) -> bool {
+    let trimmed = after_comma.trim_start();
+    let candidate = value((), tag::<_, _, OracleError<'_>>("or "))
+        .parse(trimmed)
+        .map(|(rest, _)| rest)
+        .unwrap_or(trimmed);
+    let candidate = match nom_primitives::split_once_on(candidate, ", ") {
+        Ok((_, (item, _))) => item,
+        Err(_) => candidate,
+    }
+    .trim();
+    if !is_action_verb_item(candidate) {
+        return false;
+    }
+    // The left item is the text after the previous list comma; its action verb
+    // ends it ("whenever you waterbend" → "waterbend"). Try every word-boundary
+    // suffix of the item, so the subject ("you", "a player") is skipped.
+    let mut left_item = before_comma.trim();
+    while let Ok((_, (_, rest))) = nom_primitives::split_once_on(left_item, ", ") {
+        left_item = rest.trim();
+    }
+    let left_item = value((), tag::<_, _, OracleError<'_>>("or "))
+        .parse(left_item)
+        .map(|(rest, _)| rest)
+        .unwrap_or(left_item);
+    let mut tail = left_item;
+    loop {
+        if is_action_verb_item(tail) {
+            return true;
+        }
+        match nom_primitives::split_once_on(tail, " ") {
+            Ok((_, (_, rest))) => tail = rest,
+            Err(_) => return false,
+        }
+    }
 }
 
 /// CR 603.1 + CR 205.3a: the comma before the CLOSING leg of an Oxford-comma
@@ -11087,28 +11141,8 @@ fn continues_serial_event_condition(after_comma: &str) -> bool {
 
 fn continues_player_action_list(after_comma: &str) -> bool {
     let trimmed = after_comma.trim_start();
-    let candidate = value((), tag::<_, _, OracleError<'_>>("or "))
-        .parse(trimmed)
-        .map(|(rest, _)| rest)
-        .unwrap_or(trimmed)
-        .split(", ")
-        .next()
-        .unwrap_or(trimmed)
-        .trim();
-    if all_consuming(parse_player_action_phrase_nom)
-        .parse(candidate)
-        .is_ok()
-    {
-        return true;
-    }
-    // Avatar crossover: a comma-separated bending-verb disjunction
-    // ("whenever you waterbend, earthbend, firebend, or airbend") is a single
-    // batched trigger event, so the comma after each verb is a list separator,
-    // not the condition/effect boundary.
-    if all_consuming(parse_bend_verb).parse(candidate).is_ok() {
-        return true;
-    }
-
+    // Player-action and bending-verb list items are decided by
+    // `continues_action_verb_list`, which also checks the item before the comma.
     if type_phrase_continues_to_combat_damage_player_event(trimmed) {
         return true;
     }
@@ -12224,7 +12258,40 @@ fn trigger_object_pronoun_ref_for_condition(
         return Some(recipient);
     }
 
+    // CR 509.3c + CR 608.2k: in a bare "<creature> becomes blocked" condition
+    // the condition's object is the BLOCKED ATTACKER. The event carries the
+    // (blocker, attacker) pair, whose `TriggeringSource` is the blocker
+    // (`targeting::extract_source_from_event`), so "it gets +1/+1" would pump
+    // the blocker. `ParentTarget` resolves the blocked attacker from that same
+    // event (`targeting::blocked_attacker_from_event`) — the binding "that Hero"
+    // already uses (She-Hulk, Wallbreaker). Excluded: a self subject (the
+    // source is the attacker either way), the CR 509.3d "becomes blocked by …"
+    // per-blocker form, whose event carries the blocker as its referent, and the
+    // fused "blocks or becomes blocked" head, whose source may be the blocker.
+    if !matches!(trigger_subject, TargetFilter::SelfRef)
+        && nom_primitives::scan_at_word_boundaries(
+            after_keyword,
+            parse_fused_blocks_or_becomes_blocked,
+        )
+        .is_none()
+        && nom_primitives::scan_at_word_boundaries(after_keyword, parse_bare_becomes_blocked)
+            .is_some()
+    {
+        return Some(TargetFilter::ParentTarget);
+    }
+
     None
+}
+
+fn parse_fused_blocks_or_becomes_blocked(input: &str) -> OracleResult<'_, ()> {
+    value((), tag("blocks or becomes blocked")).parse(input)
+}
+
+/// "becomes blocked" with no "by …" blocker qualifier (CR 509.3c's bare form).
+fn parse_bare_becomes_blocked(input: &str) -> OracleResult<'_, ()> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("becomes blocked").parse(input)?;
+    not(tag(" by")).parse(rest)?;
+    Ok((rest, ()))
 }
 
 /// CR 608.2k: the antecedent a singular DEMONSTRATIVE ("that creature" / "that
