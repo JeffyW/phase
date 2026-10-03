@@ -167,7 +167,7 @@ use self::imperative::{
 use self::search::parse_search_filter;
 use self::search::{
     parse_multi_search_zones, parse_search_destination, parse_search_library_details,
-    parse_seek_details, parse_total_mana_value_comparator,
+    parse_seek_details, parse_total_mana_value_comparator, search_zone_list_has_unrecognized_leg,
 };
 use self::sequence::{
     apply_clause_continuation, clause_is_dig_lookback_transparent, continuation_absorbs_current,
@@ -2039,6 +2039,7 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
         crate::parser::oracle_trigger::trigger_condition_anaphors(condition_text, &mut inner_ctx);
     inner_ctx.subject = Some(anaphors.subject);
     inner_ctx.object_pronoun_ref = anaphors.object_pronoun_ref;
+    inner_ctx.condition_object_antecedent = anaphors.condition_object_antecedent;
     inner_ctx.demonstrative_object_ref = anaphors.demonstrative_object_ref;
     let inner = parse_effect_chain_with_context(effect_text, AbilityKind::Spell, &mut inner_ctx);
     // CR 603.4: a delayed body that opens with an intervening "if" clause must
@@ -26057,6 +26058,14 @@ fn lower_subject_predicate_ast(
                     };
                 }
             }
+            // CR 509.3c + CR 120.1: under a bare "becomes blocked" condition
+            // "it" names the blocked attacker (`ParentTarget`, pinned by
+            // `trigger_object_pronoun_ref_for_condition`). `DamageSource` has no
+            // value naming that attacker, so "it deals N damage" would be dealt
+            // by the ability's source. Fail it closed instead.
+            if subject_is_unbindable_damage_source(&subject, &clause.effect, ctx) {
+                return unbindable_damage_source_clause(original_clause);
+            }
             // CR 608.2c: Inject the subject's target into targeted effects that were
             // parsed via the imperative path (connive, phase out, force block, suspect).
             if let Some(wrapped) = wrap_target_subject_damage(clause.clone(), &subject) {
@@ -26950,6 +26959,39 @@ fn rebind_each_target_damage_amount(effect: &mut Effect, power_scope: ObjectScop
             rebind_anaphoric_object_scope(amount, power_scope);
         }
         _ => {}
+    }
+}
+
+/// CR 509.3c + CR 120.1: true when the damage clause's subject is the bare
+/// "becomes blocked" condition's attacker ("it"), which no `DamageSource` value
+/// can name. Typed: the trigger condition's antecedent is the blocked attacker
+/// and the subject resolved to the matching `ParentTarget` pin.
+fn subject_is_unbindable_damage_source(
+    subject: &SubjectPhraseAst,
+    effect: &Effect,
+    ctx: &ParseContext,
+) -> bool {
+    matches!(effect, Effect::DealDamage { .. } | Effect::DamageAll { .. })
+        && ctx.condition_object_antecedent
+            == Some(crate::parser::oracle_ir::context::ConditionObjectAntecedent::BlockedAttacker)
+        && matches!(ctx.object_pronoun_ref, Some(TargetFilter::ParentTarget))
+        && matches!(
+            subject.target.as_ref().or(subject.affected.as_ref()),
+            Some(TargetFilter::ParentTarget)
+        )
+}
+
+fn unbindable_damage_source_clause(original_clause: &str) -> ParsedEffectClause {
+    ParsedEffectClause {
+        unlowered_guard: None,
+        effect: Effect::unimplemented("blocked_attacker_damage_source", original_clause),
+        duration: None,
+        sub_ability: None,
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
     }
 }
 
@@ -41423,6 +41465,12 @@ fn parse_effect_chain_ir_body(
                         .then(|| ctx.object_pronoun_ref.clone())
                         .flatten()
                 }),
+            // CR 509.3c + CR 608.2k: the antecedent travels only with the
+            // trigger-level pin it describes — not with a chain-local typed
+            // referent, and not when the pin was withheld.
+            condition_object_antecedent: (!prior_typed_referent && !binds_source_counter_pronoun)
+                .then_some(ctx.condition_object_antecedent)
+                .flatten(),
             card_name: ctx.card_name.clone(),
             // The DEMONSTRATIVE-scoped antecedent is a property of the whole
             // trigger body (the Kashi-Tribe "tap that creature and it doesn't

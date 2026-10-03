@@ -3551,6 +3551,13 @@ pub(super) fn parse_search_and_creation_ast(
     if let Some((owner, quantifier)) = try_parse_multi_zone_same_name_exile(lower) {
         return Some(SearchCreationImperativeAst::MultiZoneSameNameExile { owner, quantifier });
     }
+    // CR 701.23a: a zone list with a leg outside the zone vocabulary ("search
+    // your library, graveyard, and/or outside the game" — Invasion of
+    // Arcavios) can't be represented; searching only the recognized zones would
+    // silently drop the rest. Leave it unparsed.
+    if super::search_zone_list_has_unrecognized_leg(lower) {
+        return None;
+    }
     if starts_with_possessive(lower, "search", "library")
         // CR 701.23a: God-Pharaoh's-Gift-class multi-zone tutors ("search your
         // graveyard, hand, and/or library for ...") — the word after the

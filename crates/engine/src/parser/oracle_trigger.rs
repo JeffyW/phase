@@ -18,7 +18,9 @@ use super::oracle_effect::{
     try_parse_reanimator_aura_etb_effect_ir, try_parse_reanimator_aura_grant_etb_effect_ir,
 };
 use super::oracle_ir::ast::parsed_clause;
-use super::oracle_ir::context::{ParseContext, TriggerConditionScope, TriggerZoneChangeProvenance};
+use super::oracle_ir::context::{
+    ConditionObjectAntecedent, ParseContext, TriggerConditionScope, TriggerZoneChangeProvenance,
+};
 use super::oracle_ir::doc::PrintedTriggerIndex;
 use super::oracle_ir::effect_chain::{DieResultBranchIr, EffectChainIr};
 use super::oracle_ir::trigger::{
@@ -1572,6 +1574,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     // spell qualifier becomes the trigger's `valid_card`.
     let pending_mana_symbol_count_color =
         extract_colored_mana_symbol_spell_qualifier(condition_text);
+    let if_pronoun_ref = trigger_object_pronoun_ref_for_intervening_if(&if_condition);
     let mut effect_ctx = ParseContext {
         subject: Some(trigger_subject.clone()),
         card_name: Some(card_name.to_string()),
@@ -1612,8 +1615,11 @@ pub(crate) fn parse_trigger_line_with_index_ir(
         // ("Whenever you cast a spell, if ~ is in your graveyard, ... return it")
         // is the card that discriminates them — the spell-cast axis would
         // otherwise bind "return it" to the cast spell instead of the Phoenix.
-        object_pronoun_ref: trigger_object_pronoun_ref_for_intervening_if(&if_condition)
-            .or(anaphors.object_pronoun_ref),
+        object_pronoun_ref: if_pronoun_ref.clone().or(anaphors.object_pronoun_ref),
+        condition_object_antecedent: if_pronoun_ref
+            .is_none()
+            .then_some(anaphors.condition_object_antecedent)
+            .flatten(),
         demonstrative_object_ref: anaphors.demonstrative_object_ref,
         plural_object_pronoun_ref: trigger_plural_object_pronoun_ref_for_intervening_if(
             &if_condition,
@@ -11998,6 +12004,7 @@ fn execute_references_opponent_player(effect: &crate::types::ability::Effect) ->
 pub(crate) struct TriggerConditionAnaphors {
     pub(crate) subject: TargetFilter,
     pub(crate) object_pronoun_ref: Option<TargetFilter>,
+    pub(crate) condition_object_antecedent: Option<ConditionObjectAntecedent>,
     pub(crate) demonstrative_object_ref: Option<TargetFilter>,
 }
 
@@ -12006,8 +12013,17 @@ pub(crate) fn trigger_condition_anaphors(
     ctx: &mut ParseContext,
 ) -> TriggerConditionAnaphors {
     let subject = extract_trigger_subject_for_context(condition_text, ctx);
+    let lower = condition_text.to_lowercase();
+    let after_keyword = alt((
+        value((), tag::<_, _, OracleError<'_>>("whenever ")),
+        value((), tag("when ")),
+    ))
+    .parse(lower.as_str())
+    .map(|(rest, _)| rest)
+    .unwrap_or(&lower);
     TriggerConditionAnaphors {
         object_pronoun_ref: trigger_object_pronoun_ref_for_condition(condition_text, &subject),
+        condition_object_antecedent: condition_object_antecedent(after_keyword, &subject),
         demonstrative_object_ref: trigger_demonstrative_object_ref_for_condition(
             condition_text,
             &subject,
@@ -12264,23 +12280,36 @@ fn trigger_object_pronoun_ref_for_condition(
     // (`targeting::extract_source_from_event`), so "it gets +1/+1" would pump
     // the blocker. `ParentTarget` resolves the blocked attacker from that same
     // event (`targeting::blocked_attacker_from_event`) — the binding "that Hero"
-    // already uses (She-Hulk, Wallbreaker). Excluded: a self subject (the
-    // source is the attacker either way), the CR 509.3d "becomes blocked by …"
-    // per-blocker form, whose event carries the blocker as its referent, and the
-    // fused "blocks or becomes blocked" head, whose source may be the blocker.
-    if !matches!(trigger_subject, TargetFilter::SelfRef)
+    // already uses (She-Hulk, Wallbreaker).
+    if condition_object_antecedent(after_keyword, trigger_subject)
+        == Some(ConditionObjectAntecedent::BlockedAttacker)
+    {
+        return Some(TargetFilter::ParentTarget);
+    }
+
+    None
+}
+
+/// CR 509.3c + CR 608.2k: the object a bare-pronoun pin names, where the pinned
+/// `TargetFilter` is ambiguous on its own (see
+/// [`ConditionObjectAntecedent`]). `after_keyword` is the lowercase condition
+/// after "whenever"/"when". Excluded from `BlockedAttacker`: a self subject (the
+/// source is the attacker either way), the CR 509.3d "becomes blocked by …"
+/// per-blocker form, whose event carries the blocker as its referent, and the
+/// fused "blocks or becomes blocked" head, whose source may be the blocker.
+fn condition_object_antecedent(
+    after_keyword: &str,
+    trigger_subject: &TargetFilter,
+) -> Option<ConditionObjectAntecedent> {
+    (!matches!(trigger_subject, TargetFilter::SelfRef)
         && nom_primitives::scan_at_word_boundaries(
             after_keyword,
             parse_fused_blocks_or_becomes_blocked,
         )
         .is_none()
         && nom_primitives::scan_at_word_boundaries(after_keyword, parse_bare_becomes_blocked)
-            .is_some()
-    {
-        return Some(TargetFilter::ParentTarget);
-    }
-
-    None
+            .is_some())
+    .then_some(ConditionObjectAntecedent::BlockedAttacker)
 }
 
 fn parse_fused_blocks_or_becomes_blocked(input: &str) -> OracleResult<'_, ()> {

@@ -541,3 +541,75 @@ fn delayed_body_with_a_recognized_intervening_if_keeps_it() {
     assert!(body.condition.is_some(), "{body:?}");
     assert!(matches!(&*body.effect, Effect::Draw { .. }), "{body:?}");
 }
+
+fn has_unimplemented(def: &AbilityDefinition, gap: &str) -> bool {
+    serde_json::to_string(def)
+        .expect("serialize")
+        .contains(&format!("\"name\":\"{gap}\""))
+}
+
+/// CR 509.3c + CR 120.1: under a bare "becomes blocked" condition, "it deals N
+/// damage" names the blocked attacker as the damage source. No `DamageSource`
+/// value can name it, so the clause fails closed instead of being dealt by the
+/// Equipment. Reach guard: the trigger is a `BecomesBlocked` trigger whose
+/// "it" pin is live (a target-position "it" in the same shape binds
+/// `ParentTarget`, asserted by `bare_becomes_blocked_it_binds_the_attacker_not_the_blocker`).
+#[test]
+fn bare_becomes_blocked_it_as_damage_source_fails_closed() {
+    let parsed = engine::parser::oracle::parse_oracle_text(
+        "Equipped creature gets +1/+1.\nWhenever equipped creature becomes blocked, it deals 1 damage to defending player.\nEquip {1}",
+        "Tormentor's Helm",
+        &["Equip".to_string()],
+        &["Artifact".to_string()],
+        &["Equipment".to_string()],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::BecomesBlocked)
+        .expect("BecomesBlocked trigger");
+    let execute = trigger.execute.as_deref().expect("execute");
+    assert!(
+        has_unimplemented(execute, "blocked_attacker_damage_source"),
+        "{execute:?}"
+    );
+}
+
+/// CR 701.23a: a search zone list with a leg outside the zone vocabulary is
+/// not represented by searching only the recognized zones. Invasion of
+/// Arcavios stays unsupported, with no unconditional shuffle.
+#[test]
+fn search_with_an_unrecognized_zone_leg_fails_closed() {
+    let parsed = engine::parser::oracle::parse_oracle_text(
+        "(As a Siege enters, choose an opponent to protect it. You and others can attack it. When it's defeated, exile it, then cast it transformed.)\nWhen this Siege enters, search your library, graveyard, and/or outside the game for an instant or sorcery card you own, reveal it, and put it into your hand. If you search your library this way, shuffle.",
+        "Invasion of Arcavios",
+        &[],
+        &["Battle".to_string()],
+        &["Siege".to_string()],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.destination == Some(Zone::Battlefield))
+        .expect("ETB trigger");
+    let json = serde_json::to_string(trigger).expect("serialize");
+    assert!(json.contains("\"Unimplemented\""), "{json}");
+    assert!(
+        !json.contains("\"SearchLibrary\""),
+        "no partial search of only the recognized zones: {json}"
+    );
+}
+
+/// Control: a fully recognized multi-zone search keeps all its zones.
+#[test]
+fn search_with_a_recognized_zone_list_keeps_every_zone() {
+    let def = parse_effect_chain(
+        "Search your graveyard, hand, and/or library for a card named God-Pharaoh's Gift and put it onto the battlefield. If you search your library this way, shuffle.",
+        AbilityKind::Spell,
+    );
+    let json = serde_json::to_string(&def).expect("serialize");
+    assert!(
+        json.contains("\"source_zones\":[\"Graveyard\",\"Hand\",\"Library\"]"),
+        "{json}"
+    );
+}
