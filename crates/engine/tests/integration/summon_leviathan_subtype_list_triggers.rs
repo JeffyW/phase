@@ -1090,3 +1090,166 @@ fn immolation_shaman_punishes_only_non_mana_activations() {
     assert_eq!(runner.life(P1), 19, "a non-mana land ability triggers it");
     assert_eq!(runner.life(P0), 20);
 }
+
+const BEREAVEMENT: &str = "Whenever a green creature dies, its controller discards a card.";
+const EDRIC: &str = "Whenever a creature deals combat damage to one of your opponents, its controller may draw a card.";
+const VERNAL_BLOOM: &str =
+    "Whenever a Forest is tapped for mana, its controller adds an additional {G}.";
+const MURDER: &str = "Destroy target creature.";
+
+fn free_spell(
+    scenario: &mut GameScenario,
+    owner: PlayerId,
+    name: &str,
+    instant: bool,
+    text: &str,
+) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(owner, name, instant, text)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id()
+}
+
+/// CR 608.2h + CR 603.10a (dies family). A stolen green creature dies; its
+/// controller as it last existed on the battlefield (P0) discards, not its
+/// owner. Official ruling on the same shape (Banewasp Affliction): "The player
+/// who loses life is the player who controlled the creature when it was put
+/// into a graveyard. This may not be the player whose graveyard it was put
+/// into."
+#[test]
+fn bereavement_the_last_controller_of_a_stolen_creature_discards() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Bereavement", BEREAVEMENT);
+    let green = scenario
+        .add_creature(P1, "Green Bear", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Green])
+        .id();
+    let steal = free_spell(&mut scenario, P0, "Act of Treason", false, ACT_OF_TREASON);
+    let murder = free_spell(&mut scenario, P0, "Murder", true, MURDER);
+    scenario.add_card_to_hand(P0, "P0 Card");
+    scenario.add_card_to_hand(P1, "P1 Card");
+    let mut runner = scenario.build();
+
+    runner.cast(steal).target_object(green).resolve();
+    assert_eq!(runner.state().objects[&green].controller, P0, "reach guard");
+    let (p0_hand, p1_hand) = (hand_size(&runner, P0), hand_size(&runner, P1));
+    runner.cast(murder).target_object(green).resolve();
+    resolve_stack_accepting(&mut runner, &[]);
+
+    assert_eq!(
+        zone(&runner, green),
+        Zone::Graveyard,
+        "reach guard: it died"
+    );
+    // P0's hand also lost Murder itself.
+    assert_eq!(
+        hand_size(&runner, P0),
+        p0_hand - 2,
+        "P0 cast Murder and discarded"
+    );
+    assert_eq!(
+        hand_size(&runner, P1),
+        p1_hand,
+        "the owner discards nothing"
+    );
+}
+
+/// Control: P0's own green creature dies — P0 discards, unchanged.
+#[test]
+fn bereavement_the_controller_of_its_own_creature_discards() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Bereavement", BEREAVEMENT);
+    let green = scenario
+        .add_creature(P0, "Green Bear", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Green])
+        .id();
+    let murder = free_spell(&mut scenario, P0, "Murder", true, MURDER);
+    scenario.add_card_to_hand(P0, "P0 Card");
+    scenario.add_card_to_hand(P1, "P1 Card");
+    let mut runner = scenario.build();
+    let (p0_hand, p1_hand) = (hand_size(&runner, P0), hand_size(&runner, P1));
+    runner.cast(murder).target_object(green).resolve();
+    resolve_stack_accepting(&mut runner, &[]);
+    assert_eq!(
+        zone(&runner, green),
+        Zone::Graveyard,
+        "reach guard: it died"
+    );
+    assert_eq!(hand_size(&runner, P0), p0_hand - 2);
+    assert_eq!(hand_size(&runner, P1), p1_hand);
+}
+
+/// CR 608.2h (DamageDone family). A stolen creature deals combat damage to
+/// P1, then is bounced before Edric's trigger resolves; its last controller
+/// (P0) is offered and takes the draw.
+#[test]
+fn edric_the_last_controller_of_a_departed_stolen_attacker_draws() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Edric, Spymaster of Trest", 2, 2)
+        .as_legendary()
+        .with_subtypes(vec!["Elf", "Rogue"])
+        .with_summoning_sickness()
+        .from_oracle_text(EDRIC);
+    let raider = scenario.add_creature(P1, "Raider", 2, 2).id();
+    let steal = free_spell(&mut scenario, P0, "Act of Treason", false, ACT_OF_TREASON);
+    let bounce = free_spell(&mut scenario, P0, "Unsummon", true, UNSUMMON);
+    scenario.with_library_top(P0, &["P0 Draw"]);
+    scenario.with_library_top(P1, &["P1 Draw"]);
+    let mut runner = scenario.build();
+
+    runner.cast(steal).target_object(raider).resolve();
+    attack(&mut runner, &[raider]);
+    drive_until(&mut runner, |r| !r.state().stack.is_empty());
+    assert_eq!(runner.life(P1), 18, "reach guard: combat damage dealt");
+    let (p0_hand, p1_hand) = (hand_size(&runner, P0), hand_size(&runner, P1));
+    runner.cast(bounce).target_object(raider).commit();
+    runner.resolve_top();
+    assert_eq!(zone(&runner, raider), Zone::Hand, "reach guard: bounced");
+    resolve_stack_accepting(&mut runner, &[]);
+
+    // P0's hand lost Unsummon and gained the draw.
+    assert_eq!(hand_size(&runner, P0), p0_hand, "P0 cast Unsummon and drew");
+    // P1's hand gained the bounced Raider only.
+    assert_eq!(
+        hand_size(&runner, P1),
+        p1_hand + 1,
+        "the owner draws nothing"
+    );
+}
+
+/// TapsForMana family (CR 605.4a: a triggered mana ability resolves
+/// immediately, so the triggering Forest can't leave before it resolves — the
+/// departed edge is unreachable). Control on the stolen edge that is
+/// reachable: P0 controls P1's Forest and taps it; P0 gets the extra {G}.
+#[test]
+fn vernal_bloom_pays_the_controller_of_a_stolen_forest() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P1, "Vernal Bloom", VERNAL_BLOOM);
+    let forest = scenario
+        .add_land_from_oracle(P1, "Forest", "{T}: Add {G}.")
+        .with_subtypes(vec!["Forest"])
+        .id();
+    let steal_land = free_spell(
+        &mut scenario,
+        P0,
+        "Steal Land",
+        false,
+        "Gain control of target land until end of turn.",
+    );
+    let mut runner = scenario.build();
+    runner.cast(steal_land).target_object(forest).resolve();
+    assert_eq!(
+        runner.state().objects[&forest].controller,
+        P0,
+        "reach guard: P0 controls the Forest"
+    );
+    runner.activate(forest, 0).resolve();
+    let pool = |p: PlayerId| runner.state().players[p.0 as usize].mana_pool.total();
+    assert_eq!(pool(P0), 2, "P0 tapped it: {{G}} plus the additional {{G}}");
+    assert_eq!(pool(P1), 0);
+}
