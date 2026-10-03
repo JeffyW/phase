@@ -1979,7 +1979,15 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
         // of [phase]" is a printed trigger and must not be intercepted here.
         None if is_phase_form => return None,
         None => {
-            let boundary = crate::parser::oracle_trigger::find_effect_boundary(tp.lower)?;
+            // A condition the shared authority cannot bound (its list guards
+            // read the whole tail as a continuation — "…, investigate") keeps
+            // the first comma, as before.
+            let boundary =
+                crate::parser::oracle_trigger::find_effect_boundary(tp.lower).or_else(|| {
+                    nom_primitives::split_once_on(tp.lower, ", ")
+                        .ok()
+                        .map(|(_, (before, _))| before.len())
+                })?;
             let (before, _) = tp.split_at(boundary);
             let (_, after) = tp.split_at(boundary + ", ".len());
             (before, after)
@@ -2027,21 +2035,19 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // is already lowercase (`before.lower`).
     inner_ctx.relative_player_scope =
         crate::parser::oracle_trigger::relative_player_scope_for_condition(condition_text);
-    // CR 608.2k: an untargeted object anaphor ("it") in the delayed effect body
-    // names the object the trigger condition referred to — the per-firing
-    // attacker, blocker, or damage dealer (`TriggeringSource`) when the subject
-    // is another object (Battle Cry's "it gets +0/+1", Love on the Battlefield's
-    // "put a +1/+1 counter on it"). Seeded by the same authority the printed
-    // trigger body uses (`parse_trigger_line`), so delayed and printed triggers
-    // bind "it" identically. A self subject ("he" in the `Delayed` scope — Human
-    // Torch) or a subjectless condition yields `SelfRef`/`Any`, which
-    // `resolve_it_pronoun` keeps bound to the ability's source.
-    inner_ctx.subject = Some(
-        crate::parser::oracle_trigger::extract_trigger_subject_for_context(
-            condition_text,
-            &mut inner_ctx,
-        ),
-    );
+    // CR 608.2k: an untargeted object anaphor in the delayed effect body names
+    // the object the trigger condition referred to — the per-firing attacker or
+    // blocker ("it gets +0/+1" — Battle Cry), the damage recipient ("is dealt
+    // damage, destroy it" — Shriveling Rot), the cast spell ("copy it"). Bound by
+    // the same authority the printed trigger body uses (`parse_trigger_line`), so
+    // a delayed trigger binds exactly what the same printed condition would. A
+    // self subject ("he" in the `Delayed` scope — Human Torch) or a subjectless
+    // condition yields `SelfRef`/`Any`, which keeps "it" bound to the source.
+    let anaphors =
+        crate::parser::oracle_trigger::trigger_condition_anaphors(condition_text, &mut inner_ctx);
+    inner_ctx.subject = Some(anaphors.subject);
+    inner_ctx.object_pronoun_ref = anaphors.object_pronoun_ref;
+    inner_ctx.demonstrative_object_ref = anaphors.demonstrative_object_ref;
     let inner = parse_effect_chain_with_context(effect_text, AbilityKind::Spell, &mut inner_ctx);
 
     Some(ParsedEffectClause {

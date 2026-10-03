@@ -1497,7 +1497,8 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     // "its" → source) from other-death ("its" → the dying event object). The window
     // from here to the extract call is ctx-inert (nothing in it reads or mutates ctx)
     // and this call is diagnostics-neutral, so the hoist is behavior-preserving.
-    let trigger_subject = extract_trigger_subject_for_context(condition_text, ctx);
+    let anaphors = trigger_condition_anaphors(condition_text, ctx);
+    let trigger_subject = anaphors.subject.clone();
 
     // Hoisted above the intervening-if extraction (formerly bound just before
     // `extract_unless_pay_modifier`) so the dies-shape prover below can read
@@ -1612,11 +1613,8 @@ pub(crate) fn parse_trigger_line_with_index_ir(
         // is the card that discriminates them — the spell-cast axis would
         // otherwise bind "return it" to the cast spell instead of the Phoenix.
         object_pronoun_ref: trigger_object_pronoun_ref_for_intervening_if(&if_condition)
-            .or_else(|| trigger_object_pronoun_ref_for_condition(condition_text, &trigger_subject)),
-        demonstrative_object_ref: trigger_demonstrative_object_ref_for_condition(
-            condition_text,
-            &trigger_subject,
-        ),
+            .or(anaphors.object_pronoun_ref),
+        demonstrative_object_ref: anaphors.demonstrative_object_ref,
         plural_object_pronoun_ref: trigger_plural_object_pronoun_ref_for_intervening_if(
             &if_condition,
         ),
@@ -11953,6 +11951,37 @@ fn execute_references_opponent_player(effect: &crate::types::ability::Effect) ->
     }
 }
 
+/// CR 608.2k: what a trigger CONDITION establishes for its effect body's
+/// untargeted object anaphors — the subject ("it" names the triggering object
+/// when the subject is another object), the condition's own pin for a bare
+/// pronoun (the cast spell; the damage recipient in either voice), and the pin
+/// for a singular demonstrative ("that creature").
+///
+/// The single authority for printed trigger bodies (`parse_trigger_line`) and
+/// delayed "whenever …" bodies (`try_parse_whenever_this_turn`), so the same
+/// condition binds the same referents whether the trigger is printed or created
+/// by an effect.
+pub(crate) struct TriggerConditionAnaphors {
+    pub(crate) subject: TargetFilter,
+    pub(crate) object_pronoun_ref: Option<TargetFilter>,
+    pub(crate) demonstrative_object_ref: Option<TargetFilter>,
+}
+
+pub(crate) fn trigger_condition_anaphors(
+    condition_text: &str,
+    ctx: &mut ParseContext,
+) -> TriggerConditionAnaphors {
+    let subject = extract_trigger_subject_for_context(condition_text, ctx);
+    TriggerConditionAnaphors {
+        object_pronoun_ref: trigger_object_pronoun_ref_for_condition(condition_text, &subject),
+        demonstrative_object_ref: trigger_demonstrative_object_ref_for_condition(
+            condition_text,
+            &subject,
+        ),
+        subject,
+    }
+}
+
 /// CR 608.2k: Extract the trigger subject from condition text for pronoun context.
 /// Reuses `parse_trigger_subject` but only needs the `TargetFilter`, not the remainder.
 /// For subjectless triggers (phase, player-action, game mechanics), the result is `Any`
@@ -11961,7 +11990,7 @@ fn execute_references_opponent_player(effect: &crate::types::ability::Effect) ->
 /// Warnings from `parse_trigger_subject` are discarded — this function is a best-effort
 /// subject extraction for pronoun resolution, not a diagnostic site. Warnings for
 /// degraded subjects are emitted by the main trigger condition path instead.
-pub(crate) fn extract_trigger_subject_for_context(
+fn extract_trigger_subject_for_context(
     condition_text: &str,
     ctx: &mut ParseContext,
 ) -> TargetFilter {
