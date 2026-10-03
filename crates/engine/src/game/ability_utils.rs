@@ -772,6 +772,29 @@ pub fn build_target_slots_labelled(
     Ok((acc.slots, acc.labels))
 }
 
+/// CR 608.2h + CR 109.4: The controller of a permanent as it last existed on
+/// the battlefield. `reset_for_battlefield_exit()` reverts `controller` to the
+/// owner when a permanent leaves the battlefield, so for any object that is no
+/// longer there the LKI snapshot (captured just before the zone change) holds
+/// the pre-exit controller. Prefer it over the live — post-reset — value, so
+/// "its controller" anchors on who controlled the permanent at departure, not
+/// the owner who now appears to control the exiled/graved object. The single
+/// authority for "that permanent's controller" over an object reference,
+/// whether the object came from a chosen target or from the trigger event.
+pub(crate) fn last_known_permanent_controller(state: &GameState, id: ObjectId) -> Option<PlayerId> {
+    let obj_opt = state.objects.get(&id);
+    let off_battlefield = obj_opt.is_none_or(|obj| obj.zone != Zone::Battlefield);
+    if off_battlefield {
+        state
+            .lki_cache
+            .get(&id)
+            .map(|lki| lki.controller)
+            .or_else(|| obj_opt.map(|obj| obj.controller))
+    } else {
+        obj_opt.map(|obj| obj.controller)
+    }
+}
+
 /// CR 109.4 + CR 608.2c: Resolve the controller of an ability's first parent target.
 ///
 /// This is the canonical lookup for `ControllerRef::ParentTargetController` and
@@ -799,27 +822,7 @@ pub fn parent_target_controller(ability: &ResolvedAbility, state: &GameState) ->
             .iter()
             .find(|entry| entry.id == *id || entry.source_id == *id)
             .map(|entry| stack_object_controller(state, entry))
-            .or_else(|| {
-                let obj_opt = state.objects.get(id);
-                // CR 608.2h: reset_for_battlefield_exit() reverts `controller`
-                // to the owner when a permanent leaves the battlefield. For any
-                // object that is no longer on the battlefield, the LKI snapshot
-                // (captured just before the zone change) holds the correct
-                // pre-exit controller. Prefer it over the live — post-reset —
-                // value so that "its controller" anchors on who controlled the
-                // permanent at departure, not the owner who now appears to
-                // control the exiled/graved object.
-                let off_battlefield = obj_opt.is_none_or(|obj| obj.zone != Zone::Battlefield);
-                if off_battlefield {
-                    state
-                        .lki_cache
-                        .get(id)
-                        .map(|lki| lki.controller)
-                        .or_else(|| obj_opt.map(|obj| obj.controller))
-                } else {
-                    obj_opt.map(|obj| obj.controller)
-                }
-            }),
+            .or_else(|| last_known_permanent_controller(state, *id)),
         TargetRef::Player(pid) => Some(*pid),
     }) {
         return Some(player);

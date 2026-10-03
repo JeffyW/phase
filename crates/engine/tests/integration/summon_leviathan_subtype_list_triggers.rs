@@ -746,6 +746,15 @@ fn intervening_if_strict_fail_boundary_controls() {
         !has_unimplemented(&body, "delayed_intervening_if_dropped"),
         "{body:?}"
     );
+    // Positive guard on the same input: the body is the Draw itself, with no
+    // gap anywhere in it.
+    assert!(matches!(&*body.effect, Effect::Draw { .. }), "{body:?}");
+    assert!(
+        !serde_json::to_string(&body)
+            .expect("serialize")
+            .contains("\"Unimplemented\""),
+        "{body:?}"
+    );
     let parsed = engine::parser::oracle::parse_oracle_text(
         "Whenever you cast a spell, if you control an artifact, draw a card.",
         "Printed Conditional Probe",
@@ -908,4 +917,176 @@ fn delayed_list_then_action_tail_investigates_at_runtime() {
     };
     attack(&mut runner, &[serpent]);
     assert_eq!(clues(&runner), 1, "the Serpent's attack investigates once");
+}
+
+const ROYAL_DECREE: &str = "Cumulative upkeep {W}\nWhenever a Swamp, Mountain, black permanent, or red permanent becomes tapped, this enchantment deals 1 damage to that permanent's controller.";
+const ACT_OF_TREASON: &str = "Gain control of target creature until end of turn. Untap that creature. It gains haste until end of turn.";
+const UNSUMMON: &str = "Return target creature to its owner's hand.";
+
+/// A Royal Decree board: P0 controls the enchantment; P1 owns a red creature.
+fn royal_decree_board() -> (GameScenario, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let red = scenario
+        .add_creature(P1, "Red Raider", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Red])
+        .id();
+    let steal = scenario
+        .add_spell_to_hand_from_oracle(P0, "Act of Treason", false, ACT_OF_TREASON)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let bounce = scenario
+        .add_spell_to_hand_from_oracle(P0, "Unsummon", true, UNSUMMON)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    (scenario, red, steal, bounce)
+}
+
+/// Steal the red creature and attack with it; its tapping triggers Royal
+/// Decree, and the trigger is waiting on the stack.
+fn steal_and_attack(runner: &mut GameRunner, red: ObjectId, steal: ObjectId) {
+    runner.cast(steal).target_object(red).resolve();
+    assert_eq!(
+        runner.state().objects[&red].controller,
+        P0,
+        "reach guard: Act of Treason gave P0 control"
+    );
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(red, AttackTarget::Player(P1))])
+        .expect("attack with the stolen creature");
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "reach guard: exactly one Royal Decree trigger for the tapped attacker"
+    );
+}
+
+/// CR 608.2h + CR 109.4: "that permanent's controller" reads the controller as
+/// the permanent last existed on the battlefield. The stolen red creature is
+/// bounced to its owner's hand before the trigger resolves; P0, who controlled
+/// it when it became tapped, takes the damage, not its owner.
+#[test]
+fn royal_decree_damages_the_last_controller_of_a_departed_permanent() {
+    let (scenario, red, steal, bounce) = royal_decree_board();
+    let mut runner = scenario.build();
+    steal_and_attack(&mut runner, red, steal);
+
+    runner.cast(bounce).target_object(red).commit();
+    runner.resolve_top();
+    assert_eq!(zone(&runner, red), Zone::Hand, "reach guard: bounced");
+    runner.resolve_top();
+
+    assert_eq!(runner.life(P0), 19, "P0 controlled it when it tapped");
+    assert_eq!(runner.life(P1), 20, "its owner takes nothing");
+}
+
+/// Control: the stolen creature stays — its current controller (P0) is hit.
+#[test]
+fn royal_decree_damages_the_controller_of_a_stolen_permanent_that_stays() {
+    let (scenario, red, steal, _) = royal_decree_board();
+    let mut runner = scenario.build();
+    steal_and_attack(&mut runner, red, steal);
+    runner.resolve_top();
+    assert_eq!(runner.life(P0), 19);
+    assert_eq!(runner.life(P1), 20);
+}
+
+/// Control: P0's own red creature taps and is bounced before resolution —
+/// P0 is hit, unchanged by the departure.
+#[test]
+fn royal_decree_damages_the_controller_of_its_own_departed_permanent() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let red = scenario
+        .add_creature(P0, "Red Raider", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Red])
+        .id();
+    let bounce = scenario
+        .add_spell_to_hand_from_oracle(P0, "Unsummon", true, UNSUMMON)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(red, AttackTarget::Player(P1))])
+        .expect("attack");
+    assert_eq!(runner.state().stack.len(), 1, "reach guard: one trigger");
+    runner.cast(bounce).target_object(red).commit();
+    runner.resolve_top();
+    runner.resolve_top();
+    assert_eq!(runner.life(P0), 19);
+    assert_eq!(runner.life(P1), 20);
+}
+
+/// Official ruling: Royal Decree triggers at most once for each permanent that
+/// becomes tapped, even if it meets several criteria. A Swamp Mountain taps →
+/// one trigger, 1 damage to its controller (P1).
+#[test]
+fn royal_decree_triggers_once_for_a_permanent_meeting_several_criteria() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let dual = scenario
+        .add_land_from_oracle(P1, "Swamp Mountain", "{T}: Add {B}.")
+        .with_subtypes(vec!["Swamp", "Mountain"])
+        .id();
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    runner.activate(dual, 0).resolve();
+    assert!(runner.state().objects[&dual].tapped, "reach guard: tapped");
+    runner.advance_until_stack_empty();
+    // Two triggers would deal 2.
+    assert_eq!(runner.life(P1), 19, "exactly one trigger");
+}
+
+/// CR 603.2 + the CR 602.2 non-mana gate: Immolation Shaman damages an
+/// opponent who activates a non-mana ability of an artifact, creature, or land
+/// (here a land), and not one who activates a mana ability.
+#[test]
+fn immolation_shaman_punishes_only_non_mana_activations() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Immolation Shaman", 1, 1)
+        .with_subtypes(vec!["Viashino", "Shaman"])
+        .from_oracle_text(
+            "Whenever an opponent activates an ability of an artifact, creature, or land that isn't a mana ability, this creature deals 1 damage to that player.\n{3}{R}{R}: This creature gets +3/+3 and gains menace until end of turn.",
+        );
+    let land = scenario
+        .add_land_from_oracle(P1, "Scry Land", "{T}: Add {C}.\n{T}: Scry 1.")
+        .id();
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+
+    // Mana ability: no trigger.
+    runner.activate(land, 0).resolve();
+    assert_eq!(runner.life(P1), 20, "a mana ability does not trigger it");
+    runner.state_mut().objects.get_mut(&land).unwrap().tapped = false;
+
+    // Non-mana ability: 1 damage to the activating opponent.
+    runner.activate(land, 1).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.life(P1), 19, "a non-mana land ability triggers it");
+    assert_eq!(runner.life(P0), 20);
 }
