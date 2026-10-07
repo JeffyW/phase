@@ -28950,7 +28950,14 @@ fn parsed_condition_satisfied_with_committed_targets(
 /// and every other binding are kept.
 fn ability_with_chain_targets(ability: &ResolvedAbility) -> ResolvedAbility {
     let mut chain = ability.clone();
-    chain.targets = declared_targets_in_chain(ability);
+    // An occurrence-preserving chain flatten: each declared occurrence keeps
+    // its own announced pin.
+    chain.replace_target_occurrences(
+        crate::game::ability_utils::declared_target_entries_in_chain(ability)
+            .into_iter()
+            .map(|entry| (entry.target, entry.pin))
+            .collect(),
+    );
     chain
 }
 

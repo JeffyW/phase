@@ -1333,7 +1333,7 @@ fn choose_new_targets_keeps_an_already_illegal_equipment_target() {
 
 /// H2 (CR 115.3 + CR 115.7d): one two-target node selects artifact creature A
 /// and creature B; choosing new targets puts A in the creature slot too. The
-/// node's pins are id-keyed (one A pin for both positions), and the creature
+/// pins are positional (each A occurrence carries its own pin), and the creature
 /// slot still reads A — A's Equipment is destroyed, B's is not.
 #[test]
 fn two_target_head_retargeted_onto_one_object_reads_its_pin() {
@@ -1368,12 +1368,20 @@ fn two_target_head_retargeted_onto_one_object_reads_its_pin() {
         .iter()
         .find(|entry| entry.id == spell)
         .and_then(|entry| entry.ability())
-        .map(|ability| ability.selected_target_incarnations.clone())
+        .map(|ability| {
+            let mut pins = ability.aligned_target_pins();
+            if let Some(sub) = ability.sub_ability.as_deref() {
+                pins.extend(sub.aligned_target_pins());
+            }
+            pins
+        })
         .expect("probe on the stack");
     assert_eq!(
-        pins.iter().filter(|pin| pin.object_id == a).count(),
-        1,
-        "reach guard: one id-keyed A pin serves both positions"
+        pins.iter()
+            .filter(|pin| pin.is_some_and(|pin| pin.object_id == a))
+            .count(),
+        2,
+        "reach guard: each A occurrence (artifact and creature slots) carries its own pin"
     );
     runner.advance_until_stack_empty();
     let state = runner.state();
@@ -1406,11 +1414,11 @@ fn missing_or_stale_pin_names_no_referent() {
             let ability = entry.ability_mut().expect("spell ability");
             let node = ability.sub_ability.as_deref_mut().expect("damage node");
             if stale {
-                for pin in &mut node.selected_target_incarnations {
+                for pin in node.target_pins.iter_mut().flatten() {
                     pin.incarnation += 100;
                 }
             } else {
-                node.selected_target_incarnations.clear();
+                node.target_pins.clear();
             }
         }
         let outcome = commit.resolve();
@@ -1831,9 +1839,10 @@ fn equipment_pin(runner: &GameRunner, spell: ObjectId, eq: ObjectId) -> u64 {
         .and_then(|entry| entry.ability())
         .and_then(|ability| ability.sub_ability.as_deref())
         .and_then(|node| {
-            node.selected_target_incarnations
-                .iter()
-                .find(|pin| pin.object_id == eq)
+            node.target_occurrences()
+                .into_iter()
+                .find_map(|(target, pin)| (target == TargetRef::Object(eq)).then_some(pin))
+                .flatten()
         })
         .map(|pin| pin.incarnation)
         .expect("the Equipment node pins Equipment 1")
@@ -2007,9 +2016,10 @@ fn root_pin(runner: &GameRunner, spell: ObjectId, id: ObjectId) -> u64 {
         .and_then(|entry| entry.ability())
         .and_then(|ability| {
             ability
-                .selected_target_incarnations
-                .iter()
-                .find(|pin| pin.object_id == id)
+                .target_occurrences()
+                .into_iter()
+                .find_map(|(target, pin)| (target == TargetRef::Object(id)).then_some(pin))
+                .flatten()
         })
         .map(|pin| pin.incarnation)
         .expect("the root pins the object")
@@ -2177,9 +2187,10 @@ fn node_pin(runner: &GameRunner, spell: ObjectId, depth: usize, id: ObjectId) ->
     for _ in 0..depth {
         node = node.sub_ability.as_deref().expect("chain node");
     }
-    node.selected_target_incarnations
-        .iter()
-        .find(|pin| pin.object_id == id)
+    node.target_occurrences()
+        .into_iter()
+        .find_map(|(target, pin)| (target == TargetRef::Object(id)).then_some(pin))
+        .flatten()
         .map(|pin| pin.incarnation)
         .expect("node pins the object")
 }
@@ -2450,11 +2461,14 @@ fn same_object_in_two_positions_anchor_keeps_its_announced_pin() {
     assert_eq!(root_pin(&runner, spell, a), 0, "the retained pin is kept");
 }
 
-/// A partial change cannot carry the same unrealizable reading: changing the
-/// player while resubmitting `[A, A]` is refused, and nothing is re-pinned.
-/// Control: the exact resubmission on the same board is accepted.
+/// CR 115.3 + CR 115.7d + CR 400.7 (positional occurrence pins): a partial
+/// change that resubmits `[A, A]` while changing the player is now
+/// realizable. Each occurrence carries its own pin, so the artifact position
+/// RETAINS the announced (old) A with its announced pin while the creature
+/// position ELECTS the new A with a fresh pin; electing at one position no
+/// longer re-pins the other. Before positional pins this reading was refused.
 #[test]
-fn same_object_in_two_positions_partial_change_is_refused() {
+fn same_object_in_two_positions_partial_change_elects_per_position() {
     const TEXT: &str =
         "Exchange control of target artifact and target creature. Target player loses 1 life.";
     let parsed = parse_oracle_text(TEXT, "Probe", &[], &types("Instant"), &[]);
@@ -2463,22 +2477,33 @@ fn same_object_in_two_positions_partial_change_is_refused() {
         "reach guard"
     );
     let (mut runner, spell, a) = same_object_two_positions_board(TEXT, true);
+    let new_incarnation = runner.state().objects[&a].incarnation;
+    assert_ne!(new_incarnation, 0, "reach guard: A is a new object");
     let mut changed = objects(&[a, a]);
     changed.push(TargetRef::Player(P0));
-    assert!(runner
+    runner
         .act(GameAction::RetargetSpell {
             new_targets: changed,
         })
-        .is_err());
-    assert_eq!(root_pin(&runner, spell, a), 0);
-    let mut anchor = objects(&[a, a]);
-    anchor.push(TargetRef::Player(P1));
-    runner
-        .act(GameAction::RetargetSpell {
-            new_targets: anchor,
-        })
-        .expect("the exact resubmission is accepted");
-    assert_eq!(root_pin(&runner, spell, a), 0);
+        .expect("retain old A, elect new A, change the player");
+    let root = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == spell)
+        .and_then(|entry| entry.ability())
+        .expect("probe on the stack");
+    let pins: Vec<Option<u64>> = root
+        .aligned_target_pins()
+        .into_iter()
+        .map(|pin| pin.map(|pin| pin.incarnation))
+        .collect();
+    assert_eq!(
+        pins,
+        vec![Some(0), Some(new_incarnation)],
+        "the artifact position keeps its announced pin; the creature position \
+         carries the elected incarnation"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -661,7 +661,7 @@ fn handed_child<'c>(
     };
     (inherited == after_a_choice).then(|| {
         let mut handed = child.clone();
-        handed.targets = inherited;
+        handed.set_targets(inherited);
         Cow::Owned(handed)
     })
 }

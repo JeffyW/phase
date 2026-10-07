@@ -4191,7 +4191,8 @@ fn walk_ability(
         trigger_definition_ref: _, // exact trigger occurrence, no read/write effect
         force_block_attacker: _, // exact force-block referent, no read/write effect
         target_incarnations: _, // CR 400.7 pins on the referents, no read/write effect
-        selected_target_incarnations: _, // CR 400.7 selected-target pins, no read/write effect
+        target_pins: _,        // CR 400.7 selected-target pins, no read/write effect
+        legacy_selected_target_incarnations: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp, no read/write effect
         illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no read/write effect
         controller: _,

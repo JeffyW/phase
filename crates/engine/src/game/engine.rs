@@ -16257,7 +16257,7 @@ pub(crate) fn validate_retarget_submission(
     // CR 115.7d: "choose new targets" is an operation on the SPELL, so it
     // writes every chain node that owns an addressed slot, not only the root
     // — and the target-incarnation pin refresh follows the same address,
-    // because `selected_target_incarnations` is a field of the OWNING
+    // because the occurrence pins (`target_pins`) are a field of the OWNING
     // `ResolvedAbility` (phase-rs/phase#8355).
     //
     // CR 115.7d again (phase-rs/phase#8355 round-8 review finding MED-3,
@@ -16268,7 +16268,7 @@ pub(crate) fn validate_retarget_submission(
     // an unchanged-but-illegal target stay illegal. The write loop below
     // addresses EVERY position in `new_targets` unconditionally, changed or
     // not; whether a given position's PIN is refreshed is decided
-    // separately, per position, by `retarget_target_requires_pin_refresh` —
+    // separately, per position, by `retarget_requires_pin_refresh_at` —
     // never by raw `TargetRef` (in)equality (H2). A same-ID retarget can
     // still be a genuine re-incarnation (the object left and returned) whose
     // pin is stale, and that function is the only thing that can tell a true
@@ -16296,29 +16296,27 @@ pub(crate) fn validate_retarget_submission(
             // Falling back to that exact write (rather than silently writing
             // nothing) is what keeps this case "behaves as at BASE" rather than a
             // silently-accepted no-op.
-            let target_pins: Vec<_> = new_targets
+            let occurrences: Vec<_> = new_targets
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| positions_changed.get(*i).copied().unwrap_or(false))
-                .filter_map(|(_, target)| match target {
-                    TargetRef::Object(id) => {
-                        state.objects.get(id).map(ObjectIncarnationRef::from_object)
-                    }
-                    TargetRef::Player(_) => None,
+                .map(|(i, target)| {
+                    let pin = if positions_changed.get(i).copied().unwrap_or(false) {
+                        crate::game::ability_utils::live_target_pin(state, target)
+                    } else {
+                        mutated.target_pin_at(i)
+                    };
+                    (target.clone(), pin)
                 })
                 .collect();
-            mutated.targets = new_targets.to_vec();
-            for pin in target_pins {
-                mutated.update_selected_target_incarnation(pin);
-            }
+            mutated.replace_target_occurrences(occurrences);
         } else {
             // CR 400.7 + CR 603.7c (mirrors `write_retarget_position`'s forced-path
             // semantics, incl. its `exposed.len() == 1` exemption): do NOT skip a
             // position on raw `TargetRef` equality. A same-ID retarget can still be
             // a genuine re-incarnation (the object left and returned) whose pin is
-            // stale, and only `retarget_target_requires_pin_refresh` can tell that
+            // stale, and only `retarget_requires_pin_refresh_at` can tell that
             // apart from a true no-op — skipping the whole branch here made that
-            // case unreachable and left `update_selected_target_incarnation` uncalled
+            // case unreachable and left the stale pin unrefreshed
             // on the interactive path (phase-rs/phase#8355 round-8 review finding
             // H2). Writing the same `TargetRef` back is harmless; the pin decision
             // is the part that must not be shortcut.
@@ -16339,52 +16337,38 @@ pub(crate) fn validate_retarget_submission(
                 // the pre-write chain, so an earlier position's pin refresh on
                 // this node cannot change it.
                 let refresh = positions_changed.get(i).copied().unwrap_or(false);
-                node.targets[address.slot] = new_target.clone();
-                if refresh {
-                    let pin = match new_target {
-                        TargetRef::Object(id) => {
-                            state.objects.get(id).map(ObjectIncarnationRef::from_object)
-                        }
-                        TargetRef::Player(_) => None,
-                    };
-                    if let Some(pin) = pin {
-                        node.update_selected_target_incarnation(pin);
-                    }
-                }
+                // CR 115.7d + CR 400.7: a changed occurrence takes the live
+                // incarnation; an unchanged one keeps its OWN announced pin.
+                let pin = if refresh {
+                    crate::game::ability_utils::live_target_pin(state, new_target)
+                } else {
+                    node.target_pin_at(address.slot)
+                };
+                node.set_target_at(address.slot, new_target.clone(), pin);
             }
         }
         crate::game::ability_utils::restamp_derived_chain_targets(&mut mutated);
 
-        // CR 115.7d + CR 400.7: a position this reading RETAINS must still name
-        // its announced incarnation. Pins are keyed by object id per node, so
-        // electing a new incarnation at one position re-pins every position on
-        // that node holding the same id; a reading that cannot keep a retained
-        // position's pin cannot be realized and is refused (an exact
-        // resubmission then falls back to leaving every target unchanged).
+        // CR 115.7d + CR 400.7: a position this reading RETAINS still names its
+        // announced incarnation. Pins are positional (`target_occurrences`), so
+        // electing a new incarnation at one position can no longer re-pin
+        // another position holding the same id; this is an internal invariant
+        // of the write above, asserted rather than refused.
+        #[cfg(debug_assertions)]
         if let Some(pre) = state.stack[stack_entry_index].ability() {
             let pin_at = |chain: &crate::types::ability::ResolvedAbility,
                           address: &RetargetSlotAddress| {
-                let node = crate::game::ability_utils::node_at(chain, &address.path)?;
-                match node.targets.get(address.slot)? {
-                    TargetRef::Object(id) => node
-                        .selected_target_incarnations
-                        .iter()
-                        .find(|pin| pin.object_id == *id)
-                        .copied(),
-                    TargetRef::Player(_) => None,
-                }
+                crate::game::ability_utils::node_at(chain, &address.path)?
+                    .target_pin_at(address.slot)
             };
-            let retained_pin_lost = written.iter().enumerate().any(|(i, address)| {
-                !positions_changed.get(i).copied().unwrap_or(false)
-                    && pin_at(pre, address)
-                        .is_some_and(|announced| pin_at(&mutated, address) != Some(announced))
-            });
-            if retained_pin_lost {
-                return Err(EngineError::InvalidAction(
-                    "Retarget: a retained target would lose its announced incarnation"
-                        .to_string(),
-                ));
-            }
+            debug_assert!(
+                !written.iter().enumerate().any(|(i, address)| {
+                    !positions_changed.get(i).copied().unwrap_or(false)
+                        && pin_at(pre, address)
+                            .is_some_and(|announced| pin_at(&mutated, address) != Some(announced))
+                }),
+                "a retained retarget position lost its announced incarnation"
+            );
         }
 
         // CR 115.7d (second clause) + CR 115.7e ("only the final set of targets is

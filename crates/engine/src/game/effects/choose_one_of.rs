@@ -188,7 +188,7 @@ pub(crate) fn resolve_branch(
 
     let mut resolved = build_resolved_from_def(branch, source_id, controller);
     resolved.context = context;
-    resolved.targets = parent_targets;
+    resolved.set_targets(parent_targets);
     resolved.set_replacement_applied_recursive(replacement_applied);
     resolved.set_scoped_player_recursive(player);
     if !resolved
@@ -196,7 +196,7 @@ pub(crate) fn resolve_branch(
         .iter()
         .any(|target| matches!(target, TargetRef::Player(pid) if *pid == player))
     {
-        resolved.targets.push(TargetRef::Player(player));
+        resolved.push_target(TargetRef::Player(player));
     }
 
     // CR 608.2c + CR 701.55d: Instructions after a multi-player branch choice

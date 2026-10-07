@@ -97,15 +97,19 @@ pub(super) fn finish_resolving_stack_entry(
 /// reads here as a pruned slot. No printed card combines that re-seeding with
 /// a `ParentTargetSlot` consumer; writing the seeded copy back into the carrier
 /// would make the two agree.
-fn record_illegal_target_slots(state: &mut GameState, validated: Option<&mut ResolvedAbility>) {
+fn record_illegal_target_slots(
+    state: &mut GameState,
+    judged_and_validated: Option<(&ResolvedAbility, &ResolvedAbility)>,
+) {
     if let Some(root) = state
         .resolving_stack_entry
         .as_mut()
         .and_then(StackEntry::ability_mut)
     {
-        root.illegal_target_slots = validated.map_or_else(Vec::new, |validated| {
-            illegal_declared_target_slots(root, validated)
-        });
+        root.illegal_target_slots = judged_and_validated
+            .map_or_else(Vec::new, |(judged, validated)| {
+                illegal_declared_target_slots(root, judged, validated)
+            });
     }
 }
 
@@ -1865,7 +1869,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             && !bestow_reverted_at_resolution
             && !mutate_reverted_at_resolution
         {
-            let mut validated = validate_targets_in_chain(state, ability);
+            let validated = validate_targets_in_chain(state, ability);
             let legal_targets = flatten_specified_targets_in_chain(&validated);
             if targeting::check_fizzle(&original_targets, &legal_targets) {
                 // CR 608.2b: Fizzle — all targets illegal, spell is countered on resolution.
@@ -1921,8 +1925,9 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 state.resolution_source_relatch = None;
                 return;
             }
-            record_illegal_target_slots(state, Some(&mut validated));
-            let _ = illegal_declared_target_slots(ability, &mut validated);
+            // CR 608.2b: validation already stamped each node's local illegal
+            // positions; the carrier receives the chain-numbered stamp.
+            record_illegal_target_slots(state, Some((ability, &validated)));
             execute_effect(state, &validated, events);
         } else {
             record_illegal_target_slots(state, None);
@@ -3831,7 +3836,8 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         trigger_definition_ref,
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
-        selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        target_pins: _,         // CR 400.7 selected-target pins; batch candidacy is shape-only
+        legacy_selected_target_incarnations: _,
         activation_cost_reduction: _,
         activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
@@ -4075,7 +4081,8 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         trigger_definition_ref: _,
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
-        selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        target_pins: _,         // CR 400.7 selected-target pins; batch candidacy is shape-only
+        legacy_selected_target_incarnations: _,
         activation_cost_reduction: _,
         activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
@@ -4299,7 +4306,8 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         trigger_definition_ref: _,
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
-        selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        target_pins: _,         // CR 400.7 selected-target pins; batch candidacy is shape-only
+        legacy_selected_target_incarnations: _,
         activation_cost_reduction: _,
         activation_record: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
@@ -4846,7 +4854,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         modal: a_modal,
         mode_abilities: a_mode_abilities,
         parent_target_missing_reason: a_parent_target_missing_reason,
-        selected_target_incarnations: a_selected_target_incarnations,
+        target_pins: _,
+        legacy_selected_target_incarnations: _,
         activation_cost_reduction: a_activation_cost_reduction,
         activation_record: a_activation_record,
         illegal_target_slots: a_illegal_target_slots,
@@ -4928,7 +4937,8 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         modal: b_modal,
         mode_abilities: b_mode_abilities,
         parent_target_missing_reason: b_parent_target_missing_reason,
-        selected_target_incarnations: b_selected_target_incarnations,
+        target_pins: _,
+        legacy_selected_target_incarnations: _,
         activation_cost_reduction: b_activation_cost_reduction,
         activation_record: b_activation_record,
         illegal_target_slots: b_illegal_target_slots,
@@ -4947,7 +4957,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         // keeps this manual comparison in agreement with the type's derived
         // `PartialEq`; disagreeing with the derive would be the actual defect.
         && a_target_incarnations == b_target_incarnations
-        && a_selected_target_incarnations == b_selected_target_incarnations
+        && a.aligned_target_pins() == b.aligned_target_pins()
         // CR 608.2b: the resolution legality stamp participates for the same
         // reason — agreement with the derived `PartialEq`.
         && a_activation_cost_reduction == b_activation_cost_reduction

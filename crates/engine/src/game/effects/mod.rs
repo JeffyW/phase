@@ -973,9 +973,9 @@ fn rebind_child_to_forwarded_objects(
         if attach_target_is_parent {
             if child.targets.is_empty() {
                 if !producer_targets.is_empty() {
-                    child.targets = producer_targets.to_vec();
+                    child.set_targets(producer_targets.to_vec());
                 } else {
-                    child.targets.push(TargetRef::Object(producer));
+                    child.push_target(TargetRef::Object(producer));
                 }
             }
         } else if !attach_target_is_last_created
@@ -984,7 +984,7 @@ fn rebind_child_to_forwarded_objects(
                 .iter()
                 .any(|t| matches!(t, TargetRef::Object(id) if *id == producer))
         {
-            child.targets.push(TargetRef::Object(producer));
+            child.push_target(TargetRef::Object(producer));
         }
     }
     // CR 608.2c: OriginalSource names the ability's TRUE pre-rebind source — the
@@ -2814,7 +2814,7 @@ pub(crate) fn resolve_effect_pay_cost_rider(
     };
     let mut rider = sub.as_ref().clone();
     if should_propagate_parent_targets(ability, &rider) {
-        rider.targets = ability.targets.clone();
+        rider.set_targets(ability.targets.clone());
     }
     apply_parent_chain_context(&mut rider, ability, None, state);
     resolve_ability_chain(state, &rider, events, 1)
@@ -2840,7 +2840,7 @@ pub(crate) fn prepend_remaining_pay_cost_continuation(
     if let Some(sub) = ability.sub_ability.as_ref() {
         let mut sub_clone = sub.as_ref().clone();
         if should_propagate_parent_targets(ability, &sub_clone) {
-            sub_clone.targets = ability.targets.clone();
+            sub_clone.set_targets(ability.targets.clone());
         }
         apply_parent_chain_context(&mut sub_clone, ability, None, state);
         super::ability_utils::append_to_sub_chain(&mut remaining_payment, sub_clone);
@@ -3513,7 +3513,7 @@ fn try_materialize_reflexive_trigger_inner(
             && ability_refs_parent_target(&owned)
             && should_propagate_parent_targets(parent, &owned)
         {
-            owned.targets = parent.targets.clone();
+            owned.set_targets(parent.targets.clone());
             propagated_parent_targets = true;
         }
         apply_parent_chain_context(&mut owned, parent, effect_context_object, state);
@@ -3956,7 +3956,14 @@ fn prepare_one_sided_fight_child(
 fn bind_one_sided_fight_subject(child: &mut ResolvedAbility, subject: OneSidedFightSubject) {
     let binding = match subject {
         OneSidedFightSubject::Prepend(source) => {
-            child.targets.insert(0, TargetRef::Object(source));
+            // The prepended subject keeps the pin this node recorded for it
+            // (first occurrence of that object), if any.
+            let pin = child
+                .target_occurrences()
+                .into_iter()
+                .find(|(target, _)| *target == TargetRef::Object(source))
+                .and_then(|(_, pin)| pin);
+            child.insert_target(0, TargetRef::Object(source), pin);
             TargetDamageSourceBinding::Bound
         }
         OneSidedFightSubject::Illegal => TargetDamageSourceBinding::Illegal,
@@ -3977,8 +3984,10 @@ fn bind_forwarded_result_targets_for_legacy_effect(child: &mut ResolvedAbility) 
         && effect_refs_parent_target(&child.effect)
     {
         if let Some(context) = &child.context.forwarded_result_context {
-            child.targets = context.targets.clone();
-            child.set_target_incarnations_recursive(context.object_incarnations.clone());
+            let targets = context.targets.clone();
+            let incarnations = context.object_incarnations.clone();
+            child.set_targets(targets);
+            child.set_target_incarnations_recursive(incarnations);
         }
     }
 }
@@ -4503,7 +4512,7 @@ pub(super) fn resolve_optional_effect_decision(
                 if should_propagate_parent_targets(&ability, &resolved)
                     && effect_refs_parent_target(&resolved.effect)
                 {
-                    resolved.targets = ability.targets.clone();
+                    resolved.set_targets(ability.targets.clone());
                 }
                 resolved.context = ability.context.clone();
                 // CR 608.2c: This optional effect was DECLINED — the decline
@@ -4974,7 +4983,8 @@ fn instruction_outlives_declined_gate(
         trigger_source: _,
         trigger_definition_ref: _,
         target_incarnations: _,
-        selected_target_incarnations: _,
+        target_pins: _,
+        legacy_selected_target_incarnations: _,
         illegal_target_slots: _,
         illegal_local_target_slots: _,
         controller: _,
@@ -10906,7 +10916,7 @@ pub(crate) fn bind_detached_continuation_to_parent(
             });
         continuation.set_target_incarnations_recursive(pins);
     }
-    continuation.targets = referents;
+    continuation.set_targets(referents);
 }
 
 /// CR 603.7 + CR 109.5: Replace the first `TargetRef::Object` in a target
@@ -10936,20 +10946,21 @@ fn rebind_first_object_target(
 /// binding for their independent target slots.
 fn rebind_member_driven_parent_target(ability: &mut ResolvedAbility, member: ObjectId) {
     if ability.context.parent_target_iteration_members.is_some() {
-        let insertion_index = ability
-            .targets
+        let mut targets = ability.targets.clone();
+        let insertion_index = targets
             .iter()
             .position(|target| matches!(target, TargetRef::Object(_)))
-            .unwrap_or(ability.targets.len());
-        ability
-            .targets
-            .retain(|target| !matches!(target, TargetRef::Object(_)));
-        ability.targets.insert(
-            insertion_index.min(ability.targets.len()),
+            .unwrap_or(targets.len());
+        targets.retain(|target| !matches!(target, TargetRef::Object(_)));
+        targets.insert(
+            insertion_index.min(targets.len()),
             TargetRef::Object(member),
         );
+        ability.set_targets(targets);
     } else {
-        rebind_first_object_target(&mut ability.targets, member);
+        let mut targets = ability.targets.clone();
+        rebind_first_object_target(&mut targets, member);
+        ability.set_targets(targets);
     }
 }
 
@@ -11188,7 +11199,7 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
                     }
 
                     let mut candidate = ability.clone();
-                    candidate.targets = vec![TargetRef::Object(id)];
+                    candidate.set_targets(vec![TargetRef::Object(id)]);
                     let mut simulated = state.clone();
                     cast_from_zone::resolve(&mut simulated, &candidate, &mut Vec::new()).is_ok()
                 });
@@ -12119,7 +12130,7 @@ fn ability_with_event_context_targets(
             state.current_trigger_event.as_ref(),
             pending.source_id,
         ) {
-            pending.targets.push(TargetRef::Player(defending_player));
+            pending.push_target(TargetRef::Player(defending_player));
         }
         return pending;
     }
@@ -12132,7 +12143,7 @@ fn ability_with_event_context_targets(
     if ability_refs_post_replacement_event_target(&pending) {
         if let Some(target) = state.post_replacement_event_target() {
             if !pending.targets.contains(target) {
-                pending.targets.push(target.clone());
+                pending.push_target(target.clone());
             }
             return pending;
         }
@@ -12145,7 +12156,7 @@ fn ability_with_event_context_targets(
                     filter,
                     pending.source_id,
                 ) {
-                    pending.targets.push(target);
+                    pending.push_target(target);
                 }
             }
         }
@@ -12221,11 +12232,11 @@ fn hydrate_event_context_targets<'a>(
 
     let mut resolved = ability.clone();
     if let Some(target_ref) = root_ref {
-        resolved.targets = vec![target_ref];
+        resolved.set_targets(vec![target_ref]);
     }
     if let Some(host_ref) = nested_host_ref {
         if let Some(sub) = resolved.sub_ability.as_mut() {
-            sub.targets = vec![host_ref];
+            sub.set_targets(vec![host_ref]);
         }
     }
     Cow::Owned(resolved)
@@ -13102,7 +13113,7 @@ pub(super) fn bind_resolution_exile_batch_paths(
                     .iter()
                     .any(|existing| existing.object_id == pin.object_id)
                 {
-                    ability.targets.push(TargetRef::Object(pin.object_id));
+                    ability.push_target(TargetRef::Object(pin.object_id));
                     ability.target_incarnations.push(*pin);
                 }
             }
@@ -14992,7 +15003,7 @@ fn resolve_chain_body(
             if let Some(id) = own_id {
                 targets.push(TargetRef::Object(id));
             }
-            sub.targets = targets;
+            sub.set_targets(targets);
             sub.multi_target = None;
             apply_parent_chain_context(&mut sub, ability, own_snapshot.as_ref(), state);
             narrowed_subs.push(sub);
@@ -15089,7 +15100,7 @@ fn resolve_chain_body(
             let initial_waiting_for = state.waiting_for.clone();
             for (i, pid) in fanout_players.iter().enumerate() {
                 let mut narrowed = per_target.clone();
-                narrowed.targets = vec![TargetRef::Player(*pid)];
+                narrowed.set_targets(vec![TargetRef::Player(*pid)]);
                 narrowed.multi_target = None;
                 resolve_ability_chain(state, &narrowed, events, depth + 1)?;
 
@@ -15103,7 +15114,7 @@ fn resolve_chain_body(
                     let mut tail = after_fanout.clone();
                     for &remaining_pid in remaining.iter().rev() {
                         let mut remaining_narrowed = per_target.clone();
-                        remaining_narrowed.targets = vec![TargetRef::Player(remaining_pid)];
+                        remaining_narrowed.set_targets(vec![TargetRef::Player(remaining_pid)]);
                         remaining_narrowed.multi_target = None;
                         if let Some(prev) = tail {
                             super::ability_utils::append_to_sub_chain(
@@ -15561,7 +15572,7 @@ fn resolve_chain_body(
                         0 => {}
                         1 => {
                             let mut bound = ability.clone();
-                            bound.targets = legal;
+                            bound.set_targets(legal);
                             return resolve_ability_chain(state, &bound, events, depth);
                         }
                         _ => {
@@ -15575,7 +15586,7 @@ fn resolve_chain_body(
                                 .collect();
                             if !candidates.is_empty() {
                                 let mut cont = ability.clone();
-                                cont.targets.clear();
+                                cont.clear_targets();
                                 state.park_ability_continuation(PendingContinuation::new(
                                     Box::new(cont),
                                     state,
@@ -15620,7 +15631,7 @@ fn resolve_chain_body(
             if let Some(ref else_branch) = ability.else_ability {
                 let mut else_resolved = else_branch.as_ref().clone();
                 if should_propagate_parent_targets(ability, &else_resolved) {
-                    else_resolved.targets = ability.targets.clone();
+                    else_resolved.set_targets(ability.targets.clone());
                 }
                 else_resolved.context = ability.context.clone();
                 if try_begin_deferred_else_branch_target_selection(
@@ -15730,7 +15741,7 @@ fn resolve_chain_body(
                     // offer its own choice (Kathril, Aspect Warper, issue
                     // #6321 / PR #6533).
                     if should_propagate_parent_targets(ability, &sub_resolved) {
-                        sub_resolved.targets = ability.targets.clone();
+                        sub_resolved.set_targets(ability.targets.clone());
                     }
                     sub_resolved.context = ability.context.clone();
                     // CR 608.2c: The false-parent ordinal escape bypasses the
@@ -16268,14 +16279,14 @@ fn resolve_chain_body(
                                 );
                             }
                         } else {
-                            bound.targets = vec![TargetRef::Object(legal[0])];
+                            bound.set_targets(vec![TargetRef::Object(legal[0])]);
                         }
                         return resolve_ability_chain(state, &bound, events, depth);
                     }
                     _ => {
                         let mut cont = ability.clone();
                         if matches!(cont.effect, Effect::PutCounter { .. }) {
-                            cont.targets.clear();
+                            cont.clear_targets();
                         }
                         state.park_ability_continuation(PendingContinuation::new(
                             Box::new(cont),
@@ -17292,7 +17303,7 @@ fn resolve_chain_body(
                 .cloned();
             if let Some(tail) = direct_sequential_tail.as_mut() {
                 if should_propagate_parent_targets(ability, tail) {
-                    tail.targets = ability.targets.clone();
+                    tail.set_targets(ability.targets.clone());
                 }
                 apply_parent_chain_context(tail, ability, effect_context_object.as_ref(), state);
             }
@@ -17481,15 +17492,17 @@ fn resolve_chain_body(
                 .cloned();
             if let Some(mut tail) = direct_sequential_tail {
                 if should_propagate_parent_targets(ability, &tail) {
-                    tail.targets = ability
-                        .targets
-                        .iter()
-                        .filter(|target| {
-                            matches!(target, TargetRef::Object(id)
-                                if state.exile_rider_countered_ids.contains(id))
-                        })
-                        .cloned()
-                        .collect();
+                    tail.set_targets(
+                        ability
+                            .targets
+                            .iter()
+                            .filter(|target| {
+                                matches!(target, TargetRef::Object(id)
+                                    if state.exile_rider_countered_ids.contains(id))
+                            })
+                            .cloned()
+                            .collect(),
+                    );
                 }
                 apply_parent_chain_context(
                     &mut tail,
@@ -17567,7 +17580,7 @@ fn resolve_chain_body(
                 if let Some(ref base_chain) = sub.else_ability {
                     let mut resolved = base_chain.as_ref().clone();
                     if should_propagate_parent_targets(ability, &resolved) {
-                        resolved.targets = ability.targets.clone();
+                        resolved.set_targets(ability.targets.clone());
                     }
                     apply_parent_chain_context(
                         &mut resolved,
@@ -17655,7 +17668,7 @@ fn resolve_chain_body(
                             }
                             None => {
                                 if should_propagate_parent_targets(ability, &resolved) {
-                                    resolved.targets = ability.targets.clone();
+                                    resolved.set_targets(ability.targets.clone());
                                 }
                                 apply_parent_chain_context(
                                     &mut resolved,
@@ -17746,7 +17759,7 @@ fn resolve_chain_body(
             {
                 let mut sub_clone = sub.as_ref().clone();
                 if should_propagate_parent_targets(ability, &sub_clone) {
-                    sub_clone.targets = ability.targets.clone();
+                    sub_clone.set_targets(ability.targets.clone());
                 }
                 apply_parent_chain_context(
                     &mut sub_clone,
@@ -17785,7 +17798,7 @@ fn resolve_chain_body(
                 && ability.targets.is_empty()
             {
                 let mut clone = ability.clone();
-                clone.targets = inject_last_revealed_targets(state, ability, sub.as_ref());
+                clone.set_targets(inject_last_revealed_targets(state, ability, sub.as_ref()));
                 injected_parent = clone;
                 &injected_parent
             } else {
@@ -17800,7 +17813,7 @@ fn resolve_chain_body(
                     && condition_depends_on_result_object(condition)
                 {
                     let mut clone = ability.clone();
-                    clone.targets = inject_last_revealed_targets(state, ability, sub.as_ref());
+                    clone.set_targets(inject_last_revealed_targets(state, ability, sub.as_ref()));
                     condition_injected_parent = clone;
                     &condition_injected_parent
                 } else {
@@ -17855,13 +17868,15 @@ fn resolve_chain_body(
                     {
                         // CR 309.4c + CR 607.1: Forward exiled card IDs to else-ability
                         // (linked ability pair — second refers to cards exiled by the first).
-                        else_resolved.targets = state
-                            .last_zone_changed_ids
-                            .iter()
-                            .map(|&id| TargetRef::Object(id))
-                            .collect();
+                        else_resolved.set_targets(
+                            state
+                                .last_zone_changed_ids
+                                .iter()
+                                .map(|&id| TargetRef::Object(id))
+                                .collect(),
+                        );
                     } else if should_propagate_parent_targets(ability, &else_resolved) {
-                        else_resolved.targets = ability.targets.clone();
+                        else_resolved.set_targets(ability.targets.clone());
                     }
                     apply_parent_chain_context(
                         &mut else_resolved,
@@ -17898,7 +17913,7 @@ fn resolve_chain_body(
                         if starts_independent_instruction(sibling) {
                             let mut sibling_resolved = sibling.as_ref().clone();
                             if should_propagate_parent_targets(ability, &sibling_resolved) {
-                                sibling_resolved.targets = ability.targets.clone();
+                                sibling_resolved.set_targets(ability.targets.clone());
                             }
                             apply_parent_chain_context(
                                 &mut sibling_resolved,
@@ -18035,7 +18050,7 @@ fn resolve_chain_body(
         {
             let mut sub_clone = sub.as_ref().clone();
             if should_propagate_parent_targets(ability, &sub_clone) {
-                sub_clone.targets = ability.targets.clone();
+                sub_clone.set_targets(ability.targets.clone());
             }
             apply_parent_chain_context(
                 &mut sub_clone,
@@ -18100,7 +18115,7 @@ fn resolve_chain_body(
         if waits_for_resolution_choice(&state.waiting_for) {
             let mut sub_clone = sub.as_ref().clone();
             if should_propagate_parent_targets(ability, &sub_clone) {
-                sub_clone.targets = ability.targets.clone();
+                sub_clone.set_targets(ability.targets.clone());
             }
             apply_parent_chain_context(
                 &mut sub_clone,
@@ -18246,7 +18261,7 @@ fn resolve_chain_body(
             {
                 let mut sub_with_sources = sub.as_ref().clone();
                 for (i, source) in parent_sources.into_iter().enumerate() {
-                    sub_with_sources.targets.insert(i, source);
+                    sub_with_sources.insert_target(i, source, None);
                 }
                 apply_parent_chain_context(
                     &mut sub_with_sources,
@@ -18332,9 +18347,9 @@ fn resolve_chain_body(
             if let Some(trailing) = sub.sub_ability.as_ref() {
                 let mut trailing_resolved = trailing.as_ref().clone();
                 if should_propagate_parent_targets(sub, &trailing_resolved) {
-                    trailing_resolved.targets = sub.targets.clone();
+                    trailing_resolved.set_targets(sub.targets.clone());
                 } else if should_propagate_parent_targets(ability, &trailing_resolved) {
-                    trailing_resolved.targets = ability.targets.clone();
+                    trailing_resolved.set_targets(ability.targets.clone());
                 }
                 apply_parent_chain_context(
                     &mut trailing_resolved,
@@ -18410,7 +18425,11 @@ fn resolve_chain_body(
             // effects that write last_revealed_ids. Parallel to how
             // continuations inject chosen cards as targets.
             let mut sub_with_targets = sub.as_ref().clone();
-            sub_with_targets.targets = inject_last_revealed_targets(state, ability, sub.as_ref());
+            sub_with_targets.set_targets(inject_last_revealed_targets(
+                state,
+                ability,
+                sub.as_ref(),
+            ));
             apply_parent_chain_context(
                 &mut sub_with_targets,
                 ability,
@@ -18429,11 +18448,13 @@ fn resolve_chain_body(
             // reveal. Forward the draw's ZoneChanged objects as reveal targets
             // (Mad Wizard's Lair and the same draw-then-reveal class).
             let mut sub_with_targets = sub.as_ref().clone();
-            sub_with_targets.targets = state
-                .last_zone_changed_ids
-                .iter()
-                .map(|&id| TargetRef::Object(id))
-                .collect();
+            sub_with_targets.set_targets(
+                state
+                    .last_zone_changed_ids
+                    .iter()
+                    .map(|&id| TargetRef::Object(id))
+                    .collect(),
+            );
             apply_parent_chain_context(
                 &mut sub_with_targets,
                 ability,
@@ -18453,11 +18474,13 @@ fn resolve_chain_body(
             // like Suspend Aggression must iterate the full set, not just the
             // ExileTop results).
             let mut sub_with_targets = sub.as_ref().clone();
-            sub_with_targets.targets = state
-                .last_zone_changed_ids
-                .iter()
-                .map(|&id| TargetRef::Object(id))
-                .collect();
+            sub_with_targets.set_targets(
+                state
+                    .last_zone_changed_ids
+                    .iter()
+                    .map(|&id| TargetRef::Object(id))
+                    .collect(),
+            );
             apply_parent_chain_context(
                 &mut sub_with_targets,
                 ability,
@@ -18558,7 +18581,7 @@ fn resolve_chain_body(
             // bound. Broken Bond's land-put
             // (`ChangeZone { target: Typed(Land ∧ InZone(Hand)), .. }`)
             // matches; Beseech's tracked-set-bound cast and fallback do not.
-            sub_with_targets.targets = inherited_parent_targets(ability, sub);
+            sub_with_targets.set_targets(inherited_parent_targets(ability, sub));
             apply_parent_chain_context(
                 &mut sub_with_targets,
                 ability,
@@ -18578,9 +18601,7 @@ fn resolve_chain_body(
             // `parent_target_controller` — can bind to the departed object.
             let mut sub_with_referent = sub.as_ref().clone();
             if let Some(snapshot) = &effect_context_object {
-                sub_with_referent
-                    .targets
-                    .push(TargetRef::Object(snapshot.object_id));
+                sub_with_referent.push_target(TargetRef::Object(snapshot.object_id));
             }
             apply_parent_chain_context(
                 &mut sub_with_referent,
@@ -23684,9 +23705,11 @@ mod tests {
             unreachable!("test constructs MoveCounters");
         };
         *target = controlled_creature;
-        ability.selected_target_incarnations = vec![
-            ObjectIncarnationRef::from_object(&state.objects[&source]),
-            ObjectIncarnationRef::from_object(&state.objects[&destination]),
+        ability.target_pins = vec![
+            Some(ObjectIncarnationRef::from_object(&state.objects[&source])),
+            Some(ObjectIncarnationRef::from_object(
+                &state.objects[&destination],
+            )),
         ];
 
         assert!(!optional_effect_is_infeasible(&state, &ability));

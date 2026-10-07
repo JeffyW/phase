@@ -33261,11 +33261,22 @@ pub struct ResolvedAbility {
     /// `source_incarnation`'s `is_none_or` fail-open at `source_is_current`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_incarnations: Vec<ObjectIncarnationRef>,
-    /// CR 400.7 + CR 601.2c: Incarnations captured for ordinary player- or
-    /// controller-selected object targets. Separate from `target_incarnations`,
-    /// whose keyed pins are reserved for delayed-trigger referents.
+    /// CR 400.7 + CR 601.2c: the incarnation announced for each target
+    /// OCCURRENCE, aligned position-for-position with `targets` (`None` for a
+    /// player, or an occurrence nothing pinned). Empty means every occurrence
+    /// is unpinned. Separate from `target_incarnations`, whose keyed pins are
+    /// reserved for delayed-trigger referents. Written only through the
+    /// occurrence authority (`game::target_occurrences`), which moves targets
+    /// and pins together.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
+    pub target_pins: Vec<Option<ObjectIncarnationRef>>,
+    /// Decode-only alias for the pre-positional, keyed pin list
+    /// (`selected_target_incarnations`). Never serialized. The occurrence
+    /// authority reads it only while `target_pins` is empty, giving each
+    /// occurrence the first legacy pin with its object id (no pin invented),
+    /// and clears it on the first occurrence write.
+    #[serde(rename = "selected_target_incarnations", default, skip_serializing)]
+    pub legacy_selected_target_incarnations: Vec<ObjectIncarnationRef>,
     /// CR 602.2b + CR 601.2f: self-referential activation cost modification
     /// carried from the printed ability definition so target-dependent riders
     /// can be applied after targets are committed.
@@ -33677,7 +33688,8 @@ impl PartialEq for ResolvedAbility {
             trigger_definition_ref: a_trigger_definition_ref,
             force_block_attacker: a_force_block_attacker,
             target_incarnations: a_target_incarnations,
-            selected_target_incarnations: a_selected_target_incarnations,
+            target_pins: _,
+            legacy_selected_target_incarnations: _,
             activation_cost_reduction: a_activation_cost_reduction,
             activation_record: a_activation_record,
             illegal_target_slots: a_illegal_target_slots,
@@ -33747,7 +33759,8 @@ impl PartialEq for ResolvedAbility {
             trigger_definition_ref: b_trigger_definition_ref,
             force_block_attacker: b_force_block_attacker,
             target_incarnations: b_target_incarnations,
-            selected_target_incarnations: b_selected_target_incarnations,
+            target_pins: _,
+            legacy_selected_target_incarnations: _,
             activation_cost_reduction: b_activation_cost_reduction,
             activation_record: b_activation_record,
             illegal_target_slots: b_illegal_target_slots,
@@ -33817,7 +33830,9 @@ impl PartialEq for ResolvedAbility {
             && a_trigger_definition_ref == b_trigger_definition_ref
             && a_force_block_attacker == b_force_block_attacker
             && a_target_incarnations == b_target_incarnations
-            && a_selected_target_incarnations == b_selected_target_incarnations
+            // CR 400.7: occurrence pins compare in their normalized, aligned
+            // form, so a legacy keyed decode equals its positional re-encode.
+            && self.aligned_target_pins() == other.aligned_target_pins()
             && a_activation_cost_reduction == b_activation_cost_reduction
             && a_activation_record == b_activation_record
             && a_illegal_target_slots == b_illegal_target_slots
@@ -34221,7 +34236,8 @@ impl ResolvedAbility {
             trigger_definition_ref: None,
             force_block_attacker: None,
             target_incarnations: Vec::new(),
-            selected_target_incarnations: Vec::new(),
+            target_pins: Vec::new(),
+            legacy_selected_target_incarnations: Vec::new(),
             activation_cost_reduction: None,
             activation_record: None,
             illegal_target_slots: Vec::new(),
@@ -34507,7 +34523,8 @@ impl ResolvedAbility {
         // whether two abilities would resolve identically, and two pins at
         // different epochs would not. Same field, different questions.
         self.target_incarnations.clear();
-        self.selected_target_incarnations.clear();
+        self.target_pins.clear();
+        self.legacy_selected_target_incarnations.clear();
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.clear_trigger_identity_recursive();
         }
@@ -34579,22 +34596,14 @@ impl ResolvedAbility {
     }
 
     /// CR 115.1a/c/d + CR 400.7 + CR 601.2c + CR 602.2b + CR 603.3d: Capture ordinary object targets at the shared
-    /// announcement/selection seam. Existing pins belong to delayed-trigger
-    /// referents and must not be replaced by a later assignment.
+    /// announcement/selection seam, one pin per occurrence
+    /// (`announce_target_pins`). Existing `target_incarnations` belong to
+    /// delayed-trigger referents and are not replaced by a later assignment.
     pub fn capture_target_incarnations_recursive(
         &mut self,
         state: &crate::types::game_state::GameState,
     ) {
-        self.selected_target_incarnations = self
-            .targets
-            .iter()
-            .filter_map(|target| match target {
-                TargetRef::Object(id) => {
-                    state.objects.get(id).map(ObjectIncarnationRef::from_object)
-                }
-                TargetRef::Player(_) => None,
-            })
-            .collect();
+        self.announce_target_pins(state);
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.capture_target_incarnations_recursive(state);
         }
@@ -34602,7 +34611,6 @@ impl ResolvedAbility {
             else_branch.capture_target_incarnations_recursive(state);
         }
     }
-
     /// CR 400.7 + CR 603.7c: True when `id` may still be affected by this
     /// ability.
     ///
@@ -34627,48 +34635,6 @@ impl ResolvedAbility {
             .iter()
             .find(|pin| pin.object_id == id)
             .is_none_or(|pin| pin.is_current(state))
-    }
-
-    /// CR 400.7: True when an ordinary selected target still names the
-    /// incarnation captured at announcement/selection time.
-    pub fn selected_target_pin_is_current(
-        &self,
-        id: ObjectId,
-        state: &crate::types::game_state::GameState,
-    ) -> bool {
-        self.selected_target_incarnations
-            .iter()
-            .find(|pin| pin.object_id == id)
-            .is_none_or(|pin| pin.is_current(state))
-    }
-
-    /// CR 115.7: A retarget refreshes the pin when the target changes, including
-    /// a same-ID target that left and returned as a new object.
-    pub fn retarget_target_requires_pin_refresh(
-        &self,
-        old: &TargetRef,
-        new: &TargetRef,
-        state: &crate::types::game_state::GameState,
-    ) -> bool {
-        old != new
-            || matches!(
-                new,
-                TargetRef::Object(id) if !self.selected_target_pin_is_current(*id, state)
-            )
-    }
-
-    /// CR 115.7: Refresh the selected-target pin for one target changed by a
-    /// retargeting effect, leaving every unchanged slot's original pin intact.
-    pub fn update_selected_target_incarnation(&mut self, pin: ObjectIncarnationRef) {
-        if let Some(existing) = self
-            .selected_target_incarnations
-            .iter_mut()
-            .find(|existing| existing.object_id == pin.object_id)
-        {
-            *existing = pin;
-        } else {
-            self.selected_target_incarnations.push(pin);
-        }
     }
 
     /// CR 603.7c + CR 400.7: The subset of `targets` this ability may still
@@ -35611,9 +35577,18 @@ impl ResolvedAbility {
     /// guarantee they land at index 0 regardless of their prior seat position.
     pub fn push_front_player_target_recursive(&mut self, player: PlayerId) {
         // CR 608.2d: Remove any existing occurrence first so the guesser is
-        // always at index 0 regardless of seat order in the target list.
-        self.targets.retain(|t| t != &TargetRef::Player(player));
-        self.targets.insert(0, TargetRef::Player(player));
+        // always at index 0 regardless of seat order in the target list. The
+        // object occurrences keep their own pins (an occurrence projection,
+        // then an unpinned player insertion).
+        let kept: Vec<usize> = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t != TargetRef::Player(player))
+            .map(|(position, _)| position)
+            .collect();
+        self.project_target_occurrences(&kept);
+        self.insert_target(0, TargetRef::Player(player), None);
         if let Some(sub) = self.sub_ability.as_mut() {
             sub.push_front_player_target_recursive(player);
         }

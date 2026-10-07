@@ -286,7 +286,7 @@ fn target_damage_source(state: &GameState, ability: &ResolvedAbility) -> Option<
     // CR 400.7 + CR 608.2b: a pinned referent that became a new object is not
     // the object that was chosen, so it deals nothing.
     if !ability.target_pin_is_current(bound_id, state)
-        || !ability.selected_target_pin_is_current(bound_id, state)
+        || !ability.target_occurrence_is_current(0, state)
     {
         return None;
     }
@@ -1207,7 +1207,7 @@ fn cast_tail_with_parent_targets(
 ) -> ResolvedAbility {
     let mut tail = sub.clone();
     if crate::game::effects::should_propagate_parent_targets(ability, &tail) {
-        tail.targets = ability.targets.clone();
+        tail.set_targets(ability.targets.clone());
     }
     tail
 }
@@ -2744,13 +2744,14 @@ pub fn resolve_each_source_deals_damage(
         EachDamageRecipient::OtherBatchSource { source_filters } => ability
             .targets
             .iter()
+            .enumerate()
             .zip(source_filters)
-            .filter_map(|(target, source_filter)| {
+            .filter_map(|((position, target), source_filter)| {
                 let TargetRef::Object(id) = target else {
                     return None;
                 };
                 (ability.target_pin_is_current(*id, state)
-                    && ability.selected_target_pin_is_current(*id, state)
+                    && ability.target_occurrence_is_current(position, state)
                     && !crate::game::targeting::validate_targets_for_ability(
                         state,
                         std::slice::from_ref(target),

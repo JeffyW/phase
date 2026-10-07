@@ -1067,7 +1067,14 @@ fn finalize_copy_retarget_refreshes_stale_same_id_object_pin() {
 
     let ability = state.stack[0].ability().expect("copy ability on stack");
     assert!(
-        ability.selected_target_pin_is_current(target, &state),
+        ability.target_occurrence_is_current(
+            ability
+                .targets
+                .iter()
+                .position(|t| *t == TargetRef::Object(target))
+                .expect("copy targets the chosen object"),
+            &state
+        ),
         "copy same-ID retarget must refresh the selected-target pin"
     );
 }

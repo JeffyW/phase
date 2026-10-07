@@ -9,7 +9,6 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, RetargetScope, RetargetSlotAddress, StackEntry, StackEntryKind, WaitingFor,
 };
-use crate::types::identifiers::ObjectIncarnationRef;
 use crate::types::keywords::Keyword;
 use crate::types::player::PlayerId;
 use crate::types::ObjectId;
@@ -352,7 +351,7 @@ fn base_exposed_prefix(bindings: &[RetargetSlotBinding]) -> &[RetargetSlotBindin
 /// SINGLE-POSITION CASE (`exposed.len() == 1`, the overwhelming majority of
 /// forced retargets — BASE's `None => Some(0)` fallback for a non-mana-role
 /// node): NOT gated on `changes`. `write_retarget_position`'s own
-/// `retarget_target_requires_pin_refresh` call is what decides whether a
+/// `retarget_requires_pin_refresh_at` call is what decides whether a
 /// write is a genuine change OR a same-TargetRef re-incarnation (CR 400.7 +
 /// CR 603.7c) that still needs its pin refreshed; gating candidacy on raw
 /// `TargetRef` inequality here would make that same-ID case unreachable, since
@@ -395,20 +394,15 @@ fn write_retarget_position(
         return;
     };
     if let Some(node) = ability_utils::node_at_mut(&mut mutated, &address.path) {
-        if let Some(old) = node.targets.get(address.slot).cloned() {
-            let refresh = node.retarget_target_requires_pin_refresh(&old, new_target, state);
-            node.targets[address.slot] = new_target.clone();
-            if refresh {
-                let pin = match new_target {
-                    TargetRef::Object(id) => {
-                        state.objects.get(id).map(ObjectIncarnationRef::from_object)
-                    }
-                    TargetRef::Player(_) => None,
-                };
-                if let Some(pin) = pin {
-                    node.update_selected_target_incarnation(pin);
-                }
-            }
+        if node.targets.get(address.slot).is_some() {
+            // CR 115.7d + CR 400.7: a changed occurrence takes the live
+            // incarnation; an unchanged one keeps its own announced pin.
+            let pin = if node.retarget_requires_pin_refresh_at(address.slot, new_target, state) {
+                ability_utils::live_target_pin(state, new_target)
+            } else {
+                node.target_pin_at(address.slot)
+            };
+            node.set_target_at(address.slot, new_target.clone(), pin);
         }
     }
     ability_utils::restamp_derived_chain_targets(&mut mutated);

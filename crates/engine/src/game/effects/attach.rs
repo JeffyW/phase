@@ -1271,7 +1271,7 @@ pub(crate) fn bind_resolution_attachment_choice(
                     .to_string(),
             ));
         }
-        choice_ability.targets.push(TargetRef::Object(selected_id));
+        choice_ability.push_target(TargetRef::Object(selected_id));
         let selected = state
             .objects
             .get(&selected_id)

@@ -180,6 +180,7 @@ pub mod stickers;
 #[cfg(test)]
 #[path = "stickers_tests.rs"]
 mod stickers_tests;
+pub mod target_occurrences;
 pub mod targeting;
 pub mod token_presets;
 pub mod topology;

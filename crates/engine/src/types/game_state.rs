@@ -13306,6 +13306,35 @@ impl GameState {
         });
     }
 
+    /// CR 400.7 + CR 601.2c: restore boundary for target occurrence pins.
+    /// Normalizes every resolution-session fence's legacy keyed pins against
+    /// the fence's own captured provenance, then refuses any stack ability
+    /// (pending or resolving, every continuation node) or fence whose pins are
+    /// not aligned with its targets. A legacy keyed `ResolvedAbility` decode
+    /// needs no rewrite here: its first-matching reading is a pure function of
+    /// the stored data (`ResolvedAbility::aligned_target_pins`) and the first
+    /// occurrence write normalizes it.
+    fn normalize_and_validate_target_pins(
+        &mut self,
+    ) -> Result<(), crate::game::target_occurrences::TargetPinAlignmentError> {
+        if let Some(session) = self.stack_resolution_session.as_mut() {
+            for fence in &mut session.entries {
+                fence.normalize_legacy_target_pins();
+            }
+        }
+        for entry in self.stack.iter().chain(self.resolving_stack_entry.iter()) {
+            if let Some(ability) = entry.ability() {
+                crate::game::target_occurrences::validate_target_pin_alignment(ability)?;
+            }
+        }
+        if let Some(session) = self.stack_resolution_session.as_ref() {
+            for fence in &session.entries {
+                fence.validate_target_pin_alignment()?;
+            }
+        }
+        Ok(())
+    }
+
     /// A staged payment is a replay authority, not merely display data.  Keep
     /// its player references inside the restored game's seat set before any
     /// caller can finalize or replay it; otherwise a crafted raw snapshot can
@@ -13512,6 +13541,11 @@ pub enum PersistedRestoreError {
     PrioritySettlementFailed(String),
     #[error("persisted per-player choice cannot be restored: {0}")]
     InvalidPerPlayerChoice(String),
+    /// CR 400.7: a stack ability's occurrence pins are not aligned with its
+    /// targets (a pin naming another object, a pinned player, or a length
+    /// drift).
+    #[error("persisted target occurrence pins are invalid: {0}")]
+    InvalidTargetPins(crate::game::target_occurrences::TargetPinAlignmentError),
 }
 
 impl PreparedPersistedGameState {
@@ -13697,6 +13731,9 @@ impl PersistedGameState {
         state
             .validate_payment_transaction()
             .map_err(PersistedRestoreError::InvalidPaymentTransaction)?;
+        state
+            .normalize_and_validate_target_pins()
+            .map_err(PersistedRestoreError::InvalidTargetPins)?;
         crate::game::effects::choose_from_zone::migrate_legacy_per_player_frame_on_restore(
             &mut state,
         )
@@ -17781,8 +17818,15 @@ pub struct StackResolutionEntryFence {
     pub provenance: StackResolutionEntryProvenance,
     /// CR 400.7 / CR 603.7c: delayed-trigger referent pins.
     pub target_incarnations: Vec<ObjectIncarnationRef>,
-    /// CR 400.7 / CR 601.2c: ordinary selected-target pins.
-    pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
+    /// CR 400.7 / CR 601.2c: the captured entry's occurrence pins, aligned
+    /// with its provenance ability's `targets`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_pins: Vec<Option<ObjectIncarnationRef>>,
+    /// Decode-only alias for the pre-positional keyed fence pins; normalized
+    /// against the fence's OWN captured provenance at restore
+    /// (`normalize_legacy_target_pins`), never against a later live entry.
+    #[serde(rename = "selected_target_incarnations", default, skip_serializing)]
+    pub legacy_selected_target_incarnations: Vec<ObjectIncarnationRef>,
 }
 
 /// Exhaustive provenance of one stack-entry kind. Keeping every field that is
@@ -17884,15 +17928,21 @@ impl StackResolutionEntryFence {
                 assignments: assignments.clone(),
             },
         };
-        let (target_incarnations, selected_target_incarnations) = entry
+        let (target_incarnations, target_pins) = entry
             .ability()
             .map(|ability| {
                 (
                     ability.target_incarnations.clone(),
-                    ability.selected_target_incarnations.clone(),
+                    ability.aligned_target_pins(),
                 )
             })
             .unwrap_or_default();
+        // Compact form: an all-unpinned entry stores no pins.
+        let target_pins = if target_pins.iter().all(Option::is_none) {
+            Vec::new()
+        } else {
+            target_pins
+        };
 
         Self {
             entry_id: entry.id,
@@ -17900,8 +17950,80 @@ impl StackResolutionEntryFence {
             controller: entry.controller,
             provenance,
             target_incarnations,
-            selected_target_incarnations,
+            target_pins,
+            legacy_selected_target_incarnations: Vec::new(),
         }
+    }
+
+    /// The ability captured in this fence's own provenance, if any.
+    fn provenance_ability(&self) -> Option<&ResolvedAbility> {
+        match &self.provenance {
+            StackResolutionEntryProvenance::Spell { ability, .. } => ability.as_deref(),
+            StackResolutionEntryProvenance::ActivatedAbility { ability, .. } => Some(ability),
+            StackResolutionEntryProvenance::TriggeredAbility(triggered) => Some(&triggered.ability),
+            StackResolutionEntryProvenance::KeywordAction { .. }
+            | StackResolutionEntryProvenance::CombatDamage { .. } => None,
+        }
+    }
+
+    /// CR 400.7: normalize a legacy keyed fence into positional pins against
+    /// the fence's OWN captured provenance ability: each object occurrence of
+    /// its `targets` takes the first legacy pin with that id, players and
+    /// unmatched occurrences none. Never consults a live entry.
+    pub fn normalize_legacy_target_pins(&mut self) {
+        if self.legacy_selected_target_incarnations.is_empty() {
+            return;
+        }
+        let legacy = std::mem::take(&mut self.legacy_selected_target_incarnations);
+        if !self.target_pins.is_empty() {
+            return;
+        }
+        let pins: Vec<Option<ObjectIncarnationRef>> = self
+            .provenance_ability()
+            .map(|ability| {
+                ability
+                    .targets
+                    .iter()
+                    .map(|target| match target {
+                        TargetRef::Object(id) => {
+                            legacy.iter().find(|pin| pin.object_id == *id).copied()
+                        }
+                        TargetRef::Player(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.target_pins = if pins.iter().all(Option::is_none) {
+            Vec::new()
+        } else {
+            pins
+        };
+    }
+
+    /// CR 400.7: the fence's pins must align with its own provenance ability
+    /// (same rules as `validate_target_pin_alignment`), and that ability's own
+    /// occurrence pins must be aligned.
+    pub fn validate_target_pin_alignment(
+        &self,
+    ) -> Result<(), crate::game::target_occurrences::TargetPinAlignmentError> {
+        use crate::game::target_occurrences::TargetPinAlignmentError;
+        if !self.target_pins.is_empty() && !self.legacy_selected_target_incarnations.is_empty() {
+            return Err(TargetPinAlignmentError::AmbiguousLegacyAlias);
+        }
+        let Some(ability) = self.provenance_ability() else {
+            return if self.target_pins.is_empty() {
+                Ok(())
+            } else {
+                Err(TargetPinAlignmentError::LengthMismatch)
+            };
+        };
+        crate::game::target_occurrences::validate_target_pin_alignment(ability)?;
+        let mut node = ability.clone();
+        node.sub_ability = None;
+        node.else_ability = None;
+        node.legacy_selected_target_incarnations.clear();
+        node.target_pins = self.target_pins.clone();
+        crate::game::target_occurrences::validate_target_pin_alignment(&node)
     }
 
     /// Compares captured stack data only. This stays correct even when the
@@ -37138,6 +37260,51 @@ mod tests {
         );
     }
 
+    /// CR 400.7: the restore boundary refuses a stack ability whose occurrence
+    /// pin names a different object than its position (release-build check),
+    /// and admits the aligned control.
+    #[test]
+    fn restore_refuses_a_stack_target_pin_naming_another_object() {
+        let restore_with_pin = |pin: ObjectIncarnationRef| {
+            let mut state = GameState::default();
+            let mut ability = ResolvedAbility::new(
+                Effect::NoOp,
+                vec![
+                    TargetRef::Player(PlayerId(1)),
+                    TargetRef::Object(ObjectId(8)),
+                ],
+                ObjectId(7),
+                PlayerId(0),
+            );
+            ability.target_pins = vec![None, Some(pin)];
+            state.stack.push_back(StackEntry {
+                id: ObjectId(6),
+                source_id: ObjectId(7),
+                controller: PlayerId(0),
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: ObjectId(7),
+                    ability: Box::new(ability),
+                },
+            });
+            let wire = serde_json::to_value(PersistedGameState::capture(state)).unwrap();
+            serde_json::from_value::<PersistedGameState>(wire)
+                .unwrap()
+                .prepare_for_restore(PersistedRestoreFinalization::Immediate)
+                .map(|_| ())
+        };
+        assert_eq!(
+            restore_with_pin(ObjectIncarnationRef::of(ObjectId(9), 1)),
+            Err(PersistedRestoreError::InvalidTargetPins(
+                crate::game::target_occurrences::TargetPinAlignmentError::IdentityMismatch
+            ))
+        );
+        assert_eq!(
+            restore_with_pin(ObjectIncarnationRef::of(ObjectId(8), 1)),
+            Ok(()),
+            "control: an aligned pin restores"
+        );
+    }
+
     #[test]
     fn stack_resolution_entry_fence_uses_latched_lki_and_both_target_pin_vectors() {
         let mut ability = ResolvedAbility::new(
@@ -37148,7 +37315,7 @@ mod tests {
         );
         ability.source_incarnation = Some(3);
         ability.target_incarnations = vec![ObjectIncarnationRef::of(ObjectId(8), 4)];
-        ability.selected_target_incarnations = vec![ObjectIncarnationRef::of(ObjectId(8), 5)];
+        ability.target_pins = vec![Some(ObjectIncarnationRef::of(ObjectId(8), 5))];
         let entry = StackEntry {
             id: ObjectId(6),
             source_id: ObjectId(7),
@@ -37168,8 +37335,8 @@ mod tests {
             vec![ObjectIncarnationRef::of(ObjectId(8), 4)]
         );
         assert_eq!(
-            fence.selected_target_incarnations,
-            vec![ObjectIncarnationRef::of(ObjectId(8), 5)]
+            fence.target_pins,
+            vec![Some(ObjectIncarnationRef::of(ObjectId(8), 5))]
         );
         assert!(
             fence.matches_captured_entry(&entry),
@@ -37184,13 +37351,87 @@ mod tests {
         );
 
         let mut changed_selected_pin = entry;
-        changed_selected_pin
-            .ability_mut()
-            .unwrap()
-            .selected_target_incarnations = vec![ObjectIncarnationRef::of(ObjectId(8), 10)];
+        changed_selected_pin.ability_mut().unwrap().target_pins =
+            vec![Some(ObjectIncarnationRef::of(ObjectId(8), 10))];
         assert!(
             !fence.matches_captured_entry(&changed_selected_pin),
             "ordinary selected-target pins are independently fenced"
+        );
+    }
+
+    /// CR 400.7: a legacy keyed fence is normalized against its OWN captured
+    /// provenance (first matching pin per occurrence, players none), never
+    /// against a later live entry; a misaligned fence pin is refused.
+    #[test]
+    fn stack_resolution_entry_fence_normalizes_legacy_pins_against_its_provenance() {
+        let a = ObjectId(8);
+        let mut ability = ResolvedAbility::new(
+            Effect::NoOp,
+            vec![
+                TargetRef::Player(PlayerId(1)),
+                TargetRef::Object(a),
+                TargetRef::Object(a),
+            ],
+            ObjectId(7),
+            PlayerId(0),
+        );
+        ability.target_pins = vec![
+            None,
+            Some(ObjectIncarnationRef::of(a, 5)),
+            Some(ObjectIncarnationRef::of(a, 5)),
+        ];
+        let mut entry = StackEntry {
+            id: ObjectId(6),
+            source_id: ObjectId(7),
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ObjectId(7),
+                ability: Box::new(ability),
+            },
+        };
+        let captured = StackResolutionEntryFence::capture(&entry);
+        let mut legacy = serde_json::to_value(&captured).unwrap();
+        // The pre-positional wire: keyed pins on the fence AND on its
+        // captured provenance ability.
+        let keyed = serde_json::json!([
+            ObjectIncarnationRef::of(a, 5),
+            ObjectIncarnationRef::of(a, 6)
+        ]);
+        legacy.as_object_mut().unwrap().remove("target_pins");
+        legacy["selected_target_incarnations"] = keyed.clone();
+        let provenance_ability = &mut legacy["provenance"]["data"]["ability"];
+        provenance_ability
+            .as_object_mut()
+            .expect("activated provenance carries its ability")
+            .remove("target_pins");
+        provenance_ability["selected_target_incarnations"] = keyed;
+        let mut fence: StackResolutionEntryFence = serde_json::from_value(legacy).unwrap();
+        // The live entry moves on; normalization must not read it.
+        entry
+            .ability_mut()
+            .unwrap()
+            .set_targets(vec![TargetRef::Object(ObjectId(9))]);
+        fence.normalize_legacy_target_pins();
+        assert!(fence.legacy_selected_target_incarnations.is_empty());
+        assert_eq!(
+            fence.target_pins,
+            vec![
+                None,
+                Some(ObjectIncarnationRef::of(a, 5)),
+                Some(ObjectIncarnationRef::of(a, 5)),
+            ]
+        );
+        assert_eq!(
+            fence, captured,
+            "normalized legacy fence equals its re-capture"
+        );
+        assert_eq!(fence.validate_target_pin_alignment(), Ok(()));
+
+        let mut forged = fence.clone();
+        forged.target_pins[1] = Some(ObjectIncarnationRef::of(ObjectId(9), 1));
+        assert_eq!(
+            forged.validate_target_pin_alignment(),
+            Err(crate::game::target_occurrences::TargetPinAlignmentError::IdentityMismatch)
         );
     }
 

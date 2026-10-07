@@ -250,16 +250,17 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         trigger_definition_ref: _, // exact trigger occurrence, no dynamic read
         force_block_attacker: _,   // exact force-block referent, no dynamic read
         target_incarnations: _,    // CR 400.7 referent pins, no dynamic read
-        selected_target_incarnations: _, // CR 400.7 selected-target pins, no dynamic read
-        illegal_target_slots: _,   // CR 608.2b resolution legality stamp, no dynamic read
+        target_pins: _,            // CR 400.7 selected-target pins, no dynamic read
+        legacy_selected_target_incarnations: _,
+        illegal_target_slots: _, // CR 608.2b resolution legality stamp, no dynamic read
         illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no dynamic read
-        controller: _,             // player id
-        original_controller: _,    // player id
-        scoped_player: _,          // player id (iteration binding)
-        kind: _,                   // AbilityKind tag (no payload)
-        context: _,                // SpellContext: cast-time fact snapshot, not a live read
-        optional_targeting: _,     // bool
-        optional: _,               // bool
+        controller: _,           // player id
+        original_controller: _,  // player id
+        scoped_player: _,        // player id (iteration binding)
+        kind: _,                 // AbilityKind tag (no payload)
+        context: _,              // SpellContext: cast-time fact snapshot, not a live read
+        optional_targeting: _,   // bool
+        optional: _,             // bool
         optional_player,
         optional_for: _,         // OpponentMayScope: AnyOpponent/AnyPlayer, no read
         target_choice_timing: _, // Stack/Resolution tag

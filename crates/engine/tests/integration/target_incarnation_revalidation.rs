@@ -57,7 +57,7 @@ fn selected_target_does_not_follow_object_id_after_zone_change_and_return() {
             .stack
             .back()
             .and_then(|entry| entry.ability())
-            .map(|ability| ability.selected_target_incarnations.len()),
+            .map(|ability| ability.target_pins.iter().flatten().count()),
         Some(1),
         "the announced target must be pinned on the stack entry"
     );
@@ -153,7 +153,7 @@ fn stale_target_stack() -> (
             .stack
             .back()
             .and_then(|entry| entry.ability())
-            .is_some_and(|ability| ability.selected_target_pin_is_current(target, runner.state())),
+            .is_some_and(|ability| ability.target_occurrence_is_current(0, runner.state())),
         "the round-trip must stale the original selected-target pin"
     );
     (runner, target)
@@ -189,7 +189,7 @@ fn interactive_same_object_id_retarget_refreshes_selected_target_pin() {
 
     let ability = runner.state().stack[0].ability().expect("ability on stack");
     assert!(
-        ability.selected_target_pin_is_current(target, runner.state()),
+        ability.target_occurrence_is_current(0, runner.state()),
         "interactive same-ID retarget must refresh the selected-target pin"
     );
 }
@@ -264,7 +264,7 @@ fn forced_same_object_id_retarget_refreshes_selected_target_pin() {
 
     let ability = runner.state().stack[0].ability().expect("ability on stack");
     assert!(
-        ability.selected_target_pin_is_current(target, runner.state()),
+        ability.target_occurrence_is_current(0, runner.state()),
         "forced same-ID retarget must refresh the selected-target pin"
     );
 }

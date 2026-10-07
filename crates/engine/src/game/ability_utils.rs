@@ -11,6 +11,7 @@ use crate::types::ability::{
     TriggerDefinition, TypeFilter, TypedFilter,
 };
 // CR 601.2c: mana recipient / count-source role slot gate.
+use super::target_occurrences::OccurrenceVerdict;
 use crate::types::ability::mana_multi_role;
 #[cfg(test)]
 use crate::types::counter::CounterType;
@@ -331,7 +332,7 @@ pub(crate) fn apply_instead_swap(
         .target_filter()
         .is_some_and(|filter| !filter.is_context_ref())
     {
-        overridden.targets = sub.targets.clone();
+        overridden.set_targets(sub.targets.clone());
     }
     overridden
 }
@@ -1927,12 +1928,12 @@ pub fn assign_targets_in_chain(
     targets: &[TargetRef],
 ) -> Result<(), EngineError> {
     if is_per_opponent_target_fanout(ability) {
-        ability.targets = targets.to_vec();
+        ability.set_targets(targets.to_vec());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
     if !chain_has_target_sink(ability) {
-        ability.targets = targets.to_vec();
+        ability.set_targets(targets.to_vec());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
@@ -1955,12 +1956,12 @@ pub fn assign_selected_slots_in_chain(
     selected_slots: &[Option<TargetRef>],
 ) -> Result<(), EngineError> {
     if is_per_opponent_target_fanout(ability) {
-        ability.targets = selected_slots.iter().flatten().cloned().collect();
+        ability.set_targets(selected_slots.iter().flatten().cloned().collect());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
     if !chain_has_target_sink(ability) {
-        ability.targets = selected_slots.iter().flatten().cloned().collect();
+        ability.set_targets(selected_slots.iter().flatten().cloned().collect());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
@@ -1983,9 +1984,17 @@ pub fn assign_selected_slots_in_chain(
 /// Uses the two nearest `TargetOnly` producers in this branch. Empty optional
 /// slots remain in the window so older unrelated targets cannot backfill them.
 fn stamp_other_batch_source_targets(ability: &mut ResolvedAbility) {
-    fn visit(ability: &mut ResolvedAbility, recent_slots: &mut Vec<Vec<TargetRef>>) {
+    type Occurrences = Vec<(TargetRef, Option<ObjectIncarnationRef>)>;
+    fn visit(ability: &mut ResolvedAbility, recent_slots: &mut Vec<Occurrences>) {
         if matches!(ability.effect, Effect::TargetOnly { .. }) {
-            recent_slots.push(object_targets_only(&ability.targets));
+            // The producer's object occurrences, each with its own pin.
+            recent_slots.push(
+                ability
+                    .target_occurrences()
+                    .into_iter()
+                    .filter(|(target, _)| matches!(target, TargetRef::Object(_)))
+                    .collect(),
+            );
             if recent_slots.len() > 2 {
                 recent_slots.remove(0);
             }
@@ -1999,11 +2008,11 @@ fn stamp_other_batch_source_targets(ability: &mut ResolvedAbility) {
                 ..
             }
         ) {
-            ability.targets = if recent_slots.len() == 2 {
+            ability.replace_target_occurrences(if recent_slots.len() == 2 {
                 recent_slots.iter().flatten().cloned().collect()
             } else {
                 Vec::new()
-            };
+            });
         }
 
         let branch_slots = recent_slots.clone();
@@ -2019,14 +2028,52 @@ fn stamp_other_batch_source_targets(ability: &mut ResolvedAbility) {
     visit(ability, &mut Vec::new());
 }
 
+/// The positions of one chain node that count as declared target slots — the
+/// single ownership census every declared-slot producer and consumer numbers a
+/// node by (declared entries, the validated view, the fizzle stamps, retarget
+/// addresses): every occurrence, except a per-opponent fanout's player
+/// headers.
+pub(crate) fn chain_node_positions(ability: &ResolvedAbility) -> Vec<usize> {
+    let fanout = is_per_opponent_target_fanout(ability);
+    ability
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| !fanout || matches!(target, TargetRef::Object(_)))
+        .map(|(position, _)| position)
+        .collect()
+}
+
 /// The targets one chain node contributes to [`flatten_targets_in_chain`]'s
 /// numbering: a per-opponent fanout contributes only its object targets.
 fn chain_node_targets(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    if is_per_opponent_target_fanout(ability) {
-        object_targets_only(&ability.targets)
-    } else {
-        ability.targets.clone()
+    chain_node_positions(ability)
+        .into_iter()
+        .map(|position| ability.targets[position].clone())
+        .collect()
+}
+
+/// [`flatten_targets_in_chain`] with each occurrence's own pin — the chain
+/// flatten of the occurrence authority.
+pub(crate) fn flatten_target_occurrences_in_chain(
+    ability: &ResolvedAbility,
+) -> Vec<(TargetRef, Option<ObjectIncarnationRef>)> {
+    let mut occurrences: Vec<_> = chain_node_positions(ability)
+        .into_iter()
+        .map(|position| {
+            (
+                ability.targets[position].clone(),
+                ability.target_pin_at(position),
+            )
+        })
+        .collect();
+    if let Some(sub_ability) = ability.sub_ability.as_deref() {
+        occurrences.extend(flatten_target_occurrences_in_chain(sub_ability));
     }
+    if let Some(else_ability) = ability.else_ability.as_deref() {
+        occurrences.extend(flatten_target_occurrences_in_chain(else_ability));
+    }
+    occurrences
 }
 
 pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
@@ -2069,11 +2116,10 @@ pub fn declared_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DeclaredTargetEntry {
     pub(crate) target: TargetRef,
-    /// The selected-target pin of `target`, read from the DECLARING node's own
-    /// `selected_target_incarnations` by object id — the contract
-    /// `ResolvedAbility::update_selected_target_incarnation` writes. Two declared
-    /// positions holding the same object on one node share that node's pin.
-    /// `None` for a player target, or when the declaring node holds no pin.
+    /// The announced pin of THIS occurrence, read positionally from the
+    /// declaring node (`ResolvedAbility::target_pin_at`). Two declared
+    /// positions holding the same object carry their own pins. `None` for a
+    /// player target, or when the occurrence holds no pin.
     pub(crate) pin: Option<ObjectIncarnationRef>,
 }
 
@@ -2092,16 +2138,11 @@ pub(crate) fn declared_target_entries_in_chain(
             return;
         }
         if !targets_are_inherited {
-            out.extend(chain_node_targets(ability).into_iter().map(|target| {
-                let pin = match &target {
-                    TargetRef::Object(id) => ability
-                        .selected_target_incarnations
-                        .iter()
-                        .find(|pin| pin.object_id == *id)
-                        .copied(),
-                    TargetRef::Player(_) => None,
-                };
-                DeclaredTargetEntry { target, pin }
+            out.extend(chain_node_positions(ability).into_iter().map(|position| {
+                DeclaredTargetEntry {
+                    target: ability.targets[position].clone(),
+                    pin: ability.target_pin_at(position),
+                }
             }));
         }
         if let Some(sub_ability) = ability.sub_ability.as_deref() {
@@ -2197,22 +2238,29 @@ fn paid_instead_delegate(ability: &ResolvedAbility) -> Option<&ResolvedAbility> 
 /// they're illegal." A paid "instead" delegator's mirror and an inheriting
 /// rider's snapshot are not announced targets and occupy no slot.
 ///
-/// Membership is tested per node, not by position: validation compacts a
-/// node's pruned targets, so positions shift while the survivors keep their
-/// identity. It counts multiplicity, because CR 115.3 lets one object fill
-/// several target slots of a node: each surviving copy vouches for one declared
-/// copy, so a pruned copy is marked. Compaction does not record WHICH copy was
-/// pruned, so the later declared copy is the one marked. A validation arm that
-/// deliberately keeps an illegal target in place (the multi-role mana and
-/// damage-replacement role arms, which re-validate each role where it is
-/// consumed) leaves that slot unmarked.
+/// Membership is read from the validation verdicts, per occurrence: resolution
+/// validation (`validate_targets_in_chain`) stamps each publishing node's
+/// `illegal_local_target_slots` with the declared-domain positions whose own
+/// occurrence was judged illegal (`IllegalRetained` or `Dropped`), so with two
+/// occurrences of one object the one actually found illegal is the one marked,
+/// whatever storage compaction did. A `PassThrough` occurrence is never
+/// marked. `validated` must be the validation result of `judged`, the
+/// execution copy validation read.
+///
+/// `declared` is the chain whose numbering is reported (the resolution
+/// carrier, or `judged` itself). When the carrier's occurrence at a position
+/// is not the occurrence `judged` held there (a resolution-time re-seed of the
+/// execution copy), the carrier's referent was never judged, so that slot is
+/// reported illegal too: an unvalidated referent supplies no information.
 pub(crate) fn illegal_declared_target_slots(
     declared: &ResolvedAbility,
-    validated: &mut ResolvedAbility,
+    judged: &ResolvedAbility,
+    validated: &ResolvedAbility,
 ) -> Vec<usize> {
     let mut illegal = Vec::new();
     visit_illegal_declared_target_slots(
-        Some(declared),
+        declared,
+        Some(judged),
         Some(validated),
         false,
         &mut 0,
@@ -2224,94 +2272,69 @@ pub(crate) fn illegal_declared_target_slots(
 /// CR 608.2b: clears target-legality metadata before an execution path that skips the
 /// normal initial legality check.
 pub(crate) fn clear_illegal_local_target_slots(ability: &mut ResolvedAbility) {
-    let mut ignored = Vec::new();
-    visit_illegal_declared_target_slots(None, Some(ability), false, &mut 0, &mut ignored);
+    ability.illegal_local_target_slots.clear();
+    if let Some(sub_ability) = ability.sub_ability.as_deref_mut() {
+        clear_illegal_local_target_slots(sub_ability);
+    }
+    if let Some(else_ability) = ability.else_ability.as_deref_mut() {
+        clear_illegal_local_target_slots(else_ability);
+    }
 }
 
 fn visit_illegal_declared_target_slots(
-    declared: Option<&ResolvedAbility>,
-    mut validated: Option<&mut ResolvedAbility>,
+    declared: &ResolvedAbility,
+    judged: Option<&ResolvedAbility>,
+    validated: Option<&ResolvedAbility>,
     targets_are_inherited: bool,
     next_slot: &mut usize,
     illegal: &mut Vec<usize>,
 ) {
-    if let Some(validated) = validated.as_deref_mut() {
-        validated.illegal_local_target_slots.clear();
+    if let Some(delegate) = paid_instead_delegate(declared) {
+        visit_illegal_declared_target_slots(
+            delegate,
+            judged.and_then(|node| node.sub_ability.as_deref()),
+            validated.and_then(|node| node.sub_ability.as_deref()),
+            targets_are_inherited,
+            next_slot,
+            illegal,
+        );
+        return;
     }
-
-    if let Some(declared) = declared {
-        if let Some(delegate) = paid_instead_delegate(declared) {
-            let validated_delegate = validated
-                .as_deref_mut()
-                .and_then(|node| node.sub_ability.as_deref_mut());
-            visit_illegal_declared_target_slots(
-                Some(delegate),
-                validated_delegate,
-                targets_are_inherited,
-                next_slot,
-                illegal,
-            );
-            return;
-        }
-        if !targets_are_inherited {
-            let mut survivors = validated
-                .as_deref()
-                .map_or_else(Vec::new, |node| node.targets.clone());
-            for (local_slot, target) in declared.targets.iter().enumerate().filter(|(_, target)| {
-                !is_per_opponent_target_fanout(declared) || matches!(target, TargetRef::Object(_))
-            }) {
-                match survivors.iter().position(|survivor| survivor == target) {
-                    Some(found) => {
-                        survivors.swap_remove(found);
-                    }
-                    None => {
-                        illegal.push(*next_slot);
-                        if let Some(validated) = validated.as_deref_mut() {
-                            validated.illegal_local_target_slots.push(local_slot);
-                        }
-                    }
-                }
-                *next_slot += 1;
+    if !targets_are_inherited {
+        // CR 608.2b: validation stamped each publishing node with the
+        // declared-domain positions whose own occurrence verdict was illegal;
+        // a missing validated node marks every position.
+        for position in chain_node_positions(declared) {
+            let judged_here = judged
+                .is_some_and(|node| node.targets.get(position) == declared.targets.get(position));
+            let stamped_illegal =
+                validated.is_none_or(|node| node.illegal_local_target_slots.contains(&position));
+            if stamped_illegal || !judged_here {
+                illegal.push(*next_slot);
             }
+            *next_slot += 1;
         }
-        if let Some(sub_ability) = declared.sub_ability.as_deref() {
-            let validated_sub = validated
-                .as_deref_mut()
-                .and_then(|node| node.sub_ability.as_deref_mut());
-            let inherited = rider_entries_are_inherited(declared, sub_ability);
-            visit_illegal_declared_target_slots(
-                Some(sub_ability),
-                validated_sub,
-                inherited,
-                next_slot,
-                illegal,
-            );
-        }
-        if let Some(else_ability) = declared.else_ability.as_deref() {
-            let validated_else = validated
-                .as_deref_mut()
-                .and_then(|node| node.else_ability.as_deref_mut());
-            visit_illegal_declared_target_slots(
-                Some(else_ability),
-                validated_else,
-                false,
-                next_slot,
-                illegal,
-            );
-        }
-    } else if let Some(validated) = validated {
-        if let Some(sub_ability) = validated.sub_ability.as_deref_mut() {
-            visit_illegal_declared_target_slots(None, Some(sub_ability), false, next_slot, illegal);
-        }
-        if let Some(else_ability) = validated.else_ability.as_deref_mut() {
-            visit_illegal_declared_target_slots(
-                None,
-                Some(else_ability),
-                false,
-                next_slot,
-                illegal,
-            );
-        }
+    }
+    if let Some(sub_ability) = declared.sub_ability.as_deref() {
+        let inherited = rider_entries_are_inherited(declared, sub_ability);
+        visit_illegal_declared_target_slots(
+            sub_ability,
+            judged.and_then(|node| node.sub_ability.as_deref()),
+            validated.and_then(|node| node.sub_ability.as_deref()),
+            inherited,
+            next_slot,
+            illegal,
+        );
+    }
+    if let Some(else_ability) = declared.else_ability.as_deref() {
+        visit_illegal_declared_target_slots(
+            else_ability,
+            judged.and_then(|node| node.else_ability.as_deref()),
+            validated.and_then(|node| node.else_ability.as_deref()),
+            false,
+            next_slot,
+            illegal,
+        );
     }
 }
 
@@ -2519,40 +2542,59 @@ pub fn distribution_targets(ability: &ResolvedAbility) -> Vec<TargetRef> {
     }
 }
 
-/// CR 608.2b: Re-validate targets on resolution — remove any that are no longer legal.
-fn target_is_current(ability: &ResolvedAbility, target: &TargetRef, state: &GameState) -> bool {
-    match target {
-        TargetRef::Object(id) => {
+/// CR 608.2b + CR 400.7: whether the occurrence at `position` of `ability`
+/// still names the object announced for it. A delayed-trigger referent pin
+/// (`target_incarnations`) is keyed by id by design; the announced
+/// occurrence pin is positional.
+fn target_is_current_at(ability: &ResolvedAbility, position: usize, state: &GameState) -> bool {
+    match ability.targets.get(position) {
+        Some(TargetRef::Object(id)) => {
             ability.target_pin_is_current(*id, state)
-                && ability.selected_target_pin_is_current(*id, state)
+                && ability.target_occurrence_is_current(position, state)
         }
-        TargetRef::Player(_) => true,
+        Some(TargetRef::Player(_)) => true,
+        None => false,
     }
 }
 
-fn validate_pinned_targets(
-    view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
-    state: &GameState,
-    targets: &[TargetRef],
-    filter: &TargetFilter,
-    ability: &ResolvedAbility,
-) -> Vec<TargetRef> {
-    validate_pinned_targets_for_slot(
-        view,
-        state,
-        targets,
-        AbilityTargetSlot::Unpositioned(filter),
-        ability,
-    )
+/// CR 608.2b: the verdict for an occurrence an arm either keeps or prunes.
+fn legal_or_dropped(legal: bool) -> OccurrenceVerdict {
+    if legal {
+        OccurrenceVerdict::Legal
+    } else {
+        OccurrenceVerdict::Dropped
+    }
 }
 
-fn validate_pinned_targets_for_slot(
+/// CR 608.2b: whether the occurrence at `position` is legal for `filter`.
+fn occurrence_is_legal(
     view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
     state: &GameState,
-    targets: &[TargetRef],
+    position: usize,
+    filter: &TargetFilter,
+    ability: &ResolvedAbility,
+) -> bool {
+    occurrences_legal_for_slot(
+        view,
+        state,
+        &[position],
+        AbilityTargetSlot::Unpositioned(filter),
+        ability,
+    )[0]
+}
+
+/// CR 608.2b: per-occurrence legality of `ability`'s occurrences at
+/// `positions` (indices into its announced `targets`) for one slot. Each
+/// result is for THAT occurrence — its target is legal for the slot and its
+/// own announced pin is still current — so two occurrences of one id are
+/// judged separately.
+fn occurrences_legal_for_slot(
+    view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
+    state: &GameState,
+    positions: &[usize],
     slot: AbilityTargetSlot<'_>,
     ability: &ResolvedAbility,
-) -> Vec<TargetRef> {
+) -> Vec<bool> {
     // CR 608.2b + CR 115.4: a damage "any target" is rechecked against the same
     // creature/player/planeswalker/battle domain it was chosen from, in addition
     // to the ordinary ability-context legality check (narrowing only).
@@ -2563,30 +2605,42 @@ fn validate_pinned_targets_for_slot(
     // target illegal too ("If part of the effect requires information about an
     // illegal target, it fails to determine any such information"). Every other
     // filter keeps the unchanged ability-context check.
+    let legal = slot_legal_targets(view, state, slot, ability);
+    positions
+        .iter()
+        .map(|&position| {
+            ability.targets.get(position).is_some_and(|target| {
+                legal.contains(target) && target_is_current_at(ability, position, state)
+            })
+        })
+        .collect()
+}
+
+/// CR 608.2b + CR 115.4: the targets legal for `slot` now — the slot's filter
+/// (read against the validated declared view when it depends on another
+/// declared slot) narrowed to a damage "any target" domain.
+fn slot_legal_targets(
+    view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
+    state: &GameState,
+    slot: AbilityTargetSlot<'_>,
+    ability: &ResolvedAbility,
+) -> Vec<TargetRef> {
     let mut legal = match view {
         Some(view) if crate::game::filter::filter_reads_declared_slot(slot.filter()) => {
-            let legal = targeting::find_legal_targets_for_ability_with_view(
+            targeting::find_legal_targets_for_ability_with_view(
                 state,
                 slot.filter(),
                 ability,
                 ability.controller,
                 view,
-            );
-            targets
-                .iter()
-                .filter(|target| legal.contains(target))
-                .cloned()
-                .collect()
+            )
         }
-        _ => targeting::validate_targets_for_ability(state, targets, slot.filter(), ability),
+        _ => targeting::find_legal_targets_for_ability(state, slot.filter(), ability),
     };
     if let Some(domain) = damage_any_target_legal_targets(state, ability, slot) {
-        legal.retain(|t| domain.contains(t));
+        legal.retain(|target| domain.contains(target));
     }
     legal
-        .into_iter()
-        .filter(|target| target_is_current(ability, target, state))
-        .collect()
 }
 
 /// CR 608.2b: recheck an actually announced, sole derived role using the same
@@ -2597,7 +2651,7 @@ fn validate_single_derived_role(
     state: &GameState,
     ability: &ResolvedAbility,
     target_origin: TargetReadOrigin,
-) -> Option<Vec<TargetRef>> {
+) -> Option<Vec<OccurrenceVerdict>> {
     match target_origin {
         TargetReadOrigin::ParentAnnouncement => return None,
         TargetReadOrigin::OwnAnnouncement => {}
@@ -2626,18 +2680,28 @@ fn validate_single_derived_role(
                 &state.current_trigger_events,
             );
             Some(
-                ability
-                    .targets
-                    .iter()
-                    .filter(|target| {
-                        legal.contains(target) && target_is_current(ability, target, state)
+                (0..ability.targets.len())
+                    .map(|position| {
+                        legal_or_dropped(
+                            legal.contains(&ability.targets[position])
+                                && target_is_current_at(ability, position, state),
+                        )
                     })
-                    .cloned()
                     .collect(),
             )
         }
         (false, true) => effect_target_slot_filter(&ability.effect).map(|derived| {
-            validate_pinned_targets(view, state, &ability.targets, &derived.filter, ability)
+            (0..ability.targets.len())
+                .map(|position| {
+                    legal_or_dropped(occurrence_is_legal(
+                        view,
+                        state,
+                        position,
+                        &derived.filter,
+                        ability,
+                    ))
+                })
+                .collect()
         }),
         (false, false) | (true, true) => None,
     }
@@ -2658,37 +2722,66 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
 /// announced) contributes to the validated declared view, in the
 /// `declared_targets_in_chain` order and with the same exclusions — an inherited
 /// rider's snapshot and a paid-"instead" delegator's mirror contribute nothing.
-/// A position whose target did not survive validation becomes a hole (`None`).
-/// Survivors are matched to declared positions by multiset, exactly as
-/// `visit_illegal_declared_target_slots` does, so holes come from the original
-/// declared positions rather than from the compacted survivor list.
+/// Each published position reads its OWN verdict (`verdicts`, aligned with
+/// `declared.targets`): a `Legal` or `PassThrough` occurrence is published as
+/// announced with its own positional pin, an `IllegalRetained` or `Dropped`
+/// one becomes a hole (`None`). A `PassThrough` occurrence keeps its position
+/// because every declared-slot producer and consumer numbers a node by
+/// `chain_node_positions` (the whole node, fanout players aside); it is
+/// published unchanged, exactly as before validation, and never stamped.
 fn append_validated_declared_positions(
     declared: &ResolvedAbility,
-    validated: &ResolvedAbility,
+    verdicts: &[OccurrenceVerdict],
     targets_are_inherited: bool,
     view: &mut Vec<Option<targeting::DeclaredSlotBinding>>,
 ) {
     if targets_are_inherited || paid_instead_delegate(declared).is_some() {
         return;
     }
-    let mut survivors = validated.targets.clone();
-    for target in chain_node_targets(declared) {
-        let survived = survivors
-            .iter()
-            .position(|survivor| *survivor == target)
-            .map(|found| survivors.swap_remove(found));
-        view.push(survived.map(|target| {
-            let pin = match &target {
-                TargetRef::Object(id) => declared
-                    .selected_target_incarnations
-                    .iter()
-                    .find(|pin| pin.object_id == *id)
-                    .copied(),
-                TargetRef::Player(_) => None,
-            };
-            targeting::DeclaredSlotBinding::Announced { target, pin }
+    for position in chain_node_positions(declared) {
+        let verdict = verdicts
+            .get(position)
+            .copied()
+            .unwrap_or(OccurrenceVerdict::Dropped);
+        view.push((!verdict.is_declared_illegal()).then(|| {
+            targeting::DeclaredSlotBinding::Announced {
+                target: declared.targets[position].clone(),
+                pin: declared.target_pin_at(position),
+            }
         }));
     }
+}
+
+/// CR 608.2b: the local positions of `declared` whose occurrence validation
+/// found illegal (`IllegalRetained` or `Dropped`), in the declared domain —
+/// the node-local fizzle stamp.
+fn declared_illegal_local_positions(
+    declared: &ResolvedAbility,
+    verdicts: &[OccurrenceVerdict],
+) -> Vec<usize> {
+    chain_node_positions(declared)
+        .into_iter()
+        .filter(|&position| {
+            verdicts
+                .get(position)
+                .copied()
+                .unwrap_or(OccurrenceVerdict::Dropped)
+                .is_declared_illegal()
+        })
+        .collect()
+}
+
+/// CR 608.2b: one node's resolution-validation result.
+enum NodeValidation {
+    /// One verdict per announced occurrence; storage is their projection.
+    Verdicts(Vec<OccurrenceVerdict>),
+    /// The implicit-ally fight arm stores occurrences drawn from the whole
+    /// resolving chain (`flatten_target_occurrences_in_chain`), each with its
+    /// own pin; `verdicts` still judge this node's own announced occurrences.
+    Rebuilt {
+        verdicts: Vec<OccurrenceVerdict>,
+        stored: Vec<(TargetRef, Option<ObjectIncarnationRef>)>,
+    },
 }
 
 fn validate_targets_in_chain_inner(
@@ -2713,8 +2806,14 @@ fn validate_targets_in_chain_inner(
     // filters that depend on another declared slot.
     let view_snapshot = view_out.clone();
     let view: Option<&[Option<targeting::DeclaredSlotBinding>]> = Some(&view_snapshot);
-    validated.targets = if is_per_opponent_target_fanout(&validated) {
-        validate_per_opponent_target_fanout_targets(state, &validated)
+    // CR 608.2b: every arm judges each announced occurrence of this node
+    // (`OccurrenceVerdict`, aligned with `validated.targets`); storage, the
+    // declared view and the fizzle stamp are each derived from the verdicts.
+    let occurrence_count = validated.targets.len();
+    let node_validation = if is_per_opponent_target_fanout(&validated) {
+        NodeValidation::Verdicts(validate_per_opponent_target_fanout_targets(
+            state, &validated,
+        ))
     } else if let Effect::MoveCounters {
         source,
         target,
@@ -2722,21 +2821,20 @@ fn validate_targets_in_chain_inner(
         ..
     } = &validated.effect
     {
-        move_counter_stack_target_filters(source, target, *selection)
-            .into_iter()
-            .filter(|filter| !filter.is_context_ref())
-            .zip(validated.targets.iter())
-            .filter_map(|(filter, target_ref)| {
-                let legal = validate_pinned_targets(
-                    view,
-                    state,
-                    std::slice::from_ref(target_ref),
-                    filter,
-                    &validated,
-                );
-                legal.into_iter().next()
-            })
-            .collect()
+        let filters: Vec<&TargetFilter> =
+            move_counter_stack_target_filters(source, target, *selection)
+                .into_iter()
+                .filter(|filter| !filter.is_context_ref())
+                .collect();
+        NodeValidation::Verdicts(
+            (0..occurrence_count)
+                .map(|position| {
+                    legal_or_dropped(filters.get(position).is_some_and(|filter| {
+                        occurrence_is_legal(view, state, position, filter, &validated)
+                    }))
+                })
+                .collect(),
+        )
     } else if let Effect::Attach {
         attachment,
         target,
@@ -2753,30 +2851,22 @@ fn validate_targets_in_chain_inner(
         // re-validated here; any remaining, un-claimed entries must pass
         // through UNCHANGED rather than being silently dropped, or a
         // sibling relying on them downstream loses its target.
-        let mut kept = Vec::new();
-        let mut target_iter = validated.targets.iter();
+        let mut verdicts = vec![OccurrenceVerdict::PassThrough; occurrence_count];
+        let mut next = 0usize;
         for (is_attachment, filter) in [(true, attachment), (false, target)] {
             if !attach_side_needs_target_slot(filter, is_attachment, selection) {
                 continue;
             }
-            let Some(target_ref) = target_iter.next() else {
+            if next >= occurrence_count {
                 continue;
-            };
-            if let Some(legal) = validate_pinned_targets(
-                view,
-                state,
-                std::slice::from_ref(target_ref),
-                filter,
-                &validated,
-            )
-            .into_iter()
-            .next()
-            {
-                kept.push(legal);
             }
+            verdicts[next] =
+                legal_or_dropped(occurrence_is_legal(view, state, next, filter, &validated));
+            next += 1;
         }
-        kept.extend(target_iter.cloned());
-        kept
+        // The unclaimed tail keeps `PassThrough`: stored unchanged, never
+        // stamped.
+        NodeValidation::Verdicts(verdicts)
     } else if paired_subject_filters(&validated.effect).is_some() {
         // MEASURED borrow shape: collect owned filters BEFORE the assignment,
         // so the `&validated.effect` borrow ends ahead of
@@ -2862,27 +2952,18 @@ fn validate_targets_in_chain_inner(
         // Conduit; `(Controller, Player)` — Cliffside Market (×2), reserving
         // exactly one slot; `(Controller, Typed{Opponent})` — Magus of the
         // Mirror, Mirror Universe, Mister Negative.
-        let mut kept = Vec::new();
-        let mut target_iter = validated.targets.iter();
+        let mut verdicts = vec![OccurrenceVerdict::Dropped; occurrence_count];
+        let mut next = 0usize;
         for filter in &paired {
             if filter.is_context_ref() {
                 continue;
             }
-            let Some(target_ref) = target_iter.next() else {
+            if next >= occurrence_count {
                 continue;
-            };
-            if let Some(legal) = validate_pinned_targets(
-                view,
-                state,
-                std::slice::from_ref(target_ref),
-                filter,
-                &validated,
-            )
-            .into_iter()
-            .next()
-            {
-                kept.push(legal);
             }
+            verdicts[next] =
+                legal_or_dropped(occurrence_is_legal(view, state, next, filter, &validated));
+            next += 1;
         }
         // CR 608.2b: this arm deliberately does NOT pass unclaimed propagated
         // entries through, which is where it diverges from the `Attach` arm
@@ -2914,7 +2995,8 @@ fn validate_targets_in_chain_inner(
         // the now-unreachable shape and pins that the arm still refuses it.
         // If a card ever needs both, the fix is to stop having the resolver
         // consume positionally from a flat list — not to re-add this tail.
-        kept
+        // (The unclaimed tail is `Dropped`.)
+        NodeValidation::Verdicts(verdicts)
     } else if let Some(role) = mana_multi_role(&validated.effect) {
         // CR 608.2b: THREE properties, all required.
         // (1) "Illegal targets won't be affected by parts of the effect for
@@ -2956,59 +3038,50 @@ fn validate_targets_in_chain_inner(
         // For a multi-role mana the companion slots are gated off everywhere, so
         // `targets` starts with this node's own role positions and the zip is
         // sound.
-        let mut claimed: Vec<TargetRef> = Vec::new();
-        let mut any_legal = false;
-        let mut target_iter = validated.targets.iter();
+        //
+        // As occurrence verdicts: a legal role is `Legal`, an illegal one is
+        // `IllegalRetained` (stored in place, published as a hole and stamped,
+        // CR 608.2b), and when NO role is legal every claimed role is
+        // `Dropped` — the base clear policy, so a wholly illegal sink still
+        // reaches the normal all-targets-illegal fizzle. The unclaimed tail is
+        // `PassThrough` in both cases.
+        let mut verdicts = vec![OccurrenceVerdict::PassThrough; occurrence_count];
+        let mut claimed = 0usize;
         for (_slot, filter) in role.surfaced_filters() {
-            let Some(target_ref) = target_iter.next() else {
+            if claimed >= occurrence_count {
                 break;
-            };
-            if !validate_pinned_targets(
-                view,
-                state,
-                std::slice::from_ref(target_ref),
-                filter,
-                &validated,
-            )
-            .is_empty()
-            {
-                any_legal = true;
             }
-            // Position-stable regardless of legality.
-            claimed.push(target_ref.clone());
+            verdicts[claimed] = if occurrence_is_legal(view, state, claimed, filter, &validated) {
+                OccurrenceVerdict::Legal
+            } else {
+                OccurrenceVerdict::IllegalRetained
+            };
+            claimed += 1;
         }
-        let mut kept = if any_legal { claimed } else { Vec::new() };
-        kept.extend(target_iter.cloned());
-        kept
+        if !verdicts[..claimed].contains(&OccurrenceVerdict::Legal) {
+            verdicts[..claimed].fill(OccurrenceVerdict::Dropped);
+        }
+        NodeValidation::Verdicts(verdicts)
     } else if let Effect::Fight { subject, target } = &validated.effect {
         // CR 608.2b + CR 701.14a: Dual-fighter fights validate each chosen
         // fighter against its own slot filter so one illegal fighter does not
         // collapse into the single-target "~ fights" fallback shape.
         if fight_subject_needs_target_slot(subject) {
             let filters = vec![subject, target];
-            let mut kept = Vec::new();
-            let mut target_iter = validated.targets.iter();
+            let mut verdicts = vec![OccurrenceVerdict::Dropped; occurrence_count];
+            let mut next = 0usize;
             for filter in filters {
                 if matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget) {
                     continue;
                 }
-                let Some(target_ref) = target_iter.next() else {
+                if next >= occurrence_count {
                     continue;
-                };
-                if let Some(legal) = validate_pinned_targets(
-                    view,
-                    state,
-                    std::slice::from_ref(target_ref),
-                    filter,
-                    &validated,
-                )
-                .into_iter()
-                .next()
-                {
-                    kept.push(legal);
                 }
+                verdicts[next] =
+                    legal_or_dropped(occurrence_is_legal(view, state, next, filter, &validated));
+                next += 1;
             }
-            kept
+            NodeValidation::Verdicts(verdicts)
         } else {
             // CR 701.14a + CR 608.2b: "~ fights" / anaphoric "it fights" / chained
             // "that creature … and fights" — the ally fighter is implicit. Propagated
@@ -3016,13 +3089,16 @@ fn validate_targets_in_chain_inner(
             // this effect's `target` filter; pairing targets[0] against that filter
             // wrongly drops the ally (Ent's Fury, issue #1135). Nested chain links keep
             // chosen targets on the resolving spell, not on the fight sub-clause itself.
-            let candidate_targets = state
+            //
+            // The candidates are OCCURRENCES (chain flatten with each one's own
+            // pin), so the stored fighters keep the pins they were announced with.
+            let candidates = state
                 .resolving_stack_entry
                 .as_ref()
                 .and_then(|entry| entry.ability())
-                .map(flatten_targets_in_chain)
-                .filter(|targets| !targets.is_empty())
-                .unwrap_or_else(|| validated.targets.clone());
+                .map(flatten_target_occurrences_in_chain)
+                .filter(|occurrences| !occurrences.is_empty())
+                .unwrap_or_else(|| validated.target_occurrences());
 
             fn fight_creature_on_battlefield(
                 state: &GameState,
@@ -3038,40 +3114,66 @@ fn validate_targets_in_chain_inner(
                 })
             }
 
-            let explicit: Vec<TargetRef> = candidate_targets
+            // CR 400.7: a candidate occurrence is current when its own pin
+            // (and any delayed-referent pin for its id) still names the object.
+            let occurrence_is_current =
+                |(candidate, pin): &(TargetRef, Option<ObjectIncarnationRef>)| match candidate {
+                    TargetRef::Object(id) => {
+                        validated.target_pin_is_current(*id, state)
+                            && pin.is_none_or(|pin| pin.is_current(state))
+                    }
+                    TargetRef::Player(_) => true,
+                };
+            let legal = slot_legal_targets(
+                view,
+                state,
+                AbilityTargetSlot::Unpositioned(target),
+                &validated,
+            );
+            let explicit: Vec<(TargetRef, Option<ObjectIncarnationRef>)> = candidates
                 .iter()
-                .filter(|t| {
-                    validate_pinned_targets(
-                        view,
-                        state,
-                        std::slice::from_ref(t),
-                        target,
-                        &validated,
-                    )
-                    .into_iter()
-                    .next()
-                    .is_some()
+                .filter(|occurrence| {
+                    legal.contains(&occurrence.0) && occurrence_is_current(occurrence)
                 })
                 .cloned()
                 .collect();
 
-            let mut kept = Vec::new();
+            let mut stored = Vec::new();
             if explicit.len() == 1 {
-                if let Some(ally) = candidate_targets.iter().find(|t| {
-                    let TargetRef::Object(id) = t else {
+                if let Some(ally) = candidates.iter().find(|occurrence| {
+                    let TargetRef::Object(id) = &occurrence.0 else {
                         return false;
                     };
-                    !explicit.contains(t)
+                    !explicit
+                        .iter()
+                        .any(|(explicit, _)| *explicit == occurrence.0)
                         && fight_creature_on_battlefield(state, *id)
-                        && target_is_current(&validated, t, state)
+                        && occurrence_is_current(occurrence)
                 }) {
-                    kept.push(ally.clone());
+                    stored.push(ally.clone());
                 }
             }
-            kept.extend(explicit);
-            kept
+            stored.extend(explicit);
+            // This node's own announced occurrences are judged by whether the
+            // rebuilt fighter list still holds them (each stored fighter
+            // vouches for one occurrence).
+            let mut unclaimed: Vec<&TargetRef> = stored.iter().map(|(t, _)| t).collect();
+            let verdicts = validated
+                .targets
+                .iter()
+                .map(|own| {
+                    legal_or_dropped(
+                        unclaimed
+                            .iter()
+                            .position(|candidate| *candidate == own)
+                            .map(|found| unclaimed.swap_remove(found))
+                            .is_some(),
+                    )
+                })
+                .collect();
+            NodeValidation::Rebuilt { verdicts, stored }
         }
-    } else if let Some(role_legality) = damage_replacement_target_role_legality(state, &validated) {
+    } else if let Some(roles_legal) = damage_replacement_role_occurrences_legal(state, &validated) {
         // CR 115.1a + CR 601.2c + CR 608.2b: each declared damage-replacement
         // role is independently targeted and revalidated in its declared order.
         // The roles jointly specify one replacement event, so none can be
@@ -3085,10 +3187,24 @@ fn validate_targets_in_chain_inner(
         // In particular, a stack spell source must not be checked against the
         // recipient or redirect-destination filter just because it occupies
         // `targets[0]`.
-        if role_legality.has_any_legal_role() {
-            validated.targets.clone()
+        //
+        // As occurrence verdicts: with any legal role, a legal role is `Legal`
+        // and an illegal one `IllegalRetained` (layout kept, published as a
+        // hole and stamped); occurrences beyond the roles are `PassThrough`.
+        // With no legal role every occurrence is `Dropped` — the base clear
+        // policy, so the normal all-targets-illegal fizzle still applies.
+        if roles_legal.contains(&true) {
+            NodeValidation::Verdicts(
+                (0..occurrence_count)
+                    .map(|position| match roles_legal.get(position) {
+                        Some(true) => OccurrenceVerdict::Legal,
+                        Some(false) => OccurrenceVerdict::IllegalRetained,
+                        None => OccurrenceVerdict::PassThrough,
+                    })
+                    .collect(),
+            )
         } else {
-            Vec::new()
+            NodeValidation::Verdicts(vec![OccurrenceVerdict::Dropped; occurrence_count])
         }
     } else if let Some(src_leaf) = damage_replacement_source_slot_filter(&validated.effect).cloned()
     {
@@ -3098,7 +3214,15 @@ fn validate_targets_in_chain_inner(
         // would fizzle-filter the spell to battlefield presence and drop it
         // (the spell lives on the STACK). Re-validate against the source leaf
         // (`InZone Stack`-aware) instead, preserving the spell target.
-        validate_pinned_targets(view, state, &validated.targets, &src_leaf, &validated)
+        NodeValidation::Verdicts(
+            (0..occurrence_count)
+                .map(|position| {
+                    legal_or_dropped(occurrence_is_legal(
+                        view, state, position, &src_leaf, &validated,
+                    ))
+                })
+                .collect(),
+        )
     } else if crate::game::effects::mass_population_target(&validated.effect)
         .is_some_and(crate::game::effects::filter_refs_parent_or_event_subject)
     {
@@ -3123,7 +3247,9 @@ fn validate_targets_in_chain_inner(
         // `DestroyAll`, `DamageAll`, `BounceAll` and the rest fizzling on a
         // stale snapshot. Routed through the single `mass_population_target`
         // authority so the two lists cannot drift apart again.
-        validated.targets.clone()
+        //
+        // Not validated as declared targets: `PassThrough`.
+        NodeValidation::Verdicts(vec![OccurrenceVerdict::PassThrough; occurrence_count])
     } else if matches!(
         mass_all_target_filter(&validated.effect),
         Some(TargetFilter::Player)
@@ -3134,65 +3260,75 @@ fn validate_targets_in_chain_inner(
         // population scan, so it has no `target_filter()` entry; validate this
         // exceptional declared target against the same legal-player set used
         // to build the slot.
-        validate_pinned_targets(
-            view,
-            state,
-            &validated.targets,
-            &TargetFilter::Player,
-            &validated,
+        NodeValidation::Verdicts(
+            (0..occurrence_count)
+                .map(|position| {
+                    legal_or_dropped(occurrence_is_legal(
+                        view,
+                        state,
+                        position,
+                        &TargetFilter::Player,
+                        &validated,
+                    ))
+                })
+                .collect(),
         )
-    } else if let Some(targets) =
+    } else if let Some(verdicts) =
         validate_single_derived_role(view, state, &validated, target_origin)
     {
-        targets
+        NodeValidation::Verdicts(verdicts)
     } else {
-        match triggers::extract_target_filter_from_effect(&validated.effect) {
+        // CR 608.2b: the battlefield fizzle check for an effect with no slot
+        // filter — an object occurrence must still be on the battlefield and
+        // current; a player is unaffected.
+        let on_battlefield_and_current = |position: usize| match &validated.targets[position] {
+            TargetRef::Object(object_id) => {
+                state.battlefield.contains(object_id)
+                    && target_is_current_at(&validated, position, state)
+            }
+            TargetRef::Player(_) => true,
+        };
+        let against_filter = |filter: &TargetFilter| -> Vec<OccurrenceVerdict> {
+            let positions: Vec<usize> = (0..occurrence_count).collect();
+            occurrences_legal_for_slot(
+                view,
+                state,
+                &positions,
+                AbilityTargetSlot::Unpositioned(filter),
+                &validated,
+            )
+            .into_iter()
+            .map(legal_or_dropped)
+            .collect()
+        };
+        let verdicts = match triggers::extract_target_filter_from_effect(&validated.effect) {
             Some(filter) if matches!(validated.effect, Effect::PairWith { .. }) => {
                 let legal_choices = pair_with_legal_choices(state, &validated, filter);
-                validated
-                    .targets
-                    .iter()
-                    .filter(|target| {
-                        legal_choices.contains(target)
-                            && target_is_current(&validated, target, state)
+                (0..occurrence_count)
+                    .map(|position| {
+                        legal_or_dropped(
+                            legal_choices.contains(&validated.targets[position])
+                                && target_is_current_at(&validated, position, state),
+                        )
                     })
-                    .cloned()
                     .collect()
             }
             Some(filter) if ability_needs_companion_target_player_slot(&validated) => {
-                let mut kept = Vec::new();
-                let primary_targets = match validated.targets.split_first() {
-                    Some((companion, rest))
-                        if companion_target_player_legal_targets(
+                let mut verdicts = against_filter(filter);
+                if let Some(companion) = validated.targets.first() {
+                    verdicts[0] = legal_or_dropped(
+                        companion_target_player_legal_targets(
                             state,
                             &validated,
                             &state.current_trigger_events,
                         )
-                        .contains(companion) =>
-                    {
-                        kept.push(companion.clone());
-                        rest
-                    }
-                    Some((_, rest)) => rest,
-                    None => &[],
-                };
-                if let Some(companion) = kept.first() {
-                    if !target_is_current(&validated, companion, state) {
-                        kept.clear();
-                    }
+                        .contains(companion)
+                            && target_is_current_at(&validated, 0, state),
+                    );
                 }
-                kept.extend(validate_pinned_targets(
-                    view,
-                    state,
-                    primary_targets,
-                    filter,
-                    &validated,
-                ));
-                kept
+                verdicts
             }
-            Some(filter) => {
-                validate_pinned_targets(view, state, &validated.targets, filter, &validated)
-            }
+            Some(filter) => against_filter(filter),
             // CR 608.2b: A context-ref filter (`ParentTarget`,
             // `TriggeringSource`, etc.) carries a resolution-time *snapshot*,
             // not a player-chosen target. `extract_target_filter_from_effect`
@@ -3217,7 +3353,7 @@ fn validate_targets_in_chain_inner(
                 .target_filter()
                 .is_some_and(|f| f.is_context_ref()) =>
             {
-                validated.targets.clone()
+                vec![OccurrenceVerdict::PassThrough; occurrence_count]
             }
             // CR 303.4a + CR 608.2b: A plain Aura spell has no separate on-cast
             // effect — its resolving `Effect` is the `Effect::Unimplemented`
@@ -3237,44 +3373,58 @@ fn validate_targets_in_chain_inner(
                     state,
                     validated.source_id,
                 ) {
-                    Some(filter) => validate_pinned_targets(
-                        view,
-                        state,
-                        &validated.targets,
-                        &filter,
-                        &validated,
-                    ),
-                    None => validated
-                        .targets
-                        .iter()
-                        .filter(|target| match target {
-                            TargetRef::Object(object_id) => {
-                                state.battlefield.contains(object_id)
-                                    && target_is_current(&validated, target, state)
-                            }
-                            TargetRef::Player(_) => true,
-                        })
-                        .cloned()
+                    Some(filter) => against_filter(&filter),
+                    None => (0..occurrence_count)
+                        .map(|position| legal_or_dropped(on_battlefield_and_current(position)))
                         .collect(),
                 }
             }
-            None => validated
-                .targets
-                .iter()
-                .filter(|target| match target {
-                    TargetRef::Object(object_id) => {
-                        state.battlefield.contains(object_id)
-                            && target_is_current(&validated, target, state)
-                    }
-                    TargetRef::Player(_) => true,
-                })
-                .cloned()
+            None => (0..occurrence_count)
+                .map(|position| legal_or_dropped(on_battlefield_and_current(position)))
                 .collect(),
+        };
+        NodeValidation::Verdicts(verdicts)
+    };
+    // CR 608.2b: derive storage, the declared view and the node-local stamp
+    // from the verdicts. The view and stamp read the ANNOUNCED occurrences
+    // (declared domain); storage is the projection effect handlers read
+    // (stored domain, `declared_to_stored`).
+    let verdicts = match node_validation {
+        NodeValidation::Verdicts(verdicts) => {
+            validated.retain_target_occurrences(&verdicts);
+            // The storage projection crosses domains only through
+            // `declared_to_stored`: each stored occurrence is its declared
+            // occurrence, pin included.
+            #[cfg(debug_assertions)]
+            for (declared, stored) in super::target_occurrences::declared_to_stored(&verdicts)
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(super::target_occurrences::StoredIndex(stored)) = stored {
+                    debug_assert_eq!(validated.targets.get(stored), ability.targets.get(declared));
+                    debug_assert_eq!(
+                        validated.target_pin_at(stored),
+                        ability.target_pin_at(declared)
+                    );
+                }
+            }
+            verdicts
         }
+        NodeValidation::Rebuilt { verdicts, stored } => {
+            validated.replace_target_occurrences(stored);
+            verdicts
+        }
+    };
+    debug_assert_eq!(verdicts.len(), occurrence_count);
+    let publishes = !targets_are_inherited && paid_instead_delegate(ability).is_none();
+    validated.illegal_local_target_slots = if publishes {
+        declared_illegal_local_positions(ability, &verdicts)
+    } else {
+        Vec::new()
     };
     // CR 608.2b: this node's declared positions join the view BEFORE its
     // continuations are validated, so a later node's dependent filter reads them.
-    append_validated_declared_positions(ability, &validated, targets_are_inherited, view_out);
+    append_validated_declared_positions(ability, &verdicts, targets_are_inherited, view_out);
     if let Some(sub_ability) = validated.sub_ability.as_mut() {
         // Mirrors `declared_targets_in_chain`: a paid-"instead" delegate carries
         // its delegator's inheritance; any other sub inherits per
@@ -3328,23 +3478,15 @@ fn restamp_inherited_rider_target(parent: &mut ResolvedAbility) {
     if !inherits {
         return;
     }
-    let object = parent.targets.iter().find_map(|t| match t {
-        TargetRef::Object(id) => Some(*id),
-        _ => None,
-    });
-    let pins: Vec<ObjectIncarnationRef> = object
-        .map(|id| {
-            parent
-                .selected_target_incarnations
-                .iter()
-                .filter(|pin| pin.object_id == id)
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
+    // The parent's FIRST object occurrence, with that occurrence's own pin —
+    // never a pin looked up by id, which could belong to another occurrence
+    // of the same object.
+    let occurrence = parent
+        .target_occurrences()
+        .into_iter()
+        .find(|(target, _)| matches!(target, TargetRef::Object(_)));
     if let Some(sub) = parent.sub_ability.as_deref_mut() {
-        sub.targets = object.map(TargetRef::Object).into_iter().collect();
-        sub.selected_target_incarnations = pins;
+        sub.replace_target_occurrences(occurrence.into_iter().collect());
     }
 }
 
@@ -3408,10 +3550,6 @@ pub(crate) enum DamageReplacementTargetRoleLegality {
 }
 
 impl DamageReplacementTargetRoleLegality {
-    pub(crate) fn has_any_legal_role(self) -> bool {
-        matches!(self, Self::All | Self::Partial)
-    }
-
     pub(crate) fn all_required_roles_are_legal(self) -> bool {
         matches!(self, Self::All)
     }
@@ -3493,33 +3631,43 @@ pub(crate) fn damage_replacement_target_role_legality(
     state: &GameState,
     ability: &ResolvedAbility,
 ) -> Option<DamageReplacementTargetRoleLegality> {
-    let roles = damage_replacement_target_roles(&ability.effect)?;
-
-    let legal_count = roles
-        .iter()
-        .enumerate()
-        .filter(|(index, role)| {
-            ability.targets.get(*index).is_some_and(|target| {
-                !validate_pinned_targets_for_slot(
-                    None,
-                    state,
-                    std::slice::from_ref(target),
-                    AbilityTargetSlot::Declared {
-                        index: *index,
-                        filter: role.filter(),
-                    },
-                    ability,
-                )
-                .is_empty()
-            })
-        })
-        .count();
+    let roles = damage_replacement_role_occurrences_legal(state, ability)?;
+    let legal_count = roles.iter().filter(|legal| **legal).count();
 
     Some(match legal_count {
         0 => DamageReplacementTargetRoleLegality::None,
         count if count == roles.len() => DamageReplacementTargetRoleLegality::All,
         _ => DamageReplacementTargetRoleLegality::Partial,
     })
+}
+
+/// CR 115.1a + CR 608.2b: per declared damage-replacement role, whether the
+/// occurrence at that role's position is legal for that role (its own filter
+/// and its own announced pin).
+fn damage_replacement_role_occurrences_legal(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<Vec<bool>> {
+    let roles = damage_replacement_target_roles(&ability.effect)?;
+    Some(
+        roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| {
+                index < ability.targets.len()
+                    && occurrences_legal_for_slot(
+                        None,
+                        state,
+                        &[index],
+                        AbilityTargetSlot::Declared {
+                            index,
+                            filter: role.filter(),
+                        },
+                        ability,
+                    )[0]
+            })
+            .collect(),
+    )
 }
 
 /// CR 120.3a + CR 603.7c: Constrain a companion `ControllerRef::TargetPlayer`
@@ -4847,7 +4995,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
 /// `target_pin_is_current`, and `target_incarnations` means "pinned at
 /// DELAYED-TRIGGER creation" (`set_target_incarnations_recursive`, CR 400.7 +
 /// CR 603.7c) — announcement-time targets are pinned in the separate
-/// `selected_target_incarnations`. Forging a pin here would lie to
+/// `target_pins`. Forging a pin here would lie to
 /// `live_object_targets` and `pinned_object_targets_all_stale`. Measured: a
 /// clone with `.targets` prefilled and pins empty returns the SAME empty set
 /// the ability-free door already returns, so excluding this arm changes no
@@ -5001,7 +5149,7 @@ fn resolved_ability_with_bound_object_target(
     object_id: ObjectId,
 ) -> ResolvedAbility {
     let mut bound = ability.clone();
-    bound.targets = vec![TargetRef::Object(object_id)];
+    bound.set_targets(vec![TargetRef::Object(object_id)]);
     bound.target_incarnations.clear();
     bound
 }
@@ -5821,7 +5969,7 @@ fn assign_attach_attachment_selected_slots(
             ));
         }
         for target in window.iter().flatten() {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             if let Some(binding) = attach_object_binding(state, target)? {
                 ability.bind_attach_attachment_target(binding);
             }
@@ -5835,7 +5983,7 @@ fn assign_attach_attachment_selected_slots(
         };
         match selected_slot {
             Some(target) => {
-                ability.targets.push(target.clone());
+                ability.push_target(target.clone());
                 if let Some(binding) = attach_object_binding(state, target)? {
                     ability.bind_attach_attachment_target(binding);
                 }
@@ -5900,7 +6048,7 @@ fn assign_attach_attachment_declared_targets(
         }
         for slot_index in 0..attachment_window {
             if let Some(target) = targets.get(*next_target) {
-                ability.targets.push(target.clone());
+                ability.push_target(target.clone());
                 if let Some(binding) = attach_object_binding(state, target)? {
                     ability.bind_attach_attachment_target(binding);
                 }
@@ -5914,7 +6062,7 @@ fn assign_attach_attachment_declared_targets(
             }
         }
     } else if let Some(target) = targets.get(*next_target) {
-        ability.targets.push(target.clone());
+        ability.push_target(target.clone());
         if let Some(binding) = attach_object_binding(state, target)? {
             ability.bind_attach_attachment_target(binding);
         }
@@ -7580,29 +7728,28 @@ fn collect_per_opponent_target_fanout_specs(
 fn validate_per_opponent_target_fanout_targets(
     state: &GameState,
     ability: &ResolvedAbility,
-) -> Vec<TargetRef> {
+) -> Vec<OccurrenceVerdict> {
     if per_opponent_fanout_object_filter(ability).is_none() {
-        return Vec::new();
+        return vec![OccurrenceVerdict::Dropped; ability.targets.len()];
     }
 
+    // CR 608.2b: a player header is a grouping marker, not a declared slot
+    // (`chain_node_positions` skips it); it is dropped from storage exactly as
+    // before and never published or stamped.
     let mut current_player = None;
-    let mut legal = Vec::new();
-    for target in &ability.targets {
-        match target {
-            TargetRef::Player(player_id) => current_player = Some(*player_id),
-            TargetRef::Object(object_id) => {
-                let Some(player_id) = current_player else {
-                    continue;
-                };
-                let legal_targets =
-                    per_opponent_fanout_legal_object_targets(state, ability, player_id);
-                if legal_targets.contains(target) {
-                    legal.push(TargetRef::Object(*object_id));
-                }
+    ability
+        .targets
+        .iter()
+        .map(|target| match target {
+            TargetRef::Player(player_id) => {
+                current_player = Some(*player_id);
+                OccurrenceVerdict::Dropped
             }
-        }
-    }
-    legal
+            TargetRef::Object(_) => legal_or_dropped(current_player.is_some_and(|player_id| {
+                per_opponent_fanout_legal_object_targets(state, ability, player_id).contains(target)
+            })),
+        })
+        .collect()
 }
 
 fn object_targets_only(targets: &[TargetRef]) -> Vec<TargetRef> {
@@ -9370,6 +9517,11 @@ fn validate_selected_slots_with_specs(
     validate_target_constraints(Some(state), &compact_targets, constraints, Some(ability))
 }
 
+/// CR 601.2c: the announcement assigner. It appends raw `targets` while the
+/// effect borrow is held; occurrence pins are not maintained here because the
+/// only callers (`assign_targets_in_chain` and its recursion) finish with
+/// `capture_target_incarnations_recursive`, which re-announces every node's
+/// pins aligned with the assigned targets.
 fn assign_targets_recursive(
     state: &GameState,
     ability: &mut ResolvedAbility,
@@ -9382,8 +9534,11 @@ fn assign_targets_recursive(
         .filter(|sub| is_paid_instead_sub(&ability.context, sub))
     {
         assign_targets_recursive(state, sub_ability, targets, next_target)?;
-        ability.targets = sub_ability.targets.clone();
-        ability.context.attach_target_bindings = sub_ability.context.attach_target_bindings.clone();
+        // The paid-"instead" delegator mirrors its delegate's occurrences.
+        let mirrored = sub_ability.target_occurrences();
+        let bindings = sub_ability.context.attach_target_bindings.clone();
+        ability.replace_target_occurrences(mirrored);
+        ability.context.attach_target_bindings = bindings;
         return Ok(());
     }
 
@@ -9445,7 +9600,7 @@ fn assign_targets_recursive(
             )?;
             if attach_host_filter_needs_target_slot(&target) {
                 if let Some(target) = targets.get(*next_target) {
-                    ability.targets.push(target.clone());
+                    ability.push_target(target.clone());
                     if let Some(binding) = attach_object_binding(state, target)? {
                         ability.bind_attach_host_target(binding);
                     }
@@ -9536,7 +9691,7 @@ fn assign_targets_recursive(
         let claimed = paired_subject_slot_filters(&ability.effect).count();
         for _ in 0..claimed {
             if let Some(chosen) = targets.get(*next_target) {
-                ability.targets.push(chosen.clone());
+                ability.push_target(chosen.clone());
                 *next_target += 1;
             } else if !ability.optional_targeting {
                 return Err(EngineError::InvalidAction(
@@ -9604,7 +9759,7 @@ fn assign_targets_recursive(
         let surfaced = role.surfaced_filters().count();
         for _ in 0..surfaced {
             if let Some(target) = targets.get(*next_target) {
-                ability.targets.push(target.clone());
+                ability.push_target(target.clone());
                 *next_target += 1;
             } else if !ability.optional_targeting {
                 return Err(EngineError::InvalidAction(
@@ -9669,7 +9824,7 @@ fn assign_targets_recursive(
         && damage_replacement_source_slot_filter(&ability.effect).is_some()
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9688,7 +9843,7 @@ fn assign_targets_recursive(
         && ability_needs_companion_target_player_slot(ability)
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9701,7 +9856,7 @@ fn assign_targets_recursive(
         && !one_sided_fight_source_supplies_quantity_creature(&ability.effect)
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9713,7 +9868,7 @@ fn assign_targets_recursive(
         && effect_needs_parent_target_combat_relation_slot(&ability.effect)
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9736,7 +9891,7 @@ fn assign_targets_recursive(
         && become_copy_recipient_slot_filter(&ability.effect).is_some()
     {
         if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9776,7 +9931,7 @@ fn assign_targets_recursive(
                 .extend_from_slice(&targets[*next_target..*next_target + current_count]);
             *next_target += current_count;
         } else if let Some(target) = targets.get(*next_target) {
-            ability.targets.push(target.clone());
+            ability.push_target(target.clone());
             *next_target += 1;
         } else if !ability.optional_targeting {
             return Err(EngineError::InvalidAction(
@@ -9822,7 +9977,7 @@ fn assign_sub_chain_targets(
         }
         if inherits_parent_creature_target {
             if let Some(creature) = parent_creature_target {
-                sub_ability.targets.push(creature);
+                sub_ability.push_target(creature);
             }
             assign_sub_chain_targets(state, sub_ability, targets, next_target)?;
         } else {
@@ -9832,6 +9987,9 @@ fn assign_sub_chain_targets(
     Ok(())
 }
 
+/// CR 601.2c: the slot-wise announcement assigner; same raw-append contract as
+/// [`assign_targets_recursive`] (`assign_selected_slots_in_chain` re-announces
+/// every node's pins when it finishes).
 fn assign_selected_slots_recursive(
     state: &GameState,
     ability: &mut ResolvedAbility,
@@ -9844,8 +10002,11 @@ fn assign_selected_slots_recursive(
         .filter(|sub| is_paid_instead_sub(&ability.context, sub))
     {
         assign_selected_slots_recursive(state, sub_ability, selected_slots, next_slot)?;
-        ability.targets = sub_ability.targets.clone();
-        ability.context.attach_target_bindings = sub_ability.context.attach_target_bindings.clone();
+        // The paid-"instead" delegator mirrors its delegate's occurrences.
+        let mirrored = sub_ability.target_occurrences();
+        let bindings = sub_ability.context.attach_target_bindings.clone();
+        ability.replace_target_occurrences(mirrored);
+        ability.context.attach_target_bindings = bindings;
         return Ok(());
     }
 
@@ -9907,7 +10068,7 @@ fn assign_selected_slots_recursive(
                 ));
             };
             match selected_slot {
-                Some(target) => ability.targets.push(target.clone()),
+                Some(target) => ability.push_target(target.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(
@@ -9961,7 +10122,7 @@ fn assign_selected_slots_recursive(
                 };
                 match selected_slot {
                     Some(target) => {
-                        ability.targets.push(target.clone());
+                        ability.push_target(target.clone());
                         if let Some(binding) = attach_object_binding(state, target)? {
                             ability.bind_attach_host_target(binding);
                         }
@@ -10022,7 +10183,7 @@ fn assign_selected_slots_recursive(
                 ));
             };
             match selected_slot {
-                Some(chosen) => ability.targets.push(chosen.clone()),
+                Some(chosen) => ability.push_target(chosen.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(
@@ -10119,7 +10280,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -10142,7 +10303,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -10162,7 +10323,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -10181,7 +10342,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -10208,7 +10369,7 @@ fn assign_selected_slots_recursive(
             ));
         };
         match selected_slot {
-            Some(target) => ability.targets.push(target.clone()),
+            Some(target) => ability.push_target(target.clone()),
             None if ability.optional_targeting => {}
             None => {
                 return Err(EngineError::InvalidAction(
@@ -10255,7 +10416,9 @@ fn assign_selected_slots_recursive(
                     "Missing required target".to_string(),
                 ));
             }
-            ability.targets.extend(window.iter().flatten().cloned());
+            for target in window.iter().flatten().cloned() {
+                ability.push_target(target);
+            }
             *next_slot = end_slot;
         } else {
             let Some(selected_slot) = selected_slots.get(*next_slot) else {
@@ -10265,7 +10428,7 @@ fn assign_selected_slots_recursive(
             };
 
             match selected_slot {
-                Some(target) => ability.targets.push(target.clone()),
+                Some(target) => ability.push_target(target.clone()),
                 None if ability.optional_targeting => {}
                 None => {
                     return Err(EngineError::InvalidAction(
@@ -10311,7 +10474,7 @@ fn assign_sub_chain_selected_slots(
         }
         if inherits_parent_creature_target {
             if let Some(creature) = parent_creature_target {
-                sub_ability.targets.push(creature);
+                sub_ability.push_target(creature);
             }
             assign_sub_chain_selected_slots(state, sub_ability, selected_slots, next_slot)?;
         } else {
@@ -11256,16 +11419,22 @@ pub(crate) fn copy_retarget_post_chain(
     pre: &ResolvedAbility,
     targets: &[TargetRef],
 ) -> ResolvedAbility {
-    let changed_pins = pre
-        .targets
+    // CR 115.7 + CR 400.7: each root occurrence keeps its announced pin when
+    // unchanged, and takes the live incarnation when changed (a different
+    // target, or the same id whose announced object is gone) — decided per
+    // POSITION, never by object id.
+    let occurrences: Vec<(TargetRef, Option<ObjectIncarnationRef>)> = targets
         .iter()
-        .zip(targets.iter())
-        .filter(|(old, new)| pre.retarget_target_requires_pin_refresh(old, new, state))
-        .filter_map(|(_, target)| match target {
-            TargetRef::Object(id) => state.objects.get(id).map(ObjectIncarnationRef::from_object),
-            TargetRef::Player(_) => None,
+        .enumerate()
+        .map(|(index, target)| {
+            let pin = if pre.retarget_requires_pin_refresh_at(index, target, state) {
+                live_target_pin(state, target)
+            } else {
+                pre.target_pin_at(index)
+            };
+            (target.clone(), pin)
         })
-        .collect::<Vec<_>>();
+        .collect();
     let mut ability = pre.clone();
     // CR 707.10c + CR 601.2c: An additional-cost "instead choose" branch owns
     // the declared slots. The root is only its mirror. Update the child before
@@ -11278,18 +11447,24 @@ pub(crate) fn copy_retarget_post_chain(
                 Some(AbilityCondition::AdditionalCostPaidInstead)
             )
         }) {
-            sub.targets = targets.to_vec();
-            for pin in &changed_pins {
-                sub.update_selected_target_incarnation(*pin);
-            }
+            sub.replace_target_occurrences(occurrences.clone());
         }
     }
-    ability.targets = targets.to_vec();
-    for pin in changed_pins {
-        ability.update_selected_target_incarnation(pin);
-    }
+    ability.replace_target_occurrences(occurrences);
     restamp_derived_chain_targets(&mut ability);
     ability
+}
+
+/// CR 400.7: the incarnation a newly chosen target names now (`None` for a
+/// player or a missing object).
+pub(crate) fn live_target_pin(
+    state: &GameState,
+    target: &TargetRef,
+) -> Option<ObjectIncarnationRef> {
+    match target {
+        TargetRef::Object(id) => state.objects.get(id).map(ObjectIncarnationRef::from_object),
+        TargetRef::Player(_) => None,
+    }
 }
 
 /// CR 707.10c + CR 115.7d + CR 115.7e: whether choosing `targets` as the
@@ -11331,15 +11506,7 @@ pub(crate) fn copy_retarget_edit_is_legal(
         let at = |chain: &ResolvedAbility| {
             node_at(chain, &address.path).and_then(|node| {
                 let target = node.targets.get(address.slot).cloned()?;
-                let pin = match &target {
-                    TargetRef::Object(id) => node
-                        .selected_target_incarnations
-                        .iter()
-                        .find(|pin| pin.object_id == *id)
-                        .copied(),
-                    TargetRef::Player(_) => None,
-                };
-                Some((target, pin))
+                Some((target, node.target_pin_at(address.slot)))
             })
         };
         at(pre) != at(&post)
@@ -11353,8 +11520,8 @@ pub(crate) fn copy_retarget_edit_is_legal(
 /// aligned with `new_targets`), whether submitting `new_targets[i]` CHANGES
 /// that position. Built
 /// on the write path's own predicate
-/// (`ResolvedAbility::retarget_target_requires_pin_refresh` on the addressed
-/// node of `pre`): a different target, or the same id whose announced
+/// (`ResolvedAbility::retarget_requires_pin_refresh_at` on the addressed
+/// occurrence of `pre`): a different target, or the same id whose announced
 /// incarnation is gone. A same-id entry ELECTS the new object
 /// (phase-rs/phase#8355 H2) only when that object is a legal choice for the
 /// position — `pool_contains(i, target)`, the position's slot pool (Invariant
@@ -11377,7 +11544,7 @@ pub(crate) fn retarget_positions_changed(
                 return false;
             };
             node.targets.get(address.slot).is_some_and(|old| {
-                node.retarget_target_requires_pin_refresh(old, new, state)
+                node.retarget_requires_pin_refresh_at(address.slot, new, state)
                     && (old != new || pool_contains(i, new))
             })
         })
@@ -11451,12 +11618,13 @@ pub(crate) fn unchanged_targets_stay_legal(
     let slot_is_legal = |chain: &ResolvedAbility,
                          node: &ResolvedAbility,
                          filter: &TargetFilter,
+                         position: usize,
                          current: &TargetRef| {
         // CR 400.7 + CR 608.2b: an unchanged target whose announced
         // incarnation is gone names a new object — it is already illegal, so
         // the CR 115.7d first clause lets it stay, whatever the live board
         // holds under its id.
-        if !target_is_current(node, current, state) {
+        if !target_is_current_at(node, position, state) {
             return false;
         }
         if crate::game::filter::filter_reads_declared_slot(filter) {
@@ -11496,7 +11664,7 @@ pub(crate) fn unchanged_targets_stay_legal(
         let Some(pre_current) = pre_node.targets.get(binding.address.slot) else {
             continue;
         };
-        if !slot_is_legal(pre, pre_node, filter, pre_current) {
+        if !slot_is_legal(pre, pre_node, filter, binding.address.slot, pre_current) {
             // CR 115.7d FIRST clause: an already-illegal unchanged target
             // stays accepted.
             continue;
@@ -11507,7 +11675,7 @@ pub(crate) fn unchanged_targets_stay_legal(
         let Some(post_current) = post_node.targets.get(binding.address.slot) else {
             continue;
         };
-        if !slot_is_legal(post, post_node, filter, post_current) {
+        if !slot_is_legal(post, post_node, filter, binding.address.slot, post_current) {
             return Err(EngineError::InvalidAction(
                 "Retarget: the change would make an unchanged target illegal".to_string(),
             ));
@@ -11712,12 +11880,20 @@ pub(crate) fn widen_dependent_retarget_pools(
 /// pushes values downstream-to-upstream — it can never overwrite a write.
 pub(crate) fn restamp_derived_chain_targets(ability: &mut ResolvedAbility) {
     fn remirror(ability: &mut ResolvedAbility) {
+        let mut mirrored = None;
         if let Some(sub) = ability.sub_ability.as_deref_mut() {
             remirror(sub);
             if is_paid_instead_sub(&ability.context, sub) {
-                ability.targets = sub.targets.clone();
-                ability.context.attach_target_bindings = sub.context.attach_target_bindings.clone();
+                mirrored = Some((
+                    sub.target_occurrences(),
+                    sub.context.attach_target_bindings.clone(),
+                ));
             }
+        }
+        if let Some((occurrences, bindings)) = mirrored {
+            // The mirror copies the delegate's occurrences, pins included.
+            ability.replace_target_occurrences(occurrences);
+            ability.context.attach_target_bindings = bindings;
         }
         if let Some(other) = ability.else_ability.as_deref_mut() {
             remirror(other);
@@ -11733,7 +11909,7 @@ pub(crate) fn restamp_derived_chain_targets(ability: &mut ResolvedAbility) {
 fn restamp_chosen_group_targets(ability: &mut ResolvedAbility) {
     use std::collections::HashMap;
 
-    type GroupTargets = (Vec<TargetRef>, Vec<ObjectIncarnationRef>);
+    type GroupTargets = Vec<(TargetRef, Option<ObjectIncarnationRef>)>;
 
     fn collect(
         node: &ResolvedAbility,
@@ -11744,13 +11920,7 @@ fn restamp_chosen_group_targets(ability: &mut ResolvedAbility) {
             return;
         }
         if let Some(id) = node.declares_chosen_group {
-            groups.insert(
-                id,
-                (
-                    node.targets.clone(),
-                    node.selected_target_incarnations.clone(),
-                ),
-            );
+            groups.insert(id, node.target_occurrences());
         }
         if let Some(sub) = node.sub_ability.as_deref() {
             // An unpaid "instead" sub declares nothing; only its sequential
@@ -11778,9 +11948,7 @@ fn restamp_chosen_group_targets(ability: &mut ResolvedAbility) {
         groups: &HashMap<crate::types::ability::ChosenGroupId, GroupTargets>,
     ) {
         if let Some(id) = node.reads_chosen_group {
-            let (targets, pins) = groups.get(&id).cloned().unwrap_or_default();
-            node.targets = targets;
-            node.selected_target_incarnations = pins;
+            node.replace_target_occurrences(groups.get(&id).cloned().unwrap_or_default());
         }
         if let Some(sub) = node.sub_ability.as_deref_mut() {
             bind(sub, groups);
@@ -14520,11 +14688,11 @@ mod tests {
         );
     }
 
-    /// CR 608.2b: validation compacts each node's pruned targets, so the
-    /// illegal declared slots are found by per-node membership and reported in
-    /// `flatten_targets_in_chain`'s numbering — a pruned first target does not
-    /// shift the verdict onto its surviving neighbour, and a later node's slots
-    /// continue the count.
+    /// CR 608.2b: the illegal declared slots are read from each node's
+    /// validation verdict stamp (declared-domain positions) and reported in
+    /// `flatten_targets_in_chain`'s numbering, so a pruned first target does
+    /// not shift the verdict onto its surviving neighbour, and a later node's
+    /// slots continue the count.
     #[test]
     fn illegal_declared_target_slots_numbers_pruned_targets_across_the_chain() {
         let [a, b, c, d] = [1, 2, 3, 4].map(|id| TargetRef::Object(ObjectId(id)));
@@ -14539,34 +14707,32 @@ mod tests {
             )
         };
         let declared = node(vec![a, b.clone()]).sub_ability(node(vec![c.clone(), d]));
+        // The validation result: compacted storage plus each node's
+        // declared-domain verdict stamp (pre-compaction indices).
         let mut validated = node(vec![b]).sub_ability(node(vec![c]));
+        validated.illegal_local_target_slots = vec![0];
+        validated
+            .sub_ability
+            .as_deref_mut()
+            .unwrap()
+            .illegal_local_target_slots = vec![1];
 
         assert_eq!(flatten_targets_in_chain(&declared).len(), 4);
         assert_eq!(
-            illegal_declared_target_slots(&declared, &mut validated),
+            illegal_declared_target_slots(&declared, &declared, &validated),
             vec![0, 3],
             "slot 0 (pruned, compacted away) and slot 3 (pruned in the sub) are illegal"
         );
-        assert_eq!(validated.illegal_local_target_slots, vec![0]);
-        assert_eq!(
-            validated
-                .sub_ability
-                .as_deref()
-                .unwrap()
-                .illegal_local_target_slots,
-            vec![1],
-            "local slots retain each node's pre-compaction indices"
-        );
-        let mut unpruned = declared.clone();
+        let unpruned = declared.clone();
         assert!(
-            illegal_declared_target_slots(&declared, &mut unpruned).is_empty(),
-            "an unpruned chain has no illegal slots"
+            illegal_declared_target_slots(&declared, &declared, &unpruned).is_empty(),
+            "an unstamped chain has no illegal slots"
         );
     }
 
     /// CR 115.3 + CR 608.2b: one object may fill two target slots of a node.
-    /// When validation prunes one copy, the surviving copy vouches for only one
-    /// declared slot, so exactly one of the two is reported illegal.
+    /// The stamp names the occurrence validation judged illegal, so exactly
+    /// that one of the two is reported.
     #[test]
     fn illegal_declared_target_slots_counts_a_duplicated_target_per_slot() {
         let [x, y] = [1, 2].map(|id| TargetRef::Object(ObjectId(id)));
@@ -14581,14 +14747,15 @@ mod tests {
             )
         };
         let declared = node(vec![x.clone(), x.clone(), y.clone()]);
+        // Validation judged the SECOND occurrence of x illegal.
         let mut validated = node(vec![x, y]);
+        validated.illegal_local_target_slots = vec![1];
 
         assert_eq!(
-            illegal_declared_target_slots(&declared, &mut validated),
+            illegal_declared_target_slots(&declared, &declared, &validated),
             vec![1],
-            "one pruned copy of a duplicated target marks one slot"
+            "exactly the occurrence validation judged illegal is marked"
         );
-        assert_eq!(validated.illegal_local_target_slots, vec![1]);
     }
 
     /// CR 608.2b: the global carrier stamp retains its existing accounting when
@@ -14606,10 +14773,10 @@ mod tests {
         );
         let declared = ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(99), PlayerId(0))
             .sub_ability(child);
-        let mut validated = ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(99), PlayerId(0));
+        let validated = ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(99), PlayerId(0));
 
         assert_eq!(
-            illegal_declared_target_slots(&declared, &mut validated),
+            illegal_declared_target_slots(&declared, &declared, &validated),
             vec![0]
         );
         assert!(validated.illegal_local_target_slots.is_empty());
@@ -14632,20 +14799,22 @@ mod tests {
         };
         let carrier = node(1);
         let seeded = node(2);
-        let mut validated = seeded.clone();
+        // Validation judged the seeded copy's occurrence legal (no stamp).
+        let validated = seeded.clone();
 
         assert_eq!(
-            illegal_declared_target_slots(&carrier, &mut validated),
+            illegal_declared_target_slots(&carrier, &seeded, &validated),
             vec![0],
-            "the global carrier comparison remains unchanged"
+            "the carrier's re-seeded referent was never judged, so its slot is illegal"
         );
-        assert_eq!(validated.illegal_local_target_slots, vec![0]);
-
         assert!(
-            illegal_declared_target_slots(&seeded, &mut validated).is_empty(),
-            "the seeded execution comparison replaces the carrier-derived reading"
+            validated.illegal_local_target_slots.is_empty(),
+            "local evidence is the seeded copy's validation verdict"
         );
-        assert!(validated.illegal_local_target_slots.is_empty());
+        assert!(
+            illegal_declared_target_slots(&seeded, &seeded, &validated).is_empty(),
+            "the seeded execution comparison reads the verdicts alone"
+        );
     }
 
     /// CR 608.2b: an execution route that skips target validation cannot consume
@@ -14775,11 +14944,7 @@ mod tests {
         deferred_sub.sub_ability = Some(Box::new(rider));
 
         for mut parent in [deferred_parent, deferred_sub] {
-            parent
-                .sub_ability
-                .as_deref_mut()
-                .unwrap()
-                .selected_target_incarnations = vec![pin];
+            parent.sub_ability.as_deref_mut().unwrap().target_pins = vec![Some(pin)];
             let sub = parent.sub_ability.as_deref().unwrap();
             assert!(sub_ability_inherits_parent_creature_target_only(
                 &parent, sub
@@ -14792,7 +14957,7 @@ mod tests {
             let validated = validate_targets_in_chain(&state, &parent);
             let sub = validated.sub_ability.as_deref().unwrap();
             assert_eq!(sub.targets, selected);
-            assert_eq!(sub.selected_target_incarnations, vec![pin]);
+            assert_eq!(sub.aligned_target_pins(), vec![Some(pin)]);
         }
 
         // Positive control: an ordinary inherited snapshot still loses its
@@ -14996,8 +15161,9 @@ mod tests {
             declared.sub_ability.as_deref().unwrap()
         ));
         let mut a_pruned = chain(vec![], vec![], vec![TargetRef::Object(b)]);
+        a_pruned.illegal_local_target_slots = vec![0];
         assert_eq!(
-            illegal_declared_target_slots(&declared, &mut a_pruned),
+            illegal_declared_target_slots(&declared, &declared, &a_pruned),
             vec![0]
         );
         let mut b_pruned = chain(
@@ -15005,8 +15171,14 @@ mod tests {
             vec![TargetRef::Object(a)],
             vec![],
         );
+        b_pruned
+            .sub_ability
+            .as_deref_mut()
+            .and_then(|rider| rider.sub_ability.as_deref_mut())
+            .unwrap()
+            .illegal_local_target_slots = vec![0];
         assert_eq!(
-            illegal_declared_target_slots(&declared, &mut b_pruned),
+            illegal_declared_target_slots(&declared, &declared, &b_pruned),
             vec![1]
         );
         let tap_node = declared
@@ -15331,6 +15503,92 @@ mod tests {
             "an Attach node's un-claimed propagated targets must pass through \
              re-validation unchanged, not be dropped just because neither of \
              this node's own operands needed a target slot"
+        );
+    }
+
+    /// CR 608.2b occurrence verdicts on an `Attach` node: an unclaimed tail
+    /// entry is `PassThrough` — kept in storage and never stamped, even when
+    /// its object has left the battlefield — while a claimed operand slot is
+    /// judged (control: an illegal claimed host is dropped and stamped).
+    #[test]
+    fn attach_pass_through_tail_is_stored_and_never_stamped() {
+        let format = FormatConfig::duel_commander();
+        let mut state = GameState::new(format, 2, 2);
+        let creature = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(1),
+            "Grizzly Bears".to_string(),
+            Zone::Graveyard,
+        );
+        let tail = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::SelfRef,
+                target: TargetFilter::ParentTarget,
+                selection: AttachSelection::Targeted,
+            },
+            vec![TargetRef::Object(creature)],
+            ObjectId(99),
+            PlayerId(0),
+        );
+        let validated = validate_targets_in_chain(&state, &tail);
+        assert_eq!(validated.targets, vec![TargetRef::Object(creature)]);
+        assert!(
+            validated.illegal_local_target_slots.is_empty(),
+            "a PassThrough occurrence is never stamped"
+        );
+
+        // Control: a claimed host slot whose object is not a legal creature on
+        // the battlefield is judged and stamped.
+        let claimed = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::SelfRef,
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                selection: AttachSelection::Targeted,
+            },
+            vec![TargetRef::Object(creature)],
+            ObjectId(99),
+            PlayerId(0),
+        );
+        let validated = validate_targets_in_chain(&state, &claimed);
+        assert!(validated.targets.is_empty());
+        assert_eq!(validated.illegal_local_target_slots, vec![0]);
+    }
+
+    /// CR 608.2b + CR 115.10a: an inheriting rider takes its parent's FIRST
+    /// object OCCURRENCE with that occurrence's own pin — not every pin the
+    /// parent holds for that id.
+    #[test]
+    fn inherited_rider_takes_the_parent_occurrence_pin() {
+        let mut state = GameState::new(FormatConfig::duel_commander(), 2, 2);
+        let creature = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(1),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        let live = ObjectIncarnationRef::from_object(&state.objects[&creature]);
+        let stale = ObjectIncarnationRef::of(creature, live.incarnation + 7);
+        let mut parent = change_zone_head(Zone::Exile, vec![]);
+        parent.replace_target_occurrences(vec![
+            (TargetRef::Object(creature), Some(live)),
+            (TargetRef::Object(creature), Some(stale)),
+        ]);
+        let mut rider = gain_life_anaphor_rider(vec![TargetRef::Object(creature)]);
+        rider.target_pins = vec![Some(stale)];
+        parent.sub_ability = Some(Box::new(rider));
+        assert!(rider_entries_are_inherited(
+            &parent,
+            parent.sub_ability.as_deref().unwrap()
+        ));
+
+        restamp_inherited_rider_target(&mut parent);
+        let sub = parent.sub_ability.as_deref().unwrap();
+        assert_eq!(
+            sub.target_occurrences(),
+            vec![(TargetRef::Object(creature), Some(live))],
+            "the rider carries the first occurrence's own pin"
         );
     }
 
@@ -23301,6 +23559,53 @@ mod tests {
             DamageReplacementTargetRoleLegality::Partial,
             "the creature redirect filter still rejects a planeswalker"
         );
+    }
+
+    /// CR 608.2b + CR 115.1a: damage-replacement role OCCURRENCE verdicts. A
+    /// partial role set keeps every role in storage (`IllegalRetained` for the
+    /// illegal one) yet stamps exactly the illegal role, so its declared slot
+    /// is a hole; an all-legal set stamps nothing (control); an all-illegal
+    /// set keeps the base clear policy (`Dropped`), so the normal
+    /// all-targets-illegal fizzle still applies.
+    #[test]
+    fn damage_replacement_partial_roles_retain_layout_and_stamp_the_illegal_role() {
+        let (state, host, [_land, artifact, creature_a, creature_b, walker]) =
+            original_recipient_any_fixture();
+        let ability = |targets: Vec<TargetRef>| {
+            ResolvedAbility::new(
+                original_recipient_any_redirect(),
+                targets,
+                host,
+                PlayerId(0),
+            )
+        };
+
+        let partial = vec![TargetRef::Object(artifact), TargetRef::Object(creature_b)];
+        let validated = validate_targets_in_chain(&state, &ability(partial.clone()));
+        assert_eq!(validated.targets, partial, "layout kept");
+        assert_eq!(
+            validated.illegal_local_target_slots,
+            vec![0],
+            "only the illegal original-recipient role is stamped"
+        );
+        assert_eq!(
+            illegal_declared_target_slots(&ability(partial.clone()), &ability(partial), &validated),
+            vec![0]
+        );
+
+        let legal = vec![TargetRef::Object(creature_a), TargetRef::Object(creature_b)];
+        let validated = validate_targets_in_chain(&state, &ability(legal.clone()));
+        assert_eq!(validated.targets, legal);
+        assert!(validated.illegal_local_target_slots.is_empty());
+
+        let all_illegal = vec![TargetRef::Object(artifact), TargetRef::Object(walker)];
+        let validated = validate_targets_in_chain(&state, &ability(all_illegal.clone()));
+        assert!(validated.targets.is_empty(), "base clear policy");
+        assert_eq!(validated.illegal_local_target_slots, vec![0, 1]);
+        assert!(crate::game::targeting::check_fizzle(
+            &flatten_specified_targets_in_chain(&ability(all_illegal)),
+            &flatten_specified_targets_in_chain(&validated),
+        ));
     }
 
     /// CR 609.7a + CR 115.4 + CR 614.9: the "any target" domain is decided per

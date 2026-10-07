@@ -7037,7 +7037,7 @@ fn try_parse_put_counter_choice(
     // `ability_utils::target_filter_binds_prior_target`. (The setter's two other
     // callers seed it for a ZoneChanged parent target and for a forwarded result
     // context; neither printing here is either.) A target the player announces
-    // lands in the separate `selected_target_incarnations` instead,
+    // lands in the separate occurrence pins (`target_pins`) instead,
     // so for an activated ability and a beginning-of-combat trigger the
     // `ParentTarget` arm was already vacuously unpinned. Nothing was traded
     // away. Measured as well: blinking Elspeth's target in response leaves the

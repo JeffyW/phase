@@ -1132,26 +1132,22 @@ fn preserve_ability_copy_source_recursive(ability: &mut ResolvedAbility) {
 }
 
 /// CR 707.10d: Replace every object target on a copied spell with `new_target`
-/// and capture the target's current incarnation for ordinary resolution pins.
+/// and pin each rewritten occurrence to the target's current incarnation.
 fn rewrite_copy_spell_object_targets(
     ability: &mut ResolvedAbility,
     new_target: ObjectId,
     new_target_pin: Option<ObjectIncarnationRef>,
 ) {
-    let replaced_object_target = ability
-        .targets
-        .iter_mut()
-        .filter(|target| matches!(target, TargetRef::Object(_)))
-        .map(|target| {
-            *target = TargetRef::Object(new_target);
+    // Every rewritten position is refreshed; players keep their position.
+    let occurrences = ability
+        .target_occurrences()
+        .into_iter()
+        .map(|(target, pin)| match target {
+            TargetRef::Object(_) => (TargetRef::Object(new_target), new_target_pin),
+            TargetRef::Player(_) => (target, pin),
         })
-        .count()
-        > 0;
-    if replaced_object_target {
-        if let Some(pin) = new_target_pin {
-            ability.update_selected_target_incarnation(pin);
-        }
-    }
+        .collect();
+    ability.replace_target_occurrences(occurrences);
     if let Some(sub) = ability.sub_ability.as_mut() {
         rewrite_copy_spell_object_targets(sub, new_target, new_target_pin);
     }
@@ -4152,7 +4148,7 @@ mod tests {
             vec![TargetRef::Object(iteration_member)]
         );
         assert!(
-            copied_ability.selected_target_pin_is_current(iteration_member, &state),
+            copied_ability.target_occurrence_is_current(0, &state),
             "automatic retarget must capture the iteration member incarnation"
         );
 
@@ -4182,7 +4178,7 @@ mod tests {
             .cloned()
             .expect("automatic copy ability must remain on the stack");
         assert!(
-            !copied_ability.selected_target_pin_is_current(iteration_member, &state),
+            !copied_ability.target_occurrence_is_current(0, &state),
             "returned iteration member must no longer match the captured copy target pin"
         );
         crate::game::stack::resolve_top(&mut state, &mut events);

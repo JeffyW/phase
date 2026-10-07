@@ -117,13 +117,15 @@ pub fn resolve(
             };
             resume.sub_ability = None;
             if index + 1 < source_ids.len() {
-                resume.targets = source_ids[index + 1..]
-                    .iter()
-                    .copied()
-                    .map(TargetRef::Object)
-                    .collect();
+                resume.set_targets(
+                    source_ids[index + 1..]
+                        .iter()
+                        .copied()
+                        .map(TargetRef::Object)
+                        .collect(),
+                );
             } else {
-                resume.targets.clear();
+                resume.clear_targets();
             }
             super::append_to_pending_continuation(state, Some(Box::new(resume)));
             return Ok(());

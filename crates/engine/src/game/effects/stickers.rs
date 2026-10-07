@@ -155,7 +155,7 @@ fn resolve_put_sticker(
             ability.source_id,
             ability.controller,
         );
-        resolved.targets = ability.targets.clone();
+        resolved.set_targets(ability.targets.clone());
         resolved.context = ability.context.clone();
         resolved.chosen_x = ability.chosen_x;
         resolved.chosen_players = ability.chosen_players.clone();

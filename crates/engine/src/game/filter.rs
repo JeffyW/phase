@@ -7046,13 +7046,19 @@ fn combat_relation_subject_ref(
             .or_else(|| live(source.id)),
         CombatRelationSubject::ParentTarget => {
             let ability = source.ability?;
+            // The pin of the ORIGINATING occurrence (the first object target),
+            // read positionally; a delayed-trigger referent pin is keyed by id.
+            let position = ability
+                .targets
+                .iter()
+                .position(|target| matches!(target, TargetRef::Object(_)))?;
             let id = first_object_target(ability)?;
             ability
                 .target_incarnations
                 .iter()
-                .chain(&ability.selected_target_incarnations)
                 .find(|pin| pin.object_id == id)
                 .copied()
+                .or_else(|| ability.target_pin_at(position))
                 .or_else(|| live(id))
         }
     }
@@ -12959,7 +12965,7 @@ mod tests {
 
     /// U1: `combat_relation_subject_ref`'s `ParentTarget` arm prefers a pinned
     /// incarnation over the live object, and `target_incarnations` (the
-    /// delayed-trigger referent pin) over `selected_target_incarnations` when
+    /// delayed-trigger referent pin) over the occurrence pin (`target_pins`) when
     /// both are populated. This path is production-unreachable today — no
     /// parser emits `BlockedBySubject { subject: ParentTarget, .. }` — so it is
     /// exercised only here.
@@ -13008,7 +13014,7 @@ mod tests {
         // With the selected-target pin, the parent target's recorded
         // incarnation is used and the block is found.
         let mut pinned = ability.clone();
-        pinned.selected_target_incarnations = vec![blocked_at];
+        pinned.target_pins = vec![Some(blocked_at)];
         let ctx = FilterContext::from_ability(&pinned);
         assert!(
             crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
@@ -13025,15 +13031,15 @@ mod tests {
 
         // (a) When both pin lists are populated with DIFFERENT incarnations,
         // `target_incarnations` (the delayed-trigger referent) must be
-        // preferred over `selected_target_incarnations`.
+        // preferred over the occurrence pin (`target_pins`).
         let live_incarnation = ObjectIncarnationRef::from_object(&state.objects[&blocker]);
         let mut both_pinned = ability.clone();
         both_pinned.target_incarnations = vec![blocked_at];
-        both_pinned.selected_target_incarnations = vec![live_incarnation];
+        both_pinned.target_pins = vec![Some(live_incarnation)];
         let ctx = FilterContext::from_ability(&both_pinned);
         assert!(
             crate::game::filter::matches_target_filter(&state, attacker, &filter, &ctx),
-            "target_incarnations must be preferred over selected_target_incarnations"
+            "target_incarnations must be preferred over the occurrence pin"
         );
 
         // (b) With no pins at all and the live object left at the recorded
