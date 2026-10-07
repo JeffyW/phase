@@ -236,6 +236,13 @@ fn positional_pins_survive_resave_control() {
 /// root position 1 (B -> the returned A) or nothing. Returns the damage marked
 /// on `[C, B, A]` by the copy's resolution.
 fn fight_board(blink: bool, change_root: bool) -> ([u32; 3], [u32; 3]) {
+    fight_board_with(blink, change_root, false)
+}
+
+/// [`fight_board`], optionally removing C's artifact type through layers before
+/// the copy (the root's artifact declaration becomes illegal while C stays a
+/// current creature).
+fn fight_board_with(blink: bool, change_root: bool, remove_artifact: bool) -> ([u32; 3], [u32; 3]) {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     let c = s
@@ -285,6 +292,19 @@ fn fight_board(blink: bool, change_root: bool) -> ([u32; 3], [u32; 3]) {
         r.cast(flicker).target_objects(&[a, land]).commit();
         resolve_one(&mut r, flicker);
         assert_ne!(r.state().objects[&a].incarnation, 0, "reach: A blinked");
+    }
+    if remove_artifact {
+        r.state_mut().add_transient_continuous_effect(
+            c,
+            P1,
+            engine::types::ability::Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: c },
+            vec![engine::types::ability::ContinuousModification::RemoveType {
+                core_type: engine::types::CoreType::Artifact,
+            }],
+            None,
+        );
+        engine::game::layers::evaluate_layers(r.state_mut());
     }
     priority(&mut r, P0);
     r.cast(twincast).target_object(spell).commit();
@@ -467,4 +487,125 @@ fn scry_pause_continuation_inherits_the_validated_occurrence() {
         occurrences.iter().all(|pin| *pin == Some(returned)),
         "the continuation carries the validated occurrence's own pin: {occurrences:?}"
     );
+
+    // Answer the Scry and finish resolution: the continuation taps the
+    // returned A it inherited (the current occurrence), not nothing.
+    assert!(!r.state().objects[&a].tapped, "reach: A untapped before");
+    r.act(GameAction::SelectCards { cards: vec![] })
+        .expect("answer the Scry");
+    for _ in 0..16 {
+        let resolving = r.state().stack.iter().any(|e| e.source_id == spell);
+        if !resolving && matches!(r.state().waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
+        r.act(GameAction::PassPriority).expect("finish the spell");
+    }
+    assert!(
+        !r.state().stack.iter().any(|e| e.source_id == spell),
+        "reach: the spell resolved"
+    );
+    assert!(
+        r.state().objects[&a].tapped,
+        "the inherited current occurrence is tapped"
+    );
+}
+
+/// CR 608.2b + CR 701.14b (R10-2): the copy keeps its roots `[C, B]`, but C is
+/// no longer an artifact, so the root's artifact declaration is a hole. C must
+/// not be drawn as the implicit ally: no fight. Control: C still an artifact.
+#[test]
+fn illegal_root_declaration_supplies_no_implicit_ally() {
+    let (before, after) = fight_board_with(false, false, true);
+    assert_eq!(after, before, "C's root declaration is illegal: no fight");
+    let (before, after) = fight_board_with(false, false, false);
+    assert_ne!(after, before, "control: the legal root ally fights");
+}
+
+const ENTS_FURY: &str = "Put a +1/+1 counter on target creature you control if its power is 4 or greater. Then that creature gets +1/+1 until end of turn and fights target creature you don't control.";
+
+/// R10-2: the implicit ally is the parent's declared target A; A gains shroud
+/// after announcement, so its declaration is illegal (CR 702.18a + CR 608.2b)
+/// while the explicit fighter B stays legal. Neither creature fights
+/// (CR 701.14b). `printed` uses Ent's Fury (Scryfall-verified Oracle);
+/// otherwise an engine-defined Tap[A] + Fight{ParentTarget, Elf}[B].
+/// Returns (damage before, damage after, A tapped).
+fn implicit_ally_board(shroud: bool, printed: bool) -> ([u32; 2], [u32; 2], bool) {
+    use engine::types::keywords::Keyword;
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let a = s.add_creature(P0, "Implicit Ally A", 4, 12).id();
+    let b = s
+        .add_creature(P1, "Explicit Elf B", 3, 12)
+        .with_subtypes(vec!["Elf"])
+        .id();
+    let types = vec![if printed { "Sorcery" } else { "Instant" }.to_string()];
+    let definition = if printed {
+        parse_oracle_text(ENTS_FURY, "Ent's Fury", &[], &types, &[])
+            .abilities
+            .remove(0)
+    } else {
+        let mut root = parse_oracle_text("Tap target creature.", "Ally Probe", &[], &types, &[])
+            .abilities
+            .remove(0);
+        root.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Fight {
+                subject: TargetFilter::ParentTarget,
+                target: TargetFilter::Typed(TypedFilter::creature().subtype("Elf".into())),
+            },
+        )));
+        root
+    };
+    let spell = s
+        .add_spell_to_hand(
+            P0,
+            if printed { "Ent's Fury" } else { "Ally Probe" },
+            !printed,
+        )
+        .with_mana_cost(ManaCost::zero())
+        .with_ability_definition(definition)
+        .id();
+    let mut r = s.build();
+    r.cast(spell).target_objects(&[a, b]).commit();
+    assert_eq!(
+        engine::game::ability_utils::declared_targets_in_chain(ability(&r, spell)),
+        vec![TargetRef::Object(a), TargetRef::Object(b)],
+        "reach: A then B declared"
+    );
+    if shroud {
+        r.state_mut().add_transient_continuous_effect(
+            a,
+            P0,
+            engine::types::ability::Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: a },
+            vec![engine::types::ability::ContinuousModification::AddKeyword {
+                keyword: Keyword::Shroud,
+            }],
+            None,
+        );
+        engine::game::layers::evaluate_layers(r.state_mut());
+        assert!(r.state().objects[&a].has_keyword(&Keyword::Shroud), "reach");
+    }
+    let before = [a, b].map(|o| r.state().objects[&o].damage_marked);
+    resolve_one(&mut r, spell);
+    let after = [a, b].map(|o| r.state().objects[&o].damage_marked);
+    (before, after, r.state().objects[&a].tapped)
+}
+
+#[test]
+fn shrouded_parent_target_supplies_no_implicit_ally() {
+    let (before, after, tapped) = implicit_ally_board(true, false);
+    assert!(!tapped, "the illegal root target is not tapped");
+    assert_eq!(after, before, "neither creature fights");
+    let (before, after, tapped) = implicit_ally_board(false, false);
+    assert!(tapped, "control: the legal root taps A");
+    assert_ne!(after, before, "control: A and B fight");
+}
+
+#[test]
+fn ents_fury_with_its_own_creature_illegal_does_not_fight() {
+    let (before, after, _) = implicit_ally_board(true, true);
+    assert_eq!(after, before, "CR 701.14b: no fight");
+    let (before, after, _) = implicit_ally_board(false, true);
+    assert_ne!(after, before, "control: Ent's Fury fights");
 }

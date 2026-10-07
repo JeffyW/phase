@@ -2053,29 +2053,6 @@ fn chain_node_targets(ability: &ResolvedAbility) -> Vec<TargetRef> {
         .collect()
 }
 
-/// [`flatten_targets_in_chain`] with each occurrence's own pin — the chain
-/// flatten of the occurrence authority.
-pub(crate) fn flatten_target_occurrences_in_chain(
-    ability: &ResolvedAbility,
-) -> Vec<(TargetRef, Option<ObjectIncarnationRef>)> {
-    let mut occurrences: Vec<_> = chain_node_positions(ability)
-        .into_iter()
-        .map(|position| {
-            (
-                ability.targets[position].clone(),
-                ability.target_pin_at(position),
-            )
-        })
-        .collect();
-    if let Some(sub_ability) = ability.sub_ability.as_deref() {
-        occurrences.extend(flatten_target_occurrences_in_chain(sub_ability));
-    }
-    if let Some(else_ability) = ability.else_ability.as_deref() {
-        occurrences.extend(flatten_target_occurrences_in_chain(else_ability));
-    }
-    occurrences
-}
-
 pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     let mut targets = chain_node_targets(ability);
     if let Some(sub_ability) = ability.sub_ability.as_deref() {
@@ -3093,8 +3070,8 @@ fn validate_targets_in_chain_inner(
             //
             //
             // Every candidate is an OCCURRENCE with its originating address
-            // (`FighterOrigin`): this node's own announced positions, or a
-            // position of the resolving chain's flatten. When this node declares
+            // (`FighterOrigin`): this node's own announced positions, or an
+            // earlier declared position of the validated declared view. When this node declares
             // its own `target` slot, its explicit fighter is drawn ONLY from its
             // own occurrences — another node's occurrence of the same object
             // (a retargeted copy's root, CR 707.10c) never stands in for this
@@ -3111,21 +3088,63 @@ fn validate_targets_in_chain_inner(
                 .enumerate()
                 .map(|(position, occurrence)| (FighterOrigin::Own(position), occurrence))
                 .collect();
-            let chain: Vec<(FighterOrigin, Occurrence)> = state
+            // CR 608.2b + CR 701.14b: every EARLIER declared position, in
+            // declared order, with the verdict validation already reached for
+            // it. The validated declared view (`view`) publishes a judged-legal
+            // occurrence with its own pin; a hole is an illegal or unjudged
+            // declaration, whose occurrence is read from the resolving
+            // carrier's declared entries only when that carrier is the chain
+            // being validated (every published position agrees with it).
+            let declared_view: &[Option<targeting::DeclaredSlotBinding>] = &view_snapshot;
+            let carrier_entries = state
                 .resolving_stack_entry
                 .as_ref()
                 .and_then(|entry| entry.ability())
-                .map(flatten_target_occurrences_in_chain)
-                .unwrap_or_default()
-                .into_iter()
+                .map(declared_target_entries_in_chain)
+                .unwrap_or_default();
+            let carrier_aligned = carrier_entries.len() >= declared_view.len()
+                && declared_view.iter().zip(&carrier_entries).all(
+                    |(binding, entry)| match binding {
+                        Some(targeting::DeclaredSlotBinding::Announced { target, .. })
+                        | Some(targeting::DeclaredSlotBinding::Elected(target)) => {
+                            *target == entry.target
+                        }
+                        None => true,
+                    },
+                );
+            // `(origin, occurrence, judged legal)`.
+            let earlier: Vec<(FighterOrigin, Occurrence, bool)> = declared_view
+                .iter()
                 .enumerate()
-                .map(|(index, occurrence)| (FighterOrigin::Chain(index), occurrence))
+                .filter_map(|(index, binding)| {
+                    let (occurrence, legal) = match binding {
+                        Some(targeting::DeclaredSlotBinding::Announced { target, pin }) => {
+                            ((target.clone(), *pin), true)
+                        }
+                        Some(targeting::DeclaredSlotBinding::Elected(target)) => {
+                            ((target.clone(), None), true)
+                        }
+                        None if carrier_aligned => {
+                            let entry = &carrier_entries[index];
+                            ((entry.target.clone(), entry.pin), false)
+                        }
+                        None => return None,
+                    };
+                    Some((FighterOrigin::Chain(index), occurrence, legal))
+                })
                 .collect();
-            let ally_pool = if chain.is_empty() { &own } else { &chain };
+            // Only judged-legal earlier occurrences, then this node's own, may
+            // be drawn as a fighter.
+            let judged_pool: Vec<(FighterOrigin, Occurrence)> = earlier
+                .iter()
+                .filter(|(_, _, legal)| *legal)
+                .map(|(origin, occurrence, _)| (*origin, occurrence.clone()))
+                .chain(own.iter().cloned())
+                .collect();
             let explicit_pool = if !target.is_context_ref() && !own.is_empty() {
                 &own
             } else {
-                ally_pool
+                &judged_pool
             };
 
             fn fight_creature_on_battlefield(
@@ -3167,18 +3186,42 @@ fn validate_targets_in_chain_inner(
 
             let mut fighters: Vec<(FighterOrigin, Occurrence)> = Vec::new();
             if let [(explicit_origin, explicit_occurrence)] = explicit.as_slice() {
-                // The ally is a different object incarnation from the explicit
-                // fighter (never the same occurrence, nor the same object).
-                if let Some(ally) = ally_pool.iter().find(|(origin, occurrence)| {
+                // CR 608.2b + CR 701.14b: the implicit ally is the REFERENT the
+                // earlier declarations name — the first earlier declared object
+                // (other than the explicit fighter) that is a creature on the
+                // battlefield, or whose declaration is a hole because the object
+                // left the battlefield. It is identified before its legality is
+                // consulted, so an illegal referent means no ally (no fight),
+                // never a substitute drawn from a later declaration.
+                let referent = earlier.iter().find(|(origin, occurrence, legal)| {
                     let TargetRef::Object(id) = &occurrence.0 else {
                         return false;
                     };
                     origin != explicit_origin
                         && occurrence.0 != explicit_occurrence.0
-                        && fight_creature_on_battlefield(state, *id)
-                        && occurrence_is_current(occurrence)
-                }) {
-                    fighters.push(ally.clone());
+                        && (fight_creature_on_battlefield(state, *id)
+                            || (!*legal && !state.battlefield.contains(id)))
+                });
+                match referent {
+                    Some((origin, occurrence, true)) if occurrence_is_current(occurrence) => {
+                        fighters.push((*origin, occurrence.clone()));
+                    }
+                    Some(_) => {}
+                    // No earlier referent: this node's own propagated
+                    // occurrences ([ally, opponent]) supply the ally.
+                    None => {
+                        if let Some(ally) = own.iter().find(|(origin, occurrence)| {
+                            let TargetRef::Object(id) = &occurrence.0 else {
+                                return false;
+                            };
+                            origin != explicit_origin
+                                && occurrence.0 != explicit_occurrence.0
+                                && fight_creature_on_battlefield(state, *id)
+                                && occurrence_is_current(occurrence)
+                        }) {
+                            fighters.push(ally.clone());
+                        }
+                    }
                 }
             }
             fighters.extend(explicit);

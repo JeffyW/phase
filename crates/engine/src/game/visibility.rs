@@ -3955,8 +3955,7 @@ mod tests {
             source_id: ObjectId(9),
             branches: Vec::new(),
             branch_descriptions: Vec::new(),
-            parent_targets: Vec::new(),
-            parent_target_pins: Vec::new(),
+            parent_occurrences: Default::default(),
             context: Default::default(),
             continuation: Some(Box::new(ResolvedAbility::new(
                 Effect::NoOp,
