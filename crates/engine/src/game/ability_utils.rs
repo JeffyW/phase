@@ -772,27 +772,50 @@ pub fn build_target_slots_labelled(
     Ok((acc.slots, acc.labels))
 }
 
-/// CR 608.2h + CR 109.4: The controller of a permanent as it last existed on
-/// the battlefield. `reset_for_battlefield_exit()` reverts `controller` to the
-/// owner when a permanent leaves the battlefield, so for any object that is no
-/// longer there the LKI snapshot (captured just before the zone change) holds
-/// the pre-exit controller. Prefer it over the live — post-reset — value, so
-/// "its controller" anchors on who controlled the permanent at departure, not
-/// the owner who now appears to control the exiled/graved object. The single
-/// authority for "that permanent's controller" over an object reference,
-/// whether the object came from a chosen target or from the trigger event.
+/// CR 608.2h + CR 109.4: The controller of an object reference — live on the
+/// stack or battlefield, else as it last existed on the battlefield.
+/// `reset_for_battlefield_exit()` reverts `controller` to the owner when a
+/// permanent leaves the battlefield, so for any object that is no longer there
+/// the LKI snapshot (captured just before the zone change) holds the pre-exit
+/// controller. Prefer it over the live — post-reset — value, so "its
+/// controller" anchors on who controlled the permanent at departure, not the
+/// owner who now appears to control the exiled/graved object. The single
+/// authority for "that object's controller" over an object reference, whether
+/// the object came from a chosen target or from the trigger event.
+///
+/// NOT incarnation-correct: the LKI cache is keyed by bare `ObjectId`. When the
+/// departed object has already re-entered the battlefield under the same id
+/// (a blink, CR 400.7), the live battlefield row — the NEW object — answers,
+/// not the departed incarnation's last controller.
 pub(crate) fn last_known_permanent_controller(state: &GameState, id: ObjectId) -> Option<PlayerId> {
     let obj_opt = state.objects.get(&id);
-    let off_battlefield = obj_opt.is_none_or(|obj| obj.zone != Zone::Battlefield);
-    if off_battlefield {
-        state
-            .lki_cache
-            .get(&id)
-            .map(|lki| lki.controller)
-            .or_else(|| obj_opt.map(|obj| obj.controller))
-    } else {
-        obj_opt.map(|obj| obj.controller)
+    // CR 109.4: a permanent on the battlefield answers with its live controller.
+    if let Some(obj) = obj_opt.filter(|obj| obj.zone == Zone::Battlefield) {
+        return Some(obj.controller);
     }
+    // CR 109.4 + CR 601.2a + CR 608.2h: an object that is live on the stack is
+    // in the zone it was expected to be in, so it uses its current controller
+    // (the spell's caster, or a stack ability's controller) — never a stale
+    // battlefield snapshot left in the LKI cache by an earlier incarnation.
+    // The rung matches by `entry.id == id || entry.source_id == id` — a
+    // spell's `source_id == entry.id` (measured), so `stack_object_controller`
+    // is correct on both arms: it reads the spell's live controller when the
+    // object is on the stack, and falls back to `entry.controller` (CR 113.8)
+    // for an ability entry, which has no `state.objects` row.
+    if let Some(entry) = state
+        .stack
+        .iter()
+        .find(|entry| entry.id == id || entry.source_id == id)
+    {
+        return Some(stack_object_controller(state, entry));
+    }
+    // CR 608.2h: off the battlefield and off the stack — last known
+    // information from the battlefield, else the live (post-reset) row.
+    state
+        .lki_cache
+        .get(&id)
+        .map(|lki| lki.controller)
+        .or_else(|| obj_opt.map(|obj| obj.controller))
 }
 
 /// CR 109.4 + CR 608.2c: Resolve the controller of an ability's first parent target.
@@ -809,20 +832,9 @@ pub fn parent_target_controller(ability: &ResolvedAbility, state: &GameState) ->
         // battlefield — e.g. a token Recoil bounced to hand, which then ceases
         // to exist per CR 704.5d before the chained "that player discards"
         // resolves — fall back to last-known information so the player anaphor
-        // still resolves.
-        // CR 109.4: "Only objects on the stack or on the battlefield have a
-        // controller." The rung matches by `entry.id == id || entry.source_id
-        // == id` — a spell's `source_id == entry.id` (measured), so
-        // `stack_object_controller` is correct on both arms: it reads the
-        // spell's live controller when the object is on the stack, and falls
-        // back to `entry.controller` (CR 113.8) for an ability entry, which has
-        // no `state.objects` row.
-        TargetRef::Object(id) => state
-            .stack
-            .iter()
-            .find(|entry| entry.id == *id || entry.source_id == *id)
-            .map(|entry| stack_object_controller(state, entry))
-            .or_else(|| last_known_permanent_controller(state, *id)),
+        // still resolves. The stack rung and the LKI rung both live in
+        // `last_known_permanent_controller`.
+        TargetRef::Object(id) => last_known_permanent_controller(state, *id),
         TargetRef::Player(pid) => Some(*pid),
     }) {
         return Some(player);

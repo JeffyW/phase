@@ -1055,7 +1055,8 @@ fn royal_decree_triggers_once_for_a_permanent_meeting_several_criteria() {
     assert_eq!(runner.life(P1), 19, "exactly one trigger");
 }
 
-/// CR 603.2 + the CR 602.2 non-mana gate: Immolation Shaman damages an
+/// CR 603.2 + CR 605.1a (which activated abilities are mana abilities):
+/// Immolation Shaman damages an
 /// opponent who activates a non-mana ability of an artifact, creature, or land
 /// (here a land), and not one who activates a mana ability.
 #[test]
@@ -1222,9 +1223,11 @@ fn edric_the_last_controller_of_a_departed_stolen_attacker_draws() {
 }
 
 /// TapsForMana family (CR 605.4a: a triggered mana ability resolves
-/// immediately, so the triggering Forest can't leave before it resolves — the
-/// departed edge is unreachable). Control on the stolen edge that is
-/// reachable: P0 controls P1's Forest and taps it; P0 gets the extra {G}.
+/// immediately after the mana ability that triggered it, so there is no
+/// intervening response window). A source can still depart as part of its own
+/// cost ("{T}, Sacrifice this land"); that case is decided at trigger
+/// admission, not by the controller lookup. Control on the stolen edge: P0
+/// gains control of P1's Forest and taps it; P0 gets the extra {G}.
 #[test]
 fn vernal_bloom_pays_the_controller_of_a_stolen_forest() {
     let mut scenario = GameScenario::new();
@@ -1252,4 +1255,117 @@ fn vernal_bloom_pays_the_controller_of_a_stolen_forest() {
     let pool = |p: PlayerId| runner.state().players[p.0 as usize].mana_pool.total();
     assert_eq!(pool(P0), 2, "P0 tapped it: {{G}} plus the additional {{G}}");
     assert_eq!(pool(P1), 0);
+}
+
+const FORSAKEN_WASTES: &str = "Players can't gain life.\nAt the beginning of each player's upkeep, that player loses 1 life.\nWhenever this enchantment becomes the target of a spell, that spell's controller loses 5 life.";
+const CONFISCATE: &str = "Enchant permanent\nYou control enchanted permanent.";
+
+/// Forsaken Wastes board: P0's Wastes; P1 owns a Confiscate on the
+/// battlefield; P0 steals it and bounces it to P1's hand when `steal` is set.
+/// Returns at P1's precombat main with priority, the Confiscate in P1's hand.
+fn forsaken_wastes_board(steal: bool) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let wastes = scenario
+        .add_enchantment_from_oracle(P0, "Forsaken Wastes", FORSAKEN_WASTES)
+        .id();
+    let anchor = scenario.add_creature(P1, "Anchor", 1, 1).id();
+    let confiscate = scenario
+        .add_enchantment_from_oracle(P1, "Confiscate", CONFISCATE)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .from_oracle_text_with_keywords(&["Enchant"], CONFISCATE)
+        .id();
+    let take = free_spell(
+        &mut scenario,
+        P0,
+        "Take Enchantment",
+        false,
+        "Gain control of target enchantment.",
+    );
+    let bounce = free_spell(
+        &mut scenario,
+        P0,
+        "Bounce Enchantment",
+        false,
+        "Return target enchantment to its owner's hand.",
+    );
+    scenario.with_library_top(P0, &["P0 Card A", "P0 Card B"]);
+    scenario.with_library_top(P1, &["P1 Card A", "P1 Card B"]);
+    let mut runner = scenario.build();
+    // The Aura starts attached to P1's own creature.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&confiscate)
+        .unwrap()
+        .attached_to = Some(engine::game::game_object::AttachTarget::Object(anchor));
+    if steal {
+        runner.cast(take).target_object(confiscate).resolve();
+        assert_eq!(
+            runner.state().objects[&confiscate].controller,
+            P0,
+            "reach guard: P0 controls the Confiscate"
+        );
+    }
+    runner.cast(bounce).target_object(confiscate).resolve();
+    assert_eq!(
+        zone(&runner, confiscate),
+        Zone::Hand,
+        "reach guard: bounced"
+    );
+    let expected_lki = if steal { P0 } else { P1 };
+    assert_eq!(
+        runner.state().lki_cache[&confiscate].controller,
+        expected_lki,
+        "reach guard: the departed card's battlefield controller is in the LKI cache"
+    );
+    // P1's main-phase priority is staged directly: a turn boundary would
+    // clear the LKI cache, and this board needs the departed snapshot live.
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.phase = Phase::PreCombatMain;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    (runner, wastes, confiscate)
+}
+
+/// Cast the Confiscate from P1's hand targeting Wastes, resolve only the
+/// Wastes trigger, and return (P0, P1) life deltas.
+fn recast_at_wastes(runner: &mut GameRunner, wastes: ObjectId, confiscate: ObjectId) -> (i32, i32) {
+    let (p0, p1) = (runner.life(P0), runner.life(P1));
+    runner.cast(confiscate).target_object(wastes).commit();
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach guard: the spell and exactly one Wastes trigger"
+    );
+    runner.resolve_top();
+    (runner.life(P0) - p0, runner.life(P1) - p1)
+}
+
+/// CR 109.4 + CR 601.2a + CR 608.2h: "that spell's controller" for a spell
+/// live on the stack is its caster (P1). A stale battlefield snapshot from the
+/// card's earlier, stolen life under P0 must not answer.
+#[test]
+fn forsaken_wastes_hits_the_caster_of_a_recast_formerly_stolen_card() {
+    let (mut runner, wastes, confiscate) = forsaken_wastes_board(true);
+    assert_eq!(recast_at_wastes(&mut runner, wastes, confiscate), (0, -5));
+}
+
+/// Control: the card was never stolen — the caster (P1) loses 5.
+#[test]
+fn forsaken_wastes_hits_the_caster_of_a_fresh_spell() {
+    let (mut runner, wastes, confiscate) = forsaken_wastes_board(false);
+    assert_eq!(recast_at_wastes(&mut runner, wastes, confiscate), (0, -5));
 }
