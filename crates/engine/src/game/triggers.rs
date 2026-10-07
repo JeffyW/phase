@@ -1505,6 +1505,110 @@ fn declaration_records_for_attackers(
         .collect()
 }
 
+/// CR 603.2c + CR 508.3a + CR 509.3a/c/d + CR 510.2: the per-occurrence event
+/// fan-out for trigger modes whose single event can contain several
+/// occurrences — one attack declaration naming several attackers, one block
+/// declaration naming several blockers, one combat-damage step with several
+/// sources. Each returned event is one firing's narrowed context (the attacker,
+/// the blocker, the (attacker, blocker) pair, the damage source), so an event
+/// anaphor ("it", "that creature") binds that occurrence.
+///
+/// `None` means the mode does not fan out and the caller fires once on the
+/// event. The single authority shared by printed triggers
+/// (`collect_triggers_for_event`) and multi-fire delayed triggers
+/// (`collect_matching_delayed_triggers`), so a trigger fires the same number of
+/// times whether it is printed or created by an effect. Batched ("one or more")
+/// triggers are decided before this is consulted, by both callers.
+fn occurrence_trigger_events(
+    event: &GameEvent,
+    trig_def: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<Vec<GameEvent>> {
+    use super::trigger_matchers as m;
+    match trig_def.mode {
+        TriggerMode::Attacks => Some(m::matching_attack_events(
+            event,
+            trig_def,
+            source_context,
+            state,
+        )),
+        TriggerMode::YouAttack if ability.has_event_source_force_block_recursive() => {
+            let matching = m::matching_you_attack_pairs(event, trig_def, source_context, state);
+            Some(match event {
+                GameEvent::AttackersDeclared {
+                    defending_player,
+                    declaration_records,
+                    ..
+                } => singleton_attack_events(
+                    *defending_player,
+                    matching,
+                    declaration_records.clone(),
+                ),
+                _ => Vec::new(),
+            })
+        }
+        // CR 508.3e: "Whenever you attack a player" triggers once for EACH
+        // attacked player, each firing bound to its own attacked player. Ordered
+        // after the event-source force-block arm, whose attacker demonstrative
+        // needs one event per ATTACKER, which this per-player grouping strands.
+        TriggerMode::YouAttack if m::you_attack_binds_attacked_player(trig_def) => {
+            Some(m::matching_you_attack_events_by_attacked_player(
+                event,
+                trig_def,
+                source_context,
+                state,
+            ))
+        }
+        TriggerMode::Blocks => Some(m::matching_block_events(
+            event,
+            trig_def,
+            source_context,
+            state,
+        )),
+        TriggerMode::BecomesBlocked => Some(m::matching_becomes_blocked_events(
+            event,
+            trig_def,
+            source_context,
+            state,
+        )),
+        // CR 509.1h + CR 509.3d: narrow each firing to its own single
+        // (attacker, blocker) event so "the other creature"/"that creature"
+        // resolves per-firing, matching the atomic `Blocks`/`BecomesBlocked`.
+        TriggerMode::BlocksOrBecomesBlocked => Some(m::matching_blocks_or_becomes_blocked_events(
+            event,
+            trig_def,
+            source_context,
+            state,
+        )),
+        // CR 603.2c: One aggregate combat-damage event may satisfy this trigger
+        // once, while CR 608.2c makes the filtered source set available to
+        // later "those creatures" instructions.
+        TriggerMode::DamageDoneOnceByController => Some(
+            m::matching_damage_done_once_by_controller_event(
+                event,
+                trig_def,
+                source_context,
+                state,
+            )
+            .into_iter()
+            .collect(),
+        ),
+        _ if m::listens_on_aggregate_combat_damage_done(trig_def)
+            && matches!(event, GameEvent::CombatDamageDealtToPlayer { .. }) =>
+        {
+            Some(m::matching_damage_done_events(
+                event,
+                trig_def,
+                source_context,
+                state,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn split_attack_event_into_singletons(event: &GameEvent) -> Option<Vec<GameEvent>> {
     let GameEvent::AttackersDeclared {
         defending_player,
@@ -2840,125 +2944,13 @@ fn collect_matching_triggers_inner(
                     continue;
                 }
                 vec![trigger_events]
-            } else if matches!(trig_def.mode, TriggerMode::Attacks) {
-                super::trigger_matchers::matching_attack_events(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if matches!(trig_def.mode, TriggerMode::YouAttack)
-                && ability.has_event_source_force_block_recursive()
+            } else if let Some(occurrences) =
+                occurrence_trigger_events(event, trig_def, &source_context, state, &ability)
             {
-                let matching = super::trigger_matchers::matching_you_attack_pairs(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                );
-                match event {
-                    GameEvent::AttackersDeclared {
-                        defending_player,
-                        declaration_records,
-                        ..
-                    } => singleton_attack_events(
-                        *defending_player,
-                        matching,
-                        declaration_records.clone(),
-                    ),
-                    _ => Vec::new(),
-                }
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if matches!(trig_def.mode, TriggerMode::YouAttack)
-                && super::trigger_matchers::you_attack_binds_attacked_player(trig_def)
-            {
-                // CR 508.3e: "Whenever you attack a player" triggers once for
-                // EACH attacked player, each firing bound to its own attacked
-                // player. Horizon Explorer has no "that player" anaphor at all,
-                // which is what proves the cardinality belongs to the trigger
-                // CONDITION rather than to the ability's body.
-                //
-                // Ordered against the two arms above it, both MORE specific and
-                // both of which must keep winning: `trig_def.batched`, whose
-                // events must keep flowing through
-                // `matching_batched_trigger_events` (where static suppression and
-                // the per-candidate intervening-if are applied); and the
-                // event-source force-block arm, whose attacker demonstrative
-                // ("that creature") has no referent in a plural event and so needs
-                // one event per ATTACKER — which this per-player grouping strands.
-                super::trigger_matchers::matching_you_attack_events_by_attacked_player(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if matches!(trig_def.mode, TriggerMode::Blocks) {
-                super::trigger_matchers::matching_block_events(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if matches!(trig_def.mode, TriggerMode::BecomesBlocked) {
-                super::trigger_matchers::matching_becomes_blocked_events(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if matches!(trig_def.mode, TriggerMode::BlocksOrBecomesBlocked) {
-                // CR 509.1h + CR 509.3d: narrow each firing to its own single
-                // (attacker, blocker) event so "the other creature"/"that
-                // creature" resolves per-firing, matching the atomic
-                // `Blocks`/`BecomesBlocked` arms above.
-                super::trigger_matchers::matching_blocks_or_becomes_blocked_events(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if matches!(trig_def.mode, TriggerMode::DamageDoneOnceByController) {
-                // CR 603.2c: One aggregate combat-damage event may satisfy this
-                // trigger once, while CR 608.2c makes the filtered source set
-                // available to later "those creatures" instructions.
-                super::trigger_matchers::matching_damage_done_once_by_controller_event(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
-            } else if super::trigger_matchers::listens_on_aggregate_combat_damage_done(trig_def)
-                && matches!(event, GameEvent::CombatDamageDealtToPlayer { .. })
-            {
-                super::trigger_matchers::matching_damage_done_events(
-                    event,
-                    trig_def,
-                    &source_context,
-                    state,
-                )
-                .into_iter()
-                .map(|trigger_event| vec![trigger_event])
-                .collect()
+                occurrences
+                    .into_iter()
+                    .map(|trigger_event| vec![trigger_event])
+                    .collect()
             } else if ability.has_event_source_force_block_recursive() {
                 // CR 603.2 + CR 608.2c: every event-source force-block branch
                 // owns one unambiguous attacker. The ordinary attack modes
@@ -11554,13 +11546,14 @@ pub(crate) fn filter_already_collected_trigger_events_from(
 /// event unchanged (paired with `matched_index`) for every other case
 /// (non-`WheneverEvent`, or no aggregate match — e.g. a `SelfRef` source already
 /// matching the per-source `DamageDealt` event directly, or a non-damage trigger).
-fn expand_multi_fire_damage_occurrences(
+fn expand_multi_fire_occurrences(
     condition: &crate::types::ability::DelayedTriggerCondition,
     events: &[GameEvent],
     matched_index: usize,
     matched_event: &GameEvent,
     state: &GameState,
     source_context: Option<&TriggerSourceContext>,
+    ability: &ResolvedAbility,
 ) -> Vec<(usize, GameEvent)> {
     use crate::types::ability::DelayedTriggerCondition;
     let DelayedTriggerCondition::WheneverEvent { trigger, .. } = condition else {
@@ -11591,11 +11584,24 @@ fn expand_multi_fire_damage_occurrences(
             .map(move |synth| (idx, synth))
         })
         .collect();
-    if expanded.is_empty() {
-        vec![(matched_index, matched_event.clone())]
-    } else {
-        expanded
+    if !expanded.is_empty() {
+        return expanded;
     }
+    // CR 603.2c + CR 603.7b: a multi-fire delayed trigger triggers on EACH
+    // occurrence in its event — one firing per declared attacker or blocker —
+    // through the same fan-out authority printed triggers use. Batched ("one or
+    // more") delayed triggers fire once on the whole event, as printed ones do.
+    if !trigger.batched {
+        if let Some(occurrences) =
+            occurrence_trigger_events(matched_event, trigger, source_context, state, ability)
+        {
+            return occurrences
+                .into_iter()
+                .map(|occurrence| (matched_index, occurrence))
+                .collect();
+        }
+    }
+    vec![(matched_index, matched_event.clone())]
 }
 
 /// CR 603.4 + CR 608.2c: does this delayed body still carry work that the
@@ -12991,6 +12997,23 @@ fn delayed_trigger_to_context(
     // the SAME authority the collection gate below used, so the two halves of
     // the CR 603.4 pair cannot read different predicates.
     let condition = delayed_intervening_if(&trigger.ability);
+    // CR 603.2c: a batched ("one or more") delayed trigger reads "that many" as
+    // the number of matching subjects in its event, through the same counting
+    // authority printed batched triggers use — not the event's raw total.
+    let subject_match_count = match &trigger.condition {
+        crate::types::ability::DelayedTriggerCondition::WheneverEvent {
+            trigger: definition,
+            ..
+        } if definition.batched => trigger.ability.trigger_source.as_ref().and_then(|source| {
+            super::trigger_matchers::count_trigger_subjects_in_batch(
+                state,
+                definition.valid_card.as_ref(),
+                source,
+                std::slice::from_ref(&trigger_event),
+            )
+        }),
+        _ => None,
+    };
     PendingTriggerContext::delayed(
         PendingTrigger {
             source_id: trigger.source_id,
@@ -13005,7 +13028,7 @@ fn delayed_trigger_to_context(
             mode_abilities: vec![],
             description: None,
             may_trigger_origin: None,
-            subject_match_count: None,
+            subject_match_count,
             die_result: None,
             provenance: None,
         },
@@ -13108,13 +13131,14 @@ fn collect_matching_delayed_triggers(
                 // Non-aggregate matches and non-DamageDone conditions fire once on
                 // the matched event unchanged. Each occurrence carries its own
                 // originating aggregate index for consumed-occurrence tracking.
-                for (occ_index, occurrence) in expand_multi_fire_damage_occurrences(
+                for (occ_index, occurrence) in expand_multi_fire_occurrences(
                     &delayed.condition,
                     events,
                     event_index,
                     &trigger_event,
                     state,
                     delayed.ability.trigger_source.as_ref(),
+                    &delayed.ability,
                 ) {
                     to_fire.push((delayed.clone(), occ_index, occurrence, false));
                 }
@@ -26505,7 +26529,7 @@ pub mod tests {
         );
         // The expansion path requires the delayed ability to carry its
         // creation-time trigger source; without it, collection returns the event
-        // unexpanded (see `expand_multi_fire_damage_occurrences`).
+        // unexpanded (see `expand_multi_fire_occurrences`).
         let rider_ctx = trigger_source_context_for_latch(&state, &state.objects[&rider_source]);
         ability.set_trigger_source_recursive(rider_ctx);
 
