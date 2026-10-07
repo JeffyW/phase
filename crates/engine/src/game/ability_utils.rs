@@ -2593,6 +2593,7 @@ fn validate_pinned_targets_for_slot(
 /// authority as announcement. Mixed principal/derived layouts retain their own
 /// paths; pruning those positional lists here could silently exchange roles.
 fn validate_single_derived_role(
+    view: Option<&[Option<targeting::DeclaredSlotBinding>]>,
     state: &GameState,
     ability: &ResolvedAbility,
     target_origin: TargetReadOrigin,
@@ -2636,7 +2637,7 @@ fn validate_single_derived_role(
             )
         }
         (false, true) => effect_target_slot_filter(&ability.effect).map(|derived| {
-            validate_pinned_targets(None, state, &ability.targets, &derived.filter, ability)
+            validate_pinned_targets(view, state, &ability.targets, &derived.filter, ability)
         }),
         (false, false) | (true, true) => None,
     }
@@ -3140,7 +3141,9 @@ fn validate_targets_in_chain_inner(
             &TargetFilter::Player,
             &validated,
         )
-    } else if let Some(targets) = validate_single_derived_role(state, &validated, target_origin) {
+    } else if let Some(targets) =
+        validate_single_derived_role(view, state, &validated, target_origin)
+    {
         targets
     } else {
         match triggers::extract_target_filter_from_effect(&validated.effect) {

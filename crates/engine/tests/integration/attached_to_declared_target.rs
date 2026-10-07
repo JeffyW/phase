@@ -2480,3 +2480,111 @@ fn same_object_in_two_positions_partial_change_is_refused() {
         .expect("the exact resubmission is accepted");
     assert_eq!(root_pin(&runner, spell, a), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Derived quantity slot reading a declared slot (CR 608.2b)
+// ---------------------------------------------------------------------------
+
+/// An engine-defined two-node spell: "Tap target creature." then gain life equal
+/// to the mana value of target Equipment attached to that creature — the second
+/// slot is DERIVED from the quantity (`TargetObjectManaValue`) and its filter
+/// reads declared slot 0. Returns `(runner, spell, a, e, c)` with `[A, E]`
+/// announced, Equipment E (mana value 1) on creature A, and creature C.
+fn derived_mana_value_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId) {
+    use engine::types::ability::{
+        AbilityKind, QuantityExpr, QuantityRef, TapStateChange, TypedFilter,
+    };
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+    let c = scenario.add_creature(P1, "Creature C", 2, 7).id();
+    let e = scenario
+        .add_artifact_from_oracle(P1, "Equipment E", "Equipped creature gets +1/+0.")
+        .with_subtypes(vec!["Equipment"])
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    let equipment_of_slot_0 = TargetFilter::Typed(
+        TypedFilter::default()
+            .subtype("Equipment".to_string())
+            .properties(vec![FilterProp::AttachedTo {
+                to: AttachmentReferent::DeclaredTarget { slot: 0 },
+            }]),
+    );
+    let mut tap = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::SetTapState {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            scope: engine::types::ability::EffectScope::Single,
+            state: TapStateChange::Tap,
+        },
+    );
+    tap.sub_ability = Some(Box::new(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::TargetObjectManaValue {
+                    filter: Box::new(equipment_of_slot_0),
+                },
+            },
+            player: TargetFilter::Controller,
+        },
+    )));
+    let spell = scenario
+        .add_spell_to_hand(P0, "Derived Probe", true)
+        .with_mana_cost(ManaCost::generic(0))
+        .with_ability_definition(tap)
+        .id();
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), e, a);
+    runner.cast(spell).target_objects(&[a, e]).commit();
+    let declared = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == spell)
+        .and_then(|entry| entry.ability())
+        .map(|ability| {
+            std::iter::successors(Some(ability), |node| node.sub_ability.as_deref())
+                .flat_map(|node| node.targets.clone())
+                .collect::<Vec<_>>()
+        })
+        .expect("spell on the stack");
+    assert_eq!(
+        declared,
+        objects(&[a, e]),
+        "reach guard: both slots announced"
+    );
+    (runner, spell, a, e, c)
+}
+
+/// CR 608.2b: the creature became an illegal target, so the derived Equipment
+/// slot — "attached to that creature" — gets no information from it and is
+/// illegal too: with every target illegal the spell does nothing (no tap, no
+/// life). Controls: a legal creature taps it and gains 1; the Equipment moved
+/// off the creature is illegal while the tap still happens.
+#[test]
+fn derived_slot_reading_an_illegal_declared_slot_is_illegal() {
+    let (mut runner, _spell, a, _e, _c) = derived_mana_value_board();
+    give_hexproof(runner.state_mut(), a);
+    let before = runner.life(P0);
+    runner.advance_until_stack_empty();
+    assert!(!runner.state().objects[&a].tapped);
+    assert_eq!(runner.life(P0), before, "no life from an illegal referent");
+
+    let (mut runner, _spell, a, _e, _c) = derived_mana_value_board();
+    let before = runner.life(P0);
+    runner.advance_until_stack_empty();
+    assert!(runner.state().objects[&a].tapped, "control: tapped");
+    assert_eq!(runner.life(P0), before + 1, "control: mana value 1");
+
+    let (mut runner, _spell, a, e, c) = derived_mana_value_board();
+    attach::attach_to(runner.state_mut(), e, c);
+    let before = runner.life(P0);
+    runner.advance_until_stack_empty();
+    assert!(runner.state().objects[&a].tapped, "control: tapped");
+    assert_eq!(
+        runner.life(P0),
+        before,
+        "control: detached Equipment is illegal"
+    );
+}
