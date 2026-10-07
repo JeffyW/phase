@@ -480,3 +480,144 @@ fn classifier_names_declared_slot_reads_and_fails_closed_otherwise() {
         "a negated declared-slot read still reads that slot"
     );
 }
+
+/// CR 115.3 + CR 115.7e (measurement): Hex ("Destroy six target creatures.")
+/// copied by Twincast, with G chosen at position 0. Choosing G again at
+/// position 1 names one object twice in one run: the fixed pair already
+/// violates W2, so it is refused without any validator call, however large
+/// the pool. Before the pre-check it took 840 / 1,680 / 3,024 validations for
+/// pools of 8 / 9 / 10. The control, H at position 1, is admitted cheaply.
+#[test]
+fn an_impossible_fixed_pair_is_refused_without_search() {
+    for extra in 0..3 {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let ids: Vec<ObjectId> = (0..8 + extra)
+            .map(|n| s.add_creature(P1, &format!("Hex Creature {n}"), 2, 9).id())
+            .collect();
+        let hex = s
+            .add_spell_to_hand_from_oracle(P0, "Hex", false, "Destroy six target creatures.")
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let twincast = free_spell(&mut s, "Twincast", TWINCAST);
+        let r = copy_walk_board(s.build(), hex, &ids[..6], twincast);
+        let state = r.state();
+        let (walk, _) = walk_of(&state.waiting_for).unwrap();
+        let (g, h) = (TargetRef::Object(ids[6]), TargetRef::Object(ids[7]));
+
+        let search = search_of(state, &walk);
+        assert_eq!(search.len(), 6, "reach: six positions");
+        assert_eq!(search.component_census(), (1, 1), "reach: one matched run");
+        assert!(
+            !search.admits(&[Some(g.clone())], &Some(g.clone())),
+            "pool {}: G twice in one run is refused",
+            8 + extra
+        );
+        assert_eq!(
+            search.validator_calls(),
+            0,
+            "pool {}: refused by the fixed-pair check, not by search",
+            8 + extra
+        );
+
+        let control = search_of(state, &walk);
+        assert!(
+            control.admits(&[Some(g.clone())], &Some(h)),
+            "control: [G, H]"
+        );
+        assert!(
+            control.validator_calls() <= 2,
+            "pool {}: the control is cheap, took {}",
+            8 + extra,
+            control.validator_calls()
+        );
+    }
+}
+
+/// The UNSTAGED companion of `counters_on_chain_root_falls_back_to_the_combined_search`:
+/// the counter read sits on the ROOT node, whose chain-root carrier the cast
+/// itself latches (CR 601.2c), so nothing is staged. An engine-composed root
+/// "exchange control of target creature and target artifact with mana value
+/// less than or equal to the number of +1/+1 counters on that creature"
+/// announces A (read 0 before the latch: the MV-0 artifact). On the copy the
+/// carrier names A and the read is nonzero, the walk is one combined
+/// component, a third counter crosses the MV-3 threshold, and every prefix
+/// matches the validator.
+#[test]
+fn counters_on_chain_root_read_at_the_root_needs_no_staging() {
+    let artifact_le_counters = || {
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact).properties(vec![
+            FilterProp::Cmc {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::ChainRootTarget,
+                        counter_type: Some(CounterType::Plus1Plus1),
+                    },
+                },
+            },
+        ]))
+    };
+    for counters in [2_u32, 3] {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let a = s.add_creature(P1, "Creature A", 2, 2).id();
+        let _b = s.add_creature(P1, "Creature B", 2, 2).id();
+        let mv0 = s
+            .add_artifact_from_oracle(P1, "Artifact MV0", "")
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mv2 = s
+            .add_artifact_from_oracle(P1, "Artifact MV2", "")
+            .with_mana_cost(ManaCost::generic(2))
+            .id();
+        let mv3 = s
+            .add_artifact_from_oracle(P1, "Artifact MV3", "")
+            .with_mana_cost(ManaCost::generic(3))
+            .id();
+        let spell = s
+            .add_spell_to_hand(P0, "Root Counter Probe", true)
+            .with_mana_cost(ManaCost::zero())
+            .with_ability_definition(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ExchangeControl {
+                    target_a: TargetFilter::Typed(TypedFilter::creature()),
+                    target_b: artifact_le_counters(),
+                },
+            ))
+            .id();
+        let twincast = free_spell(&mut s, "Twincast", TWINCAST);
+        let mut r = s.build();
+        r.state_mut()
+            .objects
+            .get_mut(&a)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, counters);
+        let r = copy_walk_board(r, spell, &[a, mv0], twincast);
+        let state = r.state();
+        let (walk, _) = walk_of(&state.waiting_for).unwrap();
+        let search = search_of(state, &walk);
+        assert_eq!(
+            search.pre.context.chain_root_targets.first(),
+            Some(&TargetRef::Object(a)),
+            "reach: the cast latched the root carrier; nothing is staged"
+        );
+        assert_eq!(search.len(), 2, "reach: the creature and the artifact");
+        assert_eq!(
+            retarget_dependencies(&artifact_le_counters()),
+            RetargetDeps::AllPositions
+        );
+        assert_eq!(search.component_census(), (1, 0), "one combined component");
+        assert!(
+            search.slot_pools()[1].contains(&TargetRef::Object(mv2)),
+            "nonzero read: MV 2 is legal with {counters} counters"
+        );
+        assert_eq!(
+            search.slot_pools()[1].contains(&TargetRef::Object(mv3)),
+            counters >= 3,
+            "{counters} counters: the MV-3 threshold"
+        );
+        assert_walk_matches_brute_force(state);
+    }
+}

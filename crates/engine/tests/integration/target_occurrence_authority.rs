@@ -15,6 +15,7 @@
 //! Redirect. The Exchange + Fight and Exchange + Scry spells are engine-defined
 //! compositions of supported parsed definitions, not fabricated card text.
 
+use engine::game::ability_utils::validate_targets_in_chain;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
@@ -23,7 +24,8 @@ use engine::types::ability::{
 };
 use engine::types::actions::{GameAction, ResolveAllScope};
 use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization, WaitingFor};
-use engine::types::identifiers::ObjectId;
+use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
+use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -492,8 +494,6 @@ fn phased_out_referent_is_not_substituted_by_a_later_declaration() {
 /// unknown origin never permits substitution.
 #[test]
 fn illegal_referent_is_never_substituted_whatever_the_resolving_carrier() {
-    use engine::game::ability_utils::validate_targets_in_chain;
-    use engine::types::identifiers::ObjectIncarnationRef;
     let board = fight_copy(false, false, Alteration::RemoveArtifact);
     let [c, b, a] = board.objects;
     let carrier = board
@@ -680,7 +680,6 @@ const ENTS_FURY: &str = "Put a +1/+1 counter on target creature you control if i
 /// otherwise an engine-defined Tap[A] + Fight{ParentTarget, Elf}[B].
 /// Returns (damage before, damage after, A tapped).
 fn implicit_ally_board(shroud: bool, printed: bool) -> ([u32; 2], [u32; 2], bool) {
-    use engine::types::keywords::Keyword;
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     let a = s.add_creature(P0, "Implicit Ally A", 4, 12).id();

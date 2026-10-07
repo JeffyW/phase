@@ -22,12 +22,16 @@
 //! `legal_alternatives` are engine-derived at every open, advance and restore.
 
 use crate::game::ability_utils::{
-    assign_selected_slots_in_chain, build_target_selection_progress_for_ability, build_target_slots,
+    assign_selected_slots_in_chain, build_target_selection_progress_for_ability,
+    build_target_slots, choose_target_for_ability, TargetSelectionAdvance,
 };
 use crate::game::engine::EngineError;
 use crate::game::retarget_completion::{RetargetPick, RetargetSearch};
 use crate::types::ability::{EffectKind, ResolvedAbility};
-use crate::types::game_state::{CopyChoiceMode, CopyTargetSlot, GameState, WaitingFor};
+use crate::types::game_state::{
+    CopyChoiceMode, CopyTargetSlot, GameState, PersistedRestoreError, TargetSelectionProgress,
+    TargetSelectionSlot, WaitingFor,
+};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 
@@ -55,12 +59,56 @@ fn copy_stack_index(state: &GameState, copy_id: ObjectId) -> Option<usize> {
     state.stack.iter().position(|entry| entry.id == copy_id)
 }
 
-fn copy_ability(state: &GameState, copy_id: ObjectId) -> Option<&ResolvedAbility> {
+/// The copy's spell ability. `Err` when the copy is no longer on the stack;
+/// `Ok(None)` for a copy whose spell has no ability (a vanilla permanent spell,
+/// CR 707.12): it announces nothing, a successful no-walk case.
+fn copy_ability(
+    state: &GameState,
+    copy_id: ObjectId,
+) -> Result<Option<&ResolvedAbility>, EngineError> {
     state
         .stack
         .iter()
         .find(|entry| entry.id == copy_id)
-        .and_then(|entry| entry.ability())
+        .map(|entry| entry.ability())
+        .ok_or_else(|| EngineError::InvalidAction("Copy is no longer on the stack".to_string()))
+}
+
+/// CR 601.2c: the production casting walk's view of a copy's announcement —
+/// its slots and the progress replayed from the decided prefix (which also
+/// auto-advances optional slots with no legal target, and announced binders).
+struct Announcement<'s> {
+    ability: &'s ResolvedAbility,
+    slots: Vec<TargetSelectionSlot>,
+    progress: TargetSelectionProgress,
+}
+
+/// `Ok(None)` when the copy announces nothing (no ability, or no slot).
+fn announcement(
+    state: &GameState,
+    copy_id: ObjectId,
+    picks: Vec<RetargetPick>,
+) -> Result<Option<Announcement<'_>>, EngineError> {
+    let Some(ability) = copy_ability(state, copy_id)? else {
+        return Ok(None);
+    };
+    let slots = build_target_slots(state, ability)?;
+    if slots.is_empty() {
+        return Ok(None);
+    }
+    let progress = build_target_selection_progress_for_ability(
+        state,
+        ability,
+        &slots,
+        &ability.target_constraints,
+        picks.len(),
+        picks,
+    )?;
+    Ok(Some(Announcement {
+        ability,
+        slots,
+        progress,
+    }))
 }
 
 /// CR 707.10c: the retarget search over the copy's addressed positions.
@@ -98,12 +146,14 @@ pub(crate) fn walk_step(
                     },
                     address: Some(search.slots()[i].clone()),
                     can_keep: i == position && offered.can_keep,
+                    can_decline: false,
                 })
                 .collect();
             let can_keep_rest = search.can_keep_rest(&picks);
             Ok(Some(CopyWalkStep::Prompt(Box::new(
                 WaitingFor::CopyRetarget {
                     player: walk.player,
+                    controller: None,
                     copy_id: walk.copy_id,
                     target_slots,
                     effect_kind: walk.effect_kind,
@@ -117,49 +167,57 @@ pub(crate) fn walk_step(
             ))))
         }
         CopyChoiceMode::Announce => {
-            let ability = copy_ability(state, walk.copy_id).ok_or_else(|| {
-                EngineError::InvalidAction("Copy is no longer on the stack".to_string())
-            })?;
-            let slots = build_target_slots(state, ability)?;
-            if slots.is_empty() {
-                return Ok(Some(CopyWalkStep::Complete(picks)));
-            }
-            // CR 601.2c: the production casting walk; it validates the prefix,
-            // auto-skips optional slots with no legal target, and offers only
-            // targets with a legal completion.
-            let progress = build_target_selection_progress_for_ability(
-                state,
+            let Some(Announcement {
                 ability,
-                &slots,
-                &ability.target_constraints,
-                picks.len(),
-                picks,
-            )?;
+                slots,
+                progress,
+            }) = announcement(state, walk.copy_id, picks.clone())?
+            else {
+                return Ok(Some(CopyWalkStep::Complete(picks)));
+            };
             if progress.current_slot >= slots.len() {
                 return Ok(Some(CopyWalkStep::Complete(progress.selected_slots)));
             }
+            let position = progress.current_slot;
+            // CR 115.6 + CR 601.2c: declining an optional slot is answerable
+            // exactly when the casting walk's own advance accepts it.
+            let can_decline = slots[position].optional
+                && choose_target_for_ability(
+                    state,
+                    ability,
+                    &slots,
+                    &ability.target_constraints,
+                    &progress,
+                    None,
+                )
+                .is_ok();
+            // CR 601.2c + CR 115.1: a slot "of an opponent's choice" is
+            // announced by its chooser; the copy stays its controller's.
+            let chooser = slots[position].chooser.unwrap_or(walk.player);
             let target_slots = slots
                 .iter()
                 .enumerate()
                 .map(|(i, slot)| CopyTargetSlot {
                     current: progress.selected_slots.get(i).cloned().flatten(),
-                    legal_alternatives: if i == progress.current_slot {
+                    legal_alternatives: if i == position {
                         progress.current_legal_targets.clone()
                     } else {
                         slot.legal_targets.clone()
                     },
                     address: None,
                     can_keep: false,
+                    can_decline: i == position && can_decline,
                 })
                 .collect();
             Ok(Some(CopyWalkStep::Prompt(Box::new(
                 WaitingFor::CopyRetarget {
-                    player: walk.player,
+                    player: chooser,
+                    controller: (chooser != walk.player).then_some(walk.player),
                     copy_id: walk.copy_id,
                     target_slots,
                     effect_kind: walk.effect_kind,
                     effect_source_id: walk.effect_source_id,
-                    current_slot: progress.current_slot,
+                    current_slot: position,
                     paradigm_remaining_offers: walk.paradigm_remaining_offers.clone(),
                     mode: Some(CopyChoiceMode::Announce),
                     picks: Some(progress.selected_slots),
@@ -170,41 +228,76 @@ pub(crate) fn walk_step(
     }
 }
 
-/// CR 707.10c / CR 601.2c: whether `pick` is an answerable choice at position
-/// `picks.len()` of the walk — the reducer gate for `ChooseTarget`.
-pub(crate) fn pick_is_admissible(
+/// CR 707.10c / CR 601.2c: THE gate and advance for `ChooseTarget` — the
+/// walk's decided picks after answering `pick` at the current position, or
+/// `Err` when `pick` is not an answerable choice there. Retarget asks the
+/// completion search (a keep only where keeping completes, a choice only where
+/// it has a legal completion). Announce is the production casting advance
+/// (`choose_target_for_ability`): a legal target, or a decline of an optional
+/// slot, which also declines the rest of an "up to N" instance (CR 115.6).
+pub(crate) fn advance_walk(
     state: &GameState,
     walk: &CopyWalk,
     picks: &[RetargetPick],
     pick: &RetargetPick,
-) -> Result<bool, EngineError> {
+) -> Result<Vec<RetargetPick>, EngineError> {
     match walk.mode {
-        CopyChoiceMode::Retarget => Ok(copy_retarget_search(state, walk.copy_id)
-            .is_some_and(|search| search.admits(picks, pick))),
+        CopyChoiceMode::Retarget => {
+            let admitted = copy_retarget_search(state, walk.copy_id)
+                .is_some_and(|search| search.admits(picks, pick));
+            if !admitted {
+                return Err(EngineError::InvalidAction(format!(
+                    "{pick:?} is not an answerable pick for copy slot {}",
+                    picks.len()
+                )));
+            }
+            let mut next = picks.to_vec();
+            next.push(pick.clone());
+            Ok(next)
+        }
         CopyChoiceMode::Announce => {
-            let ability = copy_ability(state, walk.copy_id).ok_or_else(|| {
-                EngineError::InvalidAction("Copy is no longer on the stack".to_string())
-            })?;
-            let slots = build_target_slots(state, ability)?;
-            let progress = build_target_selection_progress_for_ability(
+            let Some(Announcement {
+                ability,
+                slots,
+                progress,
+            }) = announcement(state, walk.copy_id, picks.to_vec())?
+            else {
+                return Err(EngineError::InvalidAction(
+                    "Copy announces no targets".to_string(),
+                ));
+            };
+            if progress.current_slot >= slots.len() {
+                return Err(EngineError::InvalidAction(
+                    "Copy announcement has no undecided slot".to_string(),
+                ));
+            }
+            match choose_target_for_ability(
                 state,
                 ability,
                 &slots,
                 &ability.target_constraints,
-                picks.len(),
-                picks.to_vec(),
-            )?;
-            if progress.current_slot > picks.len() {
-                // CR 115.6 / CR 115.10a: the casting walk decides this position
-                // itself (an optional slot with no legal target is skipped, a
-                // binder is announced); only its own value replays.
-                return Ok(progress.selected_slots.get(picks.len()) == Some(pick));
+                &progress,
+                pick.clone(),
+            )? {
+                TargetSelectionAdvance::InProgress(next) => Ok(next.selected_slots),
+                TargetSelectionAdvance::Complete(selected) => Ok(selected),
             }
-            // CR 601.2c: a fresh announcement has nothing to keep.
-            Ok(pick
-                .as_ref()
-                .is_some_and(|target| progress.current_legal_targets.contains(target)))
         }
+    }
+}
+
+/// The walk's decided picks as the walk itself would publish them: the
+/// casting walk auto-advances announcement slots it decides alone; a retarget
+/// prefix is already in published form.
+fn published_picks(
+    state: &GameState,
+    walk: &CopyWalk,
+    picks: Vec<RetargetPick>,
+) -> Result<Vec<RetargetPick>, EngineError> {
+    match walk.mode {
+        CopyChoiceMode::Retarget => Ok(picks),
+        CopyChoiceMode::Announce => Ok(announcement(state, walk.copy_id, picks.clone())?
+            .map_or(picks, |announcement| announcement.progress.selected_slots)),
     }
 }
 
@@ -222,26 +315,28 @@ pub(crate) fn keep_rest_is_admissible(
 
 /// The copy's ability as it stands after the walk's final picks, without
 /// writing: the retarget validator's result (Retarget), or the production
-/// announcement assignment with pin capture (Announce).
+/// announcement assignment with pin capture (Announce). `Ok(None)` for a copy
+/// whose spell has no ability: there is nothing to write (CR 707.12).
 pub(crate) fn finalized_copy_ability(
     state: &GameState,
     walk: &CopyWalk,
     mut picks: Vec<RetargetPick>,
-) -> Result<ResolvedAbility, EngineError> {
+) -> Result<Option<ResolvedAbility>, EngineError> {
     match walk.mode {
         CopyChoiceMode::Retarget => {
             let search = copy_retarget_search(state, walk.copy_id).ok_or_else(|| {
                 EngineError::InvalidAction("Copy has no retargetable position".to_string())
             })?;
             picks.resize(search.len(), None);
-            search.validate(&picks)
+            search.validate(&picks).map(Some)
         }
         CopyChoiceMode::Announce => {
-            let mut ability = copy_ability(state, walk.copy_id).cloned().ok_or_else(|| {
-                EngineError::InvalidAction("Copy is no longer on the stack".to_string())
-            })?;
+            let Some(ability) = copy_ability(state, walk.copy_id)? else {
+                return Ok(None);
+            };
+            let mut ability = ability.clone();
             assign_selected_slots_in_chain(state, &mut ability, &picks)?;
-            Ok(ability)
+            Ok(Some(ability))
         }
     }
 }
@@ -295,6 +390,7 @@ pub(crate) fn legacy_walk_shape(
 pub(crate) fn walk_of(waiting_for: &WaitingFor) -> Option<(CopyWalk, Vec<RetargetPick>)> {
     let WaitingFor::CopyRetarget {
         player,
+        controller,
         copy_id,
         target_slots,
         effect_kind,
@@ -314,7 +410,7 @@ pub(crate) fn walk_of(waiting_for: &WaitingFor) -> Option<(CopyWalk, Vec<Retarge
     };
     Some((
         CopyWalk {
-            player: *player,
+            player: controller.unwrap_or(*player),
             copy_id: *copy_id,
             effect_kind: *effect_kind,
             effect_source_id: *effect_source_id,
@@ -361,19 +457,17 @@ pub(crate) fn open_copy_retarget_walk(
 /// CR 707.10c / CR 601.2c: rebuild a restored `CopyRetarget` walk before the
 /// state is published. A pre-mode save's mode and decided prefix are inferred
 /// (`legacy_walk_shape`); an explicit mode is kept. The decided picks are
-/// replayed through the reducer's own gate (`pick_is_admissible`) and the walk
+/// replayed through the reducer's own gate and advance (`advance_walk`) and the walk
 /// is truncated at the first pick the current board refuses, so the player is
 /// re-asked from there (CR 115.7d: an unfinished choice is still the
 /// player's). The prompt — the current slot's offered targets, its keep
 /// permission, `can_keep_rest`, and the reset suffix — is then re-derived.
 /// A fresh announcement with no legal announcement at all is not resumable:
 /// restore fails closed rather than publish an unanswerable prompt.
-pub(crate) fn restore_copy_target_walk(
-    state: &mut GameState,
-) -> Result<(), crate::types::game_state::PersistedRestoreError> {
-    use crate::types::game_state::PersistedRestoreError;
+pub(crate) fn restore_copy_target_walk(state: &mut GameState) -> Result<(), PersistedRestoreError> {
     let WaitingFor::CopyRetarget {
         player,
+        controller,
         copy_id,
         target_slots,
         effect_kind,
@@ -404,25 +498,36 @@ pub(crate) fn restore_copy_target_walk(
         )));
     }
     let walk = CopyWalk {
-        player: *player,
+        player: controller.unwrap_or(*player),
         copy_id: *copy_id,
         effect_kind: *effect_kind,
         effect_source_id: *effect_source_id,
         paradigm_remaining_offers: paradigm_remaining_offers.clone(),
         mode,
     };
-    if copy_ability(state, walk.copy_id).is_none() {
+    if copy_ability(state, walk.copy_id).is_err() {
         return Err(malformed(format!(
             "copy target walk names {:?}, which is not a copy on the stack",
             walk.copy_id
         )));
     }
+    // Replay: each saved pick must be the walk's own answer at its position,
+    // in published form (the casting walk's auto-advances included).
     let mut accepted: Vec<RetargetPick> = Vec::with_capacity(picks.len());
-    for pick in picks {
-        if !pick_is_admissible(state, &walk, &accepted, &pick).unwrap_or(false) {
-            break;
+    loop {
+        match published_picks(state, &walk, accepted.clone()) {
+            Ok(published) if picks.starts_with(&published) => accepted = published,
+            _ => break,
         }
-        accepted.push(pick);
+        let Some(pick) = picks.get(accepted.len()) else {
+            break;
+        };
+        match advance_walk(state, &walk, &accepted, pick) {
+            Ok(next) if next.len() > accepted.len() && picks.starts_with(&next) => {
+                accepted = next;
+            }
+            _ => break,
+        }
     }
     match walk_step(state, &walk, accepted.clone()) {
         Ok(Some(CopyWalkStep::Prompt(prompt))) => {

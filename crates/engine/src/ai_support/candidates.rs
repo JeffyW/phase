@@ -3202,8 +3202,9 @@ pub fn candidate_actions_broad_with_probe(
             }
         }
         // CR 707.10c / CR 601.2c: only the engine-derived answers — each
-        // offered alternative, a keep where `can_keep`, and "keep the rest"
-        // where `can_keep_rest` — so every candidate is answerable.
+        // offered alternative, a keep where `can_keep`, a decline where
+        // `can_decline`, and "keep the rest" where `can_keep_rest` — so every
+        // candidate is answerable.
         WaitingFor::CopyRetarget {
             player,
             target_slots,
@@ -3227,7 +3228,9 @@ pub fn candidate_actions_broad_with_probe(
                     )
                 })
                 .collect();
-            if slot.can_keep {
+            // CR 707.10c keep / CR 115.6 decline: both answer `None`, each
+            // only where the engine permits it.
+            if slot.can_keep || slot.can_decline {
                 out.push(candidate(
                     GameAction::ChooseTarget { target: None },
                     TacticalClass::Selection,
@@ -4089,10 +4092,12 @@ fn retarget_proposals(
             .map(|target| vec![Some(target.clone())])
             .collect(),
         // CR 115.7d: "the player may leave any number of the targets unchanged,
-        // even if those targets would be illegal." Leaving every target
-        // unchanged anchors the list; each single-slot substitution to another
-        // legal target is offered on top of it. The anchor goes through the same
-        // `slot_legal` reducer check as every other proposal — no carve-out.
+        // even if those targets would be illegal." Keeping every position
+        // (`None` at each) anchors the list; each single-position choice of a
+        // pool member is offered on top of it. `retarget_actions` keeps a
+        // proposal only when the reducer's own validator
+        // (`engine::validate_retarget_submission`) accepts it; the anchor goes
+        // through that same check as every other proposal — no carve-out.
         //
         // ENUMERATION BOUND, stated rather than left silent: this emits the
         // unchanged anchor plus every SINGLE-slot substitution. CR 115.7d permits
@@ -4108,7 +4113,7 @@ fn retarget_proposals(
             // CR 115.7a + INVARIANT SC (phase-rs/phase#8355 round-8 review
             // finding MED-1): mirrors `engine::apply_retarget`'s same guard.
             // `pool_for(slot)` degrades PER-INDEX past `effective_pools`'s own
-            // length, and `slot_legal`'s `retarget_slot_violation` zips
+            // length, and the validator's `retarget_slot_violation` zips
             // `bindings` against the submission — both silently stop
             // validating at `effective_pools.len()`/`bindings.len()`, so a
             // NON-EMPTY, short `effective_pools` would let this loop propose

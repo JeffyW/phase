@@ -74,9 +74,10 @@ pub struct TournamentRequestId(pub u64);
 ///      `GameAction::RetargetSpell.new_targets` is `[TargetRef | null]` (`null`
 ///      keeps a position's target, a bare target chooses it, so a v107 bare
 ///      vector still decodes as all-chosen), `RetargetChoice` gains
-///      `keep_is_distinct`, `CopyTargetSlot` gains `address` and `can_keep`, and
-///      `CopyRetarget` gains `mode`, `picks` and `can_keep_rest` (all serde
-///      default). A v107 peer cannot parse a `null` pick, and the client renders
+///      `keep_is_distinct`, `CopyTargetSlot` gains `address`, `can_keep` and
+///      `can_decline`, and `CopyRetarget` gains `controller` (the copy's
+///      controller when an announcement slot's chooser answers), `mode`,
+///      `picks` and `can_keep_rest` (all serde default). A v107 peer cannot parse a `null` pick, and the client renders
 ///      the keep permissions only from the engine's fields. Lobby messages are
 ///      unchanged, and P2P moves in lockstep (wire 90).
 /// 107 — `UntilCondition::NextMatches` gains `count` ("until you exile two

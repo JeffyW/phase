@@ -112,7 +112,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *       peers are browsers and neither validates the shape, so a v89 peer
  *       would take the new shape with no decode error; first contact rejects
  *       the skew instead. The same state carries positional retarget picks
- *       (null keeps) and the engine-derived copy-walk keep permissions.
+ *       (null keeps) and the engine-derived copy-walk keep and decline
+ *       permissions.
  *       Bumped in lockstep with full-game protocol 108.
  *  89 — game_setup and state_update carry GameState, whose exile-until
  *       loops now carry a match count, whose paused loop keeps its hits,

@@ -248,12 +248,13 @@ pub(crate) fn open_copy_target_selection(
             // the production announcement assignment directly.
             let post = super::copy_choice::finalized_copy_ability(state, &walk, picks)
                 .map_err(|e| format!("{e:?}"))?;
-            if let Some(ability) = state
-                .stack
-                .iter_mut()
-                .find(|e| e.id == copy_id)
-                .and_then(|entry| entry.ability_mut())
-            {
+            if let Some((post, ability)) = post.zip(
+                state
+                    .stack
+                    .iter_mut()
+                    .find(|e| e.id == copy_id)
+                    .and_then(|entry| entry.ability_mut()),
+            ) {
                 *ability = post;
             }
             Ok(false)
@@ -592,6 +593,44 @@ mod tests {
     use crate::types::player::PlayerId;
     use crate::types::replacements::ReplacementEvent;
     use crate::types::zones::Zone;
+
+    /// CR 707.12 + CR 601.2c: the copy-announcement opener separates a copy
+    /// that is not on the stack (an error) from a copy whose spell has no
+    /// ability, e.g. a vanilla creature card (nothing to announce: a successful
+    /// no-walk case that opens no prompt).
+    #[test]
+    fn open_copy_target_selection_separates_missing_from_no_ability() {
+        let mut state = GameState::new_two_player(42);
+        let copy_id = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Vanilla Copy".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(StackEntry {
+            id: copy_id,
+            source_id: copy_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(900),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        let before = state.waiting_for.clone();
+        assert_eq!(
+            open_copy_target_selection(&mut state, copy_id, PlayerId(0), None),
+            Ok(false),
+            "a copy with no spell ability announces nothing"
+        );
+        assert_eq!(state.waiting_for, before, "no prompt is armed");
+        assert!(
+            open_copy_target_selection(&mut state, ObjectId(9_999), PlayerId(0), None).is_err(),
+            "a copy that is not on the stack is an error"
+        );
+    }
 
     // CR 722.3a-b: Parser tests for "becomes prepared" / "becomes unprepared"
     // imperative patterns.

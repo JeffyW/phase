@@ -219,9 +219,10 @@ export class NativeEngineVersionMismatchError extends Error {
  *      error; the exact-match version check at connect refuses the pairing
  *      instead. The same version makes retarget picks positional:
  *      RetargetSpell.new_targets is (TargetRef | null)[] (null keeps), and the
- *      copy walk's keep permissions (CopyTargetSlot.can_keep,
- *      CopyRetarget.can_keep_rest) are engine fields this client renders
- *      without a fallback.
+ *      copy walk's keep/decline permissions (CopyTargetSlot.can_keep and
+ *      can_decline, CopyRetarget.can_keep_rest) are engine fields this client
+ *      renders without a fallback; CopyRetarget.controller names the copy's
+ *      controller when a slot's chooser answers.
  * 107 — UntilCondition NextMatches gains count ("until you exile two nonland
  *      cards …" — Invasion of Alara, CR 608.2c), the paused exile loop keeps
  *      its hits, ZoneChoiceCandidateSource gains ParentTargets, and

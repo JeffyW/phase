@@ -2008,9 +2008,11 @@ export type TargetRef =
   | { Player: PlayerId };
 
 /**
- * One position of a copy target walk (CR 707.10c / CR 601.2c). `can_keep` is
- * engine-derived: keeping this position's target (`ChooseTarget` with `null`)
- * still completes. `address` names the chain position (absent on an
+ * One position of a copy target walk (CR 707.10c / CR 601.2c). Both
+ * permissions are engine-derived and both are answered with `ChooseTarget`
+ * `null`: `can_keep` (a retarget walk: keeping this position's target still
+ * completes) and `can_decline` (an announcement: this optional slot may be
+ * declined, CR 115.6). `address` names the chain position (absent on an
  * announcement).
  */
 export type CopyTargetSlot = {
@@ -2018,6 +2020,7 @@ export type CopyTargetSlot = {
   legal_alternatives: TargetRef[];
   address?: RetargetSlotAddress | null;
   can_keep?: boolean;
+  can_decline?: boolean;
 };
 
 /** Whether a copy target walk retargets an existing copy or announces a fresh one. */
@@ -2833,7 +2836,7 @@ export type WaitingFor =
       all_kept: ObjectId[];
       scoped_players: PlayerId[];
     } }
-  | { type: "CopyRetarget"; data: { player: PlayerId; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number; mode?: CopyChoiceMode | null; picks?: (TargetRef | null)[] | null; can_keep_rest?: boolean } }
+  | { type: "CopyRetarget"; data: { player: PlayerId; controller?: PlayerId | null; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number; mode?: CopyChoiceMode | null; picks?: (TargetRef | null)[] | null; can_keep_rest?: boolean } }
   // CR 700.3 + CR 700.3a: Subject is partitioning their own eligible objects
   // into two piles for an `Effect::SeparateIntoPiles`. `player` is the
   // CR 608.2d + CR 700.3: Controller chooses which opponent separates piles (multiplayer).

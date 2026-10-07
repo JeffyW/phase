@@ -165,7 +165,11 @@ export function TargetingOverlay() {
     ? (waitingFor.data.current_slot ?? 0)
     : (selection?.current_slot ?? 0);
   const activeSlot = targetSlots[currentTargetSlot];
-  const isOptionalCurrentSlot = activeSlot?.optional === true;
+  // CR 115.6: an optional slot may be declined. A copy announcement's decline
+  // permission is engine-derived (`can_decline`); the overlay only renders it.
+  const isOptionalCurrentSlot = isCopyRetarget
+    ? waitingFor.data.target_slots[currentTargetSlot]?.can_decline === true
+    : activeSlot?.optional === true;
   // CR 601.2c: display-only hint that this slot is announced by a non-controller
   // ("of an opponent's choice", e.g. Volcanic Offering). The engine routes the
   // prompt's `WaitingFor.player` to that announcer — who is exactly the viewer of

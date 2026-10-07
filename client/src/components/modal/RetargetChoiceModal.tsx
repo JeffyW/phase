@@ -24,7 +24,12 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
   const hoverProps = useInspectHoverProps();
 
   const slotCount = Math.max(data.current_targets.length, 1);
-  const isMultiSlot = data.scope.type === "All" && slotCount > 1;
+  // CR 115.7d: "choose new targets" (All scope) may leave any position
+  // unchanged, so it offers Keep at every position count, one included.
+  // "Change the target" (Single scope) has nothing to keep. Slot chips are a
+  // separate question: they only appear when there is more than one position.
+  const permitsKeep = data.scope.type === "All";
+  const isMultiSlot = permitsKeep && slotCount > 1;
 
   // CR 115.7d: every position starts KEPT (`null`), which leaves its target
   // unchanged with its announced object. A chosen target is sent as itself.
@@ -61,11 +66,11 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
   }, [data.current_targets, data.keep_is_distinct, setSlot]);
 
   const handleConfirm = useCallback(() => {
-    const payload = isMultiSlot
+    const payload = permitsKeep
       ? selected.slice(0, slotCount)
       : selected.slice(0, 1);
     dispatch({ type: "RetargetSpell", data: { new_targets: payload } });
-  }, [dispatch, isMultiSlot, selected, slotCount]);
+  }, [dispatch, permitsKeep, selected, slotCount]);
 
   const scopeLabel =
     data.scope.type === "Single"
@@ -77,11 +82,11 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
     .join(", ");
 
   const confirmDisabled = useMemo(
-    () => (isMultiSlot ? selected.length < slotCount : selected[0] == null),
-    [isMultiSlot, selected, slotCount],
+    () => (permitsKeep ? selected.length < slotCount : selected[0] == null),
+    [permitsKeep, selected, slotCount],
   );
 
-  const activeSelection = isMultiSlot ? selected[activeSlot] : selected[0];
+  const activeSelection = permitsKeep ? selected[activeSlot] : selected[0];
 
   // CR 115.7d + INVARIANT SC (phase-rs/phase#8355 round-8 review finding
   // MED-2): admission is PER-SLOT (`engine::apply_retarget`'s `pool_for`),
@@ -92,7 +97,7 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
   // outer-empty compat payload, INVARIANT SC) falls back to the union,
   // which is what a `Legacy`-enforced or pre-field prompt's pool equals
   // anyway.
-  const renderSlot = isMultiSlot ? activeSlot : 0;
+  const renderSlot = permitsKeep ? activeSlot : 0;
   const slotOptions = data.slot_pools[renderSlot] ?? data.legal_new_targets;
 
   return (
@@ -107,7 +112,7 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
         />
       }
     >
-      {isMultiSlot && (
+      {permitsKeep && (
         <div className="mb-4 flex flex-wrap justify-center gap-2">
           <button
             type="button"
@@ -120,7 +125,7 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
           >
             {t("retargetChoice.keep")}
           </button>
-          {data.current_targets.map((current, index) => {
+          {isMultiSlot && data.current_targets.map((current, index) => {
             const chosen = selected[index];
             const isActive = index === activeSlot;
             return (
@@ -163,7 +168,7 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
               transition={{ delay: 0.1 + index * 0.08, duration: 0.35 }}
               whileHover={{ scale: 1.05, y: -6 }}
               onClick={() => (
-                isMultiSlot
+                permitsKeep
                   ? handleSelectSlot(activeSlot, target)
                   : handleSelectSingle(target)
               )}

@@ -377,12 +377,14 @@ fn legacy_copy_retarget_completion_uses_copy_as_default_source() {
 
     state.waiting_for = WaitingFor::CopyRetarget {
         player: PlayerId(0),
+        controller: None,
         copy_id,
         target_slots: vec![crate::types::game_state::CopyTargetSlot {
             current: Some(crate::types::ability::TargetRef::Player(PlayerId(1))),
             legal_alternatives: Vec::new(),
             address: None,
             can_keep: false,
+            can_decline: false,
         }],
         effect_kind: EffectKind::CopySpell,
         effect_source_id: None,

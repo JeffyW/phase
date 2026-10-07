@@ -27,16 +27,26 @@
 use engine::game::combat::AttackTarget;
 use engine::game::effects::attach;
 use engine::game::game_object::AttachTarget;
+use engine::game::interaction::{
+    bind_interaction_authority, derive_viewer_interaction, preview_interaction, submit_interaction,
+};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::visibility::filter_state_for_viewer;
 use engine::game::zone_pipeline::{move_object_for_test, ZoneMoveRequest};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityDefinition, AttachmentReferent, Effect, FilterProp, TargetFilter, TargetRef,
+    AbilityDefinition, AbilityKind, AttachmentReferent, Effect, FilterProp, QuantityExpr,
+    QuantityRef, TapStateChange, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization, WaitingFor};
 use engine::types::identifiers::ObjectId;
+use engine::types::interaction::{
+    InteractionOpportunityResponse, InteractionPreviewRequest, InteractionPreviewStatus,
+    InteractionReasonCode, InteractionResponse, InteractionSessionId, InteractionSubmission,
+    PreviewRequestId,
+};
 use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -190,6 +200,82 @@ fn fires_of_mount_doom_trigger_body_binds_slot_zero() {
         panic!("expected DestroyAll, got {effects:?}");
     };
     assert_eq!(declared_slots(target), vec![0]);
+}
+
+/// RUNTIME (CR 603.3d + CR 601.2c + CR 608.2b + CR 701.8a): Fires of Mount
+/// Doom is cast and enters; its ETB trigger announces "target creature an
+/// opponent controls" through `TriggerTargetSelection` (the trigger path, whose
+/// writer journals the trigger body's pin, not the cast path). On resolution it
+/// deals 2 damage to that creature and destroys exactly the Equipment attached
+/// to it: Equipment on another creature and unattached Equipment survive.
+#[test]
+fn fires_of_mount_doom_etb_destroys_only_the_targets_equipment() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let victim = scenario.add_creature(P1, "Victim", 2, 7).id();
+    let other = scenario.add_creature(P1, "Other", 2, 7).id();
+    let mine = scenario.add_creature(P0, "Mine", 2, 7).id();
+    let on_victim = equipment(&mut scenario, P1, "On Victim");
+    let on_other = equipment(&mut scenario, P1, "On Other");
+    let loose = equipment(&mut scenario, P1, "Unattached");
+    let fires = scenario
+        .add_spell_to_hand_from_oracle(P0, "Fires of Mount Doom", false, FIRES_OF_MOUNT_DOOM)
+        .as_enchantment()
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), on_victim, victim);
+    attach::attach_to(runner.state_mut(), on_other, other);
+    runner.cast(fires).commit();
+    let mut offered: Option<Vec<TargetRef>> = None;
+    for _ in 0..32 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection {
+                target_slots,
+                selection,
+                ..
+            } => {
+                offered = Some(target_slots[selection.current_slot].legal_targets.clone());
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(victim)),
+                    })
+                    .expect("the victim is a legal trigger target");
+            }
+            WaitingFor::Priority { .. } => {
+                if offered.is_some() && runner.state().stack.is_empty() {
+                    break;
+                }
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+    let offered = offered.expect("reach guard: the ETB trigger asked for its target");
+    assert!(offered.contains(&TargetRef::Object(victim)));
+    assert!(offered.contains(&TargetRef::Object(other)));
+    assert!(
+        !offered.contains(&TargetRef::Object(mine)),
+        "an opponent's creature only"
+    );
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&fires].zone,
+        Zone::Battlefield,
+        "Fires entered"
+    );
+    assert_eq!(
+        state.objects[&victim].damage_marked, 2,
+        "2 damage to the target"
+    );
+    assert_eq!(state.objects[&other].damage_marked, 0);
+    assert_eq!(
+        state.objects[&on_victim].zone,
+        Zone::Graveyard,
+        "the target's Equipment is destroyed"
+    );
+    assert_eq!(state.objects[&on_other].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&loose].zone, Zone::Battlefield);
 }
 
 /// SHAPE: Fiery Annihilation's Equipment target is narrowed to slot 0's
@@ -1503,13 +1589,44 @@ fn two_target_head_retargeted_onto_one_object_reads_its_pin() {
     assert_eq!(state.objects[&eq_b].zone, Zone::Battlefield);
 }
 
-/// H2 negative (CR 400.7): a declared slot whose declaring node holds no pin,
-/// or a stale pin, names nothing — the pin is never recovered from the live
-/// row, so no Equipment is destroyed though the damage is dealt.
+/// H2 negative (CR 400.7 + CR 608.2b): the declaring damage node's pin for its
+/// creature is mutated after announcement. The two arms take different routes,
+/// and each is asserted on its own:
+///
+/// - STALE pin, the ILLEGAL-TARGET CONTROL: the occurrence names an
+///   incarnation that is not the live object, so the node fails its own
+///   legality check when the spell resolves. Its slot is a hole: no damage, and
+///   the attachment reader returns at the illegal-slot check without reading.
+/// - MISSING pin, a REACHED reader: an unpinned occurrence is not judged stale,
+///   so the damage IS dealt (the slot is legal and the reader runs), but the
+///   reader has no announcement pin and never recovers one from the live row.
+///   It names no referent, and Equipment A survives.
+///
+/// The player part resolves in both. Positive guard: the unmodified control
+/// deals the 2 damage and destroys Equipment A. A stale pin that DOES reach the
+/// reader (stale only after the legality check) is
+/// `stale_pin_after_legality_reads_the_exit_record_not_the_live_object`.
 #[test]
 fn missing_or_stale_pin_names_no_referent() {
     const TEXT: &str =
         "Target player loses 1 life. ~ deals 2 damage to target creature. Destroy all Equipment attached to that creature.";
+    let mut control = loj_board(TEXT, "Probe", 7);
+    let outcome = control
+        .runner
+        .cast(control.spell)
+        .target_player(P1)
+        .target_objects(&[control.victim])
+        .resolve();
+    assert_eq!(
+        outcome.state().objects[&control.victim].damage_marked,
+        2,
+        "positive guard: an intact pin deals the damage"
+    );
+    assert_eq!(
+        outcome.zone_of(control.eq_a),
+        Zone::Graveyard,
+        "positive guard"
+    );
     for stale in [false, true] {
         let mut b = loj_board(TEXT, "Probe", 7);
         let mut commit = b
@@ -1538,11 +1655,94 @@ fn missing_or_stale_pin_names_no_referent() {
         let outcome = commit.resolve();
         outcome.assert_life_delta(P1, -1);
         assert_eq!(
+            outcome.state().objects[&b.victim].damage_marked,
+            if stale { 0 } else { 2 },
+            "stale={stale}: a stale pin makes the node's own target illegal \
+             (CR 608.2b); a missing pin leaves it legal and reaches the reader"
+        );
+        assert_eq!(
             outcome.zone_of(b.eq_a),
             Zone::Battlefield,
             "stale={stale}: no referent"
         );
     }
+}
+
+/// Append `tail` at the end of `def`'s sub-ability chain.
+fn append_sub_ability(def: &mut AbilityDefinition, tail: AbilityDefinition) {
+    match def.sub_ability.as_deref_mut() {
+        Some(next) => append_sub_ability(next, tail),
+        None => def.sub_ability = Some(Box::new(tail)),
+    }
+}
+
+/// H2, the REACHED stale reader (CR 608.2b + CR 608.2h + CR 400.7): the
+/// declared creature is legal when the spell starts to resolve, and only goes
+/// stale DURING resolution. An engine-composed spell exiles target creature
+/// and returns it (a new object, CR 400.7), then "Destroy all Equipment
+/// attached to that creature". The reader runs with the announcement pin,
+/// which no longer names the live object. It never recovers the live row:
+/// it reads the exit record of exactly the pinned incarnation (CR 608.2h), so
+/// Equipment A, attached when the creature left, is destroyed; Equipment C on
+/// another creature survives. Reach guards: the creature really left and came
+/// back (the exile node was not pruned), and slot 0 was not an illegal hole.
+#[test]
+fn stale_pin_after_legality_reads_the_exit_record_not_the_live_object() {
+    const BLINK: &str =
+        "Exile target creature, then return that card to the battlefield under its owner's control.";
+    const DESTROY_ATTACHED: &str =
+        "Tap target creature. Destroy all Equipment attached to that creature.";
+    let types = types("Instant");
+    let mut root = parse_oracle_text(BLINK, "Blink Probe", &[], &types, &[])
+        .abilities
+        .remove(0);
+    assert!(
+        unimplemented_names(&[&root]).is_empty(),
+        "reach guard: the blink parses supported"
+    );
+    let destroy = parse_oracle_text(DESTROY_ATTACHED, "Destroy Probe", &[], &types, &[])
+        .abilities
+        .remove(0)
+        .sub_ability
+        .expect("the destroy node");
+    let Effect::DestroyAll { target, .. } = destroy.effect.as_ref() else {
+        panic!("expected DestroyAll, got {:?}", destroy.effect);
+    };
+    assert_eq!(declared_slots(target), vec![0], "reach guard: reads slot 0");
+    append_sub_ability(&mut root, *destroy);
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let victim = scenario.add_creature(P1, "Victim", 2, 7).id();
+    let other = scenario.add_creature(P1, "Other", 2, 7).id();
+    let eq_a = equipment(&mut scenario, P1, "Equipment A");
+    let eq_c = equipment(&mut scenario, P1, "Equipment C");
+    let spell = scenario
+        .add_spell_to_hand(P0, "Blink Probe", true)
+        .with_mana_cost(ManaCost::zero())
+        .with_ability_definition(root)
+        .id();
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq_a, victim);
+    attach::attach_to(runner.state_mut(), eq_c, other);
+    let before = runner.state().objects[&victim].incarnation;
+    let outcome = runner.cast(spell).target_objects(&[victim]).resolve();
+    let state = outcome.state();
+    assert_eq!(
+        state.objects[&victim].zone,
+        Zone::Battlefield,
+        "reach: returned"
+    );
+    assert!(
+        state.objects[&victim].incarnation > before,
+        "reach guard: the creature left and returned during resolution"
+    );
+    assert_eq!(
+        state.objects[&eq_a].zone,
+        Zone::Graveyard,
+        "the pinned incarnation's exit record names Equipment A"
+    );
+    assert_eq!(state.objects[&eq_c].zone, Zone::Battlefield);
 }
 
 /// H2 (CR 608.2b + CR 400.7): the creature is blinked before resolution and its
@@ -1969,7 +2169,23 @@ fn equipment_pin(runner: &GameRunner, spell: ObjectId, eq: ObjectId) -> u64 {
 #[test]
 fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
     let mut board = stale_equipment_board(|b| b.twincast, |b| b.a);
-    let (a, b, eq1) = (board.a, board.b, board.eq1);
+    let (a, b, eq1, fiery) = (board.a, board.b, board.eq1, board.fiery);
+    let WaitingFor::CopyRetarget { copy_id, .. } = board.runner.state().waiting_for else {
+        panic!("expected the copy walk");
+    };
+    assert_ne!(
+        copy_id, fiery,
+        "the walk is the Twincast copy, not the original"
+    );
+    assert!(
+        board
+            .runner
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.id == fiery),
+        "reach guard: the original is still on the stack below the copy"
+    );
     assert!(
         copy_alternatives(&board.runner).contains(&TargetRef::Object(b)),
         "the stale Equipment target does not block B"
@@ -1984,13 +2200,11 @@ fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
         .runner
         .act(GameAction::ChooseTarget { target: None })
         .expect("the stale Equipment target is kept");
-    let copy_id = board
-        .runner
-        .state()
-        .stack
-        .back()
-        .map(|entry| entry.id)
-        .expect("the copy is on the stack");
+    assert_eq!(
+        equipment_pin(&board.runner, fiery, eq1),
+        0,
+        "control: the original's own announced pin"
+    );
     assert_eq!(
         equipment_pin(&board.runner, copy_id, eq1),
         0,
@@ -2666,9 +2880,6 @@ fn same_object_in_two_positions_partial_change_elects_per_position() {
 /// reads declared slot 0. Returns `(runner, spell, a, e, c)` with `[A, E]`
 /// announced, Equipment E (mana value 1) on creature A, and creature C.
 fn derived_mana_value_board() -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId) {
-    use engine::types::ability::{
-        AbilityKind, QuantityExpr, QuantityRef, TapStateChange, TypedFilter,
-    };
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
@@ -2872,17 +3083,6 @@ fn m2_partial_retarget_refuses_electing_equipment_not_on_the_new_creature() {
 /// keep id at another position, or twice, is not a legal answer.
 #[test]
 fn m2_partial_retarget_through_the_interaction_surface() {
-    use engine::game::interaction::{
-        bind_interaction_authority, derive_viewer_interaction, preview_interaction,
-        submit_interaction,
-    };
-    use engine::game::visibility::filter_state_for_viewer;
-    use engine::types::interaction::{
-        InteractionOpportunityResponse, InteractionPreviewRequest, InteractionPreviewStatus,
-        InteractionReasonCode, InteractionResponse, InteractionSessionId, InteractionSubmission,
-        PreviewRequestId,
-    };
-
     let board = m2_board(|board| board.a);
     let (b, eq1) = (board.b, board.eq1);
     let mut state = board.runner.state().clone();
@@ -2967,4 +3167,100 @@ fn m2_partial_retarget_through_the_interaction_surface() {
     runner.advance_until_stack_empty();
     assert_eq!(runner.state().objects[&b].zone, Zone::Exile);
     assert_eq!(runner.state().objects[&eq1].zone, Zone::Battlefield);
+}
+
+// ---------------------------------------------------------------------------
+// Keep actions preserve pins (CR 400.7 + CR 115.7d + CR 707.10c)
+// ---------------------------------------------------------------------------
+
+/// Fiery Annihilation at A; A is then blinked (a new object, CR 400.7) before
+/// Twincast. Keeping the copy's creature, by "keep the rest"
+/// (`KeepAllCopyTargets`) or by keeping the position (`ChooseTarget(None)`),
+/// leaves it UNCHANGED with its announced pin: the copy still names the
+/// departed A, so the returned A takes no damage. Choosing A is a distinct
+/// election of the returned object (re-pinned) and the copy hits it: the
+/// control proving the election is available, and that keep never silently
+/// becomes it.
+#[test]
+fn keeping_a_blinked_creature_keeps_its_announced_pin() {
+    for action in ["keep-rest", "keep-position", "elect"] {
+        let mut board = copy_board();
+        let (a, fiery, twincast) = (board.a, board.fiery, board.twincast);
+        fiery_then(&mut board, &[a], |state| blink(state, a), twincast);
+        let WaitingFor::CopyRetarget {
+            copy_id,
+            target_slots,
+            current_slot,
+            can_keep_rest,
+            ..
+        } = board.runner.state().waiting_for.clone()
+        else {
+            panic!("{action}: expected the copy walk");
+        };
+        assert_ne!(copy_id, fiery, "{action}: the walk is the Twincast copy");
+        assert_eq!(root_pin(&board.runner, copy_id, a), 0, "{action}: reach");
+        assert!(
+            target_slots[current_slot].can_keep && can_keep_rest,
+            "{action}: keeping is answerable"
+        );
+        assert!(
+            target_slots[current_slot]
+                .legal_alternatives
+                .contains(&TargetRef::Object(a)),
+            "{action}: electing the returned A is offered (distinct)"
+        );
+        match action {
+            "keep-rest" => {
+                board
+                    .runner
+                    .act(GameAction::KeepAllCopyTargets)
+                    .expect("keep the rest");
+            }
+            "keep-position" => {
+                board
+                    .runner
+                    .act(GameAction::ChooseTarget { target: None })
+                    .expect("keep A");
+                if matches!(
+                    board.runner.state().waiting_for,
+                    WaitingFor::CopyRetarget { .. }
+                ) {
+                    board
+                        .runner
+                        .act(GameAction::KeepAllCopyTargets)
+                        .expect("keep the rest");
+                }
+            }
+            _ => {
+                board
+                    .runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(a)),
+                    })
+                    .expect("elect the returned A");
+                if matches!(
+                    board.runner.state().waiting_for,
+                    WaitingFor::CopyRetarget { .. }
+                ) {
+                    board
+                        .runner
+                        .act(GameAction::KeepAllCopyTargets)
+                        .expect("keep the rest");
+                }
+            }
+        }
+        let returned = board.runner.state().objects[&a].incarnation;
+        let elected = action == "elect";
+        assert_eq!(
+            root_pin(&board.runner, copy_id, a),
+            if elected { returned } else { 0 },
+            "{action}: keep preserves the announced pin; elect re-pins"
+        );
+        board.runner.advance_until_stack_empty();
+        assert_eq!(
+            board.runner.state().objects[&a].damage_marked,
+            if elected { 5 } else { 0 },
+            "{action}: only an elected returned A is hit"
+        );
+    }
 }

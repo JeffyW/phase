@@ -9992,12 +9992,13 @@ fn finalize_copy_walk(
     // CR 707.10c + CR 115.7d + CR 115.7e: the final set is checked as a whole
     // before anything is written; a violation rejects the submission atomically.
     let post = effects::copy_choice::finalized_copy_ability(state, walk, picks)?;
-    if let Some(ability) = state
-        .stack
-        .iter_mut()
-        .find(|e| e.id == walk.copy_id)
-        .and_then(|entry| entry.ability_mut())
-    {
+    if let Some((post, ability)) = post.zip(
+        state
+            .stack
+            .iter_mut()
+            .find(|e| e.id == walk.copy_id)
+            .and_then(|entry| entry.ability_mut()),
+    ) {
         *ability = post;
     }
     let player = walk.player;
@@ -15264,17 +15265,11 @@ fn apply_non_priority_pass_action(
         // keep only where keeping completes; a choice only where it has a
         // legal completion), then the walk advances or finalizes.
         (WaitingFor::CopyRetarget { .. }, GameAction::ChooseTarget { target }) => {
-            let (walk, mut picks) = effects::copy_choice::walk_of(&state.waiting_for)
+            let (walk, picks) = effects::copy_choice::walk_of(&state.waiting_for)
                 .ok_or_else(|| {
                     EngineError::InvalidAction("Copy target walk is not normalized".to_string())
                 })?;
-            if !effects::copy_choice::pick_is_admissible(state, &walk, &picks, &target)? {
-                return Err(EngineError::InvalidAction(format!(
-                    "{target:?} is not an answerable pick for copy slot {}",
-                    picks.len()
-                )));
-            }
-            picks.push(target);
+            let picks = effects::copy_choice::advance_walk(state, &walk, &picks, &target)?;
             advance_copy_walk(state, &walk, picks, &mut events)?;
             state.waiting_for.clone()
         }

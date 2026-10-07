@@ -185,6 +185,7 @@ mod consuming_vapors_rebound;
 mod converge_colors_spent_trigger_lifetime;
 mod copied_ability_transform_generation;
 mod copied_cost_choices_phase1;
+mod copy_announcement_walk;
 mod copy_gy_creature_mana_value_x;
 mod copy_retarget_past_rider;
 mod copy_target_walk_restore;

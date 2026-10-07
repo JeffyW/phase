@@ -937,9 +937,11 @@ fn issue_3660_finalize_copy_retarget_stashes_offers_on_deferred_pause() {
         legal_alternatives: vec![TargetRef::Player(PlayerId(1))],
         address: None,
         can_keep: false,
+        can_decline: false,
     }];
     state.waiting_for = WaitingFor::CopyRetarget {
         player,
+        controller: None,
         copy_id,
         target_slots: slots.clone(),
         effect_kind: EffectKind::Draw,

@@ -11,6 +11,7 @@ use crate::game::quantity::{
     counter_count_from_map, quantity_expr_characteristic_reads_at, resolve_quantity,
     resolve_quantity_with_targets,
 };
+use crate::game::targeting::{DeclaredSlotBinding, SlotReferent};
 use crate::types::ability::{
     AttachmentReferent, AttackerBlockStatus, CardTypeSetSource, CastManaSpentMetric, ChoiceValue,
     ChosenAttribute, CombatRelation, CombatRelationSubject, ControllerRef, CountScope, FilterProp,
@@ -1713,7 +1714,6 @@ fn attached_to_declared_slot(
     candidate: &GameObject,
     candidate_id: ObjectId,
 ) -> bool {
-    use crate::game::targeting::{DeclaredSlotBinding, SlotReferent};
     if let Some(view) = source.declared_slot_view {
         let referent = match view.get(slot).cloned().flatten() {
             Some(DeclaredSlotBinding::Elected(TargetRef::Object(id))) => {

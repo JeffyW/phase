@@ -12437,12 +12437,21 @@ fn parse_empower_jace(lower: &str) -> Option<Effect> {
 /// clause whose referent binds to a numbered declared target slot
 /// ([`bind_attachment_qualifier`]). Only the destroy verb lowers the relation;
 /// every other mass verb keeps the fail-closed `attached_to_qualifier` gap.
-fn destroy_clause_binds_attachment_qualifier(text: &str, lower: &str, ctx: &ParseContext) -> bool {
+/// The one real parse decides the route: it runs on a tentative context that
+/// is merged back only when it succeeds, so the gap route leaves `ctx`
+/// untouched.
+fn parse_mass_destroy_attached_to_declared_slot(
+    text: &str,
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ZoneCounterImperativeAst> {
     nom_on_lower(text, lower, |input| {
         value((), alt((tag("destroy all "), tag("destroy each ")))).parse(input)
-    })
-    .is_some()
-        && parse_destroy_ast(text, lower, &mut ctx.clone_throwaway()).is_some()
+    })?;
+    let mut tentative_ctx = ctx.clone();
+    let ast = parse_destroy_ast(text, lower, &mut tentative_ctx)?;
+    *ctx = tentative_ctx;
+    Some(ast)
 }
 
 pub(super) fn parse_imperative_family_ast(
@@ -12454,13 +12463,16 @@ pub(super) fn parse_imperative_family_ast(
     let lower = lower.trim_start();
     let first_word = lower.split_whitespace().next().unwrap_or("");
 
-    if mass_verb_clause_opens_attachment_qualifier(text, lower, ctx)
-        && !destroy_clause_binds_attachment_qualifier(text, lower, ctx)
-    {
-        return Some(ImperativeFamilyAst::GainKeyword(Effect::unimplemented(
-            ATTACHED_TO_QUALIFIER_GAP,
-            text,
-        )));
+    if mass_verb_clause_opens_attachment_qualifier(text, lower, ctx) {
+        return Some(
+            match parse_mass_destroy_attached_to_declared_slot(text, lower, ctx) {
+                Some(ast) => ImperativeFamilyAst::ZoneCounter(ast),
+                None => ImperativeFamilyAst::GainKeyword(Effect::unimplemented(
+                    ATTACHED_TO_QUALIFIER_GAP,
+                    text,
+                )),
+            },
+        );
     }
 
     // CR 701.60a: "[subject] no longer suspected" — the un-designation

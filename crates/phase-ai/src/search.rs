@@ -2112,7 +2112,8 @@ pub fn fallback_action(
         // Copy retarget: keep the copied targets where the engine says keeping
         // the rest completes; else keep this position where keeping is
         // answerable; a freshly announced copy (nothing to keep) chooses the
-        // first offered target for the current slot.
+        // first offered target for the current slot, or declines an optional
+        // slot that offers none.
         WaitingFor::CopyRetarget {
             target_slots,
             current_slot,
@@ -2130,6 +2131,10 @@ pub fn fallback_action(
                     .cloned()
                     .map(|target| GameAction::ChooseTarget {
                         target: Some(target),
+                    })
+                    .or_else(|| {
+                        slot.can_decline
+                            .then_some(GameAction::ChooseTarget { target: None })
                     })
             }
         }
@@ -11639,8 +11644,6 @@ mod tests {
     /// of `chain` (its declared target, or none for a fresh copy announcing),
     /// chained as sub-abilities, with announcement pins captured.
     fn copy_on_stack(state: &mut GameState, chain: &[Option<ObjectId>]) -> ObjectId {
-        use engine::types::ability::{ResolvedAbility, TypedFilter};
-        use engine::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
         let copy_id = create_object(
             state,
             CardId(20),
@@ -11694,6 +11697,7 @@ mod tests {
                 .collect(),
             address: None,
             can_keep,
+            can_decline: false,
         }
     }
 
@@ -11705,6 +11709,7 @@ mod tests {
         let copy_id = copy_on_stack(&mut state, &[Some(original)]);
         state.waiting_for = WaitingFor::CopyRetarget {
             player: PlayerId(0),
+            controller: None,
             copy_id,
             target_slots: vec![copy_slot(Some(original), &[other], true)],
             effect_kind: EffectKind::CopySpell,
@@ -11731,6 +11736,7 @@ mod tests {
         let copy_id = copy_on_stack(&mut state, &[Some(first), Some(second)]);
         state.waiting_for = WaitingFor::CopyRetarget {
             player: PlayerId(0),
+            controller: None,
             copy_id,
             target_slots: vec![
                 copy_slot(Some(first), &[other], true),
@@ -11765,6 +11771,7 @@ mod tests {
         let copy_id = copy_on_stack(&mut state, &[None]);
         state.waiting_for = WaitingFor::CopyRetarget {
             player: PlayerId(0),
+            controller: None,
             copy_id,
             target_slots: vec![copy_slot(None, &[first, other], false)],
             effect_kind: EffectKind::CopySpell,

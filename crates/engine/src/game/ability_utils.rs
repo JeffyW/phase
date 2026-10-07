@@ -12521,8 +12521,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AttachCardinality, CopyRecipient, ManaProduction, ManaTargetRole, PreventionAmount,
-        PreventionScope,
+        AttachCardinality, AttachmentReferent, CopyRecipient, ManaProduction, ManaTargetRole,
+        PreventionAmount, PreventionScope,
     };
     use crate::types::ability::{CombatRelation, CombatRelationSubject};
 
@@ -15622,8 +15622,6 @@ mod tests {
     /// never supplies information.
     #[test]
     fn pass_through_tail_publishes_no_information_to_a_declared_slot_reader() {
-        use crate::types::ability::AttachmentReferent;
-        use crate::types::card_type::CoreType;
         let mut state = GameState::new(FormatConfig::duel_commander(), 2, 2);
         let creature = create_object(
             &mut state,
@@ -15738,7 +15736,6 @@ mod tests {
     /// an all-current pair stamps nothing.
     #[test]
     fn implicit_fight_verdicts_follow_their_own_occurrences() {
-        use crate::types::card_type::CoreType;
         let mut state = GameState::new(FormatConfig::duel_commander(), 2, 2);
         let mut creature = |name: &str, card: u64| {
             let id = create_object(

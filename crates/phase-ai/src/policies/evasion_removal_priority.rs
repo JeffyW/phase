@@ -1115,12 +1115,14 @@ mod tests {
         let copy = AiDecisionContext {
             waiting_for: WaitingFor::CopyRetarget {
                 player: P0,
+                controller: None,
                 copy_id: ObjectId(1000),
                 target_slots: vec![CopyTargetSlot {
                     current: Some(TargetRef::Object(low)),
                     legal_alternatives: vec![TargetRef::Object(high)],
                     address: None,
                     can_keep: true,
+                    can_decline: false,
                 }],
                 effect_kind: EffectKind::Destroy,
                 effect_source_id: None,

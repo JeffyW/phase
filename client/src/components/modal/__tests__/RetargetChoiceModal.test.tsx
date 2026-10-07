@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GameState, TargetRef, WaitingFor } from "../../../adapter/types.ts";
 import { CardChoiceModal } from "../CardChoiceModal.tsx";
+import { RetargetChoiceModal } from "../RetargetChoiceModal.tsx";
 import { useGameStore } from "../../../stores/gameStore.ts";
 import { useMultiplayerStore } from "../../../stores/multiplayerStore.ts";
 import {
@@ -147,5 +148,56 @@ describe("RetargetChoiceModal (via CardChoiceModal)", () => {
       type: "RetargetSpell",
       data: { new_targets: [opp2, null] },
     });
+  });
+
+  // CR 115.7d: "choose new targets" on a ONE-position spell (Unsummon on A,
+  // A gained hexproof, B is legal) still offers Keep and submits `[null]`;
+  // the single position never needs a pick to confirm.
+  it("offers Keep on a single-position All prompt and submits [null]", () => {
+    setUp({
+      player: 0,
+      scope: { type: "All" },
+      current_targets: [opp2],
+      slot_pools: [[opp1]],
+      legal_new_targets: [opp1],
+    });
+    render(<CardChoiceModal />);
+
+    expect(screen.getByRole("button", { name: /^Opp 1/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^Target 1/ })).not.toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: "Confirm" });
+    expect(confirm).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep" }));
+    fireEvent.click(confirm);
+    expect(dispatchMock).toHaveBeenLastCalledWith({
+      type: "RetargetSpell",
+      data: { new_targets: [null] },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Opp 1/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(dispatchMock).toHaveBeenLastCalledWith({
+      type: "RetargetSpell",
+      data: { new_targets: [opp1] },
+    });
+  });
+
+  // Single scope is normally routed to the board overlay; the modal is
+  // rendered directly here so the absence of Keep is not vacuous.
+  it("offers no Keep on a Single-scope prompt", () => {
+    setUp({});
+    const data = retargetChoiceWaitingForFactory
+      .withData({
+        player: 0,
+        scope: { type: "Single" },
+        current_targets: [opp2],
+        slot_pools: [[opp1]],
+        legal_new_targets: [opp1],
+      })
+      .build().data;
+    render(<RetargetChoiceModal data={data} />);
+    expect(screen.getByRole("button", { name: /^Opp 1/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Keep" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
   });
 });

@@ -677,10 +677,13 @@ impl<'s> RetargetSearch<'s> {
     ) -> Option<Vec<(usize, RetargetPick)>> {
         let component = &self.components[k];
         if component.solver == ComponentSolver::Matching {
-            if let Some(assignment) = self.solve_matching(&component.positions, fixed) {
-                if self.locally_accepted(&assignment) {
-                    return Some(assignment);
-                }
+            // A pure distinctness run with all-different announced identities:
+            // every legal completion is an all-different matching, so a failed
+            // matching is conclusive and never escalates to search. Only a
+            // matching the validator refuses locally falls back to search.
+            let assignment = self.solve_matching(&component.positions, fixed)?;
+            if self.locally_accepted(&assignment) {
+                return Some(assignment);
             }
         }
         self.solve_search(&component.positions, fixed)
@@ -819,6 +822,17 @@ impl<'s> RetargetSearch<'s> {
     /// CR 115.7e: a complete pick vector extending `prefix` that the validator
     /// accepts, or `None` when none exists.
     pub(crate) fn completion(&self, prefix: &[RetargetPick]) -> Option<Vec<RetargetPick>> {
+        // W2 (CR 115.3): a decided prefix that already names one object twice
+        // inside a run (with a changed position) has no completion; no search
+        // over the open positions can repair a fixed pair.
+        let decided = &prefix[..prefix.len().min(self.len())];
+        for (a, pick_a) in decided.iter().enumerate() {
+            for (b, pick_b) in decided[..a].iter().enumerate() {
+                if !self.pair_admissible(a, pick_a, b, pick_b) {
+                    return None;
+                }
+            }
+        }
         let mut fixed: Vec<Option<RetargetPick>> = vec![None; self.len()];
         for (position, pick) in prefix.iter().enumerate().take(self.len()) {
             fixed[position] = Some(pick.clone());

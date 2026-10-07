@@ -83,6 +83,9 @@ use crate::analysis::resource::{
 use crate::game::bracket_estimate::CommanderBracketTier;
 use crate::game::combat::{AttackTarget, BlockHistoryPair, CombatState};
 use crate::game::deck_loading::DeckEntry;
+use crate::game::target_occurrences::{
+    legacy_keyed_pins_to_positional, pins_align_with, TargetPinAlignmentError,
+};
 use crate::game::triggers::trigger_source_context_for_latch;
 
 use crate::game::game_object::{AttachTarget, BackFaceData, CaseState, GameObject, PhaseStatus};
@@ -16247,7 +16250,16 @@ pub enum WaitingFor {
     /// CR 707.10c: When a spell is copied, the controller may choose new targets.
     /// Each slot shows the current target and legal alternatives.
     CopyRetarget {
+        /// The player answering THIS prompt: the copy's controller, or, for an
+        /// announcement slot "of an opponent's choice", that slot's chooser
+        /// (CR 601.2c + CR 115.1).
         player: PlayerId,
+        /// CR 115.1: the copy's controller, when it differs from the player
+        /// answering this prompt. Finalization, priority and the
+        /// continuation/Paradigm handoff go to the controller. `None` means
+        /// `player` (every prompt the controller answers, and every older save).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        controller: Option<PlayerId>,
         copy_id: ObjectId,
         target_slots: Vec<CopyTargetSlot>,
         /// Effect metadata emitted when this retarget choice completes.
@@ -16480,9 +16492,16 @@ pub struct CopyTargetSlot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<RetargetSlotAddress>,
     /// CR 707.10c: engine-derived: keeping this position's current target
-    /// still admits a legal completion. Gates `ChooseTarget { target: None }`.
+    /// still admits a legal completion. Gates `ChooseTarget { target: None }`
+    /// in a retarget walk.
     #[serde(default)]
     pub can_keep: bool,
+    /// CR 115.6 + CR 601.2c: engine-derived: this announcement slot is
+    /// optional and declining it ("up to N") still completes. Gates
+    /// `ChooseTarget { target: None }` in an announcement walk. Distinct from
+    /// `can_keep`: there is no announced target to keep.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_decline: bool,
 }
 
 /// CR 707.10c / CR 722.3c: the two operations a `WaitingFor::CopyRetarget`
@@ -18084,12 +18103,7 @@ impl StackResolutionEntryFence {
     /// is refused BEFORE either is consumed; a legacy keyed list is folded
     /// into positional pins against the fence's own provenance ability; the
     /// result must align with that ability's targets.
-    fn normalize_decoded_target_pins(
-        &mut self,
-    ) -> Result<(), crate::game::target_occurrences::TargetPinAlignmentError> {
-        use crate::game::target_occurrences::{
-            legacy_keyed_pins_to_positional, pins_align_with, TargetPinAlignmentError,
-        };
+    fn normalize_decoded_target_pins(&mut self) -> Result<(), TargetPinAlignmentError> {
         let targets: Vec<TargetRef> = self
             .provenance_ability()
             .map(|ability| ability.targets.clone())
