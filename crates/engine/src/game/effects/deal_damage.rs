@@ -1207,7 +1207,7 @@ fn cast_tail_with_parent_targets(
 ) -> ResolvedAbility {
     let mut tail = sub.clone();
     if crate::game::effects::should_propagate_parent_targets(ability, &tail) {
-        tail.set_targets(ability.targets.clone());
+        tail.mirror_targets_from(ability);
     }
     tail
 }

@@ -40,8 +40,18 @@ pub fn resolve(
             TargetRef::Player(_) => None,
         })
         .collect();
+    // The ability's own object occurrences, aligned with `source_ids` while
+    // the sources are its targets (empty for a tracked-set population).
+    let mut source_positions: Vec<usize> = ability
+        .targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| matches!(target, TargetRef::Object(_)))
+        .map(|(position, _)| position)
+        .collect();
 
     if source_ids.is_empty() && references_tracked_set(target_filter) {
+        source_positions.clear();
         let ctx = FilterContext::from_ability(ability);
         // CR 608.2c: Resolve the tracked-set sentinel from the resolving effect's
         // last known context before collecting the affected objects.
@@ -117,13 +127,20 @@ pub fn resolve(
             };
             resume.sub_ability = None;
             if index + 1 < source_ids.len() {
-                resume.set_targets(
-                    source_ids[index + 1..]
-                        .iter()
-                        .copied()
-                        .map(TargetRef::Object)
-                        .collect(),
-                );
+                if source_positions.len() == source_ids.len() {
+                    // The remaining sources are this ability's own target
+                    // occurrences: project them, pins included.
+                    resume.project_target_occurrences(&source_positions[index + 1..]);
+                } else {
+                    // A tracked-set population: fresh, unpinned.
+                    resume.set_unpinned_targets(
+                        source_ids[index + 1..]
+                            .iter()
+                            .copied()
+                            .map(TargetRef::Object)
+                            .collect(),
+                    );
+                }
             } else {
                 resume.clear_targets();
             }

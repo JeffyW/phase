@@ -99,6 +99,7 @@ pub fn resolve(
             source_id: enduring_id,
             branches: vec![token_branch, counter_branch],
             parent_targets: ability.targets.clone(),
+            parent_target_pins: ability.aligned_target_pins(),
             context: ability.context.clone(),
             replacement_applied: ability.replacement_applied.clone(),
             continuation: None,

@@ -275,8 +275,9 @@ pub fn resolve(
                     //   as the parent target so anaphoric `ParentTarget` / `SelfRef`
                     //   references resolve to the just-exiled card.
                     if !sub_effect_references_exiled_by_source(&sub_clone) {
-                        sub_clone
-                            .set_targets(hits.iter().copied().map(TargetRef::Object).collect());
+                        sub_clone.set_unpinned_targets(
+                            hits.iter().copied().map(TargetRef::Object).collect(),
+                        );
                     }
                     sub_clone.context = ability.context.clone();
                     // CR 400.7j: the rest of this ability finds the cards this
@@ -324,7 +325,7 @@ pub fn resolve(
                     // CR 607.2a: no current pool means there is no "rest" to move.
                     if !pool.is_empty() {
                         let mut cleanup_clone = cleanup.clone();
-                        cleanup_clone.set_targets(
+                        cleanup_clone.set_unpinned_targets(
                             pool.iter()
                                 .map(|pin| TargetRef::Object(pin.object_id))
                                 .collect(),

@@ -155,7 +155,7 @@ fn resolve_put_sticker(
             ability.source_id,
             ability.controller,
         );
-        resolved.set_targets(ability.targets.clone());
+        resolved.mirror_targets_from(ability);
         resolved.context = ability.context.clone();
         resolved.chosen_x = ability.chosen_x;
         resolved.chosen_players = ability.chosen_players.clone();
@@ -238,6 +238,7 @@ fn resolve_put_sticker(
             source_id: ability.source_id,
             branches,
             parent_targets: ability.targets.clone(),
+            parent_target_pins: ability.aligned_target_pins(),
             context: ability.context.clone(),
             replacement_applied: ability.replacement_applied.clone(),
             continuation: None,
@@ -305,6 +306,7 @@ fn prompt_count_choice(
             source_id: ability.source_id,
             branches,
             parent_targets: ability.targets.clone(),
+            parent_target_pins: ability.aligned_target_pins(),
             context: ability.context.clone(),
             replacement_applied: ability.replacement_applied.clone(),
             continuation: None,

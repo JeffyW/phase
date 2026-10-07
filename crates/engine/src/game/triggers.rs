@@ -8376,7 +8376,7 @@ pub(crate) fn seed_batched_attack_parent_targets(
     if !effect_uses_parent_target(&ability.effect) || !ability.targets.is_empty() {
         return;
     }
-    ability.set_targets(
+    ability.set_unpinned_targets(
         attacker_ids
             .iter()
             .map(|id| TargetRef::Object(*id))
@@ -8485,7 +8485,7 @@ pub(crate) fn seed_event_context_parent_targets(
         }
     };
     if let Some(id) = parent_id {
-        ability.set_targets(vec![TargetRef::Object(id)]);
+        ability.set_unpinned_targets(vec![TargetRef::Object(id)]);
         // CR 400.7 + CR 603.6: a zone-change trigger refers to the exact
         // post-change object. Pin that incarnation so leaving the destination
         // zone and returning before resolution cannot retarget the ability to
@@ -39712,7 +39712,7 @@ pub mod tests {
         contexts.push(candidate(&mut state, "(e) inherited target", &|pending| {
             pending
                 .ability
-                .set_targets(vec![TargetRef::Player(PlayerId(1))]);
+                .set_unpinned_targets(vec![TargetRef::Player(PlayerId(1))]);
         }));
         let slot_effect = mana_effect(Some(crate::types::ability::ManaTargetRole::Recipient {
             recipient: TargetFilter::Player,

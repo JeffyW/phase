@@ -332,7 +332,7 @@ pub(crate) fn apply_instead_swap(
         .target_filter()
         .is_some_and(|filter| !filter.is_context_ref())
     {
-        overridden.set_targets(sub.targets.clone());
+        overridden.mirror_targets_from(sub);
     }
     overridden
 }
@@ -1928,12 +1928,12 @@ pub fn assign_targets_in_chain(
     targets: &[TargetRef],
 ) -> Result<(), EngineError> {
     if is_per_opponent_target_fanout(ability) {
-        ability.set_targets(targets.to_vec());
+        ability.set_unpinned_targets(targets.to_vec());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
     if !chain_has_target_sink(ability) {
-        ability.set_targets(targets.to_vec());
+        ability.set_unpinned_targets(targets.to_vec());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
@@ -1956,12 +1956,12 @@ pub fn assign_selected_slots_in_chain(
     selected_slots: &[Option<TargetRef>],
 ) -> Result<(), EngineError> {
     if is_per_opponent_target_fanout(ability) {
-        ability.set_targets(selected_slots.iter().flatten().cloned().collect());
+        ability.set_unpinned_targets(selected_slots.iter().flatten().cloned().collect());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
     if !chain_has_target_sink(ability) {
-        ability.set_targets(selected_slots.iter().flatten().cloned().collect());
+        ability.set_unpinned_targets(selected_slots.iter().flatten().cloned().collect());
         ability.capture_target_incarnations_recursive(state);
         return Ok(());
     }
@@ -2723,12 +2723,13 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
 /// `declared_targets_in_chain` order and with the same exclusions — an inherited
 /// rider's snapshot and a paid-"instead" delegator's mirror contribute nothing.
 /// Each published position reads its OWN verdict (`verdicts`, aligned with
-/// `declared.targets`): a `Legal` or `PassThrough` occurrence is published as
-/// announced with its own positional pin, an `IllegalRetained` or `Dropped`
-/// one becomes a hole (`None`). A `PassThrough` occurrence keeps its position
-/// because every declared-slot producer and consumer numbers a node by
-/// `chain_node_positions` (the whole node, fanout players aside); it is
-/// published unchanged, exactly as before validation, and never stamped.
+/// `declared.targets`): only a `Legal` occurrence is published, as announced
+/// with its own positional pin. Every other position is a hole (`None`): an
+/// `IllegalRetained` or `Dropped` occurrence is illegal, and a `PassThrough`
+/// occurrence was never judged, so neither may supply information to a
+/// declared-slot reader (CR 608.2b). A hole still occupies its position, so
+/// the view stays numbered by `chain_node_positions` like every other
+/// declared-slot producer and consumer.
 fn append_validated_declared_positions(
     declared: &ResolvedAbility,
     verdicts: &[OccurrenceVerdict],
@@ -2743,7 +2744,7 @@ fn append_validated_declared_positions(
             .get(position)
             .copied()
             .unwrap_or(OccurrenceVerdict::Dropped);
-        view.push((!verdict.is_declared_illegal()).then(|| {
+        view.push((verdict == OccurrenceVerdict::Legal).then(|| {
             targeting::DeclaredSlotBinding::Announced {
                 target: declared.targets[position].clone(),
                 pin: declared.target_pin_at(position),
@@ -3090,15 +3091,42 @@ fn validate_targets_in_chain_inner(
             // wrongly drops the ally (Ent's Fury, issue #1135). Nested chain links keep
             // chosen targets on the resolving spell, not on the fight sub-clause itself.
             //
-            // The candidates are OCCURRENCES (chain flatten with each one's own
-            // pin), so the stored fighters keep the pins they were announced with.
-            let candidates = state
+            //
+            // Every candidate is an OCCURRENCE with its originating address
+            // (`FighterOrigin`): this node's own announced positions, or a
+            // position of the resolving chain's flatten. When this node declares
+            // its own `target` slot, its explicit fighter is drawn ONLY from its
+            // own occurrences — another node's occurrence of the same object
+            // (a retargeted copy's root, CR 707.10c) never stands in for this
+            // node's illegal one (CR 608.2b). The ally may come from the chain.
+            #[derive(Clone, Copy, PartialEq, Eq)]
+            enum FighterOrigin {
+                Own(usize),
+                Chain(usize),
+            }
+            type Occurrence = (TargetRef, Option<ObjectIncarnationRef>);
+            let own: Vec<(FighterOrigin, Occurrence)> = validated
+                .target_occurrences()
+                .into_iter()
+                .enumerate()
+                .map(|(position, occurrence)| (FighterOrigin::Own(position), occurrence))
+                .collect();
+            let chain: Vec<(FighterOrigin, Occurrence)> = state
                 .resolving_stack_entry
                 .as_ref()
                 .and_then(|entry| entry.ability())
                 .map(flatten_target_occurrences_in_chain)
-                .filter(|occurrences| !occurrences.is_empty())
-                .unwrap_or_else(|| validated.target_occurrences());
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(index, occurrence)| (FighterOrigin::Chain(index), occurrence))
+                .collect();
+            let ally_pool = if chain.is_empty() { &own } else { &chain };
+            let explicit_pool = if !target.is_context_ref() && !own.is_empty() {
+                &own
+            } else {
+                ally_pool
+            };
 
             fn fight_creature_on_battlefield(
                 state: &GameState,
@@ -3116,60 +3144,69 @@ fn validate_targets_in_chain_inner(
 
             // CR 400.7: a candidate occurrence is current when its own pin
             // (and any delayed-referent pin for its id) still names the object.
-            let occurrence_is_current =
-                |(candidate, pin): &(TargetRef, Option<ObjectIncarnationRef>)| match candidate {
-                    TargetRef::Object(id) => {
-                        validated.target_pin_is_current(*id, state)
-                            && pin.is_none_or(|pin| pin.is_current(state))
-                    }
-                    TargetRef::Player(_) => true,
-                };
+            let occurrence_is_current = |(candidate, pin): &Occurrence| match candidate {
+                TargetRef::Object(id) => {
+                    validated.target_pin_is_current(*id, state)
+                        && pin.is_none_or(|pin| pin.is_current(state))
+                }
+                TargetRef::Player(_) => true,
+            };
             let legal = slot_legal_targets(
                 view,
                 state,
                 AbilityTargetSlot::Unpositioned(target),
                 &validated,
             );
-            let explicit: Vec<(TargetRef, Option<ObjectIncarnationRef>)> = candidates
+            let explicit: Vec<(FighterOrigin, Occurrence)> = explicit_pool
                 .iter()
-                .filter(|occurrence| {
+                .filter(|(_, occurrence)| {
                     legal.contains(&occurrence.0) && occurrence_is_current(occurrence)
                 })
                 .cloned()
                 .collect();
 
-            let mut stored = Vec::new();
-            if explicit.len() == 1 {
-                if let Some(ally) = candidates.iter().find(|occurrence| {
+            let mut fighters: Vec<(FighterOrigin, Occurrence)> = Vec::new();
+            if let [(explicit_origin, explicit_occurrence)] = explicit.as_slice() {
+                // The ally is a different object incarnation from the explicit
+                // fighter (never the same occurrence, nor the same object).
+                if let Some(ally) = ally_pool.iter().find(|(origin, occurrence)| {
                     let TargetRef::Object(id) = &occurrence.0 else {
                         return false;
                     };
-                    !explicit
-                        .iter()
-                        .any(|(explicit, _)| *explicit == occurrence.0)
+                    origin != explicit_origin
+                        && occurrence.0 != explicit_occurrence.0
                         && fight_creature_on_battlefield(state, *id)
                         && occurrence_is_current(occurrence)
                 }) {
-                    stored.push(ally.clone());
+                    fighters.push(ally.clone());
                 }
             }
-            stored.extend(explicit);
-            // This node's own announced occurrences are judged by whether the
-            // rebuilt fighter list still holds them (each stored fighter
-            // vouches for one occurrence).
-            let mut unclaimed: Vec<&TargetRef> = stored.iter().map(|(t, _)| t).collect();
-            let verdicts = validated
-                .targets
+            fighters.extend(explicit);
+            // CR 608.2b: each of this node's own announced occurrences is judged
+            // by its own address — legal when it is itself a fighter, or when a
+            // chain-sourced fighter is that very occurrence (same object AND same
+            // pin). A bare-id match never credits it.
+            let mut chain_fighters: Vec<&Occurrence> = fighters
                 .iter()
-                .map(|own| {
-                    legal_or_dropped(
-                        unclaimed
+                .filter(|(origin, _)| matches!(origin, FighterOrigin::Chain(_)))
+                .map(|(_, occurrence)| occurrence)
+                .collect();
+            let verdicts = own
+                .iter()
+                .map(|(origin, occurrence)| {
+                    let own_fighter = fighters.iter().any(|(fighter, _)| fighter == origin);
+                    let chain_fighter = !own_fighter
+                        && chain_fighters
                             .iter()
-                            .position(|candidate| *candidate == own)
-                            .map(|found| unclaimed.swap_remove(found))
-                            .is_some(),
-                    )
+                            .position(|fighter| *fighter == occurrence)
+                            .map(|found| chain_fighters.swap_remove(found))
+                            .is_some();
+                    legal_or_dropped(own_fighter || chain_fighter)
                 })
+                .collect();
+            let stored = fighters
+                .into_iter()
+                .map(|(_, occurrence)| occurrence)
                 .collect();
             NodeValidation::Rebuilt { verdicts, stored }
         }
@@ -5149,7 +5186,7 @@ fn resolved_ability_with_bound_object_target(
     object_id: ObjectId,
 ) -> ResolvedAbility {
     let mut bound = ability.clone();
-    bound.set_targets(vec![TargetRef::Object(object_id)]);
+    bound.set_unpinned_targets(vec![TargetRef::Object(object_id)]);
     bound.target_incarnations.clear();
     bound
 }
@@ -15553,6 +15590,189 @@ mod tests {
         let validated = validate_targets_in_chain(&state, &claimed);
         assert!(validated.targets.is_empty());
         assert_eq!(validated.illegal_local_target_slots, vec![0]);
+    }
+
+    /// CR 608.2b (R9-5 probe P5): a `PassThrough` occurrence is published to
+    /// the declared view as a HOLE. Chain: `TargetOnly(C)` → an `Attach`
+    /// node whose `[C]` is an unclaimed tail (declared slot 1) → a consumer
+    /// "Equipment attached to <declared slot>". Reading the root's own slot 0
+    /// finds C's Equipment (control); reading the tail's slot 1 finds nothing,
+    /// even when C's actual declaring slot is illegal — the unjudged tail
+    /// never supplies information.
+    #[test]
+    fn pass_through_tail_publishes_no_information_to_a_declared_slot_reader() {
+        use crate::types::ability::AttachmentReferent;
+        use crate::types::card_type::CoreType;
+        let mut state = GameState::new(FormatConfig::duel_commander(), 2, 2);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Creature C".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let equipment = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Equipment E".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&equipment).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Equipment".to_string());
+        }
+        crate::game::effects::attach::attach_to(&mut state, equipment, creature);
+        let chain = |root_filter: TargetFilter, read_slot: usize| {
+            let consumer = ResolvedAbility::new(
+                Effect::TargetOnly {
+                    target: TargetFilter::Typed(
+                        TypedFilter::default()
+                            .subtype("Equipment".to_string())
+                            .properties(vec![FilterProp::AttachedTo {
+                                to: AttachmentReferent::DeclaredTarget { slot: read_slot },
+                            }]),
+                    ),
+                },
+                vec![TargetRef::Object(equipment)],
+                ObjectId(99),
+                PlayerId(0),
+            );
+            let mut attach = ResolvedAbility::new(
+                Effect::Attach {
+                    attachment: TargetFilter::SelfRef,
+                    target: TargetFilter::ParentTarget,
+                    selection: AttachSelection::Targeted,
+                },
+                vec![TargetRef::Object(creature)],
+                ObjectId(99),
+                PlayerId(0),
+            );
+            attach.sub_ability = Some(Box::new(consumer));
+            let mut root = ResolvedAbility::new(
+                Effect::TargetOnly {
+                    target: root_filter,
+                },
+                vec![TargetRef::Object(creature)],
+                ObjectId(99),
+                PlayerId(0),
+            );
+            root.sub_ability = Some(Box::new(attach));
+            // Announcement pins: an unpinned announced binding answers nothing.
+            root.capture_target_incarnations_recursive(&state);
+            root
+        };
+        let consumer_targets = |validated: &ResolvedAbility| {
+            validated
+                .sub_ability
+                .as_deref()
+                .and_then(|attach| attach.sub_ability.as_deref())
+                .unwrap()
+                .targets
+                .clone()
+        };
+        let creature_filter = TargetFilter::Typed(TypedFilter::creature());
+        let artifact_filter = TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact));
+
+        let control = chain(creature_filter.clone(), 0);
+        assert_eq!(
+            declared_targets_in_chain(&control).len(),
+            3,
+            "reach: the Attach tail occupies declared slot 1"
+        );
+        let validated = validate_targets_in_chain(&state, &control);
+        assert_eq!(
+            consumer_targets(&validated),
+            vec![TargetRef::Object(equipment)],
+            "control: the root's own legal slot 0 names C"
+        );
+        let attach = validated.sub_ability.as_deref().unwrap();
+        assert_eq!(attach.targets, vec![TargetRef::Object(creature)]);
+        assert!(attach.illegal_local_target_slots.is_empty());
+
+        let tail_read = validate_targets_in_chain(&state, &chain(creature_filter, 1));
+        assert!(
+            consumer_targets(&tail_read).is_empty(),
+            "the unjudged tail publishes a hole"
+        );
+        let leaked = validate_targets_in_chain(&state, &chain(artifact_filter, 1));
+        assert!(
+            consumer_targets(&leaked).is_empty(),
+            "an illegal declaring slot cannot leak through its PassThrough copy"
+        );
+    }
+
+    /// CR 608.2b + CR 400.7 (R9-3 probe P4): the implicit-fight rebuild judges
+    /// each of the node's own occurrences by its own address. With
+    /// `[A_stale, A_current]` only the current occurrence is a fighter, so the
+    /// stamp names position 0 — never the reverse; reversed order stamps 1;
+    /// an all-current pair stamps nothing.
+    #[test]
+    fn implicit_fight_verdicts_follow_their_own_occurrences() {
+        use crate::types::card_type::CoreType;
+        let mut state = GameState::new(FormatConfig::duel_commander(), 2, 2);
+        let mut creature = |name: &str, card: u64| {
+            let id = create_object(
+                &mut state,
+                CardId(card),
+                PlayerId(1),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+            id
+        };
+        let a = creature("A", 1);
+        let b = creature("B", 2);
+        let current = ObjectIncarnationRef::from_object(&state.objects[&a]);
+        let stale = ObjectIncarnationRef::of(a, current.incarnation + 5);
+        let b_pin = ObjectIncarnationRef::from_object(&state.objects[&b]);
+        let fight = |occurrences: Vec<(TargetRef, Option<ObjectIncarnationRef>)>| {
+            let mut node = ResolvedAbility::new(
+                Effect::Fight {
+                    subject: TargetFilter::SelfRef,
+                    target: TargetFilter::Typed(TypedFilter::creature()),
+                },
+                vec![],
+                ObjectId(99),
+                PlayerId(0),
+            );
+            node.replace_target_occurrences(occurrences);
+            validate_targets_in_chain(&state, &node)
+        };
+        let stale_first = fight(vec![
+            (TargetRef::Object(a), Some(stale)),
+            (TargetRef::Object(a), Some(current)),
+        ]);
+        assert_eq!(stale_first.illegal_local_target_slots, vec![0]);
+        assert_eq!(
+            stale_first.target_occurrences(),
+            vec![(TargetRef::Object(a), Some(current))]
+        );
+        let stale_second = fight(vec![
+            (TargetRef::Object(a), Some(current)),
+            (TargetRef::Object(a), Some(stale)),
+        ]);
+        assert_eq!(stale_second.illegal_local_target_slots, vec![1]);
+        let all_current = fight(vec![
+            (TargetRef::Object(a), Some(current)),
+            (TargetRef::Object(b), Some(b_pin)),
+        ]);
+        assert!(all_current.illegal_local_target_slots.is_empty());
     }
 
     /// CR 608.2b + CR 115.10a: an inheriting rider takes its parent's FIRST

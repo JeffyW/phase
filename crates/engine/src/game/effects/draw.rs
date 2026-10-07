@@ -424,6 +424,7 @@ fn prompt_up_to_draw_count(
             source_id: ability.source_id,
             branches,
             parent_targets: ability.targets.clone(),
+            parent_target_pins: ability.aligned_target_pins(),
             context: ability.context.clone(),
             // CR 608.2c: the trailing instructions of this chain ("…, then
             // discard a card") are parked by `resolve_ability_chain`'s generic

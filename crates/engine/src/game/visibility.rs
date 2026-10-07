@@ -3956,6 +3956,7 @@ mod tests {
             branches: Vec::new(),
             branch_descriptions: Vec::new(),
             parent_targets: Vec::new(),
+            parent_target_pins: Vec::new(),
             context: Default::default(),
             continuation: Some(Box::new(ResolvedAbility::new(
                 Effect::NoOp,

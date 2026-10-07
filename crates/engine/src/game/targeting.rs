@@ -760,7 +760,7 @@ fn triggering_spell_resolved_ability(
     let mut resolved =
         crate::game::ability_utils::build_resolved_from_def(&def, spell_id, controller);
     if let Some(targets) = super::restrictions::triggering_spell_targets(state, spell_id) {
-        resolved.set_targets(targets);
+        resolved.set_unpinned_targets(targets);
     }
     Some(resolved)
 }

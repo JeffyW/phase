@@ -115,7 +115,7 @@ fn tracked_set_cast_candidates(
     // `filter: Any`, which reads no object scope) and closed here so it stays that
     // way.
     let mut scoped_ability = ability.clone();
-    scoped_ability.set_targets(deduped.iter().copied().map(TargetRef::Object).collect());
+    scoped_ability.set_unpinned_targets(deduped.iter().copied().map(TargetRef::Object).collect());
     let ctx = crate::game::filter::FilterContext::from_ability(&scoped_ability);
     deduped
         .into_iter()
@@ -328,7 +328,7 @@ pub(crate) fn stash_declined_cast_fallback(
     }
     let mut fallback = sub.clone();
     if fallback.targets.is_empty() && !ability.targets.is_empty() {
-        fallback.set_targets(ability.targets.clone());
+        fallback.mirror_targets_from(ability);
     }
     super::apply_parent_chain_context(&mut fallback, ability, None, state);
     // Reset AFTER apply_parent_chain_context (which copies the parent's context,
@@ -640,7 +640,7 @@ pub fn resolve(
         // cast grant, bind the filter's object-scope reads to the current
         // resolution's linked cards, not the source's lifetime exile pile.
         let mut scoped_ability = ability.clone();
-        scoped_ability.set_targets(
+        scoped_ability.set_unpinned_targets(
             candidate_ids
                 .iter()
                 .copied()
@@ -1070,7 +1070,7 @@ pub fn resolve(
         // The rider has been translated into the window's per-cast metadata;
         // retaining it would run a second destination move after the window.
         window.sub_ability = None;
-        window.set_targets(target_ids.drain(..).map(TargetRef::Object).collect());
+        window.set_unpinned_targets(target_ids.drain(..).map(TargetRef::Object).collect());
         return super::free_cast_from_zones::resolve_with_face_policy(
             state,
             &window,
@@ -1249,7 +1249,7 @@ fn open_resolution_cast_window(
     if graveyard_replacement.is_some() {
         window.sub_ability = None;
     }
-    window.set_targets(pool.into_iter().map(TargetRef::Object).collect());
+    window.set_unpinned_targets(pool.into_iter().map(TargetRef::Object).collect());
     super::free_cast_from_zones::resolve_with_face_policy(
         state,
         &window,
@@ -2002,7 +2002,7 @@ pub(crate) fn graveyard_exile_rider_entry_counters(
         return Vec::new();
     };
     let mut rider = sub.clone();
-    rider.set_targets(vec![TargetRef::Object(obj_id)]);
+    rider.set_unpinned_targets(vec![TargetRef::Object(obj_id)]);
     let base: Vec<(crate::types::counter::CounterType, u32)> = enter_with_counters
         .iter()
         .map(|(counter_type, quantity)| {

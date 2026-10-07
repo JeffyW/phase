@@ -512,7 +512,7 @@ fn resolve_top_votes_tally(
                             controller,
                             chain_root_targets.to_vec(),
                         );
-                        chain.set_targets(vec![TargetRef::Object(winner_obj)]);
+                        chain.set_unpinned_targets(vec![TargetRef::Object(winner_obj)]);
                         resolve_ability_chain(state, &chain, events, 1)?;
                     }
                 }
@@ -555,7 +555,7 @@ fn resolve_top_votes_tally(
                                     controller,
                                     chain_root_targets.to_vec(),
                                 );
-                                chain.set_targets(vec![TargetRef::Object(winner_obj)]);
+                                chain.set_unpinned_targets(vec![TargetRef::Object(winner_obj)]);
                                 resolve_ability_chain(state, &chain, events, 1)?;
                             }
                         }

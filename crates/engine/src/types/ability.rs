@@ -33201,7 +33201,13 @@ impl AttachTargetBindings {
 }
 
 /// Runtime ability data passed to effect handlers at resolution time.
+///
+/// Serde goes through the derived implementation (`remote = "Self"`) plus the
+/// hand-written `Deserialize` below, which normalizes and validates the target
+/// occurrence pins of every decoded node — whatever owner holds it (stack,
+/// resolution frames, pending casts, prompts) — before any reader sees it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct ResolvedAbility {
     pub effect: Effect,
     pub targets: Vec<TargetRef>,
@@ -33270,11 +33276,12 @@ pub struct ResolvedAbility {
     /// and pins together.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_pins: Vec<Option<ObjectIncarnationRef>>,
-    /// Decode-only alias for the pre-positional, keyed pin list
-    /// (`selected_target_incarnations`). Never serialized. The occurrence
-    /// authority reads it only while `target_pins` is empty, giving each
-    /// occurrence the first legacy pin with its object id (no pin invented),
-    /// and clears it on the first occurrence write.
+    /// Decode-only carrier for the pre-positional, keyed pin list (wire key
+    /// `selected_target_incarnations`). Never serialized, and always empty
+    /// after decoding: `ResolvedAbility`'s `Deserialize` folds it into
+    /// `target_pins` (each object occurrence takes the first legacy pin with
+    /// its id; players and unmatched occurrences none; no pin invented), so a
+    /// legacy save re-serializes in positional form.
     #[serde(rename = "selected_target_incarnations", default, skip_serializing)]
     pub legacy_selected_target_incarnations: Vec<ObjectIncarnationRef>,
     /// CR 602.2b + CR 601.2f: self-referential activation cost modification
@@ -33653,6 +33660,27 @@ pub struct ResolvedAbility {
     /// `WhenYouDo` gate and the `ParentTarget` guards still read it on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_target_missing_reason: Option<ParentTargetMissingReason>,
+}
+
+impl Serialize for ResolvedAbility {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ResolvedAbility::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResolvedAbility {
+    /// CR 400.7: the persisted-target-occurrence boundary. Every decoded node
+    /// (its continuations decode through this same impl) folds a legacy keyed
+    /// pin list into positional pins and is refused, as a decode error rather
+    /// than a later panic or fail-open read, when its pins are not aligned with
+    /// its targets.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut ability = ResolvedAbility::deserialize(deserializer)?;
+        ability
+            .normalize_decoded_target_pins()
+            .map_err(de::Error::custom)?;
+        Ok(ability)
+    }
 }
 
 /// CR 400.7 + CR 601.2h: Structural equality for [`ResolvedAbility`].

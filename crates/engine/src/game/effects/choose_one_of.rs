@@ -49,6 +49,7 @@ pub fn resolve(
             source_id: ability.source_id,
             branches,
             parent_targets: ability.targets.clone(),
+            parent_target_pins: ability.aligned_target_pins(),
             context: ability.context.clone(),
             continuation: ability.sub_ability.clone(),
             replacement_applied: ability.replacement_applied.clone(),
@@ -69,6 +70,7 @@ pub(crate) struct PromptRequest {
     pub source_id: ObjectId,
     pub branches: Vec<AbilityDefinition>,
     pub parent_targets: Vec<TargetRef>,
+    pub parent_target_pins: Vec<Option<crate::types::identifiers::ObjectIncarnationRef>>,
     pub context: crate::types::ability::SpellContext,
     pub continuation: Option<Box<ResolvedAbility>>,
     pub replacement_applied: HashSet<AppliedReplacementKey>,
@@ -81,6 +83,7 @@ pub(crate) fn prompt_next(state: &mut GameState, request: PromptRequest) {
         source_id,
         branches,
         parent_targets,
+        parent_target_pins,
         context,
         continuation,
         replacement_applied,
@@ -98,6 +101,7 @@ pub(crate) fn prompt_next(state: &mut GameState, request: PromptRequest) {
         branches,
         branch_descriptions,
         parent_targets,
+        parent_target_pins,
         context,
         continuation,
         replacement_applied,
@@ -128,6 +132,7 @@ pub(crate) fn resume_pending(state: &mut GameState, _events: &mut Vec<GameEvent>
             source_id: pending.source_id,
             branches: pending.branches,
             parent_targets: pending.parent_targets,
+            parent_target_pins: pending.parent_target_pins,
             context: *pending.context,
             continuation: pending.continuation,
             replacement_applied: pending.replacement_applied,
@@ -142,6 +147,7 @@ pub(crate) struct BranchSelection {
     pub source_id: ObjectId,
     pub branches: Vec<AbilityDefinition>,
     pub parent_targets: Vec<TargetRef>,
+    pub parent_target_pins: Vec<Option<crate::types::identifiers::ObjectIncarnationRef>>,
     pub context: crate::types::ability::SpellContext,
     pub continuation: Option<Box<ResolvedAbility>>,
     pub replacement_applied: HashSet<AppliedReplacementKey>,
@@ -160,6 +166,7 @@ pub(crate) fn resolve_branch(
         source_id,
         branches,
         parent_targets,
+        parent_target_pins,
         context,
         continuation,
         replacement_applied,
@@ -179,6 +186,7 @@ pub(crate) fn resolve_branch(
             source_id,
             branches: branches.clone(),
             parent_targets: parent_targets.clone(),
+            parent_target_pins: parent_target_pins.clone(),
             context: Box::new(context.clone()),
             continuation: continuation.clone(),
             replacement_applied: replacement_applied.clone(),
@@ -188,7 +196,17 @@ pub(crate) fn resolve_branch(
 
     let mut resolved = build_resolved_from_def(branch, source_id, controller);
     resolved.context = context;
-    resolved.set_targets(parent_targets);
+    // CR 400.7: the branch inherits the parent's OCCURRENCES, pins included.
+    resolved.replace_target_occurrences(
+        parent_targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let pin = parent_target_pins.get(index).copied().flatten();
+                (target, pin)
+            })
+            .collect(),
+    );
     resolved.set_replacement_applied_recursive(replacement_applied);
     resolved.set_scoped_player_recursive(player);
     if !resolved

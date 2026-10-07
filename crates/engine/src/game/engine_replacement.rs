@@ -8432,6 +8432,7 @@ mod tests {
             branches,
             branch_descriptions: Vec::new(),
             parent_targets: Vec::new(),
+            parent_target_pins: Vec::new(),
             context: Default::default(),
             continuation: None,
             replacement_applied: Default::default(),

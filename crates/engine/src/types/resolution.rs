@@ -7686,6 +7686,7 @@ mod tests {
                 source_id: ObjectId(131),
                 branches: Vec::new(),
                 parent_targets: Vec::new(),
+                parent_target_pins: Vec::new(),
                 context: Box::new(SpellContext::default()),
                 continuation: None,
                 replacement_applied: HashSet::new(),

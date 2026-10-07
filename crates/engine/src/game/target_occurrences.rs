@@ -41,8 +41,9 @@ pub(crate) enum OccurrenceVerdict {
     Dropped,
     /// Not validated as a target of this node (an `Attach` node's unclaimed
     /// tail, carried for a downstream sibling): stored unchanged and never
-    /// stamped. It keeps its declared position in the view unchanged, so the
-    /// view stays index-aligned with `declared_targets_in_chain`.
+    /// stamped. Its declared position in the view is a hole — unjudged
+    /// information is never published — so the view stays numbered like
+    /// `declared_targets_in_chain` without exposing it.
     PassThrough,
 }
 
@@ -111,16 +112,23 @@ impl std::fmt::Display for TargetPinAlignmentError {
 
 /// CR 400.7: check one node's stored occurrence pins (not its continuations).
 fn node_pin_alignment(ability: &ResolvedAbility) -> Result<(), TargetPinAlignmentError> {
-    if ability.target_pins.is_empty() {
+    pins_align_with(&ability.targets, &ability.target_pins)
+}
+
+/// CR 400.7: whether `pins` is empty (every occurrence unpinned) or aligned
+/// position-for-position with `targets`: same length, each pin naming the
+/// object at its position, no pinned player.
+pub(crate) fn pins_align_with(
+    targets: &[TargetRef],
+    pins: &[Option<ObjectIncarnationRef>],
+) -> Result<(), TargetPinAlignmentError> {
+    if pins.is_empty() {
         return Ok(());
     }
-    if !ability.legacy_selected_target_incarnations.is_empty() {
-        return Err(TargetPinAlignmentError::AmbiguousLegacyAlias);
-    }
-    if ability.target_pins.len() != ability.targets.len() {
+    if pins.len() != targets.len() {
         return Err(TargetPinAlignmentError::LengthMismatch);
     }
-    for (target, pin) in ability.targets.iter().zip(&ability.target_pins) {
+    for (target, pin) in targets.iter().zip(pins) {
         match (target, pin) {
             (_, None) => {}
             (TargetRef::Object(id), Some(pin)) if pin.object_id == *id => {}
@@ -134,7 +142,6 @@ fn node_pin_alignment(ability: &ResolvedAbility) -> Result<(), TargetPinAlignmen
 }
 
 /// CR 400.7: validate every node of a chain (sub and else branches included).
-/// Release-build check used at the persisted-restore boundary.
 pub fn validate_target_pin_alignment(
     ability: &ResolvedAbility,
 ) -> Result<(), TargetPinAlignmentError> {
@@ -148,18 +155,45 @@ pub fn validate_target_pin_alignment(
     Ok(())
 }
 
-/// Legacy keyed alias: the first pin recorded for `id` (no pin invented).
-fn first_matching_pin(
-    pins: &[ObjectIncarnationRef],
-    id: crate::types::identifiers::ObjectId,
-) -> Option<ObjectIncarnationRef> {
-    pins.iter().find(|pin| pin.object_id == id).copied()
+/// CR 400.7: the legacy (pre-positional) reading of a keyed pin list against
+/// `targets` — the ONLY first-by-id reading in the engine, used solely to
+/// decode a legacy save: each object occurrence takes the first legacy pin
+/// recorded for its id; players and unmatched occurrences take none; no pin is
+/// invented. Compacted to the empty form when nothing is pinned.
+pub(crate) fn legacy_keyed_pins_to_positional(
+    targets: &[TargetRef],
+    legacy: &[ObjectIncarnationRef],
+) -> Vec<Option<ObjectIncarnationRef>> {
+    let pins: Vec<Option<ObjectIncarnationRef>> = targets
+        .iter()
+        .map(|target| match target {
+            TargetRef::Object(id) => legacy.iter().find(|pin| pin.object_id == *id).copied(),
+            TargetRef::Player(_) => None,
+        })
+        .collect();
+    if pins.iter().all(Option::is_none) {
+        Vec::new()
+    } else {
+        pins
+    }
 }
 
 impl ResolvedAbility {
-    /// CR 400.7: the pin of every occurrence, aligned with `targets`. A legacy
-    /// keyed decode is read as "each object occurrence gets the first legacy
-    /// pin with its id; players get none".
+    /// CR 400.7: the decode boundary for one node — fold a legacy keyed pin
+    /// list into positional pins, then require alignment. A node carrying both
+    /// encodings is ambiguous and refused before either is consumed.
+    pub(crate) fn normalize_decoded_target_pins(&mut self) -> Result<(), TargetPinAlignmentError> {
+        if !self.legacy_selected_target_incarnations.is_empty() {
+            if !self.target_pins.is_empty() {
+                return Err(TargetPinAlignmentError::AmbiguousLegacyAlias);
+            }
+            let legacy = std::mem::take(&mut self.legacy_selected_target_incarnations);
+            self.target_pins = legacy_keyed_pins_to_positional(&self.targets, &legacy);
+        }
+        node_pin_alignment(self)
+    }
+
+    /// CR 400.7: the pin of every occurrence, aligned with `targets`.
     pub fn aligned_target_pins(&self) -> Vec<Option<ObjectIncarnationRef>> {
         (0..self.targets.len())
             .map(|index| self.target_pin_at(index))
@@ -169,18 +203,13 @@ impl ResolvedAbility {
     /// CR 400.7: the incarnation announced for the occurrence at `index`, if
     /// any. Positional: two occurrences holding the same id can carry
     /// different pins (a retained old object and an elected new one).
+    ///
+    /// A reader never panics: decoding refuses misaligned pins, and a pin
+    /// that does not name the object at its position reads as no pin.
     pub fn target_pin_at(&self, index: usize) -> Option<ObjectIncarnationRef> {
         let TargetRef::Object(id) = self.targets.get(index)? else {
             return None;
         };
-        if self.target_pins.is_empty() {
-            return first_matching_pin(&self.legacy_selected_target_incarnations, *id);
-        }
-        debug_assert_eq!(
-            node_pin_alignment(self),
-            Ok(()),
-            "occurrence pins drifted from targets"
-        );
         self.target_pins
             .get(index)
             .copied()
@@ -210,12 +239,9 @@ impl ResolvedAbility {
                 && !self.target_occurrence_is_current(index, state))
     }
 
-    /// Normalize the legacy alias into positional form and return the
-    /// aligned pins for mutation. Every writer below starts here.
-    fn begin_occurrence_write(&mut self) -> Vec<Option<ObjectIncarnationRef>> {
-        let pins = self.aligned_target_pins();
-        self.legacy_selected_target_incarnations.clear();
-        pins
+    /// The aligned pins for mutation. Every writer below starts here.
+    fn begin_occurrence_write(&self) -> Vec<Option<ObjectIncarnationRef>> {
+        self.aligned_target_pins()
     }
 
     /// Store `pins` (aligned with the already-written `targets`), compacting
@@ -234,7 +260,6 @@ impl ResolvedAbility {
     /// live incarnation it names now. Non-recursive; the chain-wide wrapper is
     /// `capture_target_incarnations_recursive`.
     pub fn announce_target_pins(&mut self, state: &GameState) {
-        let _ = self.begin_occurrence_write();
         let pins = self
             .targets
             .iter()
@@ -248,41 +273,38 @@ impl ResolvedAbility {
         self.finish_occurrence_write(pins);
     }
 
-    /// Replace every occurrence with `targets`, carrying pins forward by the
-    /// legacy rule: each new object occurrence takes the pin of the first old
-    /// occurrence holding that object (no pin invented). For writers that
-    /// rebuild a node from scratch at resolution time; lifecycle writers that
-    /// know their source occurrences use the positional operations instead.
-    pub fn set_targets(&mut self, targets: Vec<TargetRef>) {
-        let old_pins = self.begin_occurrence_write();
-        let old_targets = std::mem::replace(&mut self.targets, targets);
-        let pins = self
-            .targets
-            .iter()
-            .map(|target| match target {
-                TargetRef::Object(_) => old_targets
-                    .iter()
-                    .position(|old| old == target)
-                    .and_then(|found| old_pins[found]),
-                TargetRef::Player(_) => None,
-            })
-            .collect();
-        self.finish_occurrence_write(pins);
-    }
-
-    /// Replace every occurrence with unpinned `targets`: objects chosen at
-    /// resolution, never announced as targets of this node.
+    /// FRESH RESEED: replace every occurrence with unpinned `targets` —
+    /// objects or players chosen, found or produced at resolution (a search
+    /// result, a vote winner, an event subject, an enumerated pool), which
+    /// were never announced as targets of this node. Any incarnation identity
+    /// such a population needs travels in its own authority
+    /// (`target_incarnations`, forwarded-result pins).
     pub fn set_unpinned_targets(&mut self, targets: Vec<TargetRef>) {
-        let _ = self.begin_occurrence_write();
         self.targets = targets;
         self.finish_occurrence_write(vec![None; self.targets.len()]);
     }
 
-    /// Copy `source`'s occurrences (targets and pins, position for position).
+    /// SOURCE INHERITANCE: copy `source`'s occurrences (targets and pins,
+    /// position for position) — a parent handing its targets to a child, a
+    /// pending effect handing its targets to a continuation.
     pub fn mirror_targets_from(&mut self, source: &ResolvedAbility) {
-        let _ = self.begin_occurrence_write();
         self.targets = source.targets.clone();
         self.finish_occurrence_write(source.aligned_target_pins());
+    }
+
+    /// SOURCE PROJECTION: replace every occurrence with the occurrences of
+    /// `source` its predicate keeps, in order, each with its own pin.
+    pub fn inherit_target_occurrences_where(
+        &mut self,
+        source: &ResolvedAbility,
+        keep: impl Fn(&TargetRef) -> bool,
+    ) {
+        let occurrences = source
+            .target_occurrences()
+            .into_iter()
+            .filter(|(target, _)| keep(target))
+            .collect();
+        self.replace_target_occurrences(occurrences);
     }
 
     /// Replace every occurrence with explicit `(target, pin)` occurrences.
@@ -290,7 +312,6 @@ impl ResolvedAbility {
         &mut self,
         occurrences: Vec<(TargetRef, Option<ObjectIncarnationRef>)>,
     ) {
-        let _ = self.begin_occurrence_write();
         let (targets, pins): (Vec<_>, Vec<_>) = occurrences
             .into_iter()
             .map(|(target, pin)| {
@@ -366,7 +387,6 @@ impl ResolvedAbility {
 
     /// Remove every occurrence.
     pub fn clear_targets(&mut self) {
-        let _ = self.begin_occurrence_write();
         self.targets.clear();
         self.finish_occurrence_write(Vec::new());
     }
@@ -422,89 +442,100 @@ mod tests {
         )
     }
 
-    /// CR 400.7 + CR 115.3: a legacy keyed decode of `[P1, A, A]` gives each
-    /// object occurrence the first legacy pin with its id, the player none,
-    /// and invents nothing.
+    fn decode(value: serde_json::Value) -> Result<ResolvedAbility, String> {
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    /// CR 400.7 + CR 115.3: decoding a legacy keyed pin list for `[P1, A, A]`
+    /// gives each object occurrence the first legacy pin with its id, the
+    /// player none, and invents nothing — and the decoded node is already
+    /// positional, so it re-serializes without the legacy key.
     #[test]
-    fn legacy_alias_gives_each_occurrence_the_first_matching_pin() {
+    fn legacy_wire_decodes_to_first_matching_positional_pins() {
         let a = ObjectId(7);
-        let mut ability = node(vec![
+        let ability = node(vec![
             TargetRef::Player(PlayerId(1)),
             TargetRef::Object(a),
             TargetRef::Object(a),
         ]);
-        ability.legacy_selected_target_incarnations = vec![pin(7, 3), pin(7, 4), pin(9, 1)];
+        let mut legacy = serde_json::to_value(&ability).unwrap();
+        legacy["selected_target_incarnations"] =
+            serde_json::json!([pin(7, 3), pin(7, 4), pin(9, 1)]);
+        let decoded = decode(legacy).unwrap();
+        assert!(decoded.legacy_selected_target_incarnations.is_empty());
         assert_eq!(
-            ability.aligned_target_pins(),
+            decoded.target_pins,
             vec![None, Some(pin(7, 3)), Some(pin(7, 3))]
         );
-
-        // The first write normalizes into positional form and drops the alias.
-        ability.set_target_at(2, TargetRef::Object(a), Some(pin(7, 4)));
-        assert!(ability.legacy_selected_target_incarnations.is_empty());
-        assert_eq!(
-            ability.target_pins,
-            vec![None, Some(pin(7, 3)), Some(pin(7, 4))]
-        );
-        assert_eq!(validate_target_pin_alignment(&ability), Ok(()));
-    }
-
-    /// CR 400.7: the legacy alias deserializes from the old wire key and is
-    /// never re-serialized; the positional form round-trips.
-    #[test]
-    fn legacy_wire_key_decodes_and_positional_pins_round_trip() {
-        let a = ObjectId(7);
-        let mut ability = node(vec![TargetRef::Player(PlayerId(1)), TargetRef::Object(a)]);
-        ability.announce_target_pins(&GameState::default());
-        let mut legacy = serde_json::to_value(&ability).unwrap();
-        legacy["selected_target_incarnations"] = serde_json::json!([pin(7, 5)]);
-        let decoded: ResolvedAbility = serde_json::from_value(legacy).unwrap();
-        assert_eq!(decoded.aligned_target_pins(), vec![None, Some(pin(7, 5))]);
-
-        let mut positional = decoded.clone();
-        positional.mirror_targets_from(&decoded);
-        let json = serde_json::to_value(&positional).unwrap();
+        let json = serde_json::to_value(&decoded).unwrap();
         assert!(json.get("selected_target_incarnations").is_none());
-        let back: ResolvedAbility = serde_json::from_value(json).unwrap();
-        assert_eq!(back.target_pins, vec![None, Some(pin(7, 5))]);
-        assert_eq!(back, decoded, "legacy and positional forms compare equal");
+        assert_eq!(decode(json).unwrap(), decoded);
     }
 
-    /// CR 400.7: alignment validation refuses a length drift, a pin naming a
-    /// different object than its position, a pinned player, and both forms.
+    /// CR 400.7 (R9-1): legacy pins survive a DOUBLE round trip with no
+    /// occurrence write in between — on every node of a chain.
     #[test]
-    fn alignment_validation_refuses_mismatched_pins() {
+    fn legacy_pins_survive_a_double_round_trip_without_a_write() {
         let mut ability = node(vec![TargetRef::Object(ObjectId(7))]);
-        ability.target_pins = vec![Some(pin(8, 1))];
+        ability.sub_ability = Some(Box::new(node(vec![TargetRef::Object(ObjectId(8))])));
+        let mut legacy = serde_json::to_value(&ability).unwrap();
+        legacy["selected_target_incarnations"] = serde_json::json!([pin(7, 2)]);
+        legacy["sub_ability"]["selected_target_incarnations"] = serde_json::json!([pin(8, 5)]);
+        let first = decode(legacy).unwrap();
+        let second = decode(serde_json::to_value(&first).unwrap()).unwrap();
+        assert_eq!(second.target_pins, vec![Some(pin(7, 2))]);
         assert_eq!(
-            validate_target_pin_alignment(&ability),
+            second.sub_ability.as_deref().unwrap().target_pins,
+            vec![Some(pin(8, 5))]
+        );
+    }
+
+    /// CR 400.7 (R9-2): decoding refuses — with an error, never a panic — a pin
+    /// naming another object, a length drift, a pinned player, and a node
+    /// carrying both encodings; a misaligned continuation is refused too.
+    #[test]
+    fn decode_refuses_misaligned_pins() {
+        let wire = |targets: Vec<TargetRef>, edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = serde_json::to_value(node(targets)).unwrap();
+            edit(&mut value);
+            value
+        };
+        let object = || vec![TargetRef::Object(ObjectId(7))];
+        let identity = decode(wire(object(), &|v| {
+            v["target_pins"] = serde_json::json!([pin(8, 1)]);
+        }))
+        .unwrap_err();
+        assert!(identity.contains("different object"), "{identity}");
+        let length = decode(wire(object(), &|v| {
+            v["target_pins"] = serde_json::json!([pin(7, 1), null]);
+        }))
+        .unwrap_err();
+        assert!(length.contains("not aligned"), "{length}");
+        let player = decode(wire(vec![TargetRef::Player(PlayerId(0))], &|v| {
+            v["target_pins"] = serde_json::json!([pin(7, 1)]);
+        }))
+        .unwrap_err();
+        assert!(player.contains("player"), "{player}");
+        let both = decode(wire(object(), &|v| {
+            v["target_pins"] = serde_json::json!([pin(7, 1)]);
+            v["selected_target_incarnations"] = serde_json::json!([pin(7, 1)]);
+        }))
+        .unwrap_err();
+        assert!(both.contains("legacy"), "{both}");
+        let nested = decode(wire(object(), &|v| {
+            let mut sub = serde_json::to_value(node(object())).unwrap();
+            sub["target_pins"] = serde_json::json!([pin(9, 1)]);
+            v["sub_ability"] = sub;
+        }))
+        .unwrap_err();
+        assert!(nested.contains("different object"), "{nested}");
+        // A reader on a hand-built misaligned node degrades to "no pin".
+        let mut drifted = node(object());
+        drifted.target_pins = vec![Some(pin(8, 1))];
+        assert_eq!(drifted.target_pin_at(0), None);
+        assert_eq!(
+            validate_target_pin_alignment(&drifted),
             Err(TargetPinAlignmentError::IdentityMismatch)
-        );
-        ability.target_pins = vec![Some(pin(7, 1)), None];
-        assert_eq!(
-            validate_target_pin_alignment(&ability),
-            Err(TargetPinAlignmentError::LengthMismatch)
-        );
-        let mut player = node(vec![TargetRef::Player(PlayerId(0))]);
-        player.target_pins = vec![Some(pin(7, 1))];
-        assert_eq!(
-            validate_target_pin_alignment(&player),
-            Err(TargetPinAlignmentError::PlayerPinned)
-        );
-        let mut both = node(vec![TargetRef::Object(ObjectId(7))]);
-        both.target_pins = vec![Some(pin(7, 1))];
-        both.legacy_selected_target_incarnations = vec![pin(7, 1)];
-        assert_eq!(
-            validate_target_pin_alignment(&both),
-            Err(TargetPinAlignmentError::AmbiguousLegacyAlias)
-        );
-        let mut chain = node(vec![TargetRef::Object(ObjectId(7))]);
-        chain.target_pins = vec![Some(pin(7, 1))];
-        chain.sub_ability = Some(Box::new(ability));
-        assert_eq!(
-            validate_target_pin_alignment(&chain),
-            Err(TargetPinAlignmentError::LengthMismatch),
-            "a continuation's misalignment is refused too"
         );
     }
 
