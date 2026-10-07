@@ -1584,6 +1584,7 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
         TargetFilter::EventTargetController => {
             let event = event?;
             let target_obj_id = extract_target_object_from_event(event)?;
+            let obj_opt = state.objects.get(&target_obj_id);
             // CR 608.2h + CR 109.4: prefer the LKI snapshot once the recipient
             // has LEFT the battlefield, rather than reading live first.
             // `reset_for_battlefield_exit` reverts `controller` to the OWNER on
@@ -1593,9 +1594,17 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             // has already moved the recipient before the trigger resolves.
             // When owner and controller coincide that substitution is
             // invisible, which is why the regressions deliberately diverge
-            // them. Same authority as `ParentTargetController`.
-            let controller =
-                crate::game::ability_utils::last_known_permanent_controller(state, target_obj_id)?;
+            // them. Mirrors `ability_utils::parent_target_controller`.
+            let off_battlefield = obj_opt.is_none_or(|obj| obj.zone != Zone::Battlefield);
+            let controller = if off_battlefield {
+                state
+                    .lki_cache
+                    .get(&target_obj_id)
+                    .map(|lki| lki.controller)
+                    .or_else(|| obj_opt.map(|obj| obj.controller))
+            } else {
+                obj_opt.map(|obj| obj.controller)
+            }?;
             Some(TargetRef::Player(controller))
         }
         TargetFilter::ParentTarget => {
@@ -1676,16 +1685,10 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
                 }
             }
         }
-        // CR 608.2h + CR 109.4: "that permanent's controller" on an event
-        // whose object may have left the battlefield before the trigger
-        // resolves (Royal Decree: the tapped permanent was bounced) reads the
-        // controller as it last existed there — the same authority
-        // `parent_target_controller` uses for a chosen target.
         TargetFilter::ParentTargetController => {
             let event = event?;
             let source_obj_id = extract_source_from_event(event)?;
-            let controller =
-                crate::game::ability_utils::last_known_permanent_controller(state, source_obj_id)?;
+            let controller = state.objects.get(&source_obj_id)?.controller;
             Some(TargetRef::Player(controller))
         }
         // CR 108.3 + CR 603.10a + CR 608.2c + CR 608.2h: `ParentTargetOwner`
@@ -1940,9 +1943,11 @@ pub fn resolve_effect_player_ref(
                 resolve_event_context_target(state, filter, ability.source_id).and_then(|target| {
                     match target {
                         TargetRef::Player(player) => Some(player),
-                        TargetRef::Object(id) => {
-                            crate::game::ability_utils::last_known_permanent_controller(state, id)
-                        }
+                        TargetRef::Object(id) => state
+                            .objects
+                            .get(&id)
+                            .map(|obj| obj.controller)
+                            .or_else(|| state.lki_cache.get(&id).map(|lki| lki.controller)),
                     }
                 })
             })

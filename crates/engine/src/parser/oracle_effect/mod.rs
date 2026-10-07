@@ -26982,10 +26982,17 @@ fn subject_is_unbindable_damage_source(
 }
 
 fn unbindable_damage_source_clause(original_clause: &str) -> ParsedEffectClause {
-    parsed_clause(Effect::unimplemented(
-        "blocked_attacker_damage_source",
-        original_clause,
-    ))
+    ParsedEffectClause {
+        unlowered_guard: None,
+        effect: Effect::unimplemented("blocked_attacker_damage_source", original_clause),
+        duration: None,
+        sub_ability: None,
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    }
 }
 
 fn bind_damage_clause_source(
