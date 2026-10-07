@@ -825,3 +825,165 @@ fn mirari_conjecture_copies_each_instant_once() {
     settle(&mut runner, &[]);
     assert_eq!(runner.life(P0), life + 2, "the spell and one copy");
 }
+
+const ZOMBIE_BOA: &str = "{1}{B}: Choose a color. Whenever this creature becomes blocked by a creature of that color this turn, destroy that creature. Activate only as a sorcery.";
+
+/// Zombie Boa activated once per color in `colors` (P0's main), then attacks;
+/// P1 blocks with `blockers`. Returns the runner after the blocks are declared
+/// and the firing count collected, before any firing resolves.
+fn boa_board(
+    colors: &[&str],
+    blockers: &[(&str, ManaColor)],
+) -> (GameRunner, ObjectId, Vec<ObjectId>, usize) {
+    let mut scenario = board();
+    let boa = scenario
+        .add_creature_from_oracle(P0, "Zombie Boa", 3, 3, ZOMBIE_BOA)
+        .with_subtypes(vec!["Zombie", "Snake"])
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        (0..colors.len() * 2)
+            .map(|_| {
+                engine::types::mana::ManaUnit::new(
+                    engine::types::mana::ManaType::Black,
+                    ObjectId(0),
+                    false,
+                    vec![],
+                )
+            })
+            .collect(),
+    );
+    let blocker_ids: Vec<ObjectId> = blockers
+        .iter()
+        .map(|(name, color)| {
+            scenario
+                .add_creature(P1, name, 1, 1)
+                .with_color(vec![*color])
+                .id()
+        })
+        .collect();
+    let mut runner = scenario.build();
+    for color in colors {
+        runner.activate(boa, 0).choose_option(color).resolve();
+    }
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        colors.len(),
+        "reach guard: one installed generator per activation"
+    );
+    attack(&mut runner, &[boa], P1);
+    let assignments: Vec<(ObjectId, ObjectId)> = blocker_ids.iter().map(|&b| (b, boa)).collect();
+    block(&mut runner, &assignments);
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    let firings = runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id == boa)
+        .count();
+    (runner, boa, blocker_ids, firings)
+}
+
+/// CR 509.3d + CR 105.4: one firing per blocker of the chosen color; the
+/// blocker is destroyed, not Boa or a blocker of another color.
+#[test]
+fn zombie_boa_destroys_each_blocker_of_the_chosen_color() {
+    let (mut runner, boa, blockers, firings) = boa_board(
+        &["White"],
+        &[
+            ("White Blocker", ManaColor::White),
+            ("Red Blocker", ManaColor::Red),
+        ],
+    );
+    assert_eq!(firings, 1, "one firing: one white blocker");
+    settle(&mut runner, &[]);
+    assert_eq!(
+        zone(&runner, blockers[0]),
+        Zone::Graveyard,
+        "the white blocker"
+    );
+    assert_eq!(zone(&runner, blockers[1]), Zone::Battlefield, "not red");
+    assert_eq!(zone(&runner, boa), Zone::Battlefield, "not Boa");
+}
+
+/// Each generator keeps the color chosen when it was created: white, then red,
+/// destroys the white blocker and the red blocker, each by its own generator.
+#[test]
+fn zombie_boa_generators_keep_their_own_chosen_color() {
+    let (mut runner, boa, blockers, firings) = boa_board(
+        &["White", "Red"],
+        &[
+            ("White Blocker", ManaColor::White),
+            ("Red Blocker", ManaColor::Red),
+        ],
+    );
+    assert_eq!(
+        firings, 2,
+        "one firing per generator, each for its own color"
+    );
+    settle(&mut runner, &[]);
+    assert_eq!(zone(&runner, blockers[0]), Zone::Graveyard);
+    assert_eq!(zone(&runner, blockers[1]), Zone::Graveyard);
+    assert_eq!(zone(&runner, boa), Zone::Battlefield);
+}
+
+/// Two white generators and one white blocker: two firings are collected
+/// before either resolves; the blocker is destroyed once and the second firing
+/// finds nothing to destroy.
+#[test]
+fn zombie_boa_two_white_generators_fire_twice_for_one_white_blocker() {
+    let (mut runner, boa, blockers, firings) =
+        boa_board(&["White", "White"], &[("White Blocker", ManaColor::White)]);
+    assert_eq!(firings, 2, "two generators, two firings");
+    let graveyard_before = runner.state().players[1].graveyard.len();
+    settle(&mut runner, &[]);
+    assert_eq!(zone(&runner, blockers[0]), Zone::Graveyard);
+    assert_eq!(
+        runner.state().players[1].graveyard.len(),
+        graveyard_before + 1,
+        "destroyed once"
+    );
+    assert_eq!(zone(&runner, boa), Zone::Battlefield);
+}
+
+/// CR 603.7b: a generator lasts "this turn"; on Boa's next turn a white
+/// blocker is not destroyed.
+#[test]
+fn zombie_boa_generator_expires_at_end_of_turn() {
+    let mut scenario = board();
+    let boa = scenario
+        .add_creature_from_oracle(P0, "Zombie Boa", 3, 3, ZOMBIE_BOA)
+        .with_subtypes(vec!["Zombie", "Snake"])
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        (0..2)
+            .map(|_| {
+                engine::types::mana::ManaUnit::new(
+                    engine::types::mana::ManaType::Black,
+                    ObjectId(0),
+                    false,
+                    vec![],
+                )
+            })
+            .collect(),
+    );
+    let white = scenario
+        .add_creature(P1, "White Blocker", 1, 1)
+        .with_color(vec![ManaColor::White])
+        .id();
+    let mut runner = scenario.build();
+    runner.activate(boa, 0).choose_option("White").resolve();
+    assert_eq!(runner.state().delayed_triggers.len(), 1, "reach guard");
+    let turn = runner.state().turn_number;
+    drive_until(&mut runner, |r| {
+        r.state().turn_number >= turn + 2 && r.state().phase == Phase::PreCombatMain
+    });
+    assert!(runner.state().delayed_triggers.is_empty(), "expired");
+    attack(&mut runner, &[boa], P1);
+    block(&mut runner, &[(white, boa)]);
+    settle(&mut runner, &[]);
+    assert_eq!(zone(&runner, white), Zone::Battlefield);
+}

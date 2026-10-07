@@ -15225,7 +15225,28 @@ fn try_parse_event(
             .parse(input)
             .ok()?;
         let (filter, rest) = parse_type_phrase_folding(type_phrase);
-        rest.trim().is_empty().then_some(filter)
+        if rest.trim().is_empty() {
+            return Some(filter);
+        }
+        // CR 105.4 + CR 509.3d: "becomes blocked by a creature of that color"
+        // (Zombie Boa) — the blocker filter carries the creating ability's
+        // chosen color.
+        let (after, _) = alt((
+            tag::<_, _, OracleError<'_>>("of that color"),
+            tag("of the chosen color"),
+        ))
+        .parse(rest.trim_start())
+        .ok()?;
+        if !after.trim().is_empty() {
+            return None;
+        }
+        match filter {
+            TargetFilter::Typed(mut typed) => {
+                typed.properties.push(FilterProp::IsChosenColor);
+                Some(TargetFilter::Typed(typed))
+            }
+            _ => None,
+        }
     }
     /// CR 509.3b: "blocks a <filter>" carries a target-side (attacker) qualifier —
     /// mirrors `parse_becomes_blocked_by_filter`'s blocker-side qualifier exactly.
