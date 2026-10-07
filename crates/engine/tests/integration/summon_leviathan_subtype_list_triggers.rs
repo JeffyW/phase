@@ -242,7 +242,7 @@ fn chapter_two_draws_once_per_listed_attacker() {
     );
 }
 
-/// CR 603.7c + CR 714.4: chapter III's delayed trigger is independent of its
+/// CR 603.7e + CR 113.7a + CR 714.4: chapter III's delayed trigger is independent of its
 /// source. The Saga is sacrificed as soon as chapter III leaves the stack, and a
 /// Kraken attacking later that turn still draws its controller a card.
 #[test]

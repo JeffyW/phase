@@ -1006,12 +1006,19 @@ fn count_matching_trigger_event_subjects(
         // Object target events yield the affected object as subject. Player
         // target events carry no object subject; player scoping lives on
         // `valid_target`.
-        GameEvent::DamageDealt { target, .. } | GameEvent::BecomesTarget { target, .. } => {
-            match target {
-                TargetRef::Object(id) => count_one(*id),
-                TargetRef::Player(_) => 0,
-            }
-        }
+        GameEvent::BecomesTarget { target, .. } => match target {
+            TargetRef::Object(id) => count_one(*id),
+            TargetRef::Player(_) => 0,
+        },
+        // CR 120.4b + CR 608.2c: like `CounterAdded` below, a damage event's
+        // batch amount is the DAMAGE dealt to matching recipients, not a
+        // recipient headcount — "one or more creatures you control are dealt
+        // damage, you gain that much life" reads the damage. A headcount here
+        // would shadow the event's own magnitude in `EventContextAmount`.
+        GameEvent::DamageDealt { target, amount, .. } => match target {
+            TargetRef::Object(id) if matches(*id) => *amount,
+            TargetRef::Object(_) | TargetRef::Player(_) => 0,
+        },
         // CR 603.2c + CR 608.2: For a batched "one or more counters are put on
         // <FILTER>" trigger whose effect reads "that much"/`EventContextAmount`
         // (All Will Be One), the batch amount is the NUMBER OF COUNTERS placed by

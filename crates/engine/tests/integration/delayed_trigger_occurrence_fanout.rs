@@ -452,9 +452,25 @@ fn garruk_batched_attack_trigger_fires_once() {
     runner.activate(garruk, 2).resolve();
     assert_eq!(runner.state().delayed_triggers.len(), 1, "reach guard");
     attack(&mut runner, &[a1, a2], P1);
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "one firing for the whole declaration"
+    );
     settle(&mut runner, &[]);
     assert_eq!(pt(&mut runner, a1), (4, 4), "+2/+2 once");
     assert_eq!(pt(&mut runner, a2), (4, 4), "+2/+2 once");
+    for (id, name) in [(a1, "A"), (a2, "B")] {
+        assert!(
+            runner.state().objects[&id]
+                .keywords
+                .contains(&engine::types::keywords::Keyword::Trample),
+            "Attacker {name} gained trample"
+        );
+    }
 }
 
 /// Batched ("one or more") delayed control with a non-additive body: one
@@ -707,6 +723,55 @@ fn shriveling_rot_destroys_the_damaged_creature_not_the_dealer() {
     );
 }
 
+/// CR 120.4b + CR 608.2c: a batched ("one or more") damage trigger's "that
+/// much" is the damage dealt, not the number of creatures dealt damage. A
+/// Lightning Bolt dealing 3 to one creature gains 3 life, from both a delayed
+/// trigger and the same printed trigger (synthetic text). The matching-subject
+/// count stays a headcount where the event has no magnitude (the Basri Ket row).
+#[test]
+fn batched_damage_trigger_that_much_reads_the_damage_not_the_headcount() {
+    const DELAYED: &str = "Until end of turn, whenever one or more creatures you control are dealt damage, you gain that much life.";
+    const PRINTED: &str =
+        "Whenever one or more creatures you control are dealt damage, you gain that much life.";
+    const BOLT: &str = "Lightning Bolt deals 3 damage to any target.";
+    for printed in [false, true] {
+        let label = if printed { "printed" } else { "delayed" };
+        let mut scenario = board();
+        let wall = scenario.add_creature(P0, "Sturdy Wall", 2, 5).id();
+        let spell = if printed {
+            scenario.add_enchantment_from_oracle(P0, "Synthetic Mending", PRINTED);
+            None
+        } else {
+            Some(free_spell(
+                &mut scenario,
+                P0,
+                "Synthetic Mending",
+                true,
+                DELAYED,
+            ))
+        };
+        let bolt = free_spell(&mut scenario, P0, "Lightning Bolt", true, BOLT);
+        let mut runner = scenario.build();
+        if let Some(spell) = spell {
+            runner.cast(spell).resolve();
+            assert_eq!(
+                runner.state().delayed_triggers.len(),
+                1,
+                "[{label}] reach guard"
+            );
+        }
+        let life = runner.life(P0);
+        runner.cast(bolt).target_object(wall).resolve();
+        settle(&mut runner, &[]);
+        assert_eq!(
+            runner.state().objects[&wall].damage_marked,
+            3,
+            "[{label}] reach guard: the Bolt dealt 3"
+        );
+        assert_eq!(runner.life(P0), life + 3, "[{label}] that much = 3 damage");
+    }
+}
+
 /// False Cure: "that player" is the player who gained life — P1 loses life and
 /// P0, the caster, doesn't. (The amount is out of scope here: "2 life for each
 /// 1 life they gained" currently parses as a fixed 2, disclosed separately.)
@@ -723,7 +788,15 @@ fn false_cure_punishes_the_player_who_gains_life() {
     );
     let mut runner = scenario.build();
     runner.cast(cure).resolve();
-    runner.cast(gift).target_player(P1).resolve();
+    let gift_outcome = runner.cast(gift).target_player(P1).resolve();
+    assert!(
+        gift_outcome.events().iter().any(|e| matches!(
+            e,
+            engine::types::events::GameEvent::LifeChanged { player_id, amount: 2, .. }
+                if *player_id == P1
+        )),
+        "reach guard: P1 gained 2 life"
+    );
     settle(&mut runner, &[]);
     assert!(runner.life(P1) < 22, "the gaining player loses life");
     assert_eq!(runner.life(P0), 20, "the caster doesn't");
