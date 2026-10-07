@@ -1628,7 +1628,8 @@ fn parse_number_of_counters_it_had(input: &str) -> OracleResult<'_, QuantityRef>
     ))
 }
 
-/// Parse the object scope for counter references: "it", "that creature", "that permanent", etc.
+/// Parse the object scope for counter references: the granter placeholder, "it",
+/// "that creature", "that permanent", etc.
 ///
 /// CR 122.1 + CR 608.2k: A creature's ability that counts "+1/+1 counters on
 /// him" / "on her" / "on them" refers to that same source object's counters
@@ -1639,6 +1640,11 @@ fn parse_number_of_counters_it_had(input: &str) -> OracleResult<'_, QuantityRef>
 /// the self-reference token `~`) so it cannot drift from the other sites.
 fn parse_counter_object_scope(input: &str) -> OracleResult<'_, ObjectScope> {
     alt((
+        // CR 201.5a: a granted body's by-name counter read names the granting object.
+        value(
+            ObjectScope::GrantingObject,
+            super::target::parse_granting_object_ref,
+        ),
         value(
             ObjectScope::Source,
             alt((tag("~"), super::primitives::parse_object_recipient_pronoun)),
@@ -2895,7 +2901,7 @@ fn filter_is_population_anchored(filter: &TargetFilter) -> bool {
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
@@ -3031,7 +3037,7 @@ pub(crate) fn objects_filter_zone_is_unambiguous(filter: &TargetFilter) -> bool 
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
