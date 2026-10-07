@@ -374,6 +374,11 @@ fn forsaken_wastes_hits_the_caster_without_commandeer() {
 /// CR 601.2a + CR 601.2c: the announcement recorded on the targeting event is
 /// the one the finalized spell still carries after an interactive payment
 /// pause and the move to the stack.
+///
+/// Scope: this proves the identity hand-off ONLY. It does not prove that a
+/// "becomes the target of a spell" trigger fires under interactive payment:
+/// it doesn't today, a pre-existing casting-payment defect disclosed on the
+/// PR and tracked for its own follow-up PR.
 #[test]
 fn interactive_payment_keeps_the_announcement_its_targeting_event_recorded() {
     use engine::types::ability::TargetRef;
