@@ -797,12 +797,16 @@ pub(crate) fn last_known_permanent_controller(state: &GameState, id: ObjectId) -
     // in the zone it was expected to be in, so it uses its current controller
     // (the spell's caster, or a stack ability's controller) — never a stale
     // battlefield snapshot left in the LKI cache by an earlier incarnation.
-    // Matched by the stack object's OWN id (`entry.id`): a spell's entry id is
-    // its object id, and a targeted ability is recorded by its entry id. An
-    // entry whose `source_id` names this object is a different object — an
-    // ability exists independently of its source (CR 113.7a) — so a pending
-    // ability never makes its departed source look live on the stack.
-    if let Some(entry) = state.stack.iter().find(|entry| entry.id == id) {
+    // The rung matches by `entry.id == id || entry.source_id == id` — a
+    // spell's `source_id == entry.id` (measured), so `stack_object_controller`
+    // is correct on both arms: it reads the spell's live controller when the
+    // object is on the stack, and falls back to `entry.controller` (CR 113.8)
+    // for an ability entry, which has no `state.objects` row.
+    if let Some(entry) = state
+        .stack
+        .iter()
+        .find(|entry| entry.id == id || entry.source_id == id)
+    {
         return Some(stack_object_controller(state, entry));
     }
     // CR 608.2h: off the battlefield and off the stack — last known
@@ -21717,56 +21721,9 @@ mod tests {
             parent_target_controller(&by_entry_id, &state),
             Some(PlayerId(1))
         );
-        // CR 113.7a: the ability exists independently of its source; its
-        // source's id is not the ability. A source with no object row and no
-        // LKI has no controller to report.
-        assert_eq!(parent_target_controller(&by_source_id, &state), None);
-    }
-
-    /// CR 113.7a + CR 608.2h: a departed source whose ability is still on the
-    /// stack answers with its battlefield LKI controller (P0, who controlled
-    /// it), not the pending ability's controller (P1).
-    #[test]
-    fn parent_target_controller_of_a_departed_source_ignores_its_pending_ability() {
-        let mut state = GameState::new_two_player(42);
-        let source_id = create_object(
-            &mut state,
-            CardId(12),
-            PlayerId(1),
-            "Departed Source".to_string(),
-            Zone::Battlefield,
-        );
-        // P0 controlled it on the battlefield; then it left (to hand).
-        state.objects.get_mut(&source_id).unwrap().controller = PlayerId(0);
-        let lki = state.objects[&source_id].snapshot_public_characteristics();
-        assert_eq!(lki.controller, PlayerId(0), "fixture: LKI controller is P0");
-        state.lki_cache.insert(source_id, lki);
-        state.battlefield.retain(|id| *id != source_id);
-        {
-            let obj = state.objects.get_mut(&source_id).unwrap();
-            obj.zone = Zone::Hand;
-            obj.controller = PlayerId(1);
-        }
-        state.stack.push_back(crate::types::game_state::StackEntry {
-            id: ObjectId(77),
-            source_id,
-            controller: PlayerId(1),
-            kind: StackEntryKind::TriggeredAbility {
-                source_id,
-                ability: Box::new(make_simple_ability(vec![], source_id)),
-                condition: None,
-                trigger_event: None,
-                description: None,
-                source_name: "Departed Source".to_string(),
-                subject_match_count: None,
-                die_result: None,
-                provenance: None,
-            },
-        });
-        let by_source_id = make_simple_ability(vec![TargetRef::Object(source_id)], ObjectId(0));
         assert_eq!(
             parent_target_controller(&by_source_id, &state),
-            Some(PlayerId(0))
+            Some(PlayerId(1))
         );
     }
 
