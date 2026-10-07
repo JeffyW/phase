@@ -2115,6 +2115,15 @@ pub fn fallback_action(
         // first offered target for the current slot, or declines an optional
         // slot that offers none.
         WaitingFor::CopyRetarget {
+            announcer_election: Some(election),
+            ..
+        } => election
+            .candidates
+            .first()
+            .map(|opponent| GameAction::ChooseAnnouncingOpponent {
+                opponent: *opponent,
+            }),
+        WaitingFor::CopyRetarget {
             target_slots,
             current_slot,
             can_keep_rest,
@@ -11719,6 +11728,7 @@ mod tests {
             mode: Some(engine::types::game_state::CopyChoiceMode::Retarget),
             picks: Some(Vec::new()),
             can_keep_rest: true,
+            announcer_election: None,
         };
 
         let action = fallback_action_default(&state).expect("fallback returns an action");
@@ -11749,6 +11759,7 @@ mod tests {
             mode: Some(engine::types::game_state::CopyChoiceMode::Retarget),
             picks: Some(Vec::new()),
             can_keep_rest: false,
+            announcer_election: None,
         };
 
         let action = fallback_action_default(&state).expect("fallback returns an action");
@@ -11781,6 +11792,7 @@ mod tests {
             mode: Some(engine::types::game_state::CopyChoiceMode::Announce),
             picks: Some(Vec::new()),
             can_keep_rest: false,
+            announcer_election: None,
         };
 
         let action = fallback_action_default(&state).expect("fallback returns an action");

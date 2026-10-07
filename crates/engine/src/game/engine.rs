@@ -15264,7 +15264,30 @@ fn apply_non_priority_pass_action(
         // pick is answerable only when the engine-derived walk admits it (a
         // keep only where keeping completes; a choice only where it has a
         // legal completion), then the walk advances or finalizes.
-        (WaitingFor::CopyRetarget { .. }, GameAction::ChooseTarget { target }) => {
+        // CR 601.2c + CR 115.1 (CR 707.12): the copy announcement's
+        // announcing-opponent election, recorded through the casting
+        // authority; the walk then continues.
+        (
+            WaitingFor::CopyRetarget {
+                announcer_election: Some(_),
+                ..
+            },
+            GameAction::ChooseAnnouncingOpponent { opponent },
+        ) => {
+            let (walk, _) = effects::copy_choice::walk_of(&state.waiting_for).ok_or_else(|| {
+                EngineError::InvalidAction("Copy target walk is not normalized".to_string())
+            })?;
+            effects::copy_choice::elect_announcing_opponent(state, &walk, opponent)?;
+            advance_copy_walk(state, &walk, Vec::new(), &mut events)?;
+            state.waiting_for.clone()
+        }
+        (
+            WaitingFor::CopyRetarget {
+                announcer_election: None,
+                ..
+            },
+            GameAction::ChooseTarget { target },
+        ) => {
             let (walk, picks) = effects::copy_choice::walk_of(&state.waiting_for)
                 .ok_or_else(|| {
                     EngineError::InvalidAction("Copy target walk is not normalized".to_string())
@@ -15275,7 +15298,13 @@ fn apply_non_priority_pass_action(
         }
         // CR 707.10c: "Keep Current Targets" — keep every remaining position
         // in one action, offered only when keeping them completes.
-        (WaitingFor::CopyRetarget { .. }, GameAction::KeepAllCopyTargets) => {
+        (
+            WaitingFor::CopyRetarget {
+                announcer_election: None,
+                ..
+            },
+            GameAction::KeepAllCopyTargets,
+        ) => {
             let (walk, picks) = effects::copy_choice::walk_of(&state.waiting_for)
                 .ok_or_else(|| {
                     EngineError::InvalidAction("Copy target walk is not normalized".to_string())

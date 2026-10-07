@@ -25,12 +25,15 @@ use crate::game::ability_utils::{
     assign_selected_slots_in_chain, build_target_selection_progress_for_ability,
     build_target_slots, choose_target_for_ability, TargetSelectionAdvance,
 };
+use crate::game::casting_costs::{
+    assign_next_announcing_opponent, next_announcing_opponent_choice,
+};
 use crate::game::engine::EngineError;
 use crate::game::retarget_completion::{RetargetPick, RetargetSearch};
 use crate::types::ability::{EffectKind, ResolvedAbility};
 use crate::types::game_state::{
-    CopyChoiceMode, CopyTargetSlot, GameState, PersistedRestoreError, TargetSelectionProgress,
-    TargetSelectionSlot, WaitingFor,
+    AnnouncerElection, CopyChoiceMode, CopyTargetSlot, GameState, PersistedRestoreError,
+    TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
@@ -163,10 +166,29 @@ pub(crate) fn walk_step(
                     mode: Some(CopyChoiceMode::Retarget),
                     picks: Some(picks),
                     can_keep_rest,
+                    announcer_election: None,
                 },
             ))))
         }
         CopyChoiceMode::Announce => {
+            if let Some(election) = announcer_election(state, walk, &picks)? {
+                return Ok(Some(CopyWalkStep::Prompt(Box::new(
+                    WaitingFor::CopyRetarget {
+                        player: walk.player,
+                        controller: None,
+                        copy_id: walk.copy_id,
+                        target_slots: Vec::new(),
+                        effect_kind: walk.effect_kind,
+                        effect_source_id: walk.effect_source_id,
+                        current_slot: 0,
+                        paradigm_remaining_offers: walk.paradigm_remaining_offers.clone(),
+                        mode: Some(CopyChoiceMode::Announce),
+                        picks: Some(Vec::new()),
+                        can_keep_rest: false,
+                        announcer_election: Some(election),
+                    },
+                ))));
+            }
             let Some(Announcement {
                 ability,
                 slots,
@@ -192,7 +214,8 @@ pub(crate) fn walk_step(
                 )
                 .is_ok();
             // CR 601.2c + CR 115.1: a slot "of an opponent's choice" is
-            // announced by its chooser; the copy stays its controller's.
+            // announced by its chooser; CR 112.2: the copy stays its
+            // controller's.
             let chooser = slots[position].chooser.unwrap_or(walk.player);
             let target_slots = slots
                 .iter()
@@ -222,10 +245,76 @@ pub(crate) fn walk_step(
                     mode: Some(CopyChoiceMode::Announce),
                     picks: Some(progress.selected_slots),
                     can_keep_rest: false,
+                    announcer_election: None,
                 },
             ))))
         }
     }
+}
+
+/// CR 601.2c + CR 115.1 (CR 707.12): the copy announcement's next
+/// announcing-opponent election, through the casting authority
+/// (`next_announcing_opponent_choice`, `choosable_opponents`): before any
+/// target is announced, while an "of an opponent's choice" group has no
+/// announcer and the controller has two or more choosable opponents. With one
+/// opponent there is no decision.
+fn announcer_election(
+    state: &GameState,
+    walk: &CopyWalk,
+    picks: &[RetargetPick],
+) -> Result<Option<AnnouncerElection>, EngineError> {
+    if !picks.is_empty() {
+        return Ok(None);
+    }
+    let Some(ability) = copy_ability(state, walk.copy_id)? else {
+        return Ok(None);
+    };
+    let Some(choice) = next_announcing_opponent_choice(ability) else {
+        return Ok(None);
+    };
+    let candidates = crate::game::players::choosable_opponents(state, walk.player);
+    if candidates.len() < 2 {
+        return Ok(None);
+    }
+    Ok(Some(AnnouncerElection {
+        candidates,
+        choice_index: choice.index,
+        choice_count: choice.count,
+        target_type: choice.target_type,
+    }))
+}
+
+/// CR 601.2c + CR 115.1: answer the copy announcement's announcing-opponent
+/// election: record `opponent` on the first unassigned opponent-choice group
+/// of the copy on the stack (`assign_next_announcing_opponent`, the casting
+/// authority). The walk then continues from an empty prefix.
+pub(crate) fn elect_announcing_opponent(
+    state: &mut GameState,
+    walk: &CopyWalk,
+    opponent: PlayerId,
+) -> Result<(), EngineError> {
+    let election = announcer_election(state, walk, &[])?.ok_or_else(|| {
+        EngineError::InvalidAction(
+            "No opponent-choice effect is awaiting an announcing opponent".to_string(),
+        )
+    })?;
+    if !election.candidates.contains(&opponent) {
+        return Err(EngineError::InvalidAction(format!(
+            "Player {opponent:?} is not an eligible announcing opponent"
+        )));
+    }
+    let ability = state
+        .stack
+        .iter_mut()
+        .find(|entry| entry.id == walk.copy_id)
+        .and_then(|entry| entry.ability_mut())
+        .ok_or_else(|| EngineError::InvalidAction("Copy is no longer on the stack".to_string()))?;
+    if !assign_next_announcing_opponent(ability, opponent) {
+        return Err(EngineError::InvalidAction(
+            "No opponent-choice effect is awaiting an announcing opponent".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// CR 707.10c / CR 601.2c: THE gate and advance for `ChooseTarget` — the

@@ -267,7 +267,7 @@ fn volcanic_offering(copy: bool) {
         .find(|e| e.id == entry)
         .map(|e| e.controller)
         .expect("the announced spell is on the stack");
-    assert_eq!(controller, P0, "CR 115.1: the caster controls the spell");
+    assert_eq!(controller, P0, "CR 112.2: the caster controls the spell");
     if copy {
         assert!(
             matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P0),
@@ -400,4 +400,167 @@ fn copy_with_no_spell_ability_is_cast_and_the_batch_continues() {
 #[test]
 fn copy_batch_of_instants_control() {
     zemo_batch(false);
+}
+
+/// CR 601.2c + CR 115.1 + CR 707.12 (three players): a copy announcement runs
+/// the announcing-opponent election of the casting authority. Volcanic
+/// Offering's rulings: "you choose the opponents for Volcanic Offering as you
+/// cast the spell", the same or different opponents for each effect. The
+/// caster elects P2 for the land group and P1 for the creature group; the
+/// slots are then announced P0/P2/P0/P1, and the copy stays P0's. `copy`:
+/// through Mizzix's Mastery, else the ordinary cast (control).
+fn restore(state: &engine::types::game_state::GameState) -> GameRunner {
+    use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization};
+    let wire = serde_json::to_value(PersistedGameState::capture(state.clone())).unwrap();
+    let restored = serde_json::from_value::<PersistedGameState>(wire)
+        .expect("decodes")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("admissible")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("publishable");
+    GameRunner::from_state(restored)
+}
+
+fn volcanic_offering_three_players(copy: bool) {
+    let p2 = PlayerId(2);
+    let mut s = GameScenario::new_n_player(3, 7);
+    s.at_phase(Phase::PreCombatMain);
+    let land_p1 = s.add_land_from_oracle(P1, "P1 Nonbasic", "").id();
+    let land_p2 = s.add_land_from_oracle(p2, "P2 Nonbasic", "").id();
+    let creature_p1 = s.add_creature(P1, "P1 Creature", 3, 12).id();
+    let creature_p2 = s.add_creature(p2, "P2 Creature", 3, 12).id();
+    let (mut r, mastery, entry) = if copy {
+        let offering = s
+            .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+            .from_oracle_text(VOLCANIC_OFFERING)
+            .id();
+        let mastery = s
+            .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+            .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut r = s.build();
+        r.cast(mastery).target_object(offering).commit();
+        pass_to_choice(&mut r);
+        r.act(GameAction::SelectCards {
+            cards: vec![offering],
+        })
+        .expect("cast the copy");
+        let WaitingFor::CopyRetarget { copy_id, .. } = r.state().waiting_for else {
+            panic!("expected the copy walk, got {:?}", r.state().waiting_for);
+        };
+        (r, Some(mastery), copy_id)
+    } else {
+        let offering = s
+            .add_spell_to_hand_from_oracle(P0, "Volcanic Offering", true, VOLCANIC_OFFERING)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut r = s.build();
+        begin_cast(&mut r, offering);
+        (r, None, offering)
+    };
+    for (index, elected) in [(1, p2), (2, P1)] {
+        let election = match &r.state().waiting_for {
+            WaitingFor::ChooseAnnouncingOpponent {
+                player,
+                candidates,
+                choice_index,
+                choice_count,
+                ..
+            } => (*player, candidates.clone(), *choice_index, *choice_count),
+            WaitingFor::CopyRetarget {
+                player,
+                announcer_election: Some(election),
+                target_slots,
+                ..
+            } => {
+                assert!(target_slots.is_empty(), "no slot is answered mid-election");
+                (
+                    *player,
+                    election.candidates.clone(),
+                    election.choice_index,
+                    election.choice_count,
+                )
+            }
+            other => panic!("expected election {index}, got {other:?}"),
+        };
+        assert_eq!(election.0, P0, "the caster elects");
+        assert!(election.1.contains(&P1) && election.1.contains(&p2));
+        assert_eq!((election.2, election.3), (index, 2));
+        if copy && index == 1 {
+            assert!(
+                GameRunner::from_state(r.state().clone())
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(land_p1)),
+                    })
+                    .is_err(),
+                "no target is announced before the election"
+            );
+        }
+        if copy {
+            // A save mid-election restores to the same election.
+            let restored = restore(r.state());
+            assert_eq!(
+                restored.state().waiting_for,
+                r.state().waiting_for,
+                "election {index} survives save and restore"
+            );
+            r = restored;
+        }
+        r.act(GameAction::ChooseAnnouncingOpponent { opponent: elected })
+            .expect("the caster elects an announcing opponent");
+    }
+    let mut askers: Vec<PlayerId> = Vec::new();
+    for target in [land_p1, land_p2, creature_p1, creature_p2] {
+        let asker = match r.state().waiting_for.clone() {
+            WaitingFor::CopyRetarget {
+                player, controller, ..
+            } => {
+                assert_eq!(controller.unwrap_or(player), P0, "the copy stays P0's");
+                if player != P0 {
+                    // A save while an opponent answers keeps who answers and
+                    // whose copy it is.
+                    let restored = restore(r.state());
+                    assert_eq!(restored.state().waiting_for, r.state().waiting_for);
+                    assert!(matches!(
+                        restored.state().waiting_for,
+                        WaitingFor::CopyRetarget { player, controller: Some(c), .. }
+                            if player != P0 && c == P0
+                    ));
+                    r = restored;
+                }
+                player
+            }
+            WaitingFor::TargetSelection { player, .. } => player,
+            other => panic!("expected an announcement prompt, got {other:?}"),
+        };
+        askers.push(asker);
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(target)),
+        })
+        .expect("the asked player announces");
+    }
+    assert_eq!(askers, vec![P0, p2, P0, P1]);
+    resolve_entry(&mut r, entry);
+    assert!([land_p1, land_p2]
+        .iter()
+        .all(|l| r.state().objects[l].zone == Zone::Graveyard));
+    assert_eq!(
+        [creature_p1, creature_p2].map(|c| r.state().objects[&c].damage_marked),
+        [7, 7]
+    );
+    if let Some(mastery) = mastery {
+        resolve_entry(&mut r, mastery);
+        assert_eq!(r.state().objects[&mastery].zone, Zone::Exile);
+    }
+}
+
+#[test]
+fn copy_announcement_elects_announcing_opponents_per_effect() {
+    volcanic_offering_three_players(true);
+}
+
+#[test]
+fn ordinary_volcanic_offering_three_player_election_control() {
+    volcanic_offering_three_players(false);
 }

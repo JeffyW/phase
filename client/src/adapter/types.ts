@@ -2023,6 +2023,18 @@ export type CopyTargetSlot = {
   can_decline?: boolean;
 };
 
+/**
+ * CR 601.2c + CR 115.1: a copy announcement's announcing-opponent election
+ * (answered with `ChooseAnnouncingOpponent`). While present, no target slot is
+ * being answered.
+ */
+export type AnnouncerElection = {
+  candidates: PlayerId[];
+  choice_index: number;
+  choice_count: number;
+  target_type?: CoreType;
+};
+
 /** Whether a copy target walk retargets an existing copy or announces a fresh one. */
 export type CopyChoiceMode = "Retarget" | "Announce";
 
@@ -2836,7 +2848,7 @@ export type WaitingFor =
       all_kept: ObjectId[];
       scoped_players: PlayerId[];
     } }
-  | { type: "CopyRetarget"; data: { player: PlayerId; controller?: PlayerId | null; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number; mode?: CopyChoiceMode | null; picks?: (TargetRef | null)[] | null; can_keep_rest?: boolean } }
+  | { type: "CopyRetarget"; data: { player: PlayerId; controller?: PlayerId | null; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number; mode?: CopyChoiceMode | null; picks?: (TargetRef | null)[] | null; can_keep_rest?: boolean; announcer_election?: AnnouncerElection | null } }
   // CR 700.3 + CR 700.3a: Subject is partitioning their own eligible objects
   // into two piles for an `Effect::SeparateIntoPiles`. `player` is the
   // CR 608.2d + CR 700.3: Controller chooses which opponent separates piles (multiplayer).

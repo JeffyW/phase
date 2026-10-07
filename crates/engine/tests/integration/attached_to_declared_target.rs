@@ -2263,41 +2263,96 @@ fn choose_new_targets_accepts_a_same_id_re_election_legal_for_the_new_creature()
     assert_eq!(state.objects[&b].zone, Zone::Exile);
 }
 
-/// CR 115.1a + CR 601.2c: a controller-qualified dependent target ("target
-/// Equipment you control / an opponent controls attached to that creature") is
-/// not supported — its slot is built through per-player construction, which
-/// does not compose with the declared-slot referent — so it keeps a gap. The
-/// unqualified shape is the supported control.
+/// CR 115.1a + CR 601.2c + CR 109.5: a controller-qualified dependent target
+/// ("target Equipment you control / an opponent controls attached to that
+/// creature") composes both constraints. Creature A wears Equipment Mine
+/// (controlled by the caster) and Equipment Theirs; creature B wears Equipment
+/// B. After A is announced, "you control" offers only Mine and "an opponent
+/// controls" only Theirs; the chosen one is exiled, and the damage hits A.
 #[test]
-fn controller_qualified_dependent_target_keeps_its_gap() {
-    for qualifier in ["you control ", "an opponent controls "] {
+fn controller_qualified_dependent_target_composes_with_the_referent() {
+    for (qualifier, mine_offered) in [("you control ", true), ("an opponent controls ", false)] {
         let text = format!(
             "~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier}attached to that creature."
         );
         let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
-        let effects = chain(&parsed.abilities[0]);
         assert!(
-            matches!(effects[0], Effect::DealDamage { .. }),
-            "{qualifier}: reach guard, the damage head parses, got {effects:?}"
-        );
-        // The exile path's fail-closed gap (`parse_exile_ast` declines the
-        // whole clause), carrying the qualified fragment.
-        assert!(
-            effects.iter().any(|effect| matches!(
-                effect,
-                Effect::Unimplemented { name, description: Some(text), .. }
-                    if name == "unparsed_verb_arguments"
-                        && text.contains(&format!("Equipment {qualifier}attached to that creature"))
-            )),
-            "{qualifier}: must keep the qualified-clause gap, got {effects:?}"
+            unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+            "{qualifier}: the qualified clause parses supported"
         );
         assert!(
-            !serde_json::to_string(&parsed.abilities[0])
+            serde_json::to_string(&parsed.abilities[0])
                 .unwrap()
                 .contains("DeclaredTarget"),
-            "{qualifier}: no declared-slot referent may be emitted"
+            "{qualifier}: the declared-slot referent is emitted"
         );
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+        let b = scenario.add_creature(P1, "Creature B", 2, 7).id();
+        let mine = equipment(&mut scenario, P0, "Equipment Mine");
+        let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
+        let eq_b = equipment(&mut scenario, P1, "Equipment B");
+        let spell = free_spell(&mut scenario, "Probe", true, &text);
+        let mut runner = scenario.build();
+        attach::attach_to(runner.state_mut(), mine, a);
+        attach::attach_to(runner.state_mut(), theirs, a);
+        attach::attach_to(runner.state_mut(), eq_b, b);
+        runner
+            .act(GameAction::CastSpell {
+                object_id: spell,
+                card_id: runner.state().objects[&spell].card_id,
+                targets: vec![],
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            })
+            .expect("cast begins");
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(a)),
+            })
+            .expect("announce A");
+        let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for else {
+            panic!(
+                "{qualifier}: expected the Equipment slot, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        let (offered, chosen) = if mine_offered {
+            (mine, theirs)
+        } else {
+            (theirs, mine)
+        };
+        assert_eq!(
+            selection.current_legal_targets,
+            vec![TargetRef::Object(offered)],
+            "{qualifier}: only that controller's Equipment on A"
+        );
+        assert!(
+            GameRunner::from_state(runner.state().clone())
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(chosen)),
+                })
+                .is_err(),
+            "{qualifier}: the other controller's Equipment is refused"
+        );
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(offered)),
+            })
+            .expect("announce the qualified Equipment");
+        runner.advance_until_stack_empty();
+        let state = runner.state();
+        assert_eq!(state.objects[&a].damage_marked, 5);
+        assert_eq!(state.objects[&offered].zone, Zone::Exile);
+        assert_eq!(state.objects[&chosen].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&eq_b].zone, Zone::Battlefield);
     }
+}
+
+/// The unqualified shape stays the supported control.
+#[test]
+fn unqualified_dependent_target_control() {
     let parsed = parse_oracle_text(
         "~ deals 5 damage to target creature. Exile up to one target Equipment attached to that creature.",
         "Probe",
@@ -3263,4 +3318,106 @@ fn keeping_a_blinked_creature_keeps_its_announced_pin() {
             "{action}: only an elected returned A is hit"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forced "change a target" (CR 115.7a + CR 115.7b + CR 115.7e)
+// ---------------------------------------------------------------------------
+
+const SPELLSKITE: &str = "{U/P}: Change a target of target spell or ability to this creature. ({U/P} can be paid with either {U} or 2 life.)";
+
+/// Fiery Annihilation at A (with Equipment 1 when `with_equipment`); P0 then
+/// activates its own Spellskite, paying 2 life, which forces "a target" of
+/// Fiery to Spellskite. Returns (runner, a, eq1, spellskite) after Fiery
+/// resolves.
+fn spellskite_on_fiery(with_equipment: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+    let eq1 = equipment(&mut scenario, P1, "Equipment 1");
+    let spellskite = scenario
+        .add_creature_from_oracle(P0, "Spellskite", 0, 4, SPELLSKITE)
+        .id();
+    let fiery = free_spell(
+        &mut scenario,
+        "Fiery Annihilation",
+        true,
+        FIERY_ANNIHILATION,
+    );
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), eq1, a);
+    let targets: Vec<ObjectId> = if with_equipment {
+        vec![a, eq1]
+    } else {
+        vec![a]
+    };
+    runner.cast(fiery).target_objects(&targets).commit();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: spellskite,
+            ability_index: 0,
+        })
+        .expect("activate Spellskite");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::PhyrexianPayment { .. }
+    ) {
+        runner
+            .act(GameAction::SubmitPhyrexianChoices {
+                choices: vec![engine::types::game_state::ShardChoice::PayLife],
+            })
+            .expect("pay 2 life");
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach: Spellskite's ability is on Fiery"
+    );
+    // Resolve Spellskite's ability, then Fiery.
+    for _ in 0..2 {
+        let top = runner.state().stack.back().map(|e| e.id).unwrap();
+        for _ in 0..8 {
+            if !runner.state().stack.iter().any(|e| e.id == top) {
+                break;
+            }
+            runner.act(GameAction::PassPriority).expect("pass");
+        }
+    }
+    (runner, a, eq1, spellskite)
+}
+
+/// CR 115.7a + CR 115.7e: with Equipment 1 (attached to A) also targeted,
+/// changing Fiery's creature to Spellskite would make the unchanged Equipment
+/// target illegal (it is not attached to Spellskite). Only the final set is
+/// evaluated, so that change is not legal; the original targets are
+/// unchanged: A takes 5 and Equipment 1 is exiled. Control: with no Equipment
+/// targeted, the creature target changes to Spellskite, which takes 5 and is
+/// exiled by the rider.
+#[test]
+fn forced_change_a_target_keeps_the_dependent_equipment_target_legal() {
+    let (runner, a, eq1, spellskite) = spellskite_on_fiery(true);
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&a].damage_marked, 5,
+        "the creature target is unchanged"
+    );
+    assert_eq!(
+        state.objects[&eq1].zone,
+        Zone::Exile,
+        "Equipment 1 is still exiled"
+    );
+    assert_eq!(state.objects[&spellskite].zone, Zone::Battlefield);
+
+    let (runner, a, eq1, spellskite) = spellskite_on_fiery(false);
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&a].damage_marked, 0,
+        "control: redirected away from A"
+    );
+    assert_eq!(
+        state.objects[&spellskite].zone,
+        Zone::Exile,
+        "control: Spellskite takes 5 and the rider exiles it"
+    );
+    assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
 }

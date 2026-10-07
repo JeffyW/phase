@@ -393,6 +393,7 @@ fn legacy_copy_retarget_completion_uses_copy_as_default_source() {
         mode: None,
         picks: None,
         can_keep_rest: false,
+        announcer_election: None,
     };
 
     let result = apply(&mut state, PlayerId(0), GameAction::KeepAllCopyTargets)

@@ -951,6 +951,7 @@ fn issue_3660_finalize_copy_retarget_stashes_offers_on_deferred_pause() {
         mode: None,
         picks: None,
         can_keep_rest: false,
+        announcer_election: None,
     };
     state.deferred_triggers = vec![
         deferred_draw_trigger(&mut state, "Copy Observer A", player),

@@ -1131,6 +1131,7 @@ mod tests {
                 mode: None,
                 picks: None,
                 can_keep_rest: true,
+                announcer_election: None,
             },
             candidates: vec![candidate_for(high)],
         };

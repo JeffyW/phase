@@ -222,7 +222,9 @@ export class NativeEngineVersionMismatchError extends Error {
  *      copy walk's keep/decline permissions (CopyTargetSlot.can_keep and
  *      can_decline, CopyRetarget.can_keep_rest) are engine fields this client
  *      renders without a fallback; CopyRetarget.controller names the copy's
- *      controller when a slot's chooser answers.
+ *      controller when a slot's chooser answers, and
+ *      CopyRetarget.announcer_election carries a copy announcement's
+ *      announcing-opponent election.
  * 107 — UntilCondition NextMatches gains count ("until you exile two nonland
  *      cards …" — Invasion of Alara, CR 608.2c), the paused exile loop keeps
  *      its hits, ZoneChoiceCandidateSource gains ParentTargets, and

@@ -3207,6 +3207,23 @@ pub fn candidate_actions_broad_with_probe(
         // candidate is answerable.
         WaitingFor::CopyRetarget {
             player,
+            announcer_election: Some(election),
+            ..
+        } => election
+            .candidates
+            .iter()
+            .map(|opponent| {
+                candidate(
+                    GameAction::ChooseAnnouncingOpponent {
+                        opponent: *opponent,
+                    },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
+        WaitingFor::CopyRetarget {
+            player,
             target_slots,
             current_slot,
             can_keep_rest,

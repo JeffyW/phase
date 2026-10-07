@@ -5353,6 +5353,7 @@ fn union_over_declared_slot_candidates(
     ability: &ResolvedAbility,
     filter: &TargetFilter,
     existing_slots: &[TargetSelectionSlot],
+    controllers: &[PlayerId],
 ) -> Vec<TargetRef> {
     let [slot] = declared_slots_read_by(filter)[..] else {
         return Vec::new();
@@ -5372,15 +5373,17 @@ fn union_over_declared_slot_candidates(
     for candidate in &candidates {
         let mut view: Vec<Option<targeting::DeclaredSlotBinding>> = vec![None; slot + 1];
         view[slot] = Some(targeting::DeclaredSlotBinding::Elected(candidate.clone()));
-        for target in targeting::find_legal_targets_for_ability_with_view(
-            state,
-            filter,
-            ability,
-            ability.controller,
-            &view,
-        ) {
-            if !legal_targets.contains(&target) {
-                legal_targets.push(target);
+        for controller in controllers {
+            for target in targeting::find_legal_targets_for_ability_with_view(
+                state,
+                filter,
+                ability,
+                *controller,
+                &view,
+            ) {
+                if !legal_targets.contains(&target) {
+                    legal_targets.push(target);
+                }
             }
         }
     }
@@ -7499,7 +7502,13 @@ fn legal_targets_for_ability_filter_uncapped(
         // over every candidate of the slot it names (no selection exists yet);
         // the interactive walk narrows it to the object actually chosen.
         if crate::game::filter::filter_reads_declared_slot(filter) {
-            return union_over_declared_slot_candidates(state, ability, filter, existing_slots);
+            return union_over_declared_slot_candidates(
+                state,
+                ability,
+                filter,
+                existing_slots,
+                &[ability.controller],
+            );
         }
         if needs_ability_context {
             return targeting::find_legal_targets_for_ability(state, filter, ability);
@@ -7507,13 +7516,50 @@ fn legal_targets_for_ability_filter_uncapped(
         return targeting::find_legal_targets(state, filter, ability.controller, ability.source_id);
     }
 
-    let Some(player_slot) = existing_slots.iter().rev().find(|slot| {
+    let player_slot = existing_slots.iter().rev().find(|slot| {
         !slot.legal_targets.is_empty()
             && slot
                 .legal_targets
                 .iter()
                 .all(|target| matches!(target, TargetRef::Player(_)))
-    }) else {
+    });
+    // CR 601.2c + CR 701.3a + CR 109.5: a controller- or owner-relative
+    // declared-slot referent ("target Equipment you control attached to that
+    // creature") composes both enumerations: the referent's candidates, each
+    // under every player the relative scope can name (the companion player
+    // slot's candidates, or the controller when there is none).
+    if crate::game::filter::filter_reads_declared_slot(filter) {
+        let (enumeration_filter, players): (TargetFilter, Vec<PlayerId>) = match player_slot {
+            Some(player_slot) => (
+                match relative_kind {
+                    Some(crate::types::ability::ControllerRef::TargetPlayer) => {
+                        rewrite_declared_target_player(
+                            filter,
+                            crate::types::ability::ControllerRef::You,
+                        )
+                    }
+                    _ => filter.clone(),
+                },
+                player_slot
+                    .legal_targets
+                    .iter()
+                    .filter_map(|target| match target {
+                        TargetRef::Player(player_id) => Some(*player_id),
+                        TargetRef::Object(_) => None,
+                    })
+                    .collect(),
+            ),
+            None => (filter.clone(), vec![ability.controller]),
+        };
+        return union_over_declared_slot_candidates(
+            state,
+            ability,
+            &enumeration_filter,
+            existing_slots,
+            &players,
+        );
+    }
+    let Some(player_slot) = player_slot else {
         if needs_ability_context {
             return targeting::find_legal_targets_for_ability(state, filter, ability);
         }

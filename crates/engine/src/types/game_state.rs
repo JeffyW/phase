@@ -16254,7 +16254,7 @@ pub enum WaitingFor {
         /// announcement slot "of an opponent's choice", that slot's chooser
         /// (CR 601.2c + CR 115.1).
         player: PlayerId,
-        /// CR 115.1: the copy's controller, when it differs from the player
+        /// CR 112.2: the copy's controller, when it differs from the player
         /// answering this prompt. Finalization, priority and the
         /// continuation/Paradigm handoff go to the controller. `None` means
         /// `player` (every prompt the controller answers, and every older save).
@@ -16292,6 +16292,14 @@ pub enum WaitingFor {
         /// `GameAction::KeepAllCopyTargets`.
         #[serde(default)]
         can_keep_rest: bool,
+        /// CR 601.2c + CR 115.1 (CR 707.12): an announcement walk's opening
+        /// step: the copy's controller chooses which opponent announces the
+        /// next "of an opponent's choice" target group, answered with
+        /// `GameAction::ChooseAnnouncingOpponent`. While set, no target slot
+        /// is being answered (`target_slots` is empty). Engine-derived at
+        /// every open, advance and restore.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        announcer_election: Option<AnnouncerElection>,
     },
     /// CR 510.1c: Attacker with multiple blockers — controller divides damage as they choose.
     /// CR 702.19b/c: Trample requires lethal to each blocker before assigning excess.
@@ -16502,6 +16510,22 @@ pub struct CopyTargetSlot {
     /// `can_keep`: there is no announced target to keep.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_decline: bool,
+}
+
+/// CR 601.2c + CR 115.1: one announcing-opponent election of a copy
+/// announcement walk. The same facts `WaitingFor::ChooseAnnouncingOpponent`
+/// carries for an ordinary cast, without a `PendingCast`: the copy is already
+/// on the stack.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnouncerElection {
+    /// The choosable opponents.
+    pub candidates: Vec<PlayerId>,
+    /// One-based position of this opponent-choice group among the spell's.
+    pub choice_index: usize,
+    pub choice_count: usize,
+    /// The group's primary type constraint (a display fact only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_type: Option<crate::types::card_type::CoreType>,
 }
 
 /// CR 707.10c / CR 722.3c: the two operations a `WaitingFor::CopyRetarget`

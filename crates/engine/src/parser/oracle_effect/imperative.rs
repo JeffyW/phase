@@ -10322,20 +10322,14 @@ pub(super) fn bind_attachment_qualifier<'a>(
     legs_carry(&bound, &prop).then_some((bound, after))
 }
 
-/// The strict admissible shape for a declared-slot attachment referent: a
-/// `Typed` filter or an `Or` of them, with no controller or owner scope. A
-/// controller-relative leg ("target Equipment you control attached to that
-/// creature") is built through the per-player slot construction, which does not
-/// compose with the declared-slot union, so it stays a gap.
+/// The admissible shape for a declared-slot attachment referent: a `Typed`
+/// filter or an `Or` of them. A controller or owner scope ("target Equipment
+/// you control attached to that creature") composes: slot construction
+/// enumerates the declared referent's candidates under the slot's controller
+/// binding (`ability_utils::legal_targets_for_ability_filter_uncapped`).
 fn legs_admit_declared_referent(filter: &TargetFilter) -> bool {
     match filter {
-        TargetFilter::Typed(typed) => {
-            typed.controller.is_none()
-                && !typed
-                    .properties
-                    .iter()
-                    .any(|prop| matches!(prop, FilterProp::Owned { .. }))
-        }
+        TargetFilter::Typed(_) => true,
         TargetFilter::Or { filters } => filters.iter().all(legs_admit_declared_referent),
         _ => false,
     }

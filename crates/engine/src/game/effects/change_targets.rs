@@ -155,16 +155,44 @@ pub fn resolve(
     if let Some(filter) = forced_to {
         // CR 115.7a/b: Forced retarget uses the exposed slot's legality, which
         // can differ from the legacy whole-entry pool for a derived target.
+        // CR 115.7e: "only the final set of targets is evaluated": each
+        // candidate change is accepted only when THE retarget validator
+        // accepts the whole chain with that one position changed and every
+        // other position kept — so a change that would make an unchanged legal
+        // target illegal (Fiery Annihilation's Equipment no longer attached to
+        // the new creature) is not made. The validator's result is written:
+        // its pins (a changed occurrence takes the live incarnation, CR 400.7)
+        // and its re-derived chain targets.
         let new_targets = find_legal_targets(state, filter, ability.controller, ability.source_id);
-        if let Some((new_target, i)) = new_targets.into_iter().find_map(|new_target| {
-            forced_retarget_target_position(exposed, &slot_pools, &current_targets, &new_target)
-                .map(|i| (new_target, i))
-        }) {
-            // CR 115.7b: change exactly one position admitted by the existing
-            // slot authority, preserving all other positions and their pins.
-            write_retarget_position(state, stack_entry_index, &exposed[i].address, &new_target);
+        let accepted = crate::game::retarget_completion::RetargetSearch::for_stack_entry(
+            state,
+            stack_entry_index,
+        )
+        .and_then(|search| {
+            new_targets.into_iter().find_map(|new_target| {
+                let i = forced_retarget_target_position(
+                    exposed,
+                    &slot_pools,
+                    &current_targets,
+                    &new_target,
+                )?;
+                let position = search
+                    .slots()
+                    .iter()
+                    .position(|slot| *slot == exposed[i].address)?;
+                let mut picks = vec![None; search.len()];
+                picks[position] = Some(new_target);
+                search.validate(&picks).ok()
+            })
+        });
+        if let Some(post) = accepted {
+            // CR 115.7b: exactly one position changed; every other position
+            // keeps its target and pin.
+            if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
+                *stack_ability_mut = post;
+            }
         }
-        // CR 115.7a: if no exposed slot admits a candidate, keep every target.
+        // CR 115.7a: if no candidate change is legal, keep every target.
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::from(&ability.effect),
             source_id: ability.source_id,
@@ -352,8 +380,8 @@ fn base_exposed_prefix(bindings: &[RetargetSlotBinding]) -> &[RetargetSlotBindin
 ///
 /// SINGLE-POSITION CASE (`exposed.len() == 1`, the overwhelming majority of
 /// forced retargets — BASE's `None => Some(0)` fallback for a non-mana-role
-/// node): NOT gated on `changes`. `write_retarget_position`'s own
-/// `retarget_requires_pin_refresh_at` call is what decides whether a
+/// node): NOT gated on `changes`. The validator's shared changed verdict
+/// (`retarget_positions_changed`) is what decides whether a
 /// write is a genuine change OR a same-TargetRef re-incarnation (CR 400.7 +
 /// CR 603.7c) that still needs its pin refreshed; gating candidacy on raw
 /// `TargetRef` inequality here would make that same-ID case unreachable, since
@@ -378,39 +406,6 @@ fn forced_retarget_target_position(
         let legal = slot_pools.get(i).is_some_and(|p| p.contains(new_target));
         changes && legal
     })
-}
-
-/// CR 115.7d: write a single addressed position's new target, refreshing its
-/// target-incarnation pin (CR 400.7 + CR 603.7c) and re-deriving the chain's
-/// non-declared targets (`restamp_derived_chain_targets`). Shared per-address
-/// writer for the forced path here and `engine::apply_retarget`'s interactive
-/// write loop, so the two cannot disagree about what "write position `i`"
-/// means.
-fn write_retarget_position(
-    state: &mut GameState,
-    stack_entry_index: usize,
-    address: &RetargetSlotAddress,
-    new_target: &TargetRef,
-) {
-    let Some(mut mutated) = state.stack[stack_entry_index].ability().cloned() else {
-        return;
-    };
-    if let Some(node) = ability_utils::node_at_mut(&mut mutated, &address.path) {
-        if node.targets.get(address.slot).is_some() {
-            // CR 115.7d + CR 400.7: a changed occurrence takes the live
-            // incarnation; an unchanged one keeps its own announced pin.
-            let pin = if node.retarget_requires_pin_refresh_at(address.slot, new_target, state) {
-                ability_utils::live_target_pin(state, new_target)
-            } else {
-                node.target_pin_at(address.slot)
-            };
-            node.set_target_at(address.slot, new_target.clone(), pin);
-        }
-    }
-    ability_utils::restamp_derived_chain_targets(&mut mutated);
-    if let Some(stack_ability_mut) = state.stack[stack_entry_index].ability_mut() {
-        *stack_ability_mut = mutated;
-    }
 }
 
 /// CR 109.5 (+ CR 400.7a for a permanent spell whose controller changed):
