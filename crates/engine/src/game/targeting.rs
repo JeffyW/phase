@@ -1552,12 +1552,41 @@ fn resolve_source_attached_to(
         return Some(host);
     }
     // CR 113.7a + CR 608.2k: Last-known information when the source permanent has left the battlefield.
-    state
+    if let Some(host) = state
         .zone_changes_this_turn
         .iter()
         .rev()
         .find(|r| r.object_id == source_id && r.from_zone == Some(Zone::Battlefield))
         .and_then(|r| r.attached_to)
+    {
+        return Some(host);
+    }
+    // CR 303.4c + CR 608.2h: when the host left first, the Aura/Equipment stays
+    // attached to "the object it was attached to [that] no longer exists" until
+    // state-based actions move it, so its last-known host is the departed
+    // object. The host's departure record lists its attachments. A same-id
+    // source that is again on the battlefield at a different incarnation is a
+    // new object (CR 400.7) and never inherits that host.
+    let live_source = state
+        .objects
+        .get(&source_id)
+        .filter(|obj| obj.zone == Zone::Battlefield);
+    state
+        .zone_changes_this_turn
+        .iter()
+        .rev()
+        .filter(|r| r.from_zone == Some(Zone::Battlefield))
+        .find(|r| {
+            r.attachments.iter().any(|snapshot| {
+                snapshot.object_id == source_id
+                    && live_source.is_none_or(|obj| {
+                        snapshot
+                            .identity
+                            .is_some_and(|identity| identity.incarnation == obj.incarnation)
+                    })
+            })
+        })
+        .map(|r| crate::game::game_object::AttachTarget::Object(r.object_id))
 }
 
 pub(crate) fn resolve_event_context_target_for_event_or_state(
@@ -1764,20 +1793,24 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             }
             // CR 301.5 + CR 303.4 + CR 113.7a: Aura/Equipment fallback — the controller of the
             // source's attached host is the controller of "that creature/permanent".
+            // CR 608.2h: a host that left the battlefield answers with its
+            // controller as it last existed there, through the same authority.
             let host = resolve_source_attached_to(state, source_id)?;
             match host {
-                crate::game::game_object::AttachTarget::Object(id) => state
-                    .objects
-                    .get(&id)
-                    .map(|obj| TargetRef::Player(obj.controller))
-                    .or_else(|| {
-                        state
-                            .zone_changes_this_turn
-                            .iter()
-                            .rev()
-                            .find(|r| r.object_id == id && r.from_zone == Some(Zone::Battlefield))
-                            .map(|r| TargetRef::Player(r.controller))
-                    }),
+                crate::game::game_object::AttachTarget::Object(id) => {
+                    crate::game::ability_utils::last_known_permanent_controller(state, id)
+                        .or_else(|| {
+                            state
+                                .zone_changes_this_turn
+                                .iter()
+                                .rev()
+                                .find(|r| {
+                                    r.object_id == id && r.from_zone == Some(Zone::Battlefield)
+                                })
+                                .map(|r| r.controller)
+                        })
+                        .map(TargetRef::Player)
+                }
                 crate::game::game_object::AttachTarget::Player(player) => {
                     Some(TargetRef::Player(player))
                 }

@@ -349,6 +349,7 @@ mod eternal_wanderer_sacrifice_choice_7153;
 mod etrata_cloak_enters_under_cloaker_5944;
 mod eureka_moment_draw_trigger_strands_optional_frame;
 mod evelyn_regression;
+mod event_controller_last_known;
 mod event_target_controller_damage_anaphor;
 mod excess_damage_quantity_channel;
 mod exchange_life_totals_cards;
