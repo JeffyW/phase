@@ -2257,9 +2257,10 @@ fn parent_target_controller_of_a_stolen_spell_is_the_thief() {
     assert_eq!(parent_target_controller(&ability, &state), Some(thief));
 }
 
-/// HOSTILE (V10): the rung matches by `entry.source_id == id` too — an
-/// ability entry matched by `source_id`, where the accessor must fall back to
-/// `entry.controller` per CR 113.8 (no object row for the ability id itself).
+/// HOSTILE (V10): a target naming an ability's SOURCE (still on the
+/// battlefield) answers with that source's controller. The stack rung matches
+/// only a stack object's own id, so the pending ability doesn't answer for its
+/// source (CR 113.7a).
 #[test]
 fn parent_target_controller_matches_by_source_id_for_an_ability_entry() {
     let mut state = new_state();

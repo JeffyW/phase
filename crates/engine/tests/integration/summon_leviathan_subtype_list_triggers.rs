@@ -920,6 +920,8 @@ fn delayed_list_then_action_tail_investigates_at_runtime() {
 }
 
 const ROYAL_DECREE: &str = "Cumulative upkeep {W}\nWhenever a Swamp, Mountain, black permanent, or red permanent becomes tapped, this enchantment deals 1 damage to that permanent's controller.";
+const ACT_OF_TREASON: &str = "Gain control of target creature until end of turn. Untap that creature. It gains haste until end of turn.";
+const UNSUMMON: &str = "Return target creature to its owner's hand.";
 
 /// Give `player` priority in their own precombat main.
 fn stage_priority(runner: &mut GameRunner, player: PlayerId) {
@@ -965,6 +967,112 @@ fn royal_decree_damages_the_controller_of_a_tapped_mountain_only() {
     assert_eq!(runner.life(P0), 20);
 }
 
+/// A Royal Decree board: P0 controls the enchantment; P1 owns a red creature.
+fn royal_decree_board() -> (GameScenario, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let red = scenario
+        .add_creature(P1, "Red Raider", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Red])
+        .id();
+    let steal = scenario
+        .add_spell_to_hand_from_oracle(P0, "Act of Treason", false, ACT_OF_TREASON)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let bounce = scenario
+        .add_spell_to_hand_from_oracle(P0, "Unsummon", true, UNSUMMON)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    (scenario, red, steal, bounce)
+}
+
+/// Steal the red creature and attack with it; its tapping triggers Royal
+/// Decree, and the trigger is waiting on the stack.
+fn steal_and_attack(runner: &mut GameRunner, red: ObjectId, steal: ObjectId) {
+    runner.cast(steal).target_object(red).resolve();
+    assert_eq!(
+        runner.state().objects[&red].controller,
+        P0,
+        "reach guard: Act of Treason gave P0 control"
+    );
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(red, AttackTarget::Player(P1))])
+        .expect("attack with the stolen creature");
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "reach guard: exactly one Royal Decree trigger for the tapped attacker"
+    );
+}
+
+/// CR 608.2h + CR 109.4: "that permanent's controller" reads the controller as
+/// the permanent last existed on the battlefield. The stolen red creature is
+/// bounced to its owner's hand before the trigger resolves; P0, who controlled
+/// it when it became tapped, takes the damage, not its owner.
+#[test]
+fn royal_decree_damages_the_last_controller_of_a_departed_permanent() {
+    let (scenario, red, steal, bounce) = royal_decree_board();
+    let mut runner = scenario.build();
+    steal_and_attack(&mut runner, red, steal);
+
+    runner.cast(bounce).target_object(red).commit();
+    runner.resolve_top();
+    assert_eq!(zone(&runner, red), Zone::Hand, "reach guard: bounced");
+    runner.resolve_top();
+
+    assert_eq!(runner.life(P0), 19, "P0 controlled it when it tapped");
+    assert_eq!(runner.life(P1), 20, "its owner takes nothing");
+}
+
+/// Control: the stolen creature stays — its current controller (P0) is hit.
+#[test]
+fn royal_decree_damages_the_controller_of_a_stolen_permanent_that_stays() {
+    let (scenario, red, steal, _) = royal_decree_board();
+    let mut runner = scenario.build();
+    steal_and_attack(&mut runner, red, steal);
+    runner.resolve_top();
+    assert_eq!(runner.life(P0), 19);
+    assert_eq!(runner.life(P1), 20);
+}
+
+/// Control: P0's own red creature taps and is bounced before resolution —
+/// P0 is hit, unchanged by the departure.
+#[test]
+fn royal_decree_damages_the_controller_of_its_own_departed_permanent() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let red = scenario
+        .add_creature(P0, "Red Raider", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Red])
+        .id();
+    let bounce = scenario
+        .add_spell_to_hand_from_oracle(P0, "Unsummon", true, UNSUMMON)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(red, AttackTarget::Player(P1))])
+        .expect("attack");
+    assert_eq!(runner.state().stack.len(), 1, "reach guard: one trigger");
+    runner.cast(bounce).target_object(red).commit();
+    runner.resolve_top();
+    runner.resolve_top();
+    assert_eq!(runner.life(P0), 19);
+    assert_eq!(runner.life(P1), 20);
+}
+
 /// Official ruling: Royal Decree triggers at most once for each permanent that
 /// becomes tapped, even if it meets several criteria. A Swamp Mountain taps →
 /// one trigger, 1 damage to its controller (P1).
@@ -978,7 +1086,12 @@ fn royal_decree_triggers_once_for_a_permanent_meeting_several_criteria() {
         .with_subtypes(vec!["Swamp", "Mountain"])
         .id();
     let mut runner = scenario.build();
-    stage_priority(&mut runner, P1);
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
     runner.activate(dual, 0).resolve();
     assert!(runner.state().objects[&dual].tapped, "reach guard: tapped");
     runner.advance_until_stack_empty();
@@ -987,9 +1100,9 @@ fn royal_decree_triggers_once_for_a_permanent_meeting_several_criteria() {
 }
 
 /// CR 603.2 + CR 605.1a (which activated abilities are mana abilities):
-/// Immolation Shaman damages an opponent who activates a non-mana ability of
-/// an artifact, creature, or land (here a land), and not one who activates a
-/// mana ability.
+/// Immolation Shaman damages an
+/// opponent who activates a non-mana ability of an artifact, creature, or land
+/// (here a land), and not one who activates a mana ability.
 #[test]
 fn immolation_shaman_punishes_only_non_mana_activations() {
     let mut scenario = GameScenario::new();
@@ -1004,7 +1117,12 @@ fn immolation_shaman_punishes_only_non_mana_activations() {
         .add_land_from_oracle(P1, "Scry Land", "{T}: Add {C}.\n{T}: Scry 1.")
         .id();
     let mut runner = scenario.build();
-    stage_priority(&mut runner, P1);
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
 
     // Mana ability: no trigger.
     runner.activate(land, 0).resolve();
@@ -1016,4 +1134,526 @@ fn immolation_shaman_punishes_only_non_mana_activations() {
     runner.advance_until_stack_empty();
     assert_eq!(runner.life(P1), 19, "a non-mana land ability triggers it");
     assert_eq!(runner.life(P0), 20);
+}
+
+const BEREAVEMENT: &str = "Whenever a green creature dies, its controller discards a card.";
+const EDRIC: &str = "Whenever a creature deals combat damage to one of your opponents, its controller may draw a card.";
+const VERNAL_BLOOM: &str =
+    "Whenever a Forest is tapped for mana, its controller adds an additional {G}.";
+const MURDER: &str = "Destroy target creature.";
+
+fn free_spell(
+    scenario: &mut GameScenario,
+    owner: PlayerId,
+    name: &str,
+    instant: bool,
+    text: &str,
+) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(owner, name, instant, text)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id()
+}
+
+/// CR 608.2h + CR 603.10a (dies family). A stolen green creature dies; its
+/// controller as it last existed on the battlefield (P0) discards, not its
+/// owner. Official ruling on the same shape (Banewasp Affliction): "The player
+/// who loses life is the player who controlled the creature when it was put
+/// into a graveyard. This may not be the player whose graveyard it was put
+/// into."
+#[test]
+fn bereavement_the_last_controller_of_a_stolen_creature_discards() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Bereavement", BEREAVEMENT);
+    let green = scenario
+        .add_creature(P1, "Green Bear", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Green])
+        .id();
+    let steal = free_spell(&mut scenario, P0, "Act of Treason", false, ACT_OF_TREASON);
+    let murder = free_spell(&mut scenario, P0, "Murder", true, MURDER);
+    scenario.add_card_to_hand(P0, "P0 Card");
+    scenario.add_card_to_hand(P1, "P1 Card");
+    let mut runner = scenario.build();
+
+    runner.cast(steal).target_object(green).resolve();
+    assert_eq!(runner.state().objects[&green].controller, P0, "reach guard");
+    let (p0_hand, p1_hand) = (hand_size(&runner, P0), hand_size(&runner, P1));
+    runner.cast(murder).target_object(green).resolve();
+    resolve_stack_accepting(&mut runner, &[]);
+
+    assert_eq!(
+        zone(&runner, green),
+        Zone::Graveyard,
+        "reach guard: it died"
+    );
+    // P0's hand also lost Murder itself.
+    assert_eq!(
+        hand_size(&runner, P0),
+        p0_hand - 2,
+        "P0 cast Murder and discarded"
+    );
+    assert_eq!(
+        hand_size(&runner, P1),
+        p1_hand,
+        "the owner discards nothing"
+    );
+}
+
+/// Control: P0's own green creature dies — P0 discards, unchanged.
+#[test]
+fn bereavement_the_controller_of_its_own_creature_discards() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Bereavement", BEREAVEMENT);
+    let green = scenario
+        .add_creature(P0, "Green Bear", 2, 2)
+        .with_color(vec![engine::types::mana::ManaColor::Green])
+        .id();
+    let murder = free_spell(&mut scenario, P0, "Murder", true, MURDER);
+    scenario.add_card_to_hand(P0, "P0 Card");
+    scenario.add_card_to_hand(P1, "P1 Card");
+    let mut runner = scenario.build();
+    let (p0_hand, p1_hand) = (hand_size(&runner, P0), hand_size(&runner, P1));
+    runner.cast(murder).target_object(green).resolve();
+    resolve_stack_accepting(&mut runner, &[]);
+    assert_eq!(
+        zone(&runner, green),
+        Zone::Graveyard,
+        "reach guard: it died"
+    );
+    assert_eq!(hand_size(&runner, P0), p0_hand - 2);
+    assert_eq!(hand_size(&runner, P1), p1_hand);
+}
+
+/// CR 608.2h (DamageDone family). A stolen creature deals combat damage to
+/// P1, then is bounced before Edric's trigger resolves; its last controller
+/// (P0) is offered and takes the draw.
+#[test]
+fn edric_the_last_controller_of_a_departed_stolen_attacker_draws() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Edric, Spymaster of Trest", 2, 2)
+        .as_legendary()
+        .with_subtypes(vec!["Elf", "Rogue"])
+        .with_summoning_sickness()
+        .from_oracle_text(EDRIC);
+    let raider = scenario.add_creature(P1, "Raider", 2, 2).id();
+    let steal = free_spell(&mut scenario, P0, "Act of Treason", false, ACT_OF_TREASON);
+    let bounce = free_spell(&mut scenario, P0, "Unsummon", true, UNSUMMON);
+    scenario.with_library_top(P0, &["P0 Draw"]);
+    scenario.with_library_top(P1, &["P1 Draw"]);
+    let mut runner = scenario.build();
+
+    runner.cast(steal).target_object(raider).resolve();
+    attack(&mut runner, &[raider]);
+    drive_until(&mut runner, |r| !r.state().stack.is_empty());
+    assert_eq!(runner.life(P1), 18, "reach guard: combat damage dealt");
+    let (p0_hand, p1_hand) = (hand_size(&runner, P0), hand_size(&runner, P1));
+    runner.cast(bounce).target_object(raider).commit();
+    runner.resolve_top();
+    assert_eq!(zone(&runner, raider), Zone::Hand, "reach guard: bounced");
+    resolve_stack_accepting(&mut runner, &[]);
+
+    // P0's hand lost Unsummon and gained the draw.
+    assert_eq!(hand_size(&runner, P0), p0_hand, "P0 cast Unsummon and drew");
+    // P1's hand gained the bounced Raider only.
+    assert_eq!(
+        hand_size(&runner, P1),
+        p1_hand + 1,
+        "the owner draws nothing"
+    );
+}
+
+/// TapsForMana family (CR 605.4a: a triggered mana ability resolves
+/// immediately after the mana ability that triggered it, so there is no
+/// intervening response window). A source can still depart as part of its own
+/// cost ("{T}, Sacrifice this land"); that case is decided at trigger
+/// admission, not by the controller lookup. Control on the stolen edge: P0
+/// gains control of P1's Forest and taps it; P0 gets the extra {G}.
+#[test]
+fn vernal_bloom_pays_the_controller_of_a_stolen_forest() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P1, "Vernal Bloom", VERNAL_BLOOM);
+    let forest = scenario
+        .add_land_from_oracle(P1, "Forest", "{T}: Add {G}.")
+        .with_subtypes(vec!["Forest"])
+        .id();
+    let steal_land = free_spell(
+        &mut scenario,
+        P0,
+        "Steal Land",
+        false,
+        "Gain control of target land until end of turn.",
+    );
+    let mut runner = scenario.build();
+    runner.cast(steal_land).target_object(forest).resolve();
+    assert_eq!(
+        runner.state().objects[&forest].controller,
+        P0,
+        "reach guard: P0 controls the Forest"
+    );
+    runner.activate(forest, 0).resolve();
+    let pool = |p: PlayerId| runner.state().players[p.0 as usize].mana_pool.total();
+    assert_eq!(pool(P0), 2, "P0 tapped it: {{G}} plus the additional {{G}}");
+    assert_eq!(pool(P1), 0);
+}
+
+const FORSAKEN_WASTES: &str = "Players can't gain life.\nAt the beginning of each player's upkeep, that player loses 1 life.\nWhenever this enchantment becomes the target of a spell, that spell's controller loses 5 life.";
+const CONFISCATE: &str = "Enchant permanent\nYou control enchanted permanent.";
+
+/// Forsaken Wastes board: P0's Wastes; P1 owns a Confiscate on the
+/// battlefield; P0 steals it and bounces it to P1's hand when `steal` is set.
+/// Returns at P1's precombat main with priority, the Confiscate in P1's hand.
+fn forsaken_wastes_board(steal: bool) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let wastes = scenario
+        .add_enchantment_from_oracle(P0, "Forsaken Wastes", FORSAKEN_WASTES)
+        .id();
+    let anchor = scenario.add_creature(P1, "Anchor", 1, 1).id();
+    let confiscate = scenario
+        .add_enchantment_from_oracle(P1, "Confiscate", CONFISCATE)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .from_oracle_text_with_keywords(&["Enchant"], CONFISCATE)
+        .id();
+    let take = free_spell(
+        &mut scenario,
+        P0,
+        "Take Enchantment",
+        false,
+        "Gain control of target enchantment.",
+    );
+    let bounce = free_spell(
+        &mut scenario,
+        P0,
+        "Bounce Enchantment",
+        false,
+        "Return target enchantment to its owner's hand.",
+    );
+    scenario.with_library_top(P0, &["P0 Card A", "P0 Card B"]);
+    scenario.with_library_top(P1, &["P1 Card A", "P1 Card B"]);
+    let mut runner = scenario.build();
+    // The Aura starts attached to P1's own creature.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&confiscate)
+        .unwrap()
+        .attached_to = Some(engine::game::game_object::AttachTarget::Object(anchor));
+    if steal {
+        runner.cast(take).target_object(confiscate).resolve();
+        assert_eq!(
+            runner.state().objects[&confiscate].controller,
+            P0,
+            "reach guard: P0 controls the Confiscate"
+        );
+    }
+    runner.cast(bounce).target_object(confiscate).resolve();
+    assert_eq!(
+        zone(&runner, confiscate),
+        Zone::Hand,
+        "reach guard: bounced"
+    );
+    let expected_lki = if steal { P0 } else { P1 };
+    assert_eq!(
+        runner.state().lki_cache[&confiscate].controller,
+        expected_lki,
+        "reach guard: the departed card's battlefield controller is in the LKI cache"
+    );
+    // P1's main-phase priority is staged directly: a turn boundary would
+    // clear the LKI cache, and this board needs the departed snapshot live.
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.phase = Phase::PreCombatMain;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    (runner, wastes, confiscate)
+}
+
+/// Cast the Confiscate from P1's hand targeting Wastes, resolve only the
+/// Wastes trigger, and return (P0, P1) life deltas.
+fn recast_at_wastes(runner: &mut GameRunner, wastes: ObjectId, confiscate: ObjectId) -> (i32, i32) {
+    let (p0, p1) = (runner.life(P0), runner.life(P1));
+    runner.cast(confiscate).target_object(wastes).commit();
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach guard: the spell and exactly one Wastes trigger"
+    );
+    runner.resolve_top();
+    (runner.life(P0) - p0, runner.life(P1) - p1)
+}
+
+/// CR 109.4 + CR 601.2a + CR 608.2h: "that spell's controller" for a spell
+/// live on the stack is its caster (P1). A stale battlefield snapshot from the
+/// card's earlier, stolen life under P0 must not answer.
+#[test]
+fn forsaken_wastes_hits_the_caster_of_a_recast_formerly_stolen_card() {
+    let (mut runner, wastes, confiscate) = forsaken_wastes_board(true);
+    assert_eq!(recast_at_wastes(&mut runner, wastes, confiscate), (0, -5));
+}
+
+/// Control: the card was never stolen — the caster (P1) loses 5.
+#[test]
+fn forsaken_wastes_hits_the_caster_of_a_fresh_spell() {
+    let (mut runner, wastes, confiscate) = forsaken_wastes_board(false);
+    assert_eq!(recast_at_wastes(&mut runner, wastes, confiscate), (0, -5));
+}
+
+const PRODIGAL_PYROMANCER: &str = "{T}: This creature deals 1 damage to any target.";
+const CHANDRAS_OUTRAGE: &str =
+    "Chandra's Outrage deals 4 damage to target creature and 2 damage to that creature's controller.";
+
+/// Pass priority (resolving nothing) until `player` holds it.
+fn priority_to(runner: &mut GameRunner, player: PlayerId) {
+    let depth = runner.state().stack.len();
+    for _ in 0..4 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::Priority { player: p } if p == player => {
+                assert_eq!(runner.state().stack.len(), depth, "nothing resolved");
+                return;
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("priority not reachable: {other:?}"),
+        }
+    }
+    panic!("priority not reached");
+}
+
+/// P0 casts `spell` at `object` in response and resolves only that spell.
+fn respond_with(runner: &mut GameRunner, spell: ObjectId, object: ObjectId) {
+    priority_to(runner, P0);
+    let depth = runner.state().stack.len();
+    runner.cast(spell).target_object(object).commit();
+    for _ in 0..16 {
+        if runner.state().stack.len() == depth {
+            return;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+        }
+    }
+    panic!("the response did not resolve");
+}
+
+/// P1's Prodigal Pyromancer, P0's Royal Decree. P1 activates the Pyromancer
+/// at P0 (it taps; Decree triggers) when `pending`; otherwise a tap spell taps
+/// it. Then P0 optionally steals it and optionally bounces it. Resolves only
+/// the Decree trigger and returns (P0, P1) life deltas from that resolution.
+fn pyromancer_decree_board(theft: bool, bounce: bool, pending: bool) -> (i32, i32) {
+    use engine::types::ability::TargetRef;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let decree = scenario
+        .add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE)
+        .id();
+    let pyromancer = scenario
+        .add_creature_from_oracle(P1, "Prodigal Pyromancer", 1, 1, PRODIGAL_PYROMANCER)
+        .with_subtypes(vec!["Human", "Wizard"])
+        .with_color(vec![engine::types::mana::ManaColor::Red])
+        .id();
+    let steal = free_spell(
+        &mut scenario,
+        P0,
+        "Theft",
+        true,
+        "Gain control of target creature.",
+    );
+    let bounce_spell = free_spell(&mut scenario, P0, "Unsummon", true, UNSUMMON);
+    let tap = free_spell(&mut scenario, P0, "Tap It", true, "Tap target creature.");
+    let mut runner = scenario.build();
+
+    if pending {
+        priority_to(&mut runner, P1);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: pyromancer,
+                ability_index: 0,
+            })
+            .expect("P1 activates Prodigal Pyromancer");
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Player(P0)),
+            })
+            .expect("target P0");
+    } else {
+        // Resolve only the tap spell; its tapping puts the Decree trigger on
+        // the stack, which must stay there.
+        priority_to(&mut runner, P0);
+        runner.cast(tap).target_object(pyromancer).commit();
+        for _ in 0..16 {
+            if zone(&runner, tap) == Zone::Graveyard {
+                break;
+            }
+            match runner.state().waiting_for.clone() {
+                WaitingFor::OrderTriggers { .. } => {
+                    drain_order_triggers_with_identity(runner.state_mut());
+                }
+                _ => {
+                    runner.act(GameAction::PassPriority).expect("pass priority");
+                }
+            }
+        }
+    }
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    assert!(
+        runner.state().objects[&pyromancer].tapped,
+        "reach guard: tapped"
+    );
+    let decree_on_stack = |r: &GameRunner| {
+        r.state()
+            .stack
+            .iter()
+            .filter(|e| e.source_id == decree)
+            .count()
+    };
+    assert_eq!(
+        decree_on_stack(&runner),
+        1,
+        "reach guard: one Decree trigger"
+    );
+    if theft {
+        respond_with(&mut runner, steal, pyromancer);
+        assert_eq!(runner.state().objects[&pyromancer].controller, P0);
+    }
+    if bounce {
+        respond_with(&mut runner, bounce_spell, pyromancer);
+        assert_eq!(
+            zone(&runner, pyromancer),
+            Zone::Hand,
+            "reach guard: bounced"
+        );
+    }
+    if pending {
+        assert!(
+            runner
+                .state()
+                .stack
+                .iter()
+                .any(|e| e.source_id == pyromancer && e.controller == P1),
+            "reach guard: P1's Pyromancer ability is still on the stack"
+        );
+    }
+    assert_eq!(
+        runner.state().stack.back().map(|e| e.source_id),
+        Some(decree),
+        "reach guard: the Decree trigger is on top"
+    );
+    let (p0, p1) = (runner.life(P0), runner.life(P1));
+    priority_to(&mut runner, P0);
+    runner.resolve_top();
+    assert_eq!(decree_on_stack(&runner), 0, "the Decree trigger resolved");
+    (runner.life(P0) - p0, runner.life(P1) - p1)
+}
+
+/// CR 113.7a + CR 608.2h: an ability exists independently of its source. The
+/// stolen Pyromancer is bounced while its own ability (controlled by P1) is
+/// still on the stack; "that permanent's controller" is the Pyromancer's last
+/// battlefield controller (P0), not that pending ability's controller.
+#[test]
+fn royal_decree_ignores_a_departed_sources_pending_ability() {
+    assert_eq!(pyromancer_decree_board(true, true, true), (-1, 0));
+}
+
+/// Control: not stolen, bounced, ability pending — P1 is hit.
+#[test]
+fn royal_decree_pending_ability_unstolen_bounced_control() {
+    assert_eq!(pyromancer_decree_board(false, true, true), (0, -1));
+}
+
+/// Control: stolen and bounced, no pending ability — P0 is hit.
+#[test]
+fn royal_decree_stolen_bounced_no_pending_ability_control() {
+    assert_eq!(pyromancer_decree_board(true, true, false), (-1, 0));
+}
+
+/// Control: stolen and still on the battlefield, ability pending — P0 is hit.
+#[test]
+fn royal_decree_stolen_live_source_pending_ability_control() {
+    assert_eq!(pyromancer_decree_board(true, false, true), (-1, 0));
+}
+
+/// CR 109.4: a chosen target on the battlefield answers with its live
+/// controller. P1's Pyromancer has a pending ability; P0 steals it, then
+/// Chandra's Outrage targets it: P0, its controller, takes the 2.
+#[test]
+fn chandras_outrage_hits_the_live_controller_of_a_source_with_a_pending_ability() {
+    use engine::types::ability::TargetRef;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let pyromancer = scenario
+        .add_creature_from_oracle(P1, "Prodigal Pyromancer", 1, 5, PRODIGAL_PYROMANCER)
+        .with_subtypes(vec!["Human", "Wizard"])
+        .id();
+    let steal = free_spell(
+        &mut scenario,
+        P0,
+        "Theft",
+        true,
+        "Gain control of target creature.",
+    );
+    let outrage = free_spell(
+        &mut scenario,
+        P0,
+        "Chandra's Outrage",
+        true,
+        CHANDRAS_OUTRAGE,
+    );
+    let mut runner = scenario.build();
+
+    priority_to(&mut runner, P1);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: pyromancer,
+            ability_index: 0,
+        })
+        .expect("P1 activates Prodigal Pyromancer");
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(pyromancer)),
+        })
+        .expect("target the Pyromancer itself");
+    respond_with(&mut runner, steal, pyromancer);
+    assert_eq!(
+        runner.state().objects[&pyromancer].controller,
+        P0,
+        "reach guard"
+    );
+    let (p0, p1) = (runner.life(P0), runner.life(P1));
+    respond_with(&mut runner, outrage, pyromancer);
+    assert!(
+        runner
+            .state()
+            .stack
+            .iter()
+            .any(|e| e.source_id == pyromancer && e.controller == P1),
+        "reach guard: P1's ability is still pending"
+    );
+    assert_eq!((runner.life(P0) - p0, runner.life(P1) - p1), (-2, 0));
 }
