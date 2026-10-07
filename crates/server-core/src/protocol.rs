@@ -1141,7 +1141,8 @@ mod tests {
     use engine::types::game_state::ProductionOverride;
     use engine::types::identifiers::ObjectIncarnationRef;
     use engine::types::mana::{
-        ManaSourcePenalty, ManaSourceSelection, ManaType, TapsForManaSelection,
+        ManaSourceOutput, ManaSourcePenalty, ManaSourceQuantity, ManaSourceSelection, ManaType,
+        TapsForManaSelection,
     };
     use serde_json::Value;
 
@@ -1239,6 +1240,33 @@ mod tests {
                 action: restored_action,
             } => assert_eq!(restored_action, generic),
             _ => panic!("wrong variant"),
+        }
+
+        let GameAction::ActivateManaSource { mut selection } = generic else {
+            unreachable!("fixture action is a generic mana-source selection");
+        };
+        selection.ability_index = Some(0);
+        selection.penalty = ManaSourcePenalty::Sacrifices;
+        selection.taps_for_mana.clear();
+        for quantity in [ManaSourceQuantity::Fixed(3), ManaSourceQuantity::Variable] {
+            selection.output = ManaSourceOutput::DeferredColorChoice { quantity };
+            selection.mana_type = ManaType::Colorless;
+            let msg = ClientMessage::Action {
+                action: GameAction::ActivateManaSource {
+                    selection: selection.clone(),
+                },
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
+            let ClientMessage::Action { action } = parsed else {
+                panic!("wrong variant");
+            };
+            assert_eq!(
+                action,
+                GameAction::ActivateManaSource {
+                    selection: selection.clone()
+                }
+            );
         }
     }
 
@@ -3320,9 +3348,14 @@ mod tests {
 
     /// `FilterProp`'s attachment-referent siblings are one parameterized
     /// `FilterProp::AttachedTo { to: AttachmentReferent }` (CR 701.3a + CR
-    /// 303.4b); a v102 peer cannot parse the `"AttachedTo"` tag carried in
+    /// 303.4b); a v107 peer cannot parse the `"AttachedTo"` tag carried in
     /// `GameState` ability definitions, so it must be refused before it
-    /// receives v103 state.
+    /// receives v108 state.
+    /// `UntilCondition::NextMatches.count` (CR 608.2c), the paused loop's `hits`,
+    /// `ZoneChoiceCandidateSource::ParentTargets` and
+    /// `SpellContext.exile_until_batch` are new in serialized
+    /// full-game state; a v106 peer would run a counted loop as a one-card loop,
+    /// so it must be refused before it receives v107 state.
     /// `GameEvent::AbilityActivated` now carries `kind: "Mana"` for mana-ability
     /// activations and an optional `departed_source_lki`; a v100 peer cannot
     /// parse the `Mana` kind, so it must be refused before it receives v101 state.
@@ -3385,8 +3418,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_103_for_attached_to_referent() {
-        assert_eq!(PROTOCOL_VERSION, 103);
+    fn protocol_version_is_108_for_attached_to_referent() {
+        assert_eq!(PROTOCOL_VERSION, 108);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3397,7 +3430,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_103_for_attached_to_referent` stays
+    /// `protocol_version_is_108_for_attached_to_referent` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
