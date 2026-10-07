@@ -152,27 +152,6 @@ fn gremlin_board(departure: HostDeparture) -> (i32, i32) {
             "reach guard: bounced to its owner"
         );
     }
-    eprintln!(
-        "DBG aura zone={:?} attached={:?} stack={} zc={:?} lki_art={:?}",
-        runner.state().objects.get(&aura).map(|o| o.zone),
-        runner
-            .state()
-            .objects
-            .get(&aura)
-            .and_then(|o| o.attached_to),
-        runner.state().stack.len(),
-        runner
-            .state()
-            .zone_changes_this_turn
-            .iter()
-            .map(|r| (r.object_id, r.from_zone, r.attached_to))
-            .collect::<Vec<_>>(),
-        runner
-            .state()
-            .lki_cache
-            .get(&artifact)
-            .map(|l| l.controller)
-    );
     let before = (life(&runner, P0), life(&runner, P1));
     resolve_one(&mut runner);
     (life(&runner, P0) - before.0, life(&runner, P1) - before.1)
@@ -190,4 +169,933 @@ fn gremlin_infestation_damages_the_last_controller_of_a_departed_host() {
 #[test]
 fn gremlin_infestation_damages_the_controller_of_a_stolen_host_that_stays() {
     assert_eq!(gremlin_board(HostDeparture::Stays), (-2, 0));
+}
+
+// ---------------------------------------------------------------------------
+// CR 115.1 + CR 113.8 + CR 601.2c: the targeter is recorded at announcement.
+// ---------------------------------------------------------------------------
+
+const FORSAKEN_WASTES: &str = "Players can't gain life.\nAt the beginning of each player's upkeep, that player loses 1 life.\nWhenever this enchantment becomes the target of a spell, that spell's controller loses 5 life.";
+const CONFISCATE: &str = "Enchant permanent\nYou control enchanted permanent.";
+const COMMANDEER: &str = "You may exile two blue cards from your hand rather than pay this spell's mana cost.\nGain control of target noncreature spell. You may choose new targets for it. (If that spell is an artifact, enchantment, or planeswalker, the permanent enters under your control.)";
+const COUNTERSPELL: &str = "Counter target spell.";
+const LAVA_RUNNER: &str = "Haste\nWhenever this creature becomes the target of a spell or ability, that spell or ability's controller sacrifices a land of their choice.";
+const PRODIGAL_PYROMANCER: &str = "{T}: This creature deals 1 damage to any target.";
+const ELDER_DEEP_FIEND: &str = "Flash\nEmerge {5}{U}{U} (You may cast this spell by sacrificing a creature and paying the emerge cost reduced by that creature's mana value.)\nWhen you cast this spell, tap up to four target permanents.";
+const AETHERSNATCH: &str = "Gain control of target spell. You may choose new targets for it. (If that spell becomes a permanent, it enters under your control.)";
+const ENTS_FURY: &str = "Put a +1/+1 counter on target creature you control if its power is 4 or greater. Then that creature gets +1/+1 until end of turn and fights target creature you don't control.";
+const ROYAL_DECREE: &str = "Cumulative upkeep {W}\nWhenever a Swamp, Mountain, black permanent, or red permanent becomes tapped, this enchantment deals 1 damage to that permanent's controller.";
+const BOOMERANG: &str = "Return target permanent to its owner's hand.";
+/// Synthetic: an instant-speed creature theft.
+const STEAL_CREATURE: &str = "Gain control of target creature.";
+/// Synthetic: an instant-speed creature bounce.
+const BOUNCE_CREATURE: &str = "Return target creature to its owner's hand.";
+
+fn stage_turn(runner: &mut GameRunner, player: PlayerId) {
+    let state = runner.state_mut();
+    state.active_player = player;
+    state.phase = Phase::PreCombatMain;
+    state.priority_player = player;
+    state.waiting_for = WaitingFor::Priority { player };
+}
+
+fn drain_ordering(runner: &mut GameRunner) {
+    for _ in 0..8 {
+        if let WaitingFor::OrderTriggers { .. } = runner.state().waiting_for {
+            drain_order_triggers_with_identity(runner.state_mut());
+        } else {
+            return;
+        }
+    }
+}
+
+/// Resolve the top stack object, declining "you may" choices (new targets).
+fn resolve_one_declining(runner: &mut GameRunner) {
+    let depth = runner.state().stack.len();
+    assert!(depth > 0, "something to resolve");
+    for _ in 0..16 {
+        if runner.state().stack.len() < depth
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            return;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: false })
+                    .expect("decline");
+            }
+            _ => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+        }
+    }
+    panic!(
+        "the top object did not resolve: {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn lands(runner: &GameRunner, player: PlayerId) -> usize {
+    runner
+        .state()
+        .objects
+        .values()
+        .filter(|o| {
+            o.zone == Zone::Battlefield
+                && o.controller == player
+                && o.card_types
+                    .core_types
+                    .contains(&engine::types::card_type::CoreType::Land)
+        })
+        .count()
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SpellFate {
+    StaysOnStack,
+    Countered,
+}
+
+fn confiscate_in_hand(scenario: &mut GameScenario, cost: ManaCost) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P1, "Confiscate", false, CONFISCATE)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .from_oracle_text_with_keywords(&["Enchant"], CONFISCATE)
+        .with_mana_cost(cost)
+        .id()
+}
+
+fn one_colorless(scenario: &mut GameScenario, player: PlayerId) {
+    scenario.with_mana_pool(
+        player,
+        vec![engine::types::mana::ManaUnit::new(
+            engine::types::mana::ManaType::Colorless,
+            ObjectId(0),
+            false,
+            vec![],
+        )],
+    );
+}
+
+/// P1 casts Confiscate targeting P0's Forsaken Wastes; P0 Commandeers the
+/// Confiscate (declining new targets) when `commandeer`, then optionally
+/// counters it. Returns (P0, P1) life deltas from the Wastes trigger only.
+fn wastes_commandeer_board(commandeer: bool, fate: SpellFate) -> (i32, i32) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let wastes = scenario
+        .add_enchantment_from_oracle(P0, "Forsaken Wastes", FORSAKEN_WASTES)
+        .id();
+    let confiscate = confiscate_in_hand(&mut scenario, ManaCost::zero());
+    let commandeer_id = free_spell(&mut scenario, P0, "Commandeer", COMMANDEER);
+    let counterspell = free_spell(&mut scenario, P0, "Counterspell", COUNTERSPELL);
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    runner.cast(confiscate).target_object(wastes).commit();
+    drain_ordering(&mut runner);
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach guard: Confiscate and one Wastes trigger"
+    );
+
+    if commandeer {
+        priority_to(&mut runner, P0);
+        runner
+            .cast(commandeer_id)
+            .target_object(confiscate)
+            .commit();
+        resolve_one_declining(&mut runner);
+        assert_eq!(
+            runner.state().objects[&confiscate].controller,
+            P0,
+            "reach guard: Commandeer took the spell"
+        );
+    }
+    if let SpellFate::Countered = fate {
+        priority_to(&mut runner, P0);
+        runner.cast(counterspell).target_object(confiscate).commit();
+        resolve_one_declining(&mut runner);
+        assert_ne!(
+            runner.state().objects[&confiscate].zone,
+            Zone::Stack,
+            "reach guard: countered"
+        );
+    }
+    let expected_depth = match fate {
+        SpellFate::StaysOnStack => 2,
+        SpellFate::Countered => 1,
+    };
+    assert_eq!(
+        runner.state().stack.len(),
+        expected_depth,
+        "reach guard: the Wastes trigger is on top"
+    );
+    let before = (life(&runner, P0), life(&runner, P1));
+    resolve_one_declining(&mut runner);
+    (life(&runner, P0) - before.0, life(&runner, P1) - before.1)
+}
+
+/// CR 109.4 + CR 113.8: "that spell's controller" for a spell whose control
+/// changed on the stack is its current controller (P0, who Commandeered it).
+#[test]
+fn forsaken_wastes_hits_the_commandeering_player() {
+    assert_eq!(
+        wastes_commandeer_board(true, SpellFate::StaysOnStack),
+        (-5, 0)
+    );
+}
+
+/// CR 608.2h: the Commandeered spell is countered before the trigger
+/// resolves; its controller as it last existed on the stack is P0.
+#[test]
+fn forsaken_wastes_hits_the_last_controller_of_a_countered_spell() {
+    assert_eq!(wastes_commandeer_board(true, SpellFate::Countered), (-5, 0));
+}
+
+/// Control: no control change, so the caster (P1) is hit, live or countered.
+#[test]
+fn forsaken_wastes_hits_the_caster_without_commandeer() {
+    assert_eq!(
+        wastes_commandeer_board(false, SpellFate::StaysOnStack),
+        (0, -5)
+    );
+    assert_eq!(
+        wastes_commandeer_board(false, SpellFate::Countered),
+        (0, -5)
+    );
+}
+
+/// CR 601.2a + CR 601.2c: the announcement recorded on the targeting event is
+/// the one the finalized spell still carries after an interactive payment
+/// pause and the move to the stack.
+#[test]
+fn interactive_payment_keeps_the_announcement_its_targeting_event_recorded() {
+    use engine::types::ability::TargetRef;
+    use engine::types::events::{GameEvent, Targeter};
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let wastes = scenario
+        .add_enchantment_from_oracle(P0, "Forsaken Wastes", FORSAKEN_WASTES)
+        .id();
+    let confiscate = confiscate_in_hand(&mut scenario, ManaCost::generic(1));
+    one_colorless(&mut scenario, P1);
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    let card_id = runner.state().objects[&confiscate].card_id;
+    let mut recorded = Vec::new();
+    let result = runner
+        .act(GameAction::CastSpell {
+            object_id: confiscate,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Manual,
+        })
+        .expect("begin the cast");
+    recorded.extend(result.events);
+    let mut paused = false;
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TargetSelection { .. } => {
+                let r = runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(wastes)],
+                    })
+                    .expect("target Wastes");
+                recorded.extend(r.events);
+            }
+            WaitingFor::ManaPayment { .. } => {
+                paused = true;
+                runner.act(GameAction::PassPriority).expect("pay");
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        paused,
+        "reach guard: the cast paused at interactive payment"
+    );
+    let targeter = recorded.iter().find_map(|event| match event {
+        GameEvent::BecomesTarget {
+            source_id,
+            targeter,
+            ..
+        } if *source_id == confiscate => Some(*targeter),
+        _ => None,
+    });
+    let obj = &runner.state().objects[&confiscate];
+    assert_eq!(obj.zone, Zone::Stack, "reach guard: finalized");
+    let announcement = obj.spell_announcement.expect("the spell keeps it");
+    assert_eq!(
+        targeter,
+        Some(Some(Targeter::Spell(announcement))),
+        "the targeting event names the finalized spell"
+    );
+}
+
+/// CR 733.1: a cast backed out at payment is undone — no Wastes trigger, the
+/// announcement is cleared, and a later cast gets a fresh one.
+#[test]
+fn a_cancelled_cast_triggers_nothing_and_its_announcement_is_never_reused() {
+    use engine::types::ability::TargetRef;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let wastes = scenario
+        .add_enchantment_from_oracle(P0, "Forsaken Wastes", FORSAKEN_WASTES)
+        .id();
+    let confiscate = scenario
+        .add_spell_to_hand_from_oracle(P1, "Confiscate", false, CONFISCATE)
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .from_oracle_text_with_keywords(&["Enchant"], CONFISCATE)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    scenario.with_mana_pool(
+        P1,
+        vec![engine::types::mana::ManaUnit::new(
+            engine::types::mana::ManaType::Colorless,
+            ObjectId(0),
+            false,
+            vec![],
+        )],
+    );
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    let card_id = runner.state().objects[&confiscate].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: confiscate,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Manual,
+        })
+        .expect("begin the cast");
+    if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(wastes)],
+            })
+            .expect("target Wastes");
+    }
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
+        "reach guard: paused at payment, {:?}",
+        runner.state().waiting_for
+    );
+    let first = runner.state().objects[&confiscate]
+        .spell_announcement
+        .expect("reach guard: announced");
+    runner.act(GameAction::CancelCast).expect("cancel");
+    drain_ordering(&mut runner);
+    assert!(runner.state().stack.is_empty(), "nothing went on the stack");
+    assert_eq!((life(&runner, P0), life(&runner, P1)), (20, 20));
+    assert_eq!(
+        runner.state().objects[&confiscate].spell_announcement,
+        None,
+        "the undone announcement is cleared"
+    );
+    stage_turn(&mut runner, P1);
+    let card_id = runner.state().objects[&confiscate].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: confiscate,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Manual,
+        })
+        .expect("cast again");
+    let second = runner.state().objects[&confiscate]
+        .spell_announcement
+        .expect("announced again");
+    assert!(second > first, "a fresh, never-reused announcement");
+}
+
+/// Matt's board: P1 controls a Mountain P0 owns and taps it for mana; Royal
+/// Decree triggers; P0 returns the Mountain to its owner's hand in response.
+/// CR 608.2h: "that permanent's controller" is P1, its last controller.
+#[test]
+fn royal_decree_damages_the_tapper_of_a_departed_borrowed_mountain() {
+    for bounce in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+        let mountain = scenario
+            .add_land_from_oracle(P0, "Mountain", "{T}: Add {R}.")
+            .with_subtypes(vec!["Mountain"])
+            .id();
+        let take = free_spell(
+            &mut scenario,
+            P1,
+            "Take Land",
+            "Gain control of target land.",
+        );
+        let boomerang = free_spell(&mut scenario, P0, "Boomerang", BOOMERANG);
+        let mut runner = scenario.build();
+        stage_turn(&mut runner, P1);
+        runner.cast(take).target_object(mountain).resolve();
+        assert_eq!(
+            runner.state().objects[&mountain].controller,
+            P1,
+            "reach guard: P1 controls P0's Mountain"
+        );
+        stage_turn(&mut runner, P1);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: mountain,
+                ability_index: 0,
+            })
+            .expect("tap the Mountain for mana");
+        drain_ordering(&mut runner);
+        assert!(
+            runner.state().objects[&mountain].tapped,
+            "reach guard: tapped"
+        );
+        assert_eq!(
+            runner.state().stack.len(),
+            1,
+            "reach guard: one Decree trigger"
+        );
+        if bounce {
+            priority_to(&mut runner, P0);
+            runner.cast(boomerang).target_object(mountain).commit();
+            resolve_one_declining(&mut runner);
+            assert_eq!(
+                runner.state().objects[&mountain].zone,
+                Zone::Hand,
+                "reach guard: back in P0's hand"
+            );
+        }
+        let before = (life(&runner, P0), life(&runner, P1));
+        resolve_one_declining(&mut runner);
+        assert_eq!(
+            (life(&runner, P0) - before.0, life(&runner, P1) - before.1),
+            (0, -1),
+            "the tapper (P1) takes 1, bounced={bounce}"
+        );
+    }
+}
+
+/// Elder Deep-Fiend's cast trigger (P1's ability) targets P0's Lava Runner;
+/// P0 Aethersnatches the Deep-Fiend spell in response. CR 113.8 + CR 113.7a:
+/// the targeter is the triggered ability, still P1's, so P1 sacrifices.
+#[test]
+fn lava_runner_punishes_the_cast_trigger_controller_not_the_new_spell_controller() {
+    use engine::types::ability::TargetRef;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let runner_id = scenario
+        .add_creature_from_oracle(P0, "Lava Runner", 2, 2, LAVA_RUNNER)
+        .id();
+    scenario.add_land_from_oracle(P0, "P0 Land", "{T}: Add {R}.");
+    scenario.add_land_from_oracle(P1, "P1 Land", "{T}: Add {U}.");
+    let fiend = scenario
+        .add_creature_to_hand_from_oracle(P1, "Elder Deep-Fiend", 5, 6, ELDER_DEEP_FIEND)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let snatch = free_spell(&mut scenario, P0, "Aethersnatch", AETHERSNATCH);
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    let card_id = runner.state().objects[&fiend].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: fiend,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("cast Elder Deep-Fiend");
+    for _ in 0..6 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(runner_id)],
+                    })
+                    .expect("target Lava Runner");
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        3,
+        "reach guard: Deep-Fiend, its cast trigger, Lava Runner's trigger"
+    );
+    priority_to(&mut runner, P0);
+    runner.cast(snatch).target_object(fiend).commit();
+    resolve_one_declining(&mut runner);
+    assert_eq!(
+        runner.state().objects[&fiend].controller,
+        P0,
+        "reach guard: Aethersnatch took the Deep-Fiend spell"
+    );
+    let before = (lands(&runner, P0), lands(&runner, P1));
+    resolve_one_declining(&mut runner);
+    assert_eq!(
+        (lands(&runner, P0), lands(&runner, P1)),
+        (before.0, before.1 - 1),
+        "P1, the trigger's controller, sacrifices"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Theft {
+    Stolen,
+    Own,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SourceFate {
+    Bounced,
+    Stays,
+}
+
+/// PG7: P1's Prodigal Pyromancer activates at P0's Lava Runner; in response P0
+/// optionally steals and/or bounces the Pyromancer. Returns which player lost
+/// a land when Runner's trigger resolved: (P0 lost, P1 lost).
+fn pyromancer_runner_board(theft: Theft, fate: SourceFate) -> (usize, usize) {
+    use engine::types::ability::TargetRef;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let runner_id = scenario
+        .add_creature_from_oracle(P0, "Lava Runner", 2, 2, LAVA_RUNNER)
+        .id();
+    scenario.add_land_from_oracle(P0, "P0 Land", "{T}: Add {R}.");
+    scenario.add_land_from_oracle(P1, "P1 Land", "{T}: Add {R}.");
+    let pyromancer = scenario
+        .add_creature_from_oracle(P1, "Prodigal Pyromancer", 1, 1, PRODIGAL_PYROMANCER)
+        .id();
+    let steal = free_spell(&mut scenario, P0, "Steal Creature", STEAL_CREATURE);
+    let bounce = free_spell(&mut scenario, P0, "Bounce Creature", BOUNCE_CREATURE);
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: pyromancer,
+            ability_index: 0,
+        })
+        .expect("activate");
+    if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(runner_id)],
+            })
+            .expect("target Lava Runner");
+    }
+    drain_ordering(&mut runner);
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach guard: Pyromancer's ability and Runner's trigger"
+    );
+    // Responses go above Runner's trigger and resolve first.
+    if let Theft::Stolen = theft {
+        priority_to(&mut runner, P0);
+        runner.cast(steal).target_object(pyromancer).commit();
+        resolve_one_declining(&mut runner);
+        assert_eq!(runner.state().objects[&pyromancer].controller, P0);
+    }
+    if let SourceFate::Bounced = fate {
+        priority_to(&mut runner, P0);
+        runner.cast(bounce).target_object(pyromancer).commit();
+        resolve_one_declining(&mut runner);
+        assert_eq!(runner.state().objects[&pyromancer].zone, Zone::Hand);
+    }
+    let before = (lands(&runner, P0), lands(&runner, P1));
+    resolve_one_declining(&mut runner);
+    (before.0 - lands(&runner, P0), before.1 - lands(&runner, P1))
+}
+
+/// CR 113.8: an activated ability's controller is the player who activated it
+/// (P1) whatever then happens to its source. 4a normal, 4b theft (live source),
+/// 4c bounce, 4d theft and bounce.
+#[test]
+fn lava_runner_punishes_the_activator_whatever_happens_to_the_source() {
+    for (theft, fate, label) in [
+        (Theft::Own, SourceFate::Stays, "4a"),
+        (Theft::Stolen, SourceFate::Stays, "4b"),
+        (Theft::Own, SourceFate::Bounced, "4c"),
+        (Theft::Stolen, SourceFate::Bounced, "4d"),
+    ] {
+        assert_eq!(
+            pyromancer_runner_board(theft, fate),
+            (0, 1),
+            "{label}: P1, the activator, sacrifices"
+        );
+    }
+}
+
+/// 4e: a triggered targeter. P1's labelled synthetic creature's enters
+/// trigger targets Lava Runner; P0 steals the creature in response. CR 113.8:
+/// the trigger stays P1's.
+#[test]
+fn lava_runner_punishes_the_trigger_controller_when_the_source_is_stolen() {
+    use engine::types::ability::TargetRef;
+    for theft in [Theft::Stolen, Theft::Own] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let runner_id = scenario
+            .add_creature_from_oracle(P0, "Lava Runner", 2, 2, LAVA_RUNNER)
+            .id();
+        scenario.add_land_from_oracle(P0, "P0 Land", "{T}: Add {R}.");
+        scenario.add_land_from_oracle(P1, "P1 Land", "{T}: Add {R}.");
+        let pinger = scenario
+            .add_creature_to_hand_from_oracle(
+                P1,
+                "Pinger",
+                1,
+                1,
+                "When this creature enters, it deals 1 damage to any target.",
+            )
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let steal = free_spell(&mut scenario, P0, "Steal Creature", STEAL_CREATURE);
+        let mut runner = scenario.build();
+        stage_turn(&mut runner, P1);
+        runner.cast(pinger).commit();
+        for _ in 0..12 {
+            if runner.state().objects[&pinger].zone == Zone::Battlefield
+                && runner.state().stack.len() >= 2
+            {
+                break;
+            }
+            match runner.state().waiting_for.clone() {
+                WaitingFor::TriggerTargetSelection { .. } => {
+                    runner
+                        .act(GameAction::SelectTargets {
+                            targets: vec![TargetRef::Object(runner_id)],
+                        })
+                        .expect("target Lava Runner");
+                }
+                WaitingFor::OrderTriggers { .. } => {
+                    drain_order_triggers_with_identity(runner.state_mut());
+                }
+                _ => {
+                    runner.act(GameAction::PassPriority).expect("pass");
+                }
+            }
+        }
+        assert_eq!(
+            runner.state().stack.len(),
+            2,
+            "reach guard: the enters trigger and Runner's trigger"
+        );
+        if let Theft::Stolen = theft {
+            priority_to(&mut runner, P0);
+            runner.cast(steal).target_object(pinger).commit();
+            resolve_one_declining(&mut runner);
+            assert_eq!(runner.state().objects[&pinger].controller, P0);
+        }
+        let before = (lands(&runner, P0), lands(&runner, P1));
+        resolve_one_declining(&mut runner);
+        assert_eq!(
+            (before.0 - lands(&runner, P0), before.1 - lands(&runner, P1)),
+            (0, 1),
+            "{theft:?}: P1, the trigger's controller, sacrifices"
+        );
+    }
+}
+
+/// 4f: a printed spell targeter. P1 casts Ent's Fury with both targets legal
+/// (its own creature and P0's Lava Runner): P1 sacrifices.
+#[test]
+fn lava_runner_punishes_the_caster_of_ents_fury() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let runner_id = scenario
+        .add_creature_from_oracle(P0, "Lava Runner", 2, 2, LAVA_RUNNER)
+        .id();
+    scenario.add_land_from_oracle(P0, "P0 Land", "{T}: Add {R}.");
+    scenario.add_land_from_oracle(P1, "P1 Land", "{T}: Add {G}.");
+    let ent = scenario.add_creature(P1, "Treefolk", 5, 5).id();
+    let fury = scenario
+        .add_spell_to_hand_from_oracle(P1, "Ent's Fury", false, ENTS_FURY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    runner.cast(fury).target_objects(&[ent, runner_id]).commit();
+    drain_ordering(&mut runner);
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach guard: Ent's Fury and Runner's trigger"
+    );
+    let before = (lands(&runner, P0), lands(&runner, P1));
+    resolve_one_declining(&mut runner);
+    assert_eq!(
+        (before.0 - lands(&runner, P0), before.1 - lands(&runner, P1)),
+        (0, 1)
+    );
+}
+
+const REALITY_SMASHER: &str = "({C} represents colorless mana.)\nTrample, haste\nWhenever this creature becomes the target of a spell an opponent controls, counter that spell unless its controller discards a card.";
+const PERPLEXING_CHIMERA: &str = "Whenever an opponent casts a spell, you may exchange control of this creature and that spell. If you do, you may choose new targets for the spell. (If the spell becomes a permanent, you control that permanent.)";
+const STRIONIC_RESONATOR: &str = "{2}, {T}: Copy target triggered ability you control. You may choose new targets for the copy. (A triggered ability uses the words \"when,\" \"whenever,\" or \"at.\")";
+
+/// Bonecrusher Giant (`TriggeringSpellController`, the other spelling of the
+/// same referent): P1's spell targets it and P0 Commandeers the spell before
+/// the trigger resolves. CR 109.4: "that spell's controller" is P0 now.
+#[test]
+fn bonecrusher_giant_damages_the_targeting_spells_current_controller() {
+    const BONECRUSHER: &str = "Whenever this creature becomes the target of a spell, this creature deals 2 damage to that spell's controller.";
+    for commandeer in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let giant = scenario
+            .add_creature_from_oracle(P0, "Bonecrusher Giant", 4, 3, BONECRUSHER)
+            .id();
+        let ping = free_spell(
+            &mut scenario,
+            P1,
+            "Ping",
+            "Ping deals 1 damage to target creature.",
+        );
+        let commandeer_id = free_spell(&mut scenario, P0, "Commandeer", COMMANDEER);
+        let mut runner = scenario.build();
+        stage_turn(&mut runner, P1);
+        runner.cast(ping).target_object(giant).commit();
+        drain_ordering(&mut runner);
+        assert_eq!(
+            runner.state().stack.len(),
+            2,
+            "reach guard: Ping and the Giant's trigger"
+        );
+        if commandeer {
+            priority_to(&mut runner, P0);
+            runner.cast(commandeer_id).target_object(ping).commit();
+            resolve_one_declining(&mut runner);
+            assert_eq!(runner.state().objects[&ping].controller, P0);
+        }
+        let before = (life(&runner, P0), life(&runner, P1));
+        resolve_one_declining(&mut runner);
+        let expected = if commandeer { (-2, 0) } else { (0, -2) };
+        assert_eq!(
+            (life(&runner, P0) - before.0, life(&runner, P1) - before.1),
+            expected,
+            "commandeer={commandeer}"
+        );
+    }
+}
+
+/// Reality Smasher's payer: P1's spell targets P0's Smasher; P0 optionally
+/// Commandeers the spell first. CR 109.4: "its controller" is the spell's
+/// current controller, who is asked to discard.
+#[test]
+fn reality_smasher_asks_the_targeting_spells_current_controller() {
+    for commandeer in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let smasher = scenario
+            .add_creature_from_oracle(P0, "Reality Smasher", 5, 5, REALITY_SMASHER)
+            .id();
+        let ping = free_spell(
+            &mut scenario,
+            P1,
+            "Ping",
+            "Ping deals 1 damage to target creature.",
+        );
+        let commandeer_id = free_spell(&mut scenario, P0, "Commandeer", COMMANDEER);
+        scenario.add_card_to_hand(P0, "P0 Discard Fodder");
+        scenario.add_card_to_hand(P1, "P1 Discard Fodder");
+        let mut runner = scenario.build();
+        stage_turn(&mut runner, P1);
+        runner.cast(ping).target_object(smasher).commit();
+        drain_ordering(&mut runner);
+        assert_eq!(
+            runner.state().stack.len(),
+            2,
+            "reach guard: Ping and Smasher's trigger"
+        );
+        if commandeer {
+            priority_to(&mut runner, P0);
+            runner.cast(commandeer_id).target_object(ping).commit();
+            resolve_one_declining(&mut runner);
+            assert_eq!(runner.state().objects[&ping].controller, P0);
+        }
+        for _ in 0..6 {
+            match runner.state().waiting_for.clone() {
+                WaitingFor::UnlessPayment { .. } => break,
+                WaitingFor::OrderTriggers { .. } => {
+                    drain_order_triggers_with_identity(runner.state_mut());
+                }
+                _ => {
+                    runner.act(GameAction::PassPriority).expect("pass");
+                }
+            }
+        }
+        let expected = if commandeer { P0 } else { P1 };
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::UnlessPayment { player, .. } if player == expected
+            ),
+            "commandeer={commandeer}: {expected:?} is asked to discard, got {:?}",
+            runner.state().waiting_for
+        );
+    }
+}
+
+/// The printed Chimera discriminator: P1 casts Elder Deep-Fiend, whose cast
+/// trigger targets P0's Lava Runner; P0's Perplexing Chimera also triggers. P0
+/// copies Chimera's trigger with Strionic Resonator, and the copy exchanges
+/// control of Chimera and the Deep-Fiend spell before Runner's trigger
+/// resolves. CR 113.8: the targeter is P1's cast trigger, so P1 sacrifices.
+#[test]
+fn lava_runner_after_a_copied_chimera_exchange_punishes_the_trigger_controller() {
+    use engine::types::ability::TargetRef;
+    use engine::types::game_state::StackEntryKind;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let runner_id = scenario
+        .add_creature_from_oracle(P0, "Lava Runner", 2, 2, LAVA_RUNNER)
+        .id();
+    let chimera = scenario
+        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA)
+        .as_enchantment()
+        .id();
+    let resonator = scenario
+        .add_artifact_from_oracle(P0, "Strionic Resonator", STRIONIC_RESONATOR)
+        .id();
+    scenario.add_land_from_oracle(P0, "P0 Land", "{T}: Add {R}.");
+    scenario.add_land_from_oracle(P1, "P1 Land", "{T}: Add {U}.");
+    scenario.with_mana_pool(
+        P0,
+        (0..2)
+            .map(|_| {
+                engine::types::mana::ManaUnit::new(
+                    engine::types::mana::ManaType::Colorless,
+                    ObjectId(0),
+                    false,
+                    vec![],
+                )
+            })
+            .collect(),
+    );
+    let fiend = scenario
+        .add_creature_to_hand_from_oracle(P1, "Elder Deep-Fiend", 5, 6, ELDER_DEEP_FIEND)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    let card_id = runner.state().objects[&fiend].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: fiend,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("cast Elder Deep-Fiend");
+    for _ in 0..8 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(runner_id)],
+                    })
+                    .expect("target Lava Runner");
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    let chimera_trigger = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| {
+            entry.source_id == chimera
+                && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+        })
+        .map(|entry| entry.id)
+        .expect("reach guard: Chimera's trigger is on the stack");
+    let top_is_runner = runner
+        .state()
+        .stack
+        .back()
+        .is_some_and(|entry| entry.source_id == runner_id);
+    assert!(top_is_runner, "reach guard: Runner's trigger is on top");
+    assert_eq!(runner.state().stack.len(), 4, "reach guard: four objects");
+
+    // P0 copies Chimera's trigger; the copy resolves above Runner's trigger.
+    priority_to(&mut runner, P0);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: resonator,
+            ability_index: 0,
+        })
+        .expect("activate Strionic Resonator");
+    for _ in 0..6 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TargetSelection { .. } => {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(chimera_trigger)],
+                    })
+                    .expect("target Chimera's trigger");
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner.act(GameAction::PassPriority).expect("pay");
+            }
+            _ => break,
+        }
+    }
+    // Resolve the Resonator ability, then the copy (accept the exchange,
+    // decline new targets).
+    let depth_before = runner.state().stack.len();
+    assert_eq!(depth_before, 5, "reach guard: Resonator's ability on top");
+    let mut accepted = false;
+    for _ in 0..24 {
+        if runner.state().objects[&fiend].controller == P0
+            && runner.state().stack.len() == 4
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: !accepted })
+                    .expect("optional");
+                accepted = true;
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&fiend].controller,
+        P0,
+        "reach guard: the copied exchange gave P0 the Deep-Fiend spell"
+    );
+    assert!(
+        runner
+            .state()
+            .stack
+            .back()
+            .is_some_and(|entry| entry.source_id == runner_id),
+        "reach guard: Runner's trigger is next"
+    );
+    let before = (lands(&runner, P0), lands(&runner, P1));
+    resolve_one_declining(&mut runner);
+    assert_eq!(
+        (before.0 - lands(&runner, P0), before.1 - lands(&runner, P1)),
+        (0, 1),
+        "P1, the cast trigger's controller, sacrifices"
+    );
 }

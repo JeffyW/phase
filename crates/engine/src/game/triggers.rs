@@ -9083,6 +9083,9 @@ fn prepare_trigger_targets(state: &GameState, trigger: &PendingTrigger) -> Prepa
                 &super::ability_utils::declared_targets_in_chain(&prepared_trigger.ability),
                 prepared_trigger.source_id,
                 prepared_trigger.controller,
+                Some(crate::types::events::Targeter::Ability(
+                    crate::types::ability::StackAbilityKind::Triggered,
+                )),
                 &mut events,
             );
             PreparedTriggerTargets::AutoAssigned {
@@ -29521,6 +29524,7 @@ pub mod tests {
             target: TargetRef::Object(creature),
             source_id: spell,
             source_controller: PlayerId(0),
+            targeter: None,
         }];
 
         process_triggers(&mut state, &events);
@@ -29592,6 +29596,7 @@ pub mod tests {
             target: TargetRef::Object(creature),
             source_id: spell,
             source_controller: PlayerId(0),
+            targeter: None,
         }];
 
         process_triggers(&mut state, &events);
@@ -29640,6 +29645,7 @@ pub mod tests {
             target: TargetRef::Object(ward_target),
             source_id: prepared_source,
             source_controller: PlayerId(0),
+            targeter: None,
         };
         assert!(
             collect_pending_triggers(&mut without_overlay, std::slice::from_ref(&event)).is_empty(),
@@ -29651,6 +29657,7 @@ pub mod tests {
             target: TargetRef::Object(ward_target),
             source_id: prepared_source,
             source_controller: PlayerId(0),
+            targeter: None,
         };
         let pending = collect_pending_triggers_with_overlay(
             &mut with_overlay,
@@ -29739,6 +29746,7 @@ pub mod tests {
             target: TargetRef::Object(observer),
             source_id: source,
             source_controller: PlayerId(0),
+            targeter: None,
         };
         assert!(crate::game::trigger_matchers::match_becomes_target(
             &event,
@@ -29781,6 +29789,7 @@ pub mod tests {
                 target: TargetRef::Object(ward_target),
                 source_id: source,
                 source_controller: PlayerId(0),
+                targeter: None,
             }],
         );
         let serialized = serde_json::to_string(&pending)
@@ -29883,6 +29892,7 @@ pub mod tests {
             target: TargetRef::Object(creature),
             source_id: spell,
             source_controller: PlayerId(0),
+            targeter: None,
         }];
 
         process_triggers(&mut state, &events);
@@ -29989,6 +29999,7 @@ pub mod tests {
                 target: TargetRef::Object(p1_ward),
                 source_id: spell0,
                 source_controller: PlayerId(0),
+                targeter: None,
             }],
         );
         assert!(
@@ -30006,6 +30017,7 @@ pub mod tests {
                 target: TargetRef::Object(p0_ward),
                 source_id: spell1,
                 source_controller: PlayerId(0),
+                targeter: None,
             }],
         );
         assert!(
@@ -30060,6 +30072,7 @@ pub mod tests {
             target: TargetRef::Object(creature),
             source_id: spell,
             source_controller: PlayerId(0),
+            targeter: None,
         }];
 
         process_triggers(&mut state, &events);

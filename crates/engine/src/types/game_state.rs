@@ -1161,6 +1161,15 @@ pub struct ManaSpentSourceSnapshot {
     pub lki: LKISnapshot,
 }
 
+/// CR 601.2a + CR 400.7: the identity of one spell on the stack, minted when the
+/// spell is announced (or a copy is put onto the stack, CR 707.10) and carried
+/// unchanged through targeting, payment and finalization — unlike the object's
+/// incarnation, which advances when finalization moves the card to the stack.
+/// Never reused: the allocator only increases, and cleared identities are not
+/// reminted. Legacy saves carry no announcement, which matches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SpellAnnouncement(pub u64);
+
 /// CR 601.2i: Stable coordinate of one finalized cast in its caster's
 /// turn-scoped spell-cast journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -19816,6 +19825,11 @@ declare_game_state! {
     /// games don't re-mint colliding ids.
     #[serde(default)]
     pub next_pip_id: u64,
+    /// CR 601.2a + CR 400.7: the last [`SpellAnnouncement`] minted. Monotonic and
+    /// serialized, so a reloaded game never remints an id a live or departed
+    /// spell still carries.
+    #[serde(default)]
+    pub next_spell_announcement: u64,
     /// Resolved-rules journal for exact mana provenance and P2 mana commands.
     /// It is serialized so a restored game retains the command operands needed
     /// by later retained-prefix replay.
@@ -27466,6 +27480,7 @@ impl GameState {
             // CR 118.3a: start at 1 so minted pip ids never collide with the
             // `ManaPipId(0)` unstamped sentinel.
             next_pip_id: 1,
+            next_spell_announcement: 0,
             resolved_rules_journal: ResolvedRulesJournal::default(),
             active_payment_pins: Vec::new(),
             active_rules_execution_node: None,
@@ -27902,6 +27917,14 @@ impl GameState {
         let ts = self.next_timestamp;
         self.next_timestamp += 1;
         ts
+    }
+
+    /// CR 601.2a + CR 707.10: mint the identity of a spell put onto the stack.
+    /// Strictly increasing from 1, so it never collides with an earlier
+    /// announcement, even one minted before a reload.
+    pub(crate) fn mint_spell_announcement(&mut self) -> SpellAnnouncement {
+        self.next_spell_announcement += 1;
+        SpellAnnouncement(self.next_spell_announcement)
     }
 
     /// CR 613.7: carry the timestamp allocator past a timestamp that a CR 733
@@ -28843,6 +28866,7 @@ impl GameState {
         clone.state_revision = 0;
         clone.next_timestamp = 0;
         clone.next_object_id = 0;
+        clone.next_spell_announcement = 0;
         clone.next_delayed_trigger_token = 0;
         clone.next_delayed_trigger_instance = 0;
         clone.next_resolution_cast_offer_id = 0;
@@ -29182,6 +29206,14 @@ impl GameState {
                 (!history.is_empty()).then_some((object_id, history))
             })
             .collect();
+        // CR 104.4b + CR 601.2a: a spell's announcement is monotonic identity,
+        // not position. Renumber every announcement by its rank among those
+        // the position carries, on the spell objects, the departure records,
+        // and the `BecomesTarget` targeters on every trigger-event carrier, so
+        // two positions minted at different times still confirm as a repeat
+        // while which spell each targeter names is preserved.
+        clone.canonicalize_spell_announcements_for_loop();
+
         // CR 104.4b + CR 608.2h: records no live spell-cast trigger can reach are
         // history, not position — prune the same way as `lki_by_incarnation`,
         // against the set captured above before it was cleared.
@@ -29196,6 +29228,126 @@ impl GameState {
             })
             .collect();
         clone
+    }
+
+    /// See `normalize_for_loop`. Rank-based, so the mapping depends only on
+    /// the relative order of the announcements present, which is the same for
+    /// two positions with the same structure minted at different times.
+    fn canonicalize_spell_announcements_for_loop(&mut self) {
+        use crate::types::events::Targeter;
+        let mut present: Vec<SpellAnnouncement> = Vec::new();
+        for (_, object) in self.objects.iter() {
+            present.extend(object.spell_announcement);
+        }
+        for (_, records) in self.departed_stack_spells.iter() {
+            for (_, record) in records.iter() {
+                present.extend(record.object.spell_announcement);
+            }
+        }
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let GameEvent::BecomesTarget {
+                targeter: Some(Targeter::Spell(announcement)),
+                ..
+            } = event
+            {
+                present.push(*announcement);
+            }
+        });
+        present.sort_unstable();
+        present.dedup();
+        let canonical = |announcement: SpellAnnouncement| {
+            let rank = present
+                .binary_search(&announcement)
+                .expect("every announcement was collected above");
+            SpellAnnouncement(rank as u64 + 1)
+        };
+        for (_, object) in self.objects.iter_mut() {
+            if let Some(announcement) = object.spell_announcement.as_mut() {
+                *announcement = canonical(*announcement);
+            }
+        }
+        for (_, records) in self.departed_stack_spells.iter_mut() {
+            for (_, record) in records.iter_mut() {
+                if let Some(announcement) = record.object.spell_announcement.as_mut() {
+                    *announcement = canonical(*announcement);
+                }
+            }
+        }
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let GameEvent::BecomesTarget {
+                targeter: Some(Targeter::Spell(announcement)),
+                ..
+            } = event
+            {
+                *announcement = canonical(*announcement);
+            }
+        });
+    }
+
+    /// Every trigger-event carrier that can still resume or resolve — the same
+    /// set `normalize_for_loop` reads for LKI retention.
+    fn for_each_trigger_event_carrier_mut(&mut self, f: &mut impl FnMut(&mut GameEvent)) {
+        for entry in self
+            .stack
+            .iter_mut()
+            .chain(self.resolving_stack_entry.iter_mut())
+        {
+            if let StackEntryKind::TriggeredAbility {
+                trigger_event: Some(event),
+                ..
+            } = &mut entry.kind
+            {
+                f(event);
+            }
+        }
+        if let Some(event) = self
+            .pending_trigger
+            .as_mut()
+            .and_then(|pending| pending.trigger_event.as_mut())
+        {
+            f(event);
+        }
+        self.pending_trigger_event_batch
+            .iter_mut()
+            .for_each(&mut *f);
+        let order_contexts = self
+            .pending_trigger_order
+            .iter_mut()
+            .flat_map(|order| order.groups.iter_mut())
+            .flat_map(|group| group.triggers.iter_mut());
+        for context in self.deferred_triggers.iter_mut().chain(order_contexts) {
+            if let Some(event) = context.pending.trigger_event.as_mut() {
+                f(event);
+            }
+            context.trigger_events.iter_mut().for_each(&mut *f);
+        }
+        if let Some(event) = self.current_trigger_event.as_mut() {
+            f(event);
+        }
+        self.current_trigger_events.iter_mut().for_each(&mut *f);
+        for events in self.stack_trigger_event_batches.values_mut() {
+            events.iter_mut().for_each(&mut *f);
+        }
+        if let Some(event) = self
+            .active_optional_effect_frame_mut()
+            .and_then(|frame| frame.trigger_event.as_mut())
+        {
+            f(event);
+        }
+        if let Some(frame) = self.active_ability_continuation_frame_mut() {
+            if let Some(context) = frame.choose_zone_trigger_context.as_mut() {
+                if let Some(event) = context.event.as_mut() {
+                    f(event);
+                }
+                context.events.iter_mut().for_each(&mut *f);
+            }
+            if let Some(context) = frame.pending.trigger_context.as_mut() {
+                if let Some(event) = context.event.as_mut() {
+                    f(event);
+                }
+                context.events.iter_mut().for_each(&mut *f);
+            }
+        }
     }
 
     /// PR-3 (Option C): push one NORMALIZED post-resolution snapshot onto the
@@ -29943,6 +30095,7 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
         // #6865: a cast occurrence is resolution-semantic provenance while the
         // spell remains on the stack. Comparing it is fail-safe for loop detection.
         && x.cast_occurrence == y.cast_occurrence
+        && x.spell_announcement == y.spell_announcement
 }
 
 /// CR 104.4b compile-time totality guard for the object-growth cover gate's
@@ -29973,6 +30126,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         next_resolution_cast_offer_id: _,
         next_logical_zone_change_group_id: _,
         next_pip_id: _,
+        next_spell_announcement: _,
         resolved_rules_journal: _,
         active_payment_pins: _,
         active_rules_execution_node: _,
@@ -30389,6 +30543,7 @@ impl PartialEq for GameState {
             && self.next_delayed_trigger_instance == other.next_delayed_trigger_instance
             && self.next_resolution_cast_offer_id == other.next_resolution_cast_offer_id
             && self.next_pip_id == other.next_pip_id
+            && self.next_spell_announcement == other.next_spell_announcement
             && self.resolved_rules_journal == other.resolved_rules_journal
             && self.battlefield == other.battlefield
             && self.stack == other.stack
@@ -37393,6 +37548,126 @@ mod tests {
             "a live \"that sticker\" can change a following resolution action"
         );
         assert!(a != b, "\"that sticker\" participates in state equality");
+    }
+
+    /// CR 104.4b + CR 601.2a: two positions that differ only in WHEN their
+    /// spells were announced normalize equal, while a targeter that names a
+    /// different spell than the other position's targeter stays distinguishable.
+    #[test]
+    fn normalize_for_loop_canonicalizes_spell_announcements_by_rank() {
+        use crate::types::events::Targeter;
+        fn position(spell_a: u64, spell_b: u64, targeter_names: u64) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            for (id, announcement) in [(ObjectId(600), spell_a), (ObjectId(601), spell_b)] {
+                let mut object = GameObject::new(
+                    id,
+                    CardId(id.0),
+                    PlayerId(0),
+                    "Loop Spell".to_string(),
+                    Zone::Stack,
+                );
+                object.spell_announcement = Some(SpellAnnouncement(announcement));
+                state.objects.insert(id, object);
+            }
+            state.next_spell_announcement = spell_a.max(spell_b);
+            // `pending_trigger` is an equality-compared trigger-event carrier.
+            state.pending_trigger = Some(Box::new(crate::game::triggers::PendingTrigger {
+                source_id: ObjectId(602),
+                controller: PlayerId(1),
+                condition: None,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    Vec::new(),
+                    ObjectId(602),
+                    PlayerId(1),
+                )),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: Some(GameEvent::BecomesTarget {
+                    target: crate::types::ability::TargetRef::Player(PlayerId(1)),
+                    source_id: ObjectId(600),
+                    source_controller: PlayerId(0),
+                    targeter: Some(Targeter::Spell(SpellAnnouncement(targeter_names))),
+                }),
+                modal: None,
+                mode_abilities: vec![],
+                description: None,
+                may_trigger_origin: None,
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            }));
+            state
+        }
+        let early = position(3, 4, 3).normalize_for_loop();
+        let late = position(91, 92, 91).normalize_for_loop();
+        assert!(early == late, "minted at different times, same position");
+        let other_referent = position(91, 92, 92).normalize_for_loop();
+        assert!(
+            early != other_referent,
+            "a targeter naming the other spell is a different position"
+        );
+        assert_eq!(early.next_spell_announcement, 0);
+    }
+
+    /// CR 601.2a: the announcement, its allocator and the event's targeter
+    /// round-trip through serde; a legacy payload without them decodes to
+    /// "no announcement" (which matches nothing) and a zero allocator.
+    #[test]
+    fn spell_announcement_and_targeter_round_trip() {
+        use crate::types::events::Targeter;
+        let mut state = GameState::new_two_player(7);
+        let mut object = GameObject::new(
+            ObjectId(700),
+            CardId(700),
+            PlayerId(1),
+            "Announced".to_string(),
+            Zone::Stack,
+        );
+        object.spell_announcement = Some(SpellAnnouncement(12));
+        state.objects.insert(ObjectId(700), object);
+        state.next_spell_announcement = 12;
+        for targeter in [
+            Targeter::Spell(SpellAnnouncement(12)),
+            Targeter::Ability(crate::types::ability::StackAbilityKind::Triggered),
+        ] {
+            state.current_trigger_event = Some(GameEvent::BecomesTarget {
+                target: crate::types::ability::TargetRef::Object(ObjectId(1)),
+                source_id: ObjectId(700),
+                source_controller: PlayerId(1),
+                targeter: Some(targeter),
+            });
+            let json = serde_json::to_string(&state).expect("serialize");
+            let restored: GameState = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(
+                restored.objects[&ObjectId(700)].spell_announcement,
+                Some(SpellAnnouncement(12))
+            );
+            assert_eq!(restored.next_spell_announcement, 12);
+            assert_eq!(restored.current_trigger_event, state.current_trigger_event);
+        }
+
+        let legacy_event: GameEvent = serde_json::from_value(serde_json::json!({
+            "type": "BecomesTarget",
+            "data": {
+                "target": { "Object": 1 },
+                "source_id": 700,
+                "source_controller": 1
+            }
+        }))
+        .expect("a legacy targeting event decodes");
+        assert!(matches!(
+            legacy_event,
+            GameEvent::BecomesTarget { targeter: None, .. }
+        ));
+        let legacy_object: GameObject = serde_json::from_value({
+            let mut value = serde_json::to_value(&state.objects[&ObjectId(700)]).unwrap();
+            value.as_object_mut().unwrap().remove("spell_announcement");
+            value
+        })
+        .expect("a legacy object decodes");
+        assert_eq!(legacy_object.spell_announcement, None);
     }
 
     #[test]

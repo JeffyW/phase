@@ -1589,6 +1589,63 @@ fn resolve_source_attached_to(
         .map(|r| crate::game::game_object::AttachTarget::Object(r.object_id))
 }
 
+/// CR 608.2h + CR 109.4 + CR 113.8: the controller of an event's referent —
+/// "that permanent's controller" or "that spell or ability's controller".
+///
+/// - `BecomesTarget` names the stack object that targeted, recorded at
+///   announcement ([`Targeter`]): an ability answers with the controller the
+///   event recorded (CR 113.8); a spell answers with its current controller
+///   while it is on the stack, else its controller as it last existed there
+///   (CR 608.2h), else the recorded controller. A legacy event without a
+///   targeter falls through to the object authority below.
+/// - Every other event names an object, read through
+///   `last_known_permanent_controller` (live on the battlefield, else as it
+///   last existed there).
+pub(crate) fn event_referent_controller(state: &GameState, event: &GameEvent) -> Option<PlayerId> {
+    use crate::types::events::Targeter;
+    if let GameEvent::BecomesTarget {
+        source_id,
+        source_controller,
+        targeter: Some(targeter),
+        ..
+    } = event
+    {
+        return Some(match targeter {
+            Targeter::Ability(_) => *source_controller,
+            Targeter::Spell(announcement) => {
+                announced_spell_controller(state, *source_id, *announcement)
+                    .unwrap_or(*source_controller)
+            }
+        });
+    }
+    let id = extract_source_from_event(event)?;
+    crate::game::ability_utils::last_known_permanent_controller(state, id)
+}
+
+/// CR 109.4 + CR 608.2h: the controller of the spell `announcement` names:
+/// live on the stack (object `id` still carries that announcement), else its
+/// departure record. `None` when neither exists (it resolved, or the cast was
+/// undone).
+fn announced_spell_controller(
+    state: &GameState,
+    id: ObjectId,
+    announcement: crate::types::game_state::SpellAnnouncement,
+) -> Option<PlayerId> {
+    if let Some(obj) = state
+        .objects
+        .get(&id)
+        .filter(|obj| obj.spell_announcement == Some(announcement))
+    {
+        return Some(obj.controller);
+    }
+    state.departed_stack_spells.get(&id).and_then(|records| {
+        records
+            .values()
+            .find(|record| record.object.spell_announcement == Some(announcement))
+            .map(|record| record.object.controller)
+    })
+}
+
 pub(crate) fn resolve_event_context_target_for_event_or_state(
     state: &GameState,
     filter: &TargetFilter,
@@ -1598,6 +1655,15 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
     match filter {
         TargetFilter::TriggeringSpellController => {
             let event = event?;
+            // CR 113.8 + CR 109.4: on a targeting event, "that spell's
+            // controller" is the targeter's, through the same authority as
+            // `ParentTargetController`.
+            if let GameEvent::BecomesTarget {
+                targeter: Some(_), ..
+            } = event
+            {
+                return event_referent_controller(state, event).map(TargetRef::Player);
+            }
             let source_obj_id = extract_source_from_event(event)?;
             let controller = state.objects.get(&source_obj_id)?.controller;
             Some(TargetRef::Player(controller))
@@ -1786,9 +1852,9 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
         // controller as it last existed there — the same authority
         // `parent_target_controller` uses for a chosen target.
         TargetFilter::ParentTargetController => {
-            if let Some(controller) = event.and_then(extract_source_from_event).and_then(|id| {
-                crate::game::ability_utils::last_known_permanent_controller(state, id)
-            }) {
+            if let Some(controller) =
+                event.and_then(|event| event_referent_controller(state, event))
+            {
                 return Some(TargetRef::Player(controller));
             }
             // CR 301.5 + CR 303.4 + CR 113.7a: Aura/Equipment fallback — the controller of the
@@ -3368,6 +3434,49 @@ pub(crate) fn resolve_tracked_set_sentinel(
 #[cfg(test)]
 mod tests {
 
+    /// CR 113.8 + CR 608.2h: a targeting event's referent controller. An event
+    /// carrying no targeter (a legacy save) falls back to the object authority
+    /// on `source_id`: with the source permanent now controlled by P0 (owner
+    /// P1), the legacy reading is P0, while a recorded ability targeter keeps
+    /// the controller the event recorded (P1).
+    #[test]
+    fn event_referent_controller_reads_the_targeter_or_falls_back_for_legacy_events() {
+        use crate::types::events::Targeter;
+        let (mut state, _bear, goblin) = setup_with_creatures();
+        state.objects.get_mut(&goblin).unwrap().controller = PlayerId(0);
+        let event = |targeter| GameEvent::BecomesTarget {
+            target: TargetRef::Player(PlayerId(0)),
+            source_id: goblin,
+            source_controller: PlayerId(1),
+            targeter,
+        };
+        assert_eq!(
+            event_referent_controller(&state, &event(None)),
+            Some(PlayerId(0)),
+            "legacy: the source permanent's current controller"
+        );
+        assert_eq!(
+            event_referent_controller(
+                &state,
+                &event(Some(Targeter::Ability(
+                    crate::types::ability::StackAbilityKind::Activated
+                )))
+            ),
+            Some(PlayerId(1)),
+            "an ability targeter: the recorded activator"
+        );
+        assert_eq!(
+            event_referent_controller(
+                &state,
+                &event(Some(Targeter::Spell(
+                    crate::types::game_state::SpellAnnouncement(99)
+                )))
+            ),
+            Some(PlayerId(1)),
+            "a spell no longer live or recorded: the recorded controller"
+        );
+    }
+
     #[test]
     fn extract_target_object_from_event_handles_object_becomes_target_only() {
         let object = ObjectId(41);
@@ -3375,11 +3484,13 @@ mod tests {
             target: TargetRef::Object(object),
             source_id: ObjectId(7),
             source_controller: PlayerId(0),
+            targeter: None,
         };
         let player_event = GameEvent::BecomesTarget {
             target: TargetRef::Player(PlayerId(1)),
             source_id: ObjectId(7),
             source_controller: PlayerId(0),
+            targeter: None,
         };
 
         assert_eq!(
@@ -3641,6 +3752,7 @@ mod tests {
             target: TargetRef::Object(target),
             source_id: source,
             source_controller: PlayerId(1),
+            targeter: None,
         };
 
         // The targeting source can change controllers after targets are

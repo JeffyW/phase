@@ -87,7 +87,9 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +36: v107 adds the counted exile-until loop and the ParentTargets zone choice.
 // +37: v108 adds serialized IllegalTargetsDisposition.StillResolves.
 // +38: the v109 CR 201.5a granter binding.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 38;
+// +39: the v110 CR 601.2a spell announcement (GameObject.spell_announcement,
+// GameState.next_spell_announcement) and the BecomesTarget targeter.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 39;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -150,7 +152,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +35: wire 89 moves with full-game v107 for the counted exile-until loop.
 // +36: wire 90 moves with full-game v108 for illegal-target resolution disposition.
 // +37: wire 91 moves with full-game v109 for the CR 201.5a granter binding.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 37;
+// +38: wire 92 moves with full-game v110 for the spell announcement and targeter.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 38;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
