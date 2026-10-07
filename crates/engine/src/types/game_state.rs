@@ -13592,6 +13592,12 @@ pub enum PersistedRestoreError {
     /// nor silently undone: restore refuses the state.
     #[error("persisted copy announcement for {copy_id:?} has no legal announcement and is not resumable")]
     NonResumableCopyAnnouncement { copy_id: ObjectId },
+    /// CR 601.2c + CR 115.1: a parked copy announcement (an older save) has
+    /// announced targets while an "of an opponent's choice" group still has
+    /// no elected announcer. The election precedes every target, and is
+    /// never inferred, so the save is not resumable.
+    #[error("persisted copy announcement for {copy_id:?} has targets before its announcing-opponent election and is not resumable")]
+    UnelectedCopyAnnouncer { copy_id: ObjectId },
 }
 
 impl PreparedPersistedGameState {

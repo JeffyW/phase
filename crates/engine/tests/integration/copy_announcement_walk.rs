@@ -564,3 +564,132 @@ fn copy_announcement_elects_announcing_opponents_per_effect() {
 fn ordinary_volcanic_offering_three_player_election_control() {
     volcanic_offering_three_players(false);
 }
+
+/// The three-player Mizzix's Mastery -> Volcanic Offering copy at its first
+/// announcing-opponent election. Returns (runner, copy, [P1 land, P2 land]).
+fn three_player_copy_at_election() -> (GameRunner, ObjectId, [ObjectId; 2]) {
+    let p2 = PlayerId(2);
+    let mut s = GameScenario::new_n_player(3, 7);
+    s.at_phase(Phase::PreCombatMain);
+    let land_p1 = s.add_land_from_oracle(P1, "P1 Nonbasic", "").id();
+    let land_p2 = s.add_land_from_oracle(p2, "P2 Nonbasic", "").id();
+    s.add_creature(P1, "P1 Creature", 3, 12);
+    s.add_creature(p2, "P2 Creature", 3, 12);
+    let offering = s
+        .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+        .from_oracle_text(VOLCANIC_OFFERING)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(mastery).target_object(offering).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards {
+        cards: vec![offering],
+    })
+    .expect("cast the copy");
+    let WaitingFor::CopyRetarget {
+        copy_id,
+        announcer_election: Some(_),
+        ..
+    } = r.state().waiting_for
+    else {
+        panic!(
+            "expected the first election, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    (r, copy_id, [land_p1, land_p2])
+}
+
+fn try_restore(
+    wire: serde_json::Value,
+) -> Result<engine::types::game_state::GameState, engine::types::game_state::PersistedRestoreError>
+{
+    use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization};
+    serde_json::from_value::<PersistedGameState>(wire)
+        .expect("decodes")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)?
+        .finalize_after_rehydration(|_| Ok(()))
+}
+
+fn save_wire(state: &engine::types::game_state::GameState) -> serde_json::Value {
+    use engine::types::game_state::PersistedGameState;
+    serde_json::to_value(PersistedGameState::capture(state.clone())).unwrap()
+}
+
+/// The persisted `CopyRetarget` payload.
+fn walk_wire(value: &mut serde_json::Value) -> &mut serde_json::Map<String, serde_json::Value> {
+    fn find(
+        value: &mut serde_json::Value,
+    ) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.contains_key("target_slots") && map.contains_key("copy_id") {
+                    return Some(map);
+                }
+                map.values_mut().find_map(find)
+            }
+            serde_json::Value::Array(values) => values.iter_mut().find_map(find),
+            _ => None,
+        }
+    }
+    find(value).expect("a parked CopyRetarget payload")
+}
+
+/// CR 601.2c + CR 707.12 (?3 policy (a)): a saved copy announcement at its
+/// first announcing-opponent election, on a board where no legal announcement
+/// exists any more (every nonbasic land is gone), fails restore before
+/// publication; the election is never published for an infeasible copy.
+/// Control: the same save on the intact board restores to the election.
+#[test]
+fn copy_election_with_no_feasible_announcement_fails_closed_at_restore() {
+    use engine::types::game_state::PersistedRestoreError;
+    let (mut r, copy_id, lands) = three_player_copy_at_election();
+    let control = try_restore(save_wire(r.state())).expect("control: the election restores");
+    assert_eq!(control.waiting_for, r.state().waiting_for);
+    let mut events = Vec::new();
+    for land in lands {
+        engine::game::zones::move_to_zone(r.state_mut(), land, Zone::Graveyard, &mut events);
+    }
+    assert_eq!(
+        try_restore(save_wire(r.state())).map(|_| ()),
+        Err(PersistedRestoreError::NonResumableCopyAnnouncement { copy_id }),
+        "no election is published for an infeasible announcement"
+    );
+}
+
+/// CR 601.2c + CR 115.1: a save from before the copy walk ran the election
+/// (an r13-format announcement: a target already announced, both
+/// opponent-choice groups unelected) is not resumable; it is refused with a
+/// typed error before publication, never resumed with a seat-order announcer.
+/// The election-time save (no targets yet) is the control: it restores to the
+/// election.
+#[test]
+fn legacy_announcement_with_targets_before_the_election_is_refused() {
+    use engine::types::game_state::PersistedRestoreError;
+    let (r, copy_id, [land_p1, _]) = three_player_copy_at_election();
+    let mut wire = save_wire(r.state());
+    {
+        let walk = walk_wire(&mut wire);
+        walk.remove("announcer_election");
+        walk.insert(
+            "picks".into(),
+            serde_json::json!([serde_json::to_value(TargetRef::Object(land_p1)).unwrap()]),
+        );
+        walk.insert("current_slot".into(), serde_json::json!(1));
+        walk.insert("player".into(), serde_json::json!(1));
+        walk.insert("controller".into(), serde_json::json!(0));
+    }
+    assert_eq!(
+        try_restore(wire).map(|_| ()),
+        Err(PersistedRestoreError::UnelectedCopyAnnouncer { copy_id })
+    );
+    assert!(
+        try_restore(save_wire(r.state())).is_ok(),
+        "control: the election-time save restores"
+    );
+}

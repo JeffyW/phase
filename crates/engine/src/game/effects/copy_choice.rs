@@ -171,7 +171,18 @@ pub(crate) fn walk_step(
             ))))
         }
         CopyChoiceMode::Announce => {
-            if let Some(election) = announcer_election(state, walk, &picks)? {
+            if let Some(election) = announcer_election(state, walk)? {
+                // An announcer is elected before any target is announced; a
+                // decided prefix with an unelected group is not a walk state.
+                if !picks.is_empty() {
+                    return Err(EngineError::InvalidAction(
+                        "Copy announcement has targets before its announcing opponent".to_string(),
+                    ));
+                }
+                // CR 601.2c + CR 707.12: the election is published only for a
+                // feasible announcement; a copy with no legal announcement
+                // fails here, before any prompt (restore: fail closed).
+                announcement(state, walk.copy_id, Vec::new())?;
                 return Ok(Some(CopyWalkStep::Prompt(Box::new(
                     WaitingFor::CopyRetarget {
                         player: walk.player,
@@ -261,11 +272,7 @@ pub(crate) fn walk_step(
 fn announcer_election(
     state: &GameState,
     walk: &CopyWalk,
-    picks: &[RetargetPick],
 ) -> Result<Option<AnnouncerElection>, EngineError> {
-    if !picks.is_empty() {
-        return Ok(None);
-    }
     let Some(ability) = copy_ability(state, walk.copy_id)? else {
         return Ok(None);
     };
@@ -293,7 +300,7 @@ pub(crate) fn elect_announcing_opponent(
     walk: &CopyWalk,
     opponent: PlayerId,
 ) -> Result<(), EngineError> {
-    let election = announcer_election(state, walk, &[])?.ok_or_else(|| {
+    let election = announcer_election(state, walk)?.ok_or_else(|| {
         EngineError::InvalidAction(
             "No opponent-choice effect is awaiting an announcing opponent".to_string(),
         )
@@ -599,6 +606,21 @@ pub(crate) fn restore_copy_target_walk(state: &mut GameState) -> Result<(), Pers
             "copy target walk names {:?}, which is not a copy on the stack",
             walk.copy_id
         )));
+    }
+    // CR 601.2c + CR 115.1: an announcement that already has targets but an
+    // "of an opponent's choice" group with no elected announcer (a save from
+    // before the copy walk ran the election) cannot be resumed: the
+    // election would have to precede the saved picks, and it is never
+    // inferred from seat order.
+    if mode == CopyChoiceMode::Announce
+        && !picks.is_empty()
+        && announcer_election(state, &walk)
+            .map_err(|error| malformed(format!("{error:?}")))?
+            .is_some()
+    {
+        return Err(PersistedRestoreError::UnelectedCopyAnnouncer {
+            copy_id: walk.copy_id,
+        });
     }
     // Replay: each saved pick must be the walk's own answer at its position,
     // in published form (the casting walk's auto-advances included).

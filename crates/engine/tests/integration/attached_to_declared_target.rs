@@ -3421,3 +3421,78 @@ fn forced_change_a_target_keeps_the_dependent_equipment_target_legal() {
     );
     assert_eq!(state.objects[&eq1].zone, Zone::Battlefield);
 }
+
+/// CR 109.5: "you" in "target Equipment you control attached to that creature"
+/// is the spell's controller even when an earlier slot targets a player. With
+/// P1 chosen as the player target, only the caster's Equipment Mine on A is
+/// offered (P1's Equipment Theirs is refused), and the chosen Mine is exiled
+/// at resolution: admission and resolution agree. Choosing P0 as the player
+/// is the control.
+#[test]
+fn you_control_dependent_target_binds_the_caster_not_an_earlier_player_target() {
+    const TEXT: &str = "Target player loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment you control attached to that creature.";
+    let parsed = parse_oracle_text(TEXT, "Probe", &[], &types("Instant"), &[]);
+    assert!(
+        unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+        "reach guard: the labelled synthetic parses supported"
+    );
+    for player in [P1, P0] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+        let mine = equipment(&mut scenario, P0, "Equipment Mine");
+        let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
+        let spell = free_spell(&mut scenario, "Probe", true, TEXT);
+        let mut runner = scenario.build();
+        attach::attach_to(runner.state_mut(), mine, a);
+        attach::attach_to(runner.state_mut(), theirs, a);
+        runner
+            .act(GameAction::CastSpell {
+                object_id: spell,
+                card_id: runner.state().objects[&spell].card_id,
+                targets: vec![],
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            })
+            .expect("cast begins");
+        for target in [TargetRef::Player(player), TargetRef::Object(a)] {
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(target),
+                })
+                .expect("announce");
+        }
+        let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for else {
+            panic!(
+                "{player:?}: expected the Equipment slot, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(
+            selection.current_legal_targets,
+            vec![TargetRef::Object(mine)],
+            "{player:?}: only the caster's Equipment on A"
+        );
+        assert!(
+            GameRunner::from_state(runner.state().clone())
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(theirs)),
+                })
+                .is_err(),
+            "{player:?}: the targeted player's Equipment is refused"
+        );
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(mine)),
+            })
+            .expect("announce Mine");
+        runner.advance_until_stack_empty();
+        let state = runner.state();
+        assert_eq!(
+            state.objects[&mine].zone,
+            Zone::Exile,
+            "{player:?}: Mine exiled"
+        );
+        assert_eq!(state.objects[&theirs].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&a].damage_marked, 5);
+    }
+}

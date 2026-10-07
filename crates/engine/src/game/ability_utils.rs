@@ -7526,20 +7526,16 @@ fn legal_targets_for_ability_filter_uncapped(
     // CR 601.2c + CR 701.3a + CR 109.5: a controller- or owner-relative
     // declared-slot referent ("target Equipment you control attached to that
     // creature") composes both enumerations: the referent's candidates, each
-    // under every player the relative scope can name (the companion player
-    // slot's candidates, or the controller when there is none).
+    // under every player the relative scope can name. CR 109.5: "you" is the
+    // declaring controller, never an earlier target player; only a reference
+    // that names the targeted player ("that player controls") is enumerated
+    // over the companion player slot's candidates.
     if crate::game::filter::filter_reads_declared_slot(filter) {
+        let names_target_player =
+            relative_kind == Some(crate::types::ability::ControllerRef::TargetPlayer);
         let (enumeration_filter, players): (TargetFilter, Vec<PlayerId>) = match player_slot {
-            Some(player_slot) => (
-                match relative_kind {
-                    Some(crate::types::ability::ControllerRef::TargetPlayer) => {
-                        rewrite_declared_target_player(
-                            filter,
-                            crate::types::ability::ControllerRef::You,
-                        )
-                    }
-                    _ => filter.clone(),
-                },
+            Some(player_slot) if names_target_player => (
+                rewrite_declared_target_player(filter, crate::types::ability::ControllerRef::You),
                 player_slot
                     .legal_targets
                     .iter()
@@ -7549,7 +7545,7 @@ fn legal_targets_for_ability_filter_uncapped(
                     })
                     .collect(),
             ),
-            None => (filter.clone(), vec![ability.controller]),
+            _ => (filter.clone(), vec![ability.controller]),
         };
         return union_over_declared_slot_candidates(
             state,
@@ -8254,7 +8250,15 @@ fn legal_targets_for_selected_slot(
             return Vec::new();
         }
         let relative_kind = relative_controller_kind(&bound_filter);
-        let controller = if relative_kind.is_some() {
+        // CR 109.5: for a declared-slot referent, "you" stays the declaring
+        // controller; only a reference naming the targeted player is rebound
+        // to the selected player.
+        let rebinds_to_selected_player = match relative_kind {
+            Some(ControllerRef::TargetPlayer) => true,
+            Some(_) => !crate::game::filter::filter_reads_declared_slot(&bound_filter),
+            None => false,
+        };
+        let controller = if rebinds_to_selected_player {
             relative_filter_controller(ability, selected_slots)
         } else {
             ability.controller
