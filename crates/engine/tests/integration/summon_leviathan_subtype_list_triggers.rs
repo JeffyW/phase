@@ -746,6 +746,15 @@ fn intervening_if_strict_fail_boundary_controls() {
         !has_unimplemented(&body, "delayed_intervening_if_dropped"),
         "{body:?}"
     );
+    // Positive guard on the same input: the body is the Draw itself, with no
+    // gap anywhere in it.
+    assert!(matches!(&*body.effect, Effect::Draw { .. }), "{body:?}");
+    assert!(
+        !serde_json::to_string(&body)
+            .expect("serialize")
+            .contains("\"Unimplemented\""),
+        "{body:?}"
+    );
     let parsed = engine::parser::oracle::parse_oracle_text(
         "Whenever you cast a spell, if you control an artifact, draw a card.",
         "Printed Conditional Probe",
@@ -908,4 +917,103 @@ fn delayed_list_then_action_tail_investigates_at_runtime() {
     };
     attack(&mut runner, &[serpent]);
     assert_eq!(clues(&runner), 1, "the Serpent's attack investigates once");
+}
+
+const ROYAL_DECREE: &str = "Cumulative upkeep {W}\nWhenever a Swamp, Mountain, black permanent, or red permanent becomes tapped, this enchantment deals 1 damage to that permanent's controller.";
+
+/// Give `player` priority in their own precombat main.
+fn stage_priority(runner: &mut GameRunner, player: PlayerId) {
+    let state = runner.state_mut();
+    state.active_player = player;
+    state.priority_player = player;
+    state.waiting_for = WaitingFor::Priority { player };
+}
+
+/// Royal Decree damages the controller of the permanent that became tapped: P1
+/// taps its Mountain for mana → P1 takes 1; a Forest → nothing.
+#[test]
+fn royal_decree_damages_the_controller_of_a_tapped_mountain_only() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let mountain = scenario
+        .add_land_from_oracle(P1, "Mountain", "{T}: Add {R}.")
+        .with_subtypes(vec!["Mountain"])
+        .id();
+    let forest = scenario
+        .add_land_from_oracle(P1, "Forest", "{T}: Add {G}.")
+        .with_subtypes(vec!["Forest"])
+        .id();
+    let mut runner = scenario.build();
+    stage_priority(&mut runner, P1);
+
+    runner.activate(forest, 0).resolve();
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().objects[&forest].tapped,
+        "reach guard: tapped"
+    );
+    assert_eq!(runner.life(P1), 20, "a Forest is none of the listed kinds");
+
+    runner.activate(mountain, 0).resolve();
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().objects[&mountain].tapped,
+        "reach guard: tapped"
+    );
+    assert_eq!(runner.life(P1), 19, "the Mountain's controller takes 1");
+    assert_eq!(runner.life(P0), 20);
+}
+
+/// Official ruling: Royal Decree triggers at most once for each permanent that
+/// becomes tapped, even if it meets several criteria. A Swamp Mountain taps →
+/// one trigger, 1 damage to its controller (P1).
+#[test]
+fn royal_decree_triggers_once_for_a_permanent_meeting_several_criteria() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+    let dual = scenario
+        .add_land_from_oracle(P1, "Swamp Mountain", "{T}: Add {B}.")
+        .with_subtypes(vec!["Swamp", "Mountain"])
+        .id();
+    let mut runner = scenario.build();
+    stage_priority(&mut runner, P1);
+    runner.activate(dual, 0).resolve();
+    assert!(runner.state().objects[&dual].tapped, "reach guard: tapped");
+    runner.advance_until_stack_empty();
+    // Two triggers would deal 2.
+    assert_eq!(runner.life(P1), 19, "exactly one trigger");
+}
+
+/// CR 603.2 + CR 605.1a (which activated abilities are mana abilities):
+/// Immolation Shaman damages an opponent who activates a non-mana ability of
+/// an artifact, creature, or land (here a land), and not one who activates a
+/// mana ability.
+#[test]
+fn immolation_shaman_punishes_only_non_mana_activations() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Immolation Shaman", 1, 1)
+        .with_subtypes(vec!["Viashino", "Shaman"])
+        .from_oracle_text(
+            "Whenever an opponent activates an ability of an artifact, creature, or land that isn't a mana ability, this creature deals 1 damage to that player.\n{3}{R}{R}: This creature gets +3/+3 and gains menace until end of turn.",
+        );
+    let land = scenario
+        .add_land_from_oracle(P1, "Scry Land", "{T}: Add {C}.\n{T}: Scry 1.")
+        .id();
+    let mut runner = scenario.build();
+    stage_priority(&mut runner, P1);
+
+    // Mana ability: no trigger.
+    runner.activate(land, 0).resolve();
+    assert_eq!(runner.life(P1), 20, "a mana ability does not trigger it");
+    runner.state_mut().objects.get_mut(&land).unwrap().tapped = false;
+
+    // Non-mana ability: 1 damage to the activating opponent.
+    runner.activate(land, 1).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.life(P1), 19, "a non-mana land ability triggers it");
+    assert_eq!(runner.life(P0), 20);
 }
