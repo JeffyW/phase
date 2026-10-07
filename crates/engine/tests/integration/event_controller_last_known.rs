@@ -1099,3 +1099,72 @@ fn lava_runner_after_a_copied_chimera_exchange_punishes_the_trigger_controller()
         "P1, the cast trigger's controller, sacrifices"
     );
 }
+
+const FRACTURED_LOYALTY: &str = "Enchant creature\nWhenever enchanted creature becomes the target of a spell or ability, that spell or ability's controller gains control of that creature. (This effect lasts indefinitely.)";
+
+/// Fractured Loyalty's recipient: P1's Pyromancer ability targets P0's
+/// enchanted creature; P0 optionally steals the Pyromancer in response.
+/// CR 113.8: "that spell or ability's controller" is the activator, P1, who
+/// gains control of the creature either way.
+#[test]
+fn fractured_loyalty_gives_the_creature_to_the_ability_controller() {
+    use engine::types::ability::TargetRef;
+    for theft in [Theft::Own, Theft::Stolen] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+        let loyalty = scenario
+            .add_enchantment_from_oracle(P0, "Fractured Loyalty", "")
+            .with_subtypes(vec!["Aura"])
+            .from_oracle_text_with_keywords(&["Enchant"], FRACTURED_LOYALTY)
+            .id();
+        let pyromancer = scenario
+            .add_creature_from_oracle(P1, "Prodigal Pyromancer", 1, 1, PRODIGAL_PYROMANCER)
+            .id();
+        let steal = free_spell(&mut scenario, P0, "Steal Creature", STEAL_CREATURE);
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.objects.get_mut(&loyalty).unwrap().attached_to = Some(bear.into());
+            state
+                .objects
+                .get_mut(&bear)
+                .unwrap()
+                .attachments
+                .push(loyalty);
+            state.layers_dirty.mark_full();
+        }
+        stage_turn(&mut runner, P1);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: pyromancer,
+                ability_index: 0,
+            })
+            .expect("activate");
+        if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+            runner
+                .act(GameAction::SelectTargets {
+                    targets: vec![TargetRef::Object(bear)],
+                })
+                .expect("target the Bear");
+        }
+        drain_ordering(&mut runner);
+        assert_eq!(
+            runner.state().stack.len(),
+            2,
+            "reach guard: the ability and Loyalty's trigger"
+        );
+        if let Theft::Stolen = theft {
+            priority_to(&mut runner, P0);
+            runner.cast(steal).target_object(pyromancer).commit();
+            resolve_one_declining(&mut runner);
+            assert_eq!(runner.state().objects[&pyromancer].controller, P0);
+        }
+        resolve_one_declining(&mut runner);
+        assert_eq!(
+            runner.state().objects[&bear].controller,
+            P1,
+            "{theft:?}: the activator (P1) gains control"
+        );
+    }
+}

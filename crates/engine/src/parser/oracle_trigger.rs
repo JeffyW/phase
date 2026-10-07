@@ -2655,7 +2655,57 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         }
     }
 
+    // CR 113.8 + CR 115.1 + CR 608.2c: on a becomes-target trigger, "that spell's
+    // controller" / "that spell or ability's controller" / "its controller"
+    // names the TARGETER, which the event carries. `ParentTargetController`
+    // would let a declared parent target answer instead (Fractured Loyalty's
+    // "that creature" is the enchanted creature), so the player reference is
+    // re-pointed at `TriggeringSpellController`, the event-source referent.
+    if def.mode == TriggerMode::BecomesTarget {
+        if let Some(execute) = def.execute.as_deref_mut() {
+            rebind_parent_target_controller_to_targeter(execute);
+        }
+        if let Some(unless) = def.unless_pay.as_mut() {
+            rebind_parent_target_controller_filter_to_targeter(&mut unless.payer);
+        }
+    }
+
     def
+}
+
+/// See the becomes-target rebind above. Walks the trigger's effect chain (modes,
+/// else branches, sub links) and rewrites player-reference
+/// `ParentTargetController` leaves, including the unless-payer slot and a
+/// `GiveControl` recipient.
+fn rebind_parent_target_controller_to_targeter(ability: &mut AbilityDefinition) {
+    for mode in &mut ability.mode_abilities {
+        rebind_parent_target_controller_to_targeter(mode);
+    }
+    let mut node = Some(ability);
+    while let Some(link) = node {
+        if matches!(link.effect.as_ref(), Effect::CreateDelayedTrigger { .. }) {
+            break;
+        }
+        if let Some(else_ability) = link.else_ability.as_deref_mut() {
+            rebind_parent_target_controller_to_targeter(else_ability);
+        }
+        crate::parser::oracle_effect::each_target_filter_mut(link.effect.as_mut(), &mut |filter| {
+            rebind_parent_target_controller_filter_to_targeter(filter);
+        });
+        if let Effect::GiveControl { recipient, .. } = link.effect.as_mut() {
+            rebind_parent_target_controller_filter_to_targeter(recipient);
+        }
+        if let Some(unless) = link.unless_pay.as_mut() {
+            rebind_parent_target_controller_filter_to_targeter(&mut unless.payer);
+        }
+        node = link.sub_ability.as_deref_mut();
+    }
+}
+
+fn rebind_parent_target_controller_filter_to_targeter(filter: &mut TargetFilter) {
+    if matches!(filter, TargetFilter::ParentTargetController) {
+        *filter = TargetFilter::TriggeringSpellController;
+    }
 }
 
 /// CR 608.2k + CR 400.7e: Trigger modes whose firing event carries a specific source
