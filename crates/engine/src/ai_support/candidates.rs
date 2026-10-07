@@ -3201,18 +3201,19 @@ pub fn candidate_actions_broad_with_probe(
                     .collect()
             }
         }
-        // CR 707.10c: Copy retargeting — slot-by-slot via `ChooseTarget`. One
-        // candidate per legal alternative in the current slot, plus a "keep
-        // current" via `ChooseTarget { target: None }`. `KeepAllCopyTargets`
-        // is exposed as an additional candidate that short-circuits every
-        // remaining slot in one action (useful when no slot has alternatives).
+        // CR 707.10c / CR 601.2c: only the engine-derived answers — each
+        // offered alternative, a keep where `can_keep`, and "keep the rest"
+        // where `can_keep_rest` — so every candidate is answerable.
         WaitingFor::CopyRetarget {
             player,
             target_slots,
             current_slot,
+            can_keep_rest,
             ..
         } => {
-            let slot = &target_slots[*current_slot];
+            let Some(slot) = target_slots.get(*current_slot) else {
+                return Vec::new();
+            };
             let mut out: Vec<_> = slot
                 .legal_alternatives
                 .iter()
@@ -3226,14 +3227,14 @@ pub fn candidate_actions_broad_with_probe(
                     )
                 })
                 .collect();
-            if slot.current.is_some() {
+            if slot.can_keep {
                 out.push(candidate(
                     GameAction::ChooseTarget { target: None },
                     TacticalClass::Selection,
                     Some(*player),
                 ));
             }
-            if target_slots.iter().all(|slot| slot.current.is_some()) {
+            if *can_keep_rest {
                 out.push(candidate(
                     GameAction::KeepAllCopyTargets,
                     TacticalClass::Selection,
@@ -3395,6 +3396,7 @@ pub fn candidate_actions_broad_with_probe(
             current_targets,
             slots,
             slot_pools,
+            keep_is_distinct: _,
             legal_new_targets,
         } => retarget_actions(
             state,
@@ -3955,7 +3957,7 @@ fn retarget_proposals(
     slot_pools: &[Vec<TargetRef>],
     current_targets: &[TargetRef],
     legal_new_targets: &[TargetRef],
-) -> Vec<Vec<TargetRef>> {
+) -> Vec<Vec<Option<TargetRef>>> {
     // M15/M5: the generator's own copy of `apply_retarget`'s alignment check —
     // if the payload's addresses no longer describe the stack entry they were
     // derived from, no proposal built from `slot_pools`/`current_targets`
@@ -4084,7 +4086,7 @@ fn retarget_proposals(
         // CR-115.7b legality.
         RetargetScope::Single => pool_for(0)
             .iter()
-            .map(|target| vec![target.clone()])
+            .map(|target| vec![Some(target.clone())])
             .collect(),
         // CR 115.7d: "the player may leave any number of the targets unchanged,
         // even if those targets would be illegal." Leaving every target
@@ -4119,17 +4121,29 @@ fn retarget_proposals(
             if !effective_pools.is_empty() && effective_pools.len() < current_targets.len() {
                 return Vec::new();
             }
-            // The anchor first: under CR 115.7d it is always accepted
-            // (`engine::validate_retarget_submission` reads it as leaving
-            // every target unchanged when its elected reading is illegal).
-            let mut proposals = vec![current_targets.to_vec()];
+            // The anchor first: keeping every target is literally no change
+            // (CR 115.7d), so it is always accepted. Each substitution chooses
+            // one position's pool member; choosing the announced object itself
+            // is offered only where it is a DISTINCT election — its announced
+            // incarnation is gone, so the id names the returned object
+            // (CR 400.7) — since otherwise it is the anchor again.
+            let addresses: Vec<RetargetSlotAddress> =
+                bindings.iter().map(|b| b.address.clone()).collect();
+            let keep_is_distinct = crate::game::ability_utils::retarget_keep_is_distinct(
+                state,
+                stack_ability,
+                &addresses,
+            );
+            let mut proposals = vec![vec![None; current_targets.len()]];
             for slot in 0..current_targets.len() {
                 for target in pool_for(slot) {
-                    if current_targets[slot] == *target {
+                    if current_targets[slot] == *target
+                        && !keep_is_distinct.get(slot).copied().unwrap_or(false)
+                    {
                         continue;
                     }
-                    let mut new_targets = current_targets.to_vec();
-                    new_targets[slot] = target.clone();
+                    let mut new_targets = vec![None; current_targets.len()];
+                    new_targets[slot] = Some(target.clone());
                     proposals.push(new_targets);
                 }
             }

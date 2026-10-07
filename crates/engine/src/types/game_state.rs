@@ -13579,6 +13579,16 @@ pub enum PersistedRestoreError {
     PrioritySettlementFailed(String),
     #[error("persisted per-player choice cannot be restored: {0}")]
     InvalidPerPlayerChoice(String),
+    /// CR 707.10c / CR 601.2c: a parked copy target walk is structurally
+    /// malformed (its mode, decided picks, cursor or copy disagree).
+    #[error("persisted copy target walk cannot be restored: {0}")]
+    InvalidCopyTargetWalk(String),
+    /// CR 601.2c + CR 722.3c: a parked fresh-copy announcement (an old save,
+    /// reconstructed) has no legal announcement on the restored board. The
+    /// copy's cast is already recorded (CR 733.1), so it is neither resumable
+    /// nor silently undone: restore refuses the state.
+    #[error("persisted copy announcement for {copy_id:?} has no legal announcement and is not resumable")]
+    NonResumableCopyAnnouncement { copy_id: ObjectId },
 }
 
 impl PreparedPersistedGameState {
@@ -16252,6 +16262,24 @@ pub enum WaitingFor {
         /// chosen (issue #3660).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         paradigm_remaining_offers: Option<Vec<ObjectId>>,
+        /// CR 707.10c / CR 722.3c + CR 702.192a: which operation this walk is
+        /// — choosing new targets for a copy that holds targets, or announcing
+        /// a freshly cast copy's targets. `None` only on a pre-mode save; the
+        /// restore hook infers it from the walk's shape and never overwrites
+        /// an explicit mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<CopyChoiceMode>,
+        /// The decided prefix, aligned with `target_slots`
+        /// (`current_slot == picks.len()`): `None` keeps that position's
+        /// announced target (CR 707.10c), `Some(t)` chooses `t`. `None` (the
+        /// field absent) only on a pre-picks save, rebuilt at restore.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        picks: Option<Vec<Option<TargetRef>>>,
+        /// CR 707.10c: engine-derived: keeping every remaining position's
+        /// current target completes a legal final set. Gates
+        /// `GameAction::KeepAllCopyTargets`.
+        #[serde(default)]
+        can_keep_rest: bool,
     },
     /// CR 510.1c: Attacker with multiple blockers — controller divides damage as they choose.
     /// CR 702.19b/c: Trample requires lethal to each blocker before assigning excess.
@@ -16382,6 +16410,12 @@ pub enum WaitingFor {
         ///     "helpfully" collapse an all-empty `slot_pools` to `Vec::new()`.
         #[serde(default)]
         slot_pools: Vec<Vec<TargetRef>>,
+        /// CR 115.7d + CR 400.7: per position, whether keeping the announced
+        /// target and choosing the same object id name DIFFERENT objects (the
+        /// announced incarnation is gone, so choosing the id elects the
+        /// returned object). Engine-derived, for display only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keep_is_distinct: Vec<bool>,
         /// CR 115.7d: the UNION — BASE's cascade verbatim, extended with every
         /// `slot_pools` member not already present. Read by `interaction.rs`'s
         /// projection and by the frontend, both of which stay width- and
@@ -16441,6 +16475,26 @@ pub struct CopyTargetSlot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<TargetRef>,
     pub legal_alternatives: Vec<TargetRef>,
+    /// CR 115.7d: where this position lives in the copy's chain (a retarget
+    /// walk). `None` for an announcement slot of a freshly cast copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<RetargetSlotAddress>,
+    /// CR 707.10c: engine-derived: keeping this position's current target
+    /// still admits a legal completion. Gates `ChooseTarget { target: None }`.
+    #[serde(default)]
+    pub can_keep: bool,
+}
+
+/// CR 707.10c / CR 722.3c: the two operations a `WaitingFor::CopyRetarget`
+/// walk can be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CopyChoiceMode {
+    /// CR 707.10c: a copy that holds targets; the controller may choose new
+    /// ones, leaving any unchanged.
+    Retarget,
+    /// CR 722.3c + CR 702.192a: a freshly cast copy announces its targets;
+    /// every position must be chosen and nothing can be kept.
+    Announce,
 }
 
 /// CR 510.1c: Optional combat-damage assignment mode for attackers with text like

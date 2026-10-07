@@ -217,7 +217,11 @@ export class NativeEngineVersionMismatchError extends Error {
  *      crates/lobby-broker/src/protocol.rs. This client hands server frames to
  *      JSON.parse, so a v107 client would take the new shape with no decode
  *      error; the exact-match version check at connect refuses the pairing
- *      instead.
+ *      instead. The same version makes retarget picks positional:
+ *      RetargetSpell.new_targets is (TargetRef | null)[] (null keeps), and the
+ *      copy walk's keep permissions (CopyTargetSlot.can_keep,
+ *      CopyRetarget.can_keep_rest) are engine fields this client renders
+ *      without a fallback.
  * 107 — UntilCondition NextMatches gains count ("until you exile two nonland
  *      cards …" — Invasion of Alara, CR 608.2c), the paused exile loop keeps
  *      its hits, ZoneChoiceCandidateSource gains ParentTargets, and

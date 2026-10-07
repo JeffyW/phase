@@ -60,6 +60,32 @@ impl OccurrenceVerdict {
     }
 }
 
+/// CR 115.3 + CR 400.7: the identity a target position names in a FINAL target
+/// set — a retained position names its announced occurrence (target and
+/// pin), a changed position names the object it elects as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OccurrenceIdentity {
+    pub(crate) target: TargetRef,
+    pub(crate) pin: Option<ObjectIncarnationRef>,
+}
+
+impl OccurrenceIdentity {
+    /// CR 115.3 + CR 400.7: whether two positions name the same object. A
+    /// player is compared by id. Two pinned objects are the same only when
+    /// their incarnations are (a returned object is a new one); when either
+    /// side carries no pin (an unpinned legacy occurrence) the object id
+    /// decides.
+    pub(crate) fn same_object(&self, other: &OccurrenceIdentity) -> bool {
+        if self.target != other.target {
+            return false;
+        }
+        match (&self.target, self.pin, other.pin) {
+            (TargetRef::Object(_), Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
+}
+
 /// Map each declared (unpruned) occurrence of a node to its position in the
 /// projected execution node.
 ///

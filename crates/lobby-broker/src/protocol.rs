@@ -69,8 +69,16 @@ pub struct TournamentRequestId(pub u64);
 ///      writes only the new shape; deserialization still accepts the three old
 ///      tags (`filter_prop_from_value`), so a v108 peer reads v107 state but a
 ///      v107 peer cannot parse a v108 `GameState` holding any attachment
-///      filter — an unconditional PARSE bump. Lobby messages are unchanged, and
-///      P2P moves in lockstep (wire 90).
+///      filter — an unconditional PARSE bump. The same version also makes
+///      retarget choices positional (CR 115.7d + CR 707.10c):
+///      `GameAction::RetargetSpell.new_targets` is `[TargetRef | null]` (`null`
+///      keeps a position's target, a bare target chooses it, so a v107 bare
+///      vector still decodes as all-chosen), `RetargetChoice` gains
+///      `keep_is_distinct`, `CopyTargetSlot` gains `address` and `can_keep`, and
+///      `CopyRetarget` gains `mode`, `picks` and `can_keep_rest` (all serde
+///      default). A v107 peer cannot parse a `null` pick, and the client renders
+///      the keep permissions only from the engine's fields. Lobby messages are
+///      unchanged, and P2P moves in lockstep (wire 90).
 /// 107 — `UntilCondition::NextMatches` gains `count` ("until you exile two
 ///      nonland cards …" — Invasion of Alara, CR 608.2c), the paused loop
 ///      (`PendingExileFromTopUntil`) keeps its `hits`,

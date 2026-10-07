@@ -26,27 +26,39 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
   const slotCount = Math.max(data.current_targets.length, 1);
   const isMultiSlot = data.scope.type === "All" && slotCount > 1;
 
-  // CR 115.7: Default to keeping the current targets unchanged.
-  const [selected, setSelected] = useState<TargetRef[]>(data.current_targets);
+  // CR 115.7d: every position starts KEPT (`null`), which leaves its target
+  // unchanged with its announced object. A chosen target is sent as itself.
+  // "Change the target" (Single scope) has nothing to keep: it needs a pick.
+  const [selected, setSelected] = useState<(TargetRef | null)[]>(
+    () => Array.from({ length: slotCount }, () => null),
+  );
   const [activeSlot, setActiveSlot] = useState(0);
 
   const handleSelectSingle = useCallback((target: TargetRef) => {
     setSelected([target]);
   }, []);
 
-  const handleSelectSlot = useCallback((slotIndex: number, target: TargetRef) => {
+  const setSlot = useCallback((slotIndex: number, pick: TargetRef | null) => {
     setSelected((prev) => {
       const next = [...prev];
-      while (next.length < slotCount) {
-        next.push(data.current_targets[next.length] ?? target);
-      }
-      next[slotIndex] = target;
+      next[slotIndex] = pick;
       return next;
     });
     if (slotIndex + 1 < slotCount) {
       setActiveSlot(slotIndex + 1);
     }
-  }, [data.current_targets, slotCount]);
+  }, [slotCount]);
+
+  const handleSelectSlot = useCallback((slotIndex: number, target: TargetRef) => {
+    // Choosing the announced object again is the same as keeping it, unless
+    // the engine says the choice is a distinct election (its announced
+    // object is gone, so the id names a returned object).
+    const current = data.current_targets[slotIndex];
+    const isKeep = current != null
+      && targetsEqual(current, target)
+      && !(data.keep_is_distinct?.[slotIndex] ?? false);
+    setSlot(slotIndex, isKeep ? null : target);
+  }, [data.current_targets, data.keep_is_distinct, setSlot]);
 
   const handleConfirm = useCallback(() => {
     const payload = isMultiSlot
@@ -64,12 +76,10 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
     .map((target) => targetLabel(target, objects))
     .join(", ");
 
-  const confirmDisabled = useMemo(() => {
-    if (selected.length === 0) return true;
-    if (!isMultiSlot) return false;
-    return selected.length < slotCount
-      || selected.slice(0, slotCount).some((target) => target == null);
-  }, [isMultiSlot, selected, slotCount]);
+  const confirmDisabled = useMemo(
+    () => (isMultiSlot ? selected.length < slotCount : selected[0] == null),
+    [isMultiSlot, selected, slotCount],
+  );
 
   const activeSelection = isMultiSlot ? selected[activeSlot] : selected[0];
 
@@ -99,6 +109,17 @@ export function RetargetChoiceModal({ data }: { data: RetargetChoice["data"] }) 
     >
       {isMultiSlot && (
         <div className="mb-4 flex flex-wrap justify-center gap-2">
+          <button
+            type="button"
+            className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+              selected[activeSlot] == null
+                ? "bg-emerald-600/90 text-white ring-2 ring-emerald-300/70"
+                : "bg-slate-800/80 text-slate-200 hover:bg-slate-700/80"
+            }`}
+            onClick={() => setSlot(activeSlot, null)}
+          >
+            {t("retargetChoice.keep")}
+          </button>
           {data.current_targets.map((current, index) => {
             const chosen = selected[index];
             const isActive = index === activeSlot;

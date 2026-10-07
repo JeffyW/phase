@@ -44,7 +44,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `GameEvent::AbilityActivated`), the event's `departed_source_lki`, and
 // `AbilityActivationRecord.source_zone`.
 // v108 folds FilterProp's attachment-referent siblings into
-// `FilterProp::AttachedTo { to: AttachmentReferent }`.
+// `FilterProp::AttachedTo { to: AttachmentReferent }`, and makes retarget
+// picks positional (`RetargetSpell` nullable picks, copy-walk keep fields).
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;

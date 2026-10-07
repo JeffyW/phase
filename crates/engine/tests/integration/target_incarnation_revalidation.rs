@@ -169,6 +169,7 @@ fn interactive_same_object_id_retarget_refreshes_selected_target_pin() {
     // the compatibility fallback (which routes through a different branch in
     // `apply_retarget` and would leave this row unable to detect H2's defect).
     runner.state_mut().waiting_for = WaitingFor::RetargetChoice {
+        keep_is_distinct: Vec::new(),
         player: P0,
         stack_entry_index: 0,
         scope: RetargetScope::Single,
@@ -183,7 +184,7 @@ fn interactive_same_object_id_retarget_refreshes_selected_target_pin() {
 
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: vec![TargetRef::Object(target)],
+            new_targets: vec![Some(TargetRef::Object(target))],
         })
         .expect("same-ID retarget must be accepted");
 

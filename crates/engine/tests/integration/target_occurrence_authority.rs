@@ -33,6 +33,7 @@ const EXCHANGE: &str = "Exchange control of target artifact and target creature.
 const FLICKER: &str = "Exile two target artifacts, creatures, and/or lands you control, then return those cards to the battlefield under your control.";
 const UNSUMMON: &str = "Return target creature to its owner's hand.";
 const REDIRECT: &str = "You may choose new targets for target spell.";
+const REALITY_RIPPLE: &str = "Target artifact, creature, or land phases out. (While it's phased out, it's treated as though it doesn't exist. It phases in before its controller untaps during their next untap step.)";
 const TWINCAST: &str =
     "Copy target instant or sorcery spell. You may choose new targets for the copy.";
 
@@ -243,6 +244,57 @@ fn fight_board(blink: bool, change_root: bool) -> ([u32; 3], [u32; 3]) {
 /// the copy (the root's artifact declaration becomes illegal while C stays a
 /// current creature).
 fn fight_board_with(blink: bool, change_root: bool, remove_artifact: bool) -> ([u32; 3], [u32; 3]) {
+    let alteration = if remove_artifact {
+        Alteration::RemoveArtifact
+    } else {
+        Alteration::None
+    };
+    resolve_fight_copy(fight_copy(blink, change_root, alteration))
+}
+
+/// What happens to the exchange's first declared object C before the copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Alteration {
+    None,
+    /// CR 613.1d: C loses Artifact (its artifact declaration becomes illegal;
+    /// it is still a current creature).
+    RemoveArtifact,
+    /// CR 613.1d: C loses Creature (still an artifact, still on the
+    /// battlefield, still its announced object).
+    RemoveCreature,
+    /// CR 702.26b: C phases out (real Reality Ripple).
+    PhaseOut,
+}
+
+/// The copy of the Exchange + Fight probe, retargeted and on the stack.
+struct FightCopy {
+    runner: GameRunner,
+    copy_id: ObjectId,
+    copied: ResolvedAbility,
+    objects: [ObjectId; 3],
+}
+
+fn resolve_fight_copy(board: FightCopy) -> ([u32; 3], [u32; 3]) {
+    let FightCopy {
+        mut runner,
+        copy_id,
+        objects,
+        ..
+    } = board;
+    let before = objects.map(|o| runner.state().objects[&o].damage_marked);
+    for _ in 0..16 {
+        if !runner.state().stack.iter().any(|e| e.id == copy_id) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("resolve the copy");
+    }
+    let after = objects.map(|o| runner.state().objects[&o].damage_marked);
+    (before, after)
+}
+
+fn fight_copy(blink: bool, change_root: bool, alteration: Alteration) -> FightCopy {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     let c = s
@@ -274,6 +326,7 @@ fn fight_board_with(blink: bool, change_root: bool, remove_artifact: bool) -> ([
         .id();
     let flicker = free_spell(&mut s, P1, "Ghostly Flicker", FLICKER);
     let twincast = free_spell(&mut s, P0, "Twincast", TWINCAST);
+    let ripple = free_spell(&mut s, P0, "Reality Ripple", REALITY_RIPPLE);
     let mut r = s.build();
     r.cast(spell).target_objects(&[c, b, a]).commit();
     let original = ability(&r, spell);
@@ -293,18 +346,37 @@ fn fight_board_with(blink: bool, change_root: bool, remove_artifact: bool) -> ([
         resolve_one(&mut r, flicker);
         assert_ne!(r.state().objects[&a].incarnation, 0, "reach: A blinked");
     }
-    if remove_artifact {
+    let removed = match alteration {
+        Alteration::RemoveArtifact => Some(engine::types::CoreType::Artifact),
+        Alteration::RemoveCreature => Some(engine::types::CoreType::Creature),
+        Alteration::None | Alteration::PhaseOut => None,
+    };
+    if let Some(core_type) = removed {
         r.state_mut().add_transient_continuous_effect(
             c,
             P1,
             engine::types::ability::Duration::UntilEndOfTurn,
             TargetFilter::SpecificObject { id: c },
-            vec![engine::types::ability::ContinuousModification::RemoveType {
-                core_type: engine::types::CoreType::Artifact,
-            }],
+            vec![engine::types::ability::ContinuousModification::RemoveType { core_type }],
             None,
         );
         engine::game::layers::evaluate_layers(r.state_mut());
+        let object = &r.state().objects[&c];
+        assert_eq!(object.zone, Zone::Battlefield, "reach: C stays");
+        assert_eq!(object.incarnation, 0, "reach: C is its announced object");
+        assert!(
+            !object.card_types.core_types.contains(&core_type),
+            "reach: C lost {core_type:?}"
+        );
+    }
+    if alteration == Alteration::PhaseOut {
+        priority(&mut r, P0);
+        r.cast(ripple).target_object(c).commit();
+        resolve_one(&mut r, ripple);
+        assert!(
+            r.state().objects[&c].is_phased_out(),
+            "reach: Reality Ripple phased C out"
+        );
     }
     priority(&mut r, P0);
     r.cast(twincast).target_object(spell).commit();
@@ -351,15 +423,12 @@ fn fight_board_with(blink: bool, change_root: bool, remove_artifact: bool) -> ([
             "reach: the copy's fight still names the departed A"
         );
     }
-    let before = [c, b, a].map(|o| r.state().objects[&o].damage_marked);
-    for _ in 0..16 {
-        if !r.state().stack.iter().any(|e| e.id == copy_id) {
-            break;
-        }
-        r.act(GameAction::PassPriority).expect("resolve the copy");
+    FightCopy {
+        runner: r,
+        copy_id,
+        copied,
+        objects: [c, b, a],
     }
-    let after = [c, b, a].map(|o| r.state().objects[&o].damage_marked);
-    (before, after)
 }
 
 /// CR 701.14b + CR 608.2b + CR 707.10c: the copy's root now names the
@@ -385,6 +454,87 @@ fn illegal_declared_fighter_does_not_fall_back_to_the_roots_targets() {
 fn legal_declared_fighter_fights_control() {
     let (before, after) = fight_board(false, false);
     assert_ne!(after, before, "the all-legal copy fights");
+}
+
+/// R11-1 (verifier 9a), CR 701.14b: "If one or both creatures instructed to
+/// fight are no longer on the battlefield or are no longer creatures, neither
+/// of them fights or deals damage." The instructed ally is the original
+/// declared C, bound regardless of its current type; C lost Creature through
+/// layers (still an artifact, still the announced object), so nothing fights
+/// and the later declaration B never becomes the ally.
+#[test]
+fn noncreature_referent_is_not_substituted_by_a_later_declaration() {
+    let (before, after) = resolve_fight_copy(fight_copy(false, false, Alteration::RemoveCreature));
+    assert_eq!(
+        after, before,
+        "C cannot fight, and B must not fight A instead"
+    );
+}
+
+/// R11-1 (verifier 9b), CR 702.26b + CR 701.14b: a phased-out permanent is
+/// treated as though it doesn't exist, so the original ally C cannot fight;
+/// the later declaration B never stands in.
+#[test]
+fn phased_out_referent_is_not_substituted_by_a_later_declaration() {
+    let (before, after) = resolve_fight_copy(fight_copy(false, false, Alteration::PhaseOut));
+    assert_eq!(
+        after, before,
+        "phased-out C cannot fight, and B must not fight A"
+    );
+}
+
+/// R11-2 (verifier 10a/10b), CR 608.2b + CR 701.14b: with C's artifact
+/// declaration illegal (position 0 a hole), the shared chain validator stores
+/// only the explicit Elf A as a fighter, whatever resolving carrier is staged:
+/// none (10a), a mismatched one (10b), one with a different pin, or the
+/// matching one (control). The ally is the declared occurrence carried with
+/// its own verdict through validation, never rebuilt from a carrier, so an
+/// unknown origin never permits substitution.
+#[test]
+fn illegal_referent_is_never_substituted_whatever_the_resolving_carrier() {
+    use engine::game::ability_utils::validate_targets_in_chain;
+    use engine::types::identifiers::ObjectIncarnationRef;
+    let board = fight_copy(false, false, Alteration::RemoveArtifact);
+    let [c, b, a] = board.objects;
+    let carrier = board
+        .runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == board.copy_id)
+        .expect("reach: the real copy carrier")
+        .clone();
+    for form in ["matching", "none", "mismatched", "different-pin"] {
+        let mut state = board.runner.state().clone();
+        let mut staged = carrier.clone();
+        if matches!(form, "mismatched" | "different-pin") {
+            let staged_ability = staged.ability_mut().expect("the copy owns an ability");
+            let mut occurrences = staged_ability.target_occurrences();
+            if form == "mismatched" {
+                occurrences[1] = (TargetRef::Object(a), Some(ObjectIncarnationRef::of(a, 0)));
+            } else {
+                occurrences[0] = (TargetRef::Object(c), Some(ObjectIncarnationRef::of(c, 1)));
+            }
+            staged_ability.replace_target_occurrences(occurrences);
+        }
+        state.resolving_stack_entry = (form != "none").then_some(staged);
+        let validated = validate_targets_in_chain(&state, &board.copied);
+        assert_eq!(
+            validated.illegal_local_target_slots,
+            vec![0],
+            "{form}: reach: C's artifact declaration is the root's only hole"
+        );
+        let fight = validated.sub_ability.as_ref().expect("the fight node");
+        assert!(
+            !fight.targets.contains(&TargetRef::Object(b)),
+            "{form}: B must not be substituted for the illegal C"
+        );
+        assert_eq!(
+            fight.targets,
+            vec![TargetRef::Object(a)],
+            "{form}: only the explicit Elf A is stored"
+        );
+    }
 }
 
 /// R9-4: `[A, A]` exchange root with A's artifact type removed after a blink,
@@ -450,7 +600,7 @@ fn scry_pause_continuation_inherits_the_validated_occurrence() {
     r.cast(redirect).target_object(spell).commit();
     open_retarget_prompt(&mut r);
     r.act(GameAction::RetargetSpell {
-        new_targets: vec![TargetRef::Object(a), TargetRef::Object(a)],
+        new_targets: vec![None, Some(TargetRef::Object(a))],
     })
     .expect("keep the departed A, elect the returned A");
     assert_eq!(

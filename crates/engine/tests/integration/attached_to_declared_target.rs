@@ -1048,12 +1048,30 @@ fn copy_alternatives(runner: &GameRunner) -> Vec<TargetRef> {
             runner.state().waiting_for
         );
     };
-    assert_eq!(
-        target_slots.len(),
-        1,
-        "copy retargeting exposes the root (creature) slot only"
-    );
     target_slots[*current_slot].legal_alternatives.clone()
+}
+
+/// The copy walk's positions (CR 707.10c: every chain-addressed declared
+/// target, so Fiery Annihilation's Equipment sub-target too) and its cursor.
+fn copy_walk(runner: &GameRunner) -> (usize, usize, bool, bool) {
+    let WaitingFor::CopyRetarget {
+        target_slots,
+        current_slot,
+        can_keep_rest,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "expected CopyRetarget, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    (
+        target_slots.len(),
+        *current_slot,
+        target_slots[*current_slot].can_keep,
+        *can_keep_rest,
+    )
 }
 
 /// H1 safe positive (CR 707.10c + CR 115.7d): Equipment 1 was moved onto C
@@ -1076,12 +1094,25 @@ fn copy_may_change_the_creature_when_its_equipment_target_is_already_illegal() {
         copy_alternatives(&board.runner).contains(&TargetRef::Object(b)),
         "B is offered: Equipment 1 is no longer legal either way"
     );
+    assert_eq!(
+        copy_walk(&board.runner),
+        (2, 0, true, true),
+        "the copy walk addresses the creature and the Equipment"
+    );
     board
         .runner
         .act(GameAction::ChooseTarget {
             target: Some(TargetRef::Object(b)),
         })
         .expect("A -> B accepted");
+    assert!(
+        copy_walk(&board.runner).2,
+        "CR 707.10c + CR 115.7d: the already-illegal Equipment may stay"
+    );
+    board
+        .runner
+        .act(GameAction::ChooseTarget { target: None })
+        .expect("Equipment 1 kept");
     board.runner.advance_until_stack_empty();
     let state = board.runner.state();
     assert_eq!(state.objects[&b].zone, Zone::Exile, "copy's rider is on B");
@@ -1117,8 +1148,11 @@ fn copy_without_an_equipment_target_changes_the_creature() {
 
 /// H1 negative (CR 115.7d: new targets "must not cause any unchanged targets to
 /// become illegal"): with Equipment 1 still attached to A, changing the copy's
-/// creature to B would make the unchanged Equipment target illegal, so B is
-/// not offered and a direct submission is rejected; keeping the targets works.
+/// creature to C (which carries no Equipment) would make the unchanged
+/// Equipment target illegal with no Equipment to change it to, so C is not
+/// offered and a direct submission is rejected; keeping the targets works. B
+/// is offered only because its own Equipment 2 completes the change
+/// (`copy_may_change_the_creature_and_its_equipment_together`).
 #[test]
 fn copy_may_not_change_the_creature_away_from_its_legal_equipment_target() {
     let mut board = copy_board();
@@ -1126,16 +1160,17 @@ fn copy_may_not_change_the_creature_away_from_its_legal_equipment_target() {
     let twincast = board.twincast;
     fiery_then(&mut board, &[a, eq1], |_| {}, twincast);
     let offered = copy_alternatives(&board.runner);
-    assert!(
-        offered.contains(&TargetRef::Object(a)),
-        "reach guard: the slot's pool is populated"
+    assert_eq!(
+        copy_walk(&board.runner),
+        (2, 0, true, true),
+        "reach guard: keeping A is answerable"
     );
-    assert!(!offered.contains(&TargetRef::Object(b)));
+    assert!(offered.contains(&TargetRef::Object(b)));
     assert!(!offered.contains(&TargetRef::Object(c)));
     assert!(board
         .runner
         .act(GameAction::ChooseTarget {
-            target: Some(TargetRef::Object(b)),
+            target: Some(TargetRef::Object(c)),
         })
         .is_err());
     board
@@ -1147,6 +1182,81 @@ fn copy_may_not_change_the_creature_away_from_its_legal_equipment_target() {
     assert_eq!(state.objects[&eq1].zone, Zone::Exile, "the copy exiled it");
     assert_eq!(state.objects[&a].damage_marked, 10, "both hit A");
     assert_eq!(state.objects[&b].damage_marked, 0);
+}
+
+/// M1 (CR 707.10c + CR 115.7d + CR 115.7e): a copy may change its creature and
+/// its Equipment sub-target together — A -> B with Equipment 1 -> Equipment 2.
+/// After choosing B, keeping Equipment 1 is not answerable (it would make a
+/// legal unchanged target illegal), neither per position nor as "keep the
+/// rest"; the only offered Equipment is the one attached to B (not the
+/// unattached Equipment 3, not A's Equipment 1).
+#[test]
+fn copy_may_change_the_creature_and_its_equipment_together() {
+    let mut board = copy_board();
+    let (a, b, eq1, eq2, eq3) = (board.a, board.b, board.eq1, board.eq2, board.eq3);
+    let twincast = board.twincast;
+    fiery_then(&mut board, &[a, eq1], |_| {}, twincast);
+    board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(b)),
+        })
+        .expect("A -> B is offered: Equipment 2 completes it");
+    assert_eq!(
+        copy_walk(&board.runner),
+        (2, 1, false, false),
+        "keeping Equipment 1 is not answerable after A -> B"
+    );
+    assert_eq!(
+        copy_alternatives(&board.runner),
+        vec![TargetRef::Object(eq2)],
+        "only B's Equipment is offered"
+    );
+    for refused in [
+        GameAction::ChooseTarget { target: None },
+        GameAction::KeepAllCopyTargets,
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(eq1)),
+        },
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(eq3)),
+        },
+    ] {
+        assert!(
+            GameRunner::from_state(board.runner.state().clone())
+                .act(refused.clone())
+                .is_err(),
+            "{refused:?} is refused"
+        );
+    }
+    board
+        .runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(eq2)),
+        })
+        .expect("Equipment 1 -> Equipment 2 accepted");
+    board.runner.advance_until_stack_empty();
+    let state = board.runner.state();
+    assert_eq!(
+        state.objects[&b].zone,
+        Zone::Exile,
+        "the copy's rider is on B"
+    );
+    assert_eq!(
+        state.objects[&eq2].zone,
+        Zone::Exile,
+        "the copy exiled Equipment 2"
+    );
+    assert_eq!(
+        state.objects[&eq1].zone,
+        Zone::Exile,
+        "the original exiled Equipment 1"
+    );
+    assert_eq!(state.objects[&eq3].zone, Zone::Battlefield);
+    assert_eq!(
+        state.objects[&a].damage_marked, 5,
+        "only the original hit A"
+    );
 }
 
 /// Move `id` to exile and back (a blink). The engine keeps the storage id and
@@ -1207,6 +1317,10 @@ fn copy_stale_announced_referent_is_not_rebound_to_a_new_same_id_object() {
             target: Some(TargetRef::Object(b)),
         })
         .expect("A -> B accepted");
+    board
+        .runner
+        .act(GameAction::ChooseTarget { target: None })
+        .expect("the already-illegal Equipment 1 is kept");
     board.runner.advance_until_stack_empty();
     let state = board.runner.state();
     assert_eq!(state.objects[&b].zone, Zone::Exile);
@@ -1247,7 +1361,7 @@ fn choose_new_targets_checks_the_edited_selection_as_a_whole() {
         board
             .runner
             .act(GameAction::RetargetSpell {
-                new_targets: objects(&[b, eq1]),
+                new_targets: objects(&[b, eq1]).into_iter().map(Some).collect(),
             })
             .is_err(),
         "Equipment 1 would become illegal"
@@ -1255,7 +1369,7 @@ fn choose_new_targets_checks_the_edited_selection_as_a_whole() {
     board
         .runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[b, eq2]),
+            new_targets: objects(&[b, eq2]).into_iter().map(Some).collect(),
         })
         .expect("A -> B with B's Equipment");
     board.runner.advance_until_stack_empty();
@@ -1284,7 +1398,7 @@ fn choose_new_targets_checks_the_edited_selection_as_a_whole() {
         board
             .runner
             .act(GameAction::RetargetSpell {
-                new_targets: objects(&[b, eq3]),
+                new_targets: objects(&[b, eq3]).into_iter().map(Some).collect(),
             })
             .is_err(),
         "Equipment 3 is attached to A, not to the newly chosen B"
@@ -1292,7 +1406,7 @@ fn choose_new_targets_checks_the_edited_selection_as_a_whole() {
     board
         .runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[a, eq3]),
+            new_targets: objects(&[a, eq3]).into_iter().map(Some).collect(),
         })
         .expect("Equipment 1 -> Equipment 3 on A");
     board.runner.advance_until_stack_empty();
@@ -1318,7 +1432,7 @@ fn choose_new_targets_keeps_an_already_illegal_equipment_target() {
     board
         .runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[b, eq1]),
+            new_targets: objects(&[b, eq1]).into_iter().map(Some).collect(),
         })
         .expect("an already-illegal unchanged target may stay");
     board.runner.advance_until_stack_empty();
@@ -1359,7 +1473,7 @@ fn two_target_head_retargeted_onto_one_object_reads_its_pin() {
     drive_to_retarget_prompt(&mut runner);
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[a, a]),
+            new_targets: objects(&[a, a]).into_iter().map(Some).collect(),
         })
         .expect("B -> A in the creature slot");
     let pins = runner
@@ -1848,9 +1962,9 @@ fn equipment_pin(runner: &GameRunner, spell: ObjectId, eq: ObjectId) -> u64 {
         .expect("the Equipment node pins Equipment 1")
 }
 
-/// Copy (CR 707.10c + CR 115.7d): the root-only copy choice never writes the
-/// Equipment position, so the stale Equipment target stays unchanged (its pin
-/// is kept) and is already illegal; B is offered and accepted. The copy hits B
+/// Copy (CR 707.10c + CR 115.7d): the stale Equipment target is already
+/// illegal, so B is offered and accepted and the Equipment position may be
+/// kept explicitly — it stays unchanged with its announced pin. The copy hits B
 /// (rider: exiled) and the new Equipment 1 is untouched by either spell.
 #[test]
 fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
@@ -1866,6 +1980,10 @@ fn copy_may_change_the_creature_when_its_equipment_target_was_blinked() {
             target: Some(TargetRef::Object(b)),
         })
         .expect("A -> B accepted");
+    board
+        .runner
+        .act(GameAction::ChooseTarget { target: None })
+        .expect("the stale Equipment target is kept");
     let copy_id = board
         .runner
         .state()
@@ -1899,7 +2017,7 @@ fn choose_new_targets_refuses_a_same_id_re_election_illegal_for_the_new_creature
         board
             .runner
             .act(GameAction::RetargetSpell {
-                new_targets: objects(&[b, eq1]),
+                new_targets: objects(&[b, eq1]).into_iter().map(Some).collect(),
             })
             .is_err(),
         "the new Equipment 1 is not attached to B"
@@ -1921,7 +2039,7 @@ fn choose_new_targets_accepts_a_same_id_re_election_legal_for_the_new_creature()
     board
         .runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[b, eq1]),
+            new_targets: objects(&[b, eq1]).into_iter().map(Some).collect(),
         })
         .expect("electing the new Equipment 1 on B is legal");
     assert_ne!(equipment_pin(&board.runner, fiery, eq1), 0, "re-pinned");
@@ -1987,7 +2105,7 @@ fn controller_qualified_dependent_target_keeps_its_gap() {
 
 /// Every `RetargetSpell` the AI's raw candidate generation issues for the open
 /// prompt, each applied to a clone of the state: `(proposal, accepted)`.
-fn ai_retarget_proposals(runner: &GameRunner) -> Vec<(Vec<TargetRef>, bool)> {
+fn ai_retarget_proposals(runner: &GameRunner) -> Vec<(Vec<Option<TargetRef>>, bool)> {
     engine::ai_support::candidate_actions(runner.state())
         .into_iter()
         .filter_map(|candidate| match candidate.action {
@@ -2059,13 +2177,16 @@ fn choose_new_targets_retains_a_target_whose_new_object_is_not_a_legal_choice() 
     };
     let proposals = ai_retarget_proposals(&runner);
     assert!(
-        proposals.iter().any(|(targets, _)| *targets == current),
+        proposals
+            .iter()
+            .any(|(targets, _)| targets.len() == current.len()
+                && targets.iter().all(Option::is_none)),
         "the unchanged anchor is offered"
     );
     assert!(proposals.iter().all(|(_, accepted)| *accepted));
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: current,
+            new_targets: vec![None; current.len()],
         })
         .expect("leaving every target unchanged is accepted");
     assert_eq!(root_pin(&runner, spell, artifact), announced, "pin kept");
@@ -2100,7 +2221,7 @@ fn choose_new_targets_offers_and_accepts_a_same_id_re_election_of_both_targets()
     board
         .runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[a, eq1]),
+            new_targets: objects(&[a, eq1]).into_iter().map(Some).collect(),
         })
         .expect("electing both new objects is legal");
     assert_ne!(equipment_pin(&board.runner, fiery, eq1), 0, "re-pinned");
@@ -2136,7 +2257,7 @@ fn ai_retarget_proposals_are_all_accepted_after_a_blink() {
         assert!(
             proposals
                 .iter()
-                .any(|(targets, _)| *targets == vec![TargetRef::Object(b)]),
+                .any(|(targets, _)| *targets == vec![Some(TargetRef::Object(b))]),
             "blinked={blinked}: reach guard, [B] is proposed"
         );
         assert!(
@@ -2158,13 +2279,13 @@ fn ai_retarget_proposals_respect_the_dependent_final_set_check() {
     assert!(
         proposals
             .iter()
-            .any(|(targets, _)| *targets == objects(&[a, eq1])),
+            .any(|(targets, _)| *targets == vec![None, None]),
         "reach guard: the anchor is proposed"
     );
     assert!(
         !proposals
             .iter()
-            .any(|(targets, _)| *targets == objects(&[b, eq1])),
+            .any(|(targets, _)| *targets == vec![Some(TargetRef::Object(b)), None]),
         "[B, Equipment 1] is not proposed"
     );
     assert!(proposals.iter().all(|(_, accepted)| *accepted));
@@ -2244,11 +2365,26 @@ fn compatibility_and_full_retarget_prompts_share_one_changed_verdict() {
                 };
                 assert!(slots.is_empty() && slot_pools.is_empty());
             }
-            runner
-                .act(GameAction::RetargetSpell {
-                    new_targets: vec![TargetRef::Object(a)],
-                })
-                .expect("resubmitting A is accepted");
+            // CR 115.7d: keeping is explicit (`None`); choosing A (`Some`) is
+            // an election of the current A, legal only without hexproof.
+            let elect = GameAction::RetargetSpell {
+                new_targets: vec![Some(TargetRef::Object(a))],
+            };
+            if hexproof {
+                assert!(
+                    GameRunner::from_state(runner.state().clone())
+                        .act(elect)
+                        .is_err(),
+                    "compat={compat}: electing the hexproof A is refused"
+                );
+                runner
+                    .act(GameAction::RetargetSpell {
+                        new_targets: vec![None],
+                    })
+                    .expect("keeping A is accepted");
+            } else {
+                runner.act(elect).expect("electing the new A is accepted");
+            }
             let pin = root_pin(&runner, bolt, a);
             if hexproof {
                 assert_eq!(pin, announced, "compat={compat}: retained, pin kept");
@@ -2294,13 +2430,15 @@ fn leaving_every_target_unchanged_is_always_accepted() {
     let anchor = objects(&[a, eq1, aura1]);
     let proposals = ai_retarget_proposals(&runner);
     assert!(
-        proposals.iter().any(|(t, ok)| *t == anchor && *ok),
+        proposals
+            .iter()
+            .any(|(t, ok)| *t == vec![None; anchor.len()] && *ok),
         "the AI's list holds the accepted anchor, got {proposals:?}"
     );
     assert!(proposals.iter().all(|(_, ok)| *ok));
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: anchor,
+            new_targets: vec![None; anchor.len()],
         })
         .expect("leaving every target unchanged is accepted");
     assert_eq!(node_pin(&runner, spell, 1, eq1), 0, "stale pin kept");
@@ -2360,11 +2498,13 @@ fn four_target_prompt_opens_and_accepts_the_anchor_and_the_full_election() {
     let (mut runner, [spell, a, _c, eq, l1, _l2, ft]) = four_target_board();
     let anchor = objects(&[a, eq, l1, ft]);
     let proposals = ai_retarget_proposals(&runner);
-    assert!(proposals.iter().any(|(t, ok)| *t == anchor && *ok));
+    assert!(proposals
+        .iter()
+        .any(|(t, ok)| *t == vec![None; anchor.len()] && *ok));
     assert!(proposals.iter().all(|(_, ok)| *ok));
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: anchor,
+            new_targets: vec![None; anchor.len()],
         })
         .expect("the anchor is accepted");
     assert_eq!(node_pin(&runner, spell, 1, eq), 0);
@@ -2373,7 +2513,7 @@ fn four_target_prompt_opens_and_accepts_the_anchor_and_the_full_election() {
     let (mut runner, [spell, _a, c, eq, _l1, l2, ft]) = four_target_board();
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[c, eq, l2, ft]),
+            new_targets: objects(&[c, eq, l2, ft]).into_iter().map(Some).collect(),
         })
         .expect("the complete election is accepted");
     assert_ne!(node_pin(&runner, spell, 1, eq), 0);
@@ -2443,27 +2583,35 @@ fn same_object_two_positions_board(
     (runner, spell, a)
 }
 
-/// CR 115.3 + CR 115.7d + CR 400.7: resubmitting `[A, A]` would elect the new
-/// A in the creature position, which (pins being keyed by object id) would
-/// re-pin the artifact position the verdict retains — that reading cannot be
-/// realized, so the exact resubmission is read as leaving every target
-/// unchanged: accepted, the announced pin kept.
+/// CR 115.3 + CR 115.7d + CR 400.7: keeping both positions (`[keep, keep]`)
+/// leaves every target unchanged: accepted, the announced pin kept. Choosing
+/// `A` at the artifact position is an election of the new A, which is not an
+/// artifact, so `[A, A]` is refused — a keep is said explicitly, never
+/// inferred from a resubmitted id.
 #[test]
 fn same_object_in_two_positions_anchor_keeps_its_announced_pin() {
     const EXCHANGE: &str = "Exchange control of target artifact and target creature.";
     let (mut runner, spell, a) = same_object_two_positions_board(EXCHANGE, false);
     assert_eq!(root_pin(&runner, spell, a), 0, "reach guard");
+    assert!(
+        GameRunner::from_state(runner.state().clone())
+            .act(GameAction::RetargetSpell {
+                new_targets: objects(&[a, a]).into_iter().map(Some).collect(),
+            })
+            .is_err(),
+        "electing the new A at the artifact position is refused"
+    );
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: objects(&[a, a]),
+            new_targets: vec![None, None],
         })
         .expect("leaving every target unchanged is accepted");
     assert_eq!(root_pin(&runner, spell, a), 0, "the retained pin is kept");
 }
 
 /// CR 115.3 + CR 115.7d + CR 400.7 (positional occurrence pins): a partial
-/// change that resubmits `[A, A]` while changing the player is now
-/// realizable. Each occurrence carries its own pin, so the artifact position
+/// change `[keep, A, P0]` — keep the artifact position, elect A at the
+/// creature position, change the player — is realizable. Each occurrence carries its own pin, so the artifact position
 /// RETAINS the announced (old) A with its announced pin while the creature
 /// position ELECTS the new A with a fresh pin; electing at one position no
 /// longer re-pins the other. Before positional pins this reading was refused.
@@ -2479,11 +2627,13 @@ fn same_object_in_two_positions_partial_change_elects_per_position() {
     let (mut runner, spell, a) = same_object_two_positions_board(TEXT, true);
     let new_incarnation = runner.state().objects[&a].incarnation;
     assert_ne!(new_incarnation, 0, "reach guard: A is a new object");
-    let mut changed = objects(&[a, a]);
-    changed.push(TargetRef::Player(P0));
     runner
         .act(GameAction::RetargetSpell {
-            new_targets: changed,
+            new_targets: vec![
+                None,
+                Some(TargetRef::Object(a)),
+                Some(TargetRef::Player(P0)),
+            ],
         })
         .expect("retain old A, elect new A, change the player");
     let root = runner
@@ -2612,4 +2762,209 @@ fn derived_slot_reading_an_illegal_declared_slot_is_illegal() {
         before,
         "control: detached Equipment is illegal"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Matt's M2: a partial retarget keeps an old, now-illegal target (CR 115.7d)
+// ---------------------------------------------------------------------------
+
+/// Fiery Annihilation at `[A, Equipment 1]`; Equipment 1 then leaves and
+/// returns (a new object, CR 400.7) and is attached to `host`; Redirect opens
+/// "choose new targets". The blink and re-attachment are the test helpers
+/// (`blink`, `attach::attach_to`) standing in for Planar Incision and Magnetic
+/// Theft.
+fn m2_board(host: impl FnOnce(&CopyBoard) -> ObjectId) -> CopyBoard {
+    let mut board = copy_board();
+    let (a, eq1, redirect) = (board.a, board.eq1, board.redirect);
+    let host = host(&board);
+    fiery_then(
+        &mut board,
+        &[a, eq1],
+        |state| {
+            blink(state, eq1);
+            attach::attach_to(state, eq1, host);
+        },
+        redirect,
+    );
+    assert_eq!(
+        board.runner.state().objects[&eq1].attached_to,
+        Some(AttachTarget::Object(host)),
+        "reach: the returned Equipment 1 is on its new host"
+    );
+    board
+}
+
+/// M2 (CR 115.7d: "the player may leave any number of the targets unchanged,
+/// even if those targets would be illegal"): change the creature to B and KEEP
+/// the departed Equipment 1. `[B, keep]` is accepted with Equipment 1's
+/// announced pin kept; B takes 5 and the returned Equipment 1 is untouched.
+#[test]
+fn m2_partial_retarget_keeps_the_departed_equipment() {
+    let board = m2_board(|board| board.a);
+    let (b, eq1, fiery) = (board.b, board.eq1, board.fiery);
+    let mut runner = board.runner;
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![Some(TargetRef::Object(b)), None],
+        })
+        .expect("[B, keep] is accepted");
+    assert_eq!(
+        equipment_pin(&runner, fiery, eq1),
+        0,
+        "the announced pin is kept"
+    );
+    runner.advance_until_stack_empty();
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&b].zone,
+        Zone::Exile,
+        "B took 5 and was exiled"
+    );
+    assert_eq!(
+        state.objects[&eq1].zone,
+        Zone::Battlefield,
+        "Equipment 1 untouched"
+    );
+}
+
+/// M2-elect (CR 400.7 + CR 115.7e): with the returned Equipment 1 on B,
+/// choosing it is an election of the new object (re-pinned), legal for B.
+#[test]
+fn m2_partial_retarget_may_elect_the_returned_equipment_on_the_new_creature() {
+    let board = m2_board(|board| board.b);
+    let (b, eq1, fiery) = (board.b, board.eq1, board.fiery);
+    let mut runner = board.runner;
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![Some(TargetRef::Object(b)), Some(TargetRef::Object(eq1))],
+        })
+        .expect("[B, Equipment 1] elects the returned Equipment");
+    assert_ne!(
+        equipment_pin(&runner, fiery, eq1),
+        0,
+        "re-pinned to the new object"
+    );
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&eq1].zone, Zone::Exile);
+}
+
+/// M2-neg (CR 115.7e): with the returned Equipment 1 on A, electing it for B is
+/// refused (it is not attached to that creature); keeping it is accepted.
+#[test]
+fn m2_partial_retarget_refuses_electing_equipment_not_on_the_new_creature() {
+    let board = m2_board(|board| board.a);
+    let (b, eq1) = (board.b, board.eq1);
+    let mut runner = board.runner;
+    assert!(runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![Some(TargetRef::Object(b)), Some(TargetRef::Object(eq1))],
+        })
+        .is_err());
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![Some(TargetRef::Object(b)), None],
+        })
+        .expect("control: keeping Equipment 1 is accepted");
+}
+
+/// M2 through the interaction surface: the RetargetChoice opportunity offers a
+/// KEEP choice per position; `[B, keep Equipment 1]` previews and submits; a
+/// keep id at another position, or twice, is not a legal answer.
+#[test]
+fn m2_partial_retarget_through_the_interaction_surface() {
+    use engine::game::interaction::{
+        bind_interaction_authority, derive_viewer_interaction, preview_interaction,
+        submit_interaction,
+    };
+    use engine::game::visibility::filter_state_for_viewer;
+    use engine::types::interaction::{
+        InteractionOpportunityResponse, InteractionPreviewRequest, InteractionPreviewStatus,
+        InteractionReasonCode, InteractionResponse, InteractionSessionId, InteractionSubmission,
+        PreviewRequestId,
+    };
+
+    let board = m2_board(|board| board.a);
+    let (b, eq1) = (board.b, board.eq1);
+    let mut state = board.runner.state().clone();
+    let WaitingFor::RetargetChoice {
+        legal_new_targets,
+        current_targets,
+        ..
+    } = state.waiting_for.clone()
+    else {
+        panic!("expected RetargetChoice");
+    };
+    bind_interaction_authority(&mut state, InteractionSessionId("m2".to_string())).expect("bind");
+    let filtered = filter_state_for_viewer(&state, P0);
+    let view = derive_viewer_interaction(&state, &filtered, P0);
+    let opportunity = view
+        .opportunities
+        .iter()
+        .find(|opportunity| {
+            matches!(
+                opportunity.response,
+                InteractionOpportunityResponse::Schema { .. }
+            )
+        })
+        .expect("a schema opportunity");
+    let InteractionOpportunityResponse::Schema { candidates, .. } = &opportunity.response else {
+        unreachable!()
+    };
+    let positions = current_targets.len();
+    assert_eq!(
+        candidates.len(),
+        legal_new_targets.len() + positions,
+        "every pool member, then one KEEP per position"
+    );
+    let keep = |position: usize| candidates[legal_new_targets.len() + position].id.clone();
+    assert!(
+        serde_json::to_string(&candidates[legal_new_targets.len() + 1])
+            .unwrap()
+            .contains("keep"),
+        "reach: the KEEP choice is labelled"
+    );
+    let b_choice = candidates[legal_new_targets
+        .iter()
+        .position(|target| *target == TargetRef::Object(b))
+        .expect("B is offered")]
+    .id
+    .clone();
+    let request = |id: &str, choice_ids| InteractionPreviewRequest {
+        request_id: PreviewRequestId(id.to_string()),
+        interaction_id: opportunity.interaction_id.clone(),
+        response: InteractionResponse::Sequence { choice_ids },
+    };
+    for (id, choice_ids) in [
+        ("wrong-position", vec![keep(1), keep(1)]),
+        ("swapped", vec![b_choice.clone(), keep(0)]),
+    ] {
+        assert_eq!(
+            preview_interaction(&state, P0, &request(id, choice_ids)).status,
+            InteractionPreviewStatus::Rejected {
+                reason: InteractionReasonCode::ConstraintUnsatisfied,
+            },
+            "{id}: a KEEP answers only its own position"
+        );
+    }
+    let accepted = request("m2", vec![b_choice.clone(), keep(1)]);
+    assert!(
+        !matches!(
+            preview_interaction(&state, P0, &accepted).status,
+            InteractionPreviewStatus::Rejected { .. }
+        ),
+        "[B, keep] previews"
+    );
+    submit_interaction(
+        &mut state,
+        P0,
+        InteractionSubmission {
+            interaction_id: opportunity.interaction_id.clone(),
+            response: accepted.response.clone(),
+        },
+    )
+    .expect("[B, keep] submits");
+    let mut runner = GameRunner::from_state(state);
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&b].zone, Zone::Exile);
+    assert_eq!(runner.state().objects[&eq1].zone, Zone::Battlefield);
 }

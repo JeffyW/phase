@@ -250,6 +250,7 @@ pub fn resolve(
         return Ok(());
     }
 
+    let keep_is_distinct = ability_utils::retarget_keep_is_distinct(state, &stack_ability, &slots);
     state.waiting_for = WaitingFor::RetargetChoice {
         player: ability.controller,
         stack_entry_index,
@@ -257,6 +258,7 @@ pub fn resolve(
         current_targets,
         slots,
         slot_pools,
+        keep_is_distinct,
         legal_new_targets,
     };
     // EffectResolved is emitted by the engine handler after RetargetSpell action is submitted.
@@ -1140,7 +1142,7 @@ mod tests {
             &mut state,
             PlayerId(0),
             GameAction::RetargetSpell {
-                new_targets: vec![TargetRef::Player(PlayerId(1))],
+                new_targets: vec![Some(TargetRef::Player(PlayerId(1)))],
             },
         )
         .expect("retarget submission should succeed");

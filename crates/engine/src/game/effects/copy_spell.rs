@@ -7,9 +7,7 @@ use crate::types::ability::{
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{
-    CastingVariant, CopyTargetSlot, GameState, StackEntry, StackEntryKind, WaitingFor,
-};
+use crate::types::game_state::{CastingVariant, GameState, StackEntry, StackEntryKind};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::player::PlayerId;
 use crate::types::statics::StaticMode;
@@ -284,49 +282,26 @@ pub fn resolve(
         crate::game::triggers::collect_triggers_into_deferred(state, &[spell_copied]);
     }
 
-    // CR 707.10c: If the copy has targets, allow the controller to choose new ones.
-    let copy_targets = top_entry
-        .entry
-        .ability()
-        .map(|a| a.targets.clone())
-        .unwrap_or_default();
-
     // CR 707.10c / CR 115.1: arm retarget selection only when the copy effect
     // explicitly granted "you may choose new targets". Otherwise the copy keeps
     // the original spell's declared targets (already present on the cloned
-    // stack entry) and resolution proceeds without a player choice.
-    if !copy_targets.is_empty()
-        && matches!(
-            ability.effect,
-            Effect::CopySpell {
-                retarget: CopyRetargetPermission::MayChooseNewTargets,
-                ..
-            }
-        )
-    {
-        let Some(copy_ability) = state
-            .stack
-            .back()
-            .and_then(|entry| entry.ability())
-            .cloned()
-        else {
-            events.push(GameEvent::EffectResolved {
-                kind: EffectKind::from(&ability.effect),
-                source_id: ability.source_id,
-                subject: None,
-            });
-            drain_spell_copied_observer_triggers(state, events, copied_spell_card_id.is_some())?;
-            return Ok(());
-        };
-        open_copy_retarget_choice(
-            state,
-            copy_controller,
-            copy_id,
-            &copy_targets,
-            &copy_ability,
-            EffectKind::CopySpell,
-            copy_id,
-        );
+    // stack entry) and resolution proceeds without a player choice. Whether
+    // there is anything to choose is the chain census (`chain_retarget_slots`,
+    // every addressed declared target — e.g. Fiery Annihilation's Equipment
+    // sub-target), not the root node's own `targets`.
+    if matches!(
+        ability.effect,
+        Effect::CopySpell {
+            retarget: CopyRetargetPermission::MayChooseNewTargets,
+            ..
+        }
+    ) && super::copy_choice::open_copy_retarget_walk(
+        state,
+        copy_controller,
+        copy_id,
+        EffectKind::CopySpell,
+        copy_id,
+    ) {
         // EffectResolved deferred until after retarget choice completes.
         return Ok(());
     }
@@ -415,105 +390,6 @@ fn drain_spell_copied_observer_triggers(
         }
     }
     Ok(())
-}
-
-/// CR 707.10c + CR 115.7d: keep only the alternatives for copy slot `slot_idx`
-/// that, together with every edit already accepted in `slots` (each slot's
-/// `current`), leave a legal final set — a new choice may not make an
-/// unchanged target that was legal illegal. A no-op unless the copy's chain
-/// has a position whose filter reads a declared slot.
-pub(crate) fn restrict_copy_retarget_alternatives(
-    state: &GameState,
-    copy_id: ObjectId,
-    slots: &mut [CopyTargetSlot],
-    slot_idx: usize,
-) {
-    use super::super::ability_utils::{
-        chain_retarget_slots, copy_retarget_edit_is_legal, SlotEnforcement,
-    };
-    let Some(entry) = state.stack.iter().find(|entry| entry.id == copy_id) else {
-        return;
-    };
-    let Some(pre) = entry.ability() else {
-        return;
-    };
-    let has_dependent_slot = chain_retarget_slots(pre).iter().any(|binding| {
-        matches!(&binding.enforcement, SlotEnforcement::Filtered(filter)
-            if crate::game::filter::filter_reads_declared_slot(filter))
-    });
-    if !has_dependent_slot {
-        return;
-    }
-    let pool_controller = super::change_targets::retarget_pool_controller(state, entry, pre);
-    let Some(currents) = slots
-        .iter()
-        .map(|slot| slot.current.clone())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return;
-    };
-    if currents.len() != pre.targets.len() || slot_idx >= slots.len() {
-        return;
-    }
-    let alternatives = std::mem::take(&mut slots[slot_idx].legal_alternatives);
-    slots[slot_idx].legal_alternatives = alternatives
-        .into_iter()
-        .filter(|alternative| {
-            let mut targets = currents.clone();
-            targets[slot_idx] = alternative.clone();
-            copy_retarget_edit_is_legal(state, pre, &targets, pool_controller).is_ok()
-        })
-        .collect();
-}
-
-/// CR 707.10c: Open the shared "may choose new targets" choice for a copied
-/// spell. The copy is already on the stack; `copy_ability` is the copy's
-/// re-sourced ability, so legal alternatives reflect the copy's identity.
-pub(crate) fn open_copy_retarget_choice(
-    state: &mut GameState,
-    copy_controller: PlayerId,
-    copy_id: ObjectId,
-    copy_targets: &[TargetRef],
-    copy_ability: &ResolvedAbility,
-    effect_kind: EffectKind,
-    effect_source_id: ObjectId,
-) {
-    // Compute legal alternatives for each slot so the UI can present valid
-    // choices. If build_target_slots fails (no legal targets exist for the
-    // copy), fall back to empty alternatives — the copy still goes on the
-    // stack and will fizzle at resolution per CR 608.2b if all targets remain
-    // illegal.
-    let selection_slots =
-        super::super::ability_utils::build_target_slots(state, copy_ability).unwrap_or_default();
-
-    let target_slots: Vec<CopyTargetSlot> = copy_targets
-        .iter()
-        .enumerate()
-        .map(|(i, t)| CopyTargetSlot {
-            current: Some(t.clone()),
-            legal_alternatives: selection_slots
-                .get(i)
-                .map(|s| s.legal_targets.clone())
-                .unwrap_or_default(),
-        })
-        .collect();
-
-    let mut target_slots = target_slots;
-    for slot_idx in 0..target_slots.len() {
-        restrict_copy_retarget_alternatives(state, copy_id, &mut target_slots, slot_idx);
-    }
-
-    // CR 707.10c: "its controller may choose new targets for the copy" — the
-    // copy's controller makes the retarget choice.
-    state.waiting_for = WaitingFor::CopyRetarget {
-        player: copy_controller,
-        copy_id,
-        target_slots,
-        effect_kind,
-        effect_source_id: Some(effect_source_id),
-        current_slot: 0,
-        paradigm_remaining_offers: None,
-    };
 }
 
 /// CR 707.10: "A copy of a spell is controlled by the player under whose
@@ -1188,6 +1064,7 @@ mod tests {
     };
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
+    use crate::types::game_state::WaitingFor;
     use crate::types::game_state::{
         CastingVariant, DepartedStackSpell, StackEntry, StackEntryKind,
     };

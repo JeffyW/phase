@@ -3350,7 +3350,9 @@ mod tests {
     /// `FilterProp::AttachedTo { to: AttachmentReferent }` (CR 701.3a + CR
     /// 303.4b); a v107 peer cannot parse the `"AttachedTo"` tag carried in
     /// `GameState` ability definitions, so it must be refused before it
-    /// receives v108 state.
+    /// receives v108 state. v108 also carries the positional retarget wire
+    /// (`RetargetSpell` `null` keeps, engine-derived copy-walk keep
+    /// permissions), which a v107 peer cannot parse or render.
     /// `UntilCondition::NextMatches.count` (CR 608.2c), the paused loop's `hits`,
     /// `ZoneChoiceCandidateSource::ParentTargets` and
     /// `SpellContext.exile_until_batch` are new in serialized

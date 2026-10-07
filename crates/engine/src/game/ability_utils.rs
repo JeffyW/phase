@@ -2692,8 +2692,13 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         TargetReadOrigin::OwnAnnouncement,
         &mut view,
         false,
+        &[],
     )
 }
+
+/// CR 608.2b: one declared occurrence with the verdict resolution validation
+/// reached for it.
+type JudgedOccurrence = ((TargetRef, Option<ObjectIncarnationRef>), OccurrenceVerdict);
 
 /// CR 608.2b: append the declared target positions `declared` (the node as
 /// announced) contributes to the validated declared view, in the
@@ -2753,9 +2758,9 @@ fn declared_illegal_local_positions(
 enum NodeValidation {
     /// One verdict per announced occurrence; storage is their projection.
     Verdicts(Vec<OccurrenceVerdict>),
-    /// The implicit-ally fight arm stores occurrences drawn from the whole
-    /// resolving chain (`flatten_target_occurrences_in_chain`), each with its
-    /// own pin; `verdicts` still judge this node's own announced occurrences.
+    /// The implicit-ally fight arm stores fighters that may include the
+    /// declaring ancestor's referent occurrence (with its own pin); `verdicts`
+    /// still judge this node's own announced occurrences.
     Rebuilt {
         verdicts: Vec<OccurrenceVerdict>,
         stored: Vec<(TargetRef, Option<ObjectIncarnationRef>)>,
@@ -2768,6 +2773,11 @@ fn validate_targets_in_chain_inner(
     target_origin: TargetReadOrigin,
     view_out: &mut Vec<Option<targeting::DeclaredSlotBinding>>,
     targets_are_inherited: bool,
+    // CR 608.2b: the nearest DECLARING ancestor's own occurrences, every one
+    // with the verdict its validation reached (an ancestor that declares
+    // nothing — an inheriting rider, a paid-"instead" delegator — passes its
+    // own parent's block through). Read by the implicit-fight referent.
+    parent_block: &[JudgedOccurrence],
 ) -> ResolvedAbility {
     // Classify provenance before pruning the parent's declaration.
     let sub_origin = if ability
@@ -3068,84 +3078,20 @@ fn validate_targets_in_chain_inner(
             // wrongly drops the ally (Ent's Fury, issue #1135). Nested chain links keep
             // chosen targets on the resolving spell, not on the fight sub-clause itself.
             //
-            //
-            // Every candidate is an OCCURRENCE with its originating address
-            // (`FighterOrigin`): this node's own announced positions, or an
-            // earlier declared position of the validated declared view. When this node declares
-            // its own `target` slot, its explicit fighter is drawn ONLY from its
-            // own occurrences — another node's occurrence of the same object
-            // (a retargeted copy's root, CR 707.10c) never stands in for this
-            // node's illegal one (CR 608.2b). The ally may come from the chain.
-            #[derive(Clone, Copy, PartialEq, Eq)]
-            enum FighterOrigin {
-                Own(usize),
-                Chain(usize),
-            }
+            // CR 608.2b + CR 701.14b: the implicit ally is the REFERENT of the
+            // anaphor — the first object occurrence the nearest declaring
+            // ancestor announced (`parent_block`) — bound by that ORIGINAL
+            // occurrence regardless of the object's current zone, types,
+            // phasing or legality. Only then is it asked whether it may fight:
+            // it must carry a `Legal` verdict, still be the announced
+            // incarnation, and be a phased-in creature on the battlefield. An
+            // ineligible referent means no fight, never a substitute.
             type Occurrence = (TargetRef, Option<ObjectIncarnationRef>);
-            let own: Vec<(FighterOrigin, Occurrence)> = validated
+            let own: Vec<(usize, Occurrence)> = validated
                 .target_occurrences()
                 .into_iter()
                 .enumerate()
-                .map(|(position, occurrence)| (FighterOrigin::Own(position), occurrence))
                 .collect();
-            // CR 608.2b + CR 701.14b: every EARLIER declared position, in
-            // declared order, with the verdict validation already reached for
-            // it. The validated declared view (`view`) publishes a judged-legal
-            // occurrence with its own pin; a hole is an illegal or unjudged
-            // declaration, whose occurrence is read from the resolving
-            // carrier's declared entries only when that carrier is the chain
-            // being validated (every published position agrees with it).
-            let declared_view: &[Option<targeting::DeclaredSlotBinding>] = &view_snapshot;
-            let carrier_entries = state
-                .resolving_stack_entry
-                .as_ref()
-                .and_then(|entry| entry.ability())
-                .map(declared_target_entries_in_chain)
-                .unwrap_or_default();
-            let carrier_aligned = carrier_entries.len() >= declared_view.len()
-                && declared_view.iter().zip(&carrier_entries).all(
-                    |(binding, entry)| match binding {
-                        Some(targeting::DeclaredSlotBinding::Announced { target, .. })
-                        | Some(targeting::DeclaredSlotBinding::Elected(target)) => {
-                            *target == entry.target
-                        }
-                        None => true,
-                    },
-                );
-            // `(origin, occurrence, judged legal)`.
-            let earlier: Vec<(FighterOrigin, Occurrence, bool)> = declared_view
-                .iter()
-                .enumerate()
-                .filter_map(|(index, binding)| {
-                    let (occurrence, legal) = match binding {
-                        Some(targeting::DeclaredSlotBinding::Announced { target, pin }) => {
-                            ((target.clone(), *pin), true)
-                        }
-                        Some(targeting::DeclaredSlotBinding::Elected(target)) => {
-                            ((target.clone(), None), true)
-                        }
-                        None if carrier_aligned => {
-                            let entry = &carrier_entries[index];
-                            ((entry.target.clone(), entry.pin), false)
-                        }
-                        None => return None,
-                    };
-                    Some((FighterOrigin::Chain(index), occurrence, legal))
-                })
-                .collect();
-            // Only judged-legal earlier occurrences, then this node's own, may
-            // be drawn as a fighter.
-            let judged_pool: Vec<(FighterOrigin, Occurrence)> = earlier
-                .iter()
-                .filter(|(_, _, legal)| *legal)
-                .map(|(origin, occurrence, _)| (*origin, occurrence.clone()))
-                .chain(own.iter().cloned())
-                .collect();
-            let explicit_pool = if !target.is_context_ref() && !own.is_empty() {
-                &own
-            } else {
-                &judged_pool
-            };
 
             fn fight_creature_on_battlefield(
                 state: &GameState,
@@ -3176,75 +3122,100 @@ fn validate_targets_in_chain_inner(
                 AbilityTargetSlot::Unpositioned(target),
                 &validated,
             );
-            let explicit: Vec<(FighterOrigin, Occurrence)> = explicit_pool
-                .iter()
+            // The explicit fighter is this node's own declared occurrence; for
+            // a context-ref `target` it may be one of the ancestor's legal ones.
+            let explicit_pool: Vec<(Option<usize>, Occurrence)> = if !target.is_context_ref()
+                && !own.is_empty()
+            {
+                own.iter()
+                    .map(|(position, occurrence)| (Some(*position), occurrence.clone()))
+                    .collect()
+            } else {
+                parent_block
+                    .iter()
+                    .filter(|(_, verdict)| *verdict == OccurrenceVerdict::Legal)
+                    .map(|(occurrence, _)| (None, occurrence.clone()))
+                    .chain(
+                        own.iter()
+                            .map(|(position, occurrence)| (Some(*position), occurrence.clone())),
+                    )
+                    .collect()
+            };
+            let explicit: Vec<(Option<usize>, Occurrence)> = explicit_pool
+                .into_iter()
                 .filter(|(_, occurrence)| {
                     legal.contains(&occurrence.0) && occurrence_is_current(occurrence)
                 })
-                .cloned()
                 .collect();
 
-            let mut fighters: Vec<(FighterOrigin, Occurrence)> = Vec::new();
-            if let [(explicit_origin, explicit_occurrence)] = explicit.as_slice() {
-                // CR 608.2b + CR 701.14b: the implicit ally is the REFERENT the
-                // earlier declarations name — the first earlier declared object
-                // (other than the explicit fighter) that is a creature on the
-                // battlefield, or whose declaration is a hole because the object
-                // left the battlefield. It is identified before its legality is
-                // consulted, so an illegal referent means no ally (no fight),
-                // never a substitute drawn from a later declaration.
-                let referent = earlier.iter().find(|(origin, occurrence, legal)| {
-                    let TargetRef::Object(id) = &occurrence.0 else {
-                        return false;
-                    };
-                    origin != explicit_origin
-                        && occurrence.0 != explicit_occurrence.0
-                        && (fight_creature_on_battlefield(state, *id)
-                            || (!*legal && !state.battlefield.contains(id)))
-                });
+            let mut fighters: Vec<(Option<usize>, Occurrence)> = Vec::new();
+            if let [(explicit_position, explicit_occurrence)] = explicit.as_slice() {
+                // Only the `ParentTarget` anaphor ("that creature fights")
+                // names an ancestor's target; any other implicit subject (the
+                // source, its host) is resolved by `resolve_fight_subject`.
+                let referent = matches!(subject, TargetFilter::ParentTarget)
+                    .then(|| {
+                        parent_block.iter().find(|((target, _), _)| {
+                            matches!(target, TargetRef::Object(_))
+                                && *target != explicit_occurrence.0
+                        })
+                    })
+                    .flatten();
                 match referent {
-                    Some((origin, occurrence, true)) if occurrence_is_current(occurrence) => {
-                        fighters.push((*origin, occurrence.clone()));
+                    Some((occurrence, verdict)) => {
+                        let TargetRef::Object(id) = &occurrence.0 else {
+                            unreachable!("the referent is an object occurrence");
+                        };
+                        if *verdict == OccurrenceVerdict::Legal
+                            && occurrence_is_current(occurrence)
+                            && fight_creature_on_battlefield(state, *id)
+                        {
+                            fighters.push((None, occurrence.clone()));
+                        }
                     }
-                    Some(_) => {}
-                    // No earlier referent: this node's own propagated
-                    // occurrences ([ally, opponent]) supply the ally.
+                    // No declaring ancestor names an object: this node's own
+                    // propagated occurrences ([ally, opponent]) supply the ally.
                     None => {
-                        if let Some(ally) = own.iter().find(|(origin, occurrence)| {
-                            let TargetRef::Object(id) = &occurrence.0 else {
-                                return false;
-                            };
-                            origin != explicit_origin
-                                && occurrence.0 != explicit_occurrence.0
-                                && fight_creature_on_battlefield(state, *id)
-                                && occurrence_is_current(occurrence)
-                        }) {
-                            fighters.push(ally.clone());
+                        if let Some((position, occurrence)) =
+                            own.iter().find(|(position, occurrence)| {
+                                let TargetRef::Object(id) = &occurrence.0 else {
+                                    return false;
+                                };
+                                Some(*position) != *explicit_position
+                                    && occurrence.0 != explicit_occurrence.0
+                                    && fight_creature_on_battlefield(state, *id)
+                                    && occurrence_is_current(occurrence)
+                            })
+                        {
+                            fighters.push((Some(*position), occurrence.clone()));
                         }
                     }
                 }
             }
             fighters.extend(explicit);
             // CR 608.2b: each of this node's own announced occurrences is judged
-            // by its own address — legal when it is itself a fighter, or when a
-            // chain-sourced fighter is that very occurrence (same object AND same
-            // pin). A bare-id match never credits it.
-            let mut chain_fighters: Vec<&Occurrence> = fighters
+            // by its own address — legal when it is itself a fighter, or when
+            // the ancestor-bound ally is that very occurrence (same object AND
+            // same pin, a propagated copy of it). A bare-id match never credits
+            // it.
+            let mut ancestor_fighters: Vec<&Occurrence> = fighters
                 .iter()
-                .filter(|(origin, _)| matches!(origin, FighterOrigin::Chain(_)))
+                .filter(|(position, _)| position.is_none())
                 .map(|(_, occurrence)| occurrence)
                 .collect();
             let verdicts = own
                 .iter()
-                .map(|(origin, occurrence)| {
-                    let own_fighter = fighters.iter().any(|(fighter, _)| fighter == origin);
-                    let chain_fighter = !own_fighter
-                        && chain_fighters
+                .map(|(position, occurrence)| {
+                    let own_fighter = fighters
+                        .iter()
+                        .any(|(fighter, _)| *fighter == Some(*position));
+                    let ancestor_fighter = !own_fighter
+                        && ancestor_fighters
                             .iter()
                             .position(|fighter| *fighter == occurrence)
-                            .map(|found| chain_fighters.swap_remove(found))
+                            .map(|found| ancestor_fighters.swap_remove(found))
                             .is_some();
-                    legal_or_dropped(own_fighter || chain_fighter)
+                    legal_or_dropped(own_fighter || ancestor_fighter)
                 })
                 .collect();
             let stored = fighters
@@ -3505,6 +3476,28 @@ fn validate_targets_in_chain_inner(
     // CR 608.2b: this node's declared positions join the view BEFORE its
     // continuations are validated, so a later node's dependent filter reads them.
     append_validated_declared_positions(ability, &verdicts, targets_are_inherited, view_out);
+    // CR 608.2b: the block this node hands its continuations — its own
+    // declared occurrences with their verdicts when it declares any, else the
+    // block it received.
+    let own_block: Vec<JudgedOccurrence>;
+    let child_block: &[JudgedOccurrence] = if publishes && !chain_node_positions(ability).is_empty()
+    {
+        own_block = chain_node_positions(ability)
+            .into_iter()
+            .map(|position| {
+                (
+                    (
+                        ability.targets[position].clone(),
+                        ability.target_pin_at(position),
+                    ),
+                    verdicts[position],
+                )
+            })
+            .collect();
+        &own_block
+    } else {
+        parent_block
+    };
     if let Some(sub_ability) = validated.sub_ability.as_mut() {
         // Mirrors `declared_targets_in_chain`: a paid-"instead" delegate carries
         // its delegator's inheritance; any other sub inherits per
@@ -3523,6 +3516,7 @@ fn validate_targets_in_chain_inner(
             sub_origin,
             view_out,
             sub_inherited,
+            child_block,
         );
     }
     // CR 608.2b: an inheriting rider's entry is a snapshot of its immediate
@@ -3539,6 +3533,7 @@ fn validate_targets_in_chain_inner(
             TargetReadOrigin::OwnAnnouncement,
             view_out,
             false,
+            child_block,
         );
     }
     restamp_chosen_group_targets(&mut validated);
@@ -8672,7 +8667,7 @@ fn build_target_selection_progress(
     })
 }
 
-fn build_target_selection_progress_for_ability(
+pub(crate) fn build_target_selection_progress_for_ability(
     state: &GameState,
     ability: &ResolvedAbility,
     target_slots: &[TargetSelectionSlot],
@@ -11488,53 +11483,6 @@ pub(crate) fn node_at<'a>(
     Some(node)
 }
 
-/// CR 707.10c + CR 601.2c: the copy's chain as it would stand with its root
-/// targets set to `targets` — the exact write [`engine::finalize_copy_retarget`]
-/// commits: an additional-cost "instead choose" branch owns the declared slots
-/// (the root is only its mirror), changed objects get a fresh selected-target
-/// pin, and the derived chain targets are re-stamped. Built on a clone so a
-/// tentative edit can be checked before anything is written.
-pub(crate) fn copy_retarget_post_chain(
-    state: &GameState,
-    pre: &ResolvedAbility,
-    targets: &[TargetRef],
-) -> ResolvedAbility {
-    // CR 115.7 + CR 400.7: each root occurrence keeps its announced pin when
-    // unchanged, and takes the live incarnation when changed (a different
-    // target, or the same id whose announced object is gone) — decided per
-    // POSITION, never by object id.
-    let occurrences: Vec<(TargetRef, Option<ObjectIncarnationRef>)> = targets
-        .iter()
-        .enumerate()
-        .map(|(index, target)| {
-            let pin = if pre.retarget_requires_pin_refresh_at(index, target, state) {
-                live_target_pin(state, target)
-            } else {
-                pre.target_pin_at(index)
-            };
-            (target.clone(), pin)
-        })
-        .collect();
-    let mut ability = pre.clone();
-    // CR 707.10c + CR 601.2c: An additional-cost "instead choose" branch owns
-    // the declared slots. The root is only its mirror. Update the child before
-    // re-deriving the mirror and selected-group readers, including the
-    // unchanged members of a variable target set.
-    if ability.context.additional_cost_paid {
-        if let Some(sub) = ability.sub_ability.as_deref_mut().filter(|sub| {
-            matches!(
-                sub.condition,
-                Some(AbilityCondition::AdditionalCostPaidInstead)
-            )
-        }) {
-            sub.replace_target_occurrences(occurrences.clone());
-        }
-    }
-    ability.replace_target_occurrences(occurrences);
-    restamp_derived_chain_targets(&mut ability);
-    ability
-}
-
 /// CR 400.7: the incarnation a newly chosen target names now (`None` for a
 /// player or a missing object).
 pub(crate) fn live_target_pin(
@@ -11547,86 +11495,88 @@ pub(crate) fn live_target_pin(
     }
 }
 
-/// CR 707.10c + CR 115.7d + CR 115.7e: whether choosing `targets` as the
-/// copy's root targets is a legal final set — every changed position is legal
-/// for the edited selection, and no unchanged position that was legal becomes
-/// illegal (an already-illegal unchanged target may stay). `changed` is read by
-/// VALUE at each addressed position of the pre- and post-edit chains, so every
-/// accepted edit of the pending choice counts, not only the latest one.
-pub(crate) fn copy_retarget_edit_is_legal(
-    state: &GameState,
-    pre: &ResolvedAbility,
-    targets: &[TargetRef],
-    pool_controller: PlayerId,
-) -> Result<ResolvedAbility, EngineError> {
-    let post = copy_retarget_post_chain(state, pre, targets);
-    // Root-only copy retargeting (CR 707.10c) gates the positions whose filter
-    // reads a declared slot — the only positions a root edit can newly make
-    // illegal through this relation. Other filters keep the copy path's
-    // existing per-slot behavior.
-    let bindings: Vec<RetargetSlotBinding> = chain_retarget_slots(pre)
-        .into_iter()
-        .filter(|binding| match &binding.enforcement {
-            SlotEnforcement::Filtered(filter) => {
-                crate::game::filter::filter_reads_declared_slot(filter)
-            }
-            SlotEnforcement::Legacy => false,
-        })
-        .collect();
-    if bindings.is_empty() {
-        return Ok(post);
-    }
-    // The copy write's own verdict (`copy_retarget_post_chain`): a position
-    // changed when its target or its selected-target pin differs — so an
-    // explicit same-ID election of a returned object (phase-rs/phase#7235) is
-    // validated as a changed target, while a position the root-only write
-    // never touches (a sub-node's target) stays unchanged.
-    let changed = |i: usize| {
-        let address = &bindings[i].address;
-        let at = |chain: &ResolvedAbility| {
-            node_at(chain, &address.path).and_then(|node| {
-                let target = node.targets.get(address.slot).cloned()?;
-                Some((target, node.target_pin_at(address.slot)))
-            })
-        };
-        at(pre) != at(&post)
-    };
-    unchanged_targets_stay_legal(state, pre, &post, &bindings, &changed, pool_controller)?;
-    changed_dependent_targets_are_legal(state, pre, &post, &bindings, &changed, pool_controller)?;
-    Ok(post)
-}
-
-/// CR 115.7a + CR 115.7d + CR 400.7: for each written address (`addresses`,
-/// aligned with `new_targets`), whether submitting `new_targets[i]` CHANGES
-/// that position. Built
-/// on the write path's own predicate
-/// (`ResolvedAbility::retarget_requires_pin_refresh_at` on the addressed
-/// occurrence of `pre`): a different target, or the same id whose announced
-/// incarnation is gone. A same-id entry ELECTS the new object
-/// (phase-rs/phase#8355 H2) only when that object is a legal choice for the
-/// position — `pool_contains(i, target)`, the position's slot pool (Invariant
-/// SC) — because a target can be changed only to a legal one (CR 115.7a);
-/// otherwise it is the retained target, unchanged, keeping its announced pin
-/// (CR 115.7d first clause). `apply_retarget`'s write loop and its validation
-/// read this one vector.
+/// CR 115.7d + CR 115.7e + CR 400.7: for each written address (`addresses`,
+/// aligned with `picks`), whether the pick CHANGES that position — THE shared
+/// changed verdict every retarget check reads. `None` (keep) never changes.
+/// `Some(t)` changes when `t` is a different target, or the same object id
+/// whose announced incarnation is gone (choosing the id elects the returned,
+/// new object: phase-rs/phase#8355 H2). Choosing the announced, still-current
+/// object is no change.
 pub(crate) fn retarget_positions_changed(
     state: &GameState,
     pre: &ResolvedAbility,
     addresses: &[RetargetSlotAddress],
-    new_targets: &[TargetRef],
-    pool_contains: &dyn Fn(usize, &TargetRef) -> bool,
+    picks: &[Option<TargetRef>],
 ) -> Vec<bool> {
     addresses
         .iter()
         .enumerate()
         .map(|(i, address)| {
-            let (Some(new), Some(node)) = (new_targets.get(i), node_at(pre, &address.path)) else {
+            let (Some(Some(new)), Some(node)) = (picks.get(i), node_at(pre, &address.path)) else {
                 return false;
             };
-            node.targets.get(address.slot).is_some_and(|old| {
-                node.retarget_requires_pin_refresh_at(address.slot, new, state)
-                    && (old != new || pool_contains(i, new))
+            node.targets.get(address.slot).is_some()
+                && node.retarget_requires_pin_refresh_at(address.slot, new, state)
+        })
+        .collect()
+}
+
+/// CR 115.7d + CR 400.7: per addressed position, whether keeping the announced
+/// target and choosing the same object id name DIFFERENT objects — the
+/// announced incarnation is gone, so choosing the id elects the returned
+/// object. Engine-derived display data for the retarget prompt.
+pub(crate) fn retarget_keep_is_distinct(
+    state: &GameState,
+    stack_ability: &ResolvedAbility,
+    addresses: &[RetargetSlotAddress],
+) -> Vec<bool> {
+    addresses
+        .iter()
+        .map(|address| {
+            node_at(stack_ability, &address.path).is_some_and(|node| {
+                matches!(node.targets.get(address.slot), Some(TargetRef::Object(_)))
+                    && !node.target_occurrence_is_current(address.slot, state)
             })
+        })
+        .collect()
+}
+
+/// CR 115.3 + CR 400.7: the final identity of each written position — its
+/// announced occurrence when unchanged, the elected object as it is now when
+/// changed (`changed` is [`retarget_positions_changed`]'s verdict).
+pub(crate) fn retarget_final_identities(
+    state: &GameState,
+    pre: &ResolvedAbility,
+    addresses: &[RetargetSlotAddress],
+    picks: &[Option<TargetRef>],
+    changed: &[bool],
+) -> Vec<super::target_occurrences::OccurrenceIdentity> {
+    addresses
+        .iter()
+        .enumerate()
+        .map(|(i, address)| {
+            let node = node_at(pre, &address.path);
+            let announced = node
+                .and_then(|node| node.targets.get(address.slot))
+                .cloned();
+            match (changed.get(i).copied().unwrap_or(false), picks.get(i)) {
+                (true, Some(Some(target))) => super::target_occurrences::OccurrenceIdentity {
+                    target: target.clone(),
+                    pin: live_target_pin(state, target),
+                },
+                _ => {
+                    let target = picks
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .or(announced)
+                        .unwrap_or(TargetRef::Player(PlayerId(0)));
+                    super::target_occurrences::OccurrenceIdentity {
+                        target,
+                        pin: node.and_then(|node| node.target_pin_at(address.slot)),
+                    }
+                }
+            }
         })
         .collect()
 }
@@ -11910,8 +11860,7 @@ pub(crate) fn widen_dependent_retarget_pools(
                     state,
                     stack_ability,
                     std::slice::from_ref(&bindings[j].address),
-                    std::slice::from_ref(&referent),
-                    &|_, _| true,
+                    &[Some(referent.clone())],
                 )
                 .first()
                 .copied()
@@ -12102,33 +12051,43 @@ pub fn retarget_slots_aligned(
 /// offered. `chain_retarget_slots` decides which positions exist, `slot_pool`
 /// decides what each may hold, and this function decides whether a submission
 /// respected that.
-pub fn retarget_slot_violation(
+pub(crate) fn retarget_slot_violation(
     bindings: &[RetargetSlotBinding],
     slot_pools: &[Vec<TargetRef>],
     legal_new_targets: &[TargetRef],
-    current_targets: &[TargetRef],
-    new_targets: &[TargetRef],
+    picks: &[Option<TargetRef>],
+    changed: &[bool],
+    identities: &[super::target_occurrences::OccurrenceIdentity],
 ) -> Option<usize> {
-    for (i, (binding, submitted)) in bindings.iter().zip(new_targets.iter()).enumerate() {
-        // CR 115.7d's unchanged-position exemption, preserved word for word,
-        // including its existing rationale about INDEXING `current_targets`
-        // rather than zipping it.
-        if current_targets.get(i) == Some(submitted) {
-            continue;
+    for (i, binding) in bindings.iter().enumerate().take(picks.len()) {
+        let is_changed = changed.get(i).copied().unwrap_or(false);
+        if is_changed {
+            // INVARIANT SC: the one computation's stored value, read. CR
+            // 115.7d's unchanged-position exemption is the shared verdict.
+            let pool = slot_pools.get(i).map_or(legal_new_targets, Vec::as_slice);
+            let Some(Some(submitted)) = picks.get(i) else {
+                return Some(i);
+            };
+            if !pool.contains(submitted) {
+                return Some(i);
+            }
         }
-        // INVARIANT SC: the one computation's stored value, read.
-        let pool = slot_pools.get(i).map_or(legal_new_targets, Vec::as_slice);
-        if !pool.contains(submitted) {
-            return Some(i);
-        }
-        // CR 115.3: two positions sharing a `run` are ONE instance of "target".
+        // CR 115.3: two positions sharing a `run` are ONE instance of "target"
+        // and may not name the same object. A pair of two UNCHANGED positions
+        // is pre-existing state, not a choice made now (CR 115.7d), so only a
+        // pair with at least one changed position is checked; identity is
+        // incarnation-aware (CR 400.7), so a retained departed object and an
+        // elected returned one are different objects.
         if let Some(run) = binding.run {
-            if bindings
-                .iter()
-                .zip(new_targets)
-                .take(i)
-                .any(|(b, other)| b.run == Some(run) && other == submitted)
-            {
+            let duplicate = bindings.iter().enumerate().take(i).any(|(j, other)| {
+                other.run == Some(run)
+                    && (is_changed || changed.get(j).copied().unwrap_or(false))
+                    && identities
+                        .get(i)
+                        .zip(identities.get(j))
+                        .is_some_and(|(a, b)| a.same_object(b))
+            });
+            if duplicate {
                 return Some(i);
             }
         }
@@ -13653,6 +13612,33 @@ mod tests {
     /// binding's `run` is the only field it reads besides pool membership. A
     /// `Legacy` placeholder enforcement is fine everywhere below — the value is
     /// never consulted.
+    /// The old (current, submitted) form of a whole-vector retarget submission,
+    /// through the positional `retarget_slot_violation`: every position is a
+    /// `Some` pick, changed when it differs from the current target.
+    fn slot_violation_of(
+        bindings: &[RetargetSlotBinding],
+        slot_pools: &[Vec<TargetRef>],
+        current: &[TargetRef],
+        submitted: &[TargetRef],
+    ) -> Option<usize> {
+        let picks: Vec<Option<TargetRef>> = submitted.iter().cloned().map(Some).collect();
+        let changed: Vec<bool> = current
+            .iter()
+            .zip(submitted)
+            .map(|(current, submitted)| current != submitted)
+            .collect();
+        let identities: Vec<super::super::target_occurrences::OccurrenceIdentity> = submitted
+            .iter()
+            .map(
+                |target| super::super::target_occurrences::OccurrenceIdentity {
+                    target: target.clone(),
+                    pin: None,
+                },
+            )
+            .collect();
+        retarget_slot_violation(bindings, slot_pools, &[], &picks, &changed, &identities)
+    }
+
     fn plain_binding(slot: usize) -> RetargetSlotBinding {
         RetargetSlotBinding {
             address: RetargetSlotAddress { path: vec![], slot },
@@ -13699,10 +13685,9 @@ mod tests {
         // genuinely CHANGE against the current targets passed here, so this case
         // proves legality rather than the CR 115.7d unchanged-position exemption.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -13710,7 +13695,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(0)),
                     TargetRef::Player(PlayerId(1)),
-                ],
+                ]
             ),
             None,
             "P0 is a legal recipient and P1 a legal count source"
@@ -13721,10 +13706,9 @@ mod tests {
         // genuinely changes (P1 -> P0) against the current targets, so the
         // exemption does not apply and the violation must be reported.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(1)),
@@ -13732,7 +13716,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
-                ],
+                ]
             ),
             Some(1),
             "CR 115.7a: P0 is not an opponent, so it is illegal in slot 1's OWN pool \
@@ -13776,10 +13760,9 @@ mod tests {
         // reported. Without this, the exemption assertion below could pass in a
         // world where this authority stopped rejecting anything at all.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(1)),
@@ -13787,7 +13770,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
-                ],
+                ]
             ),
             Some(1),
             "reach guard: a CHANGED slot-illegal submission is still a violation"
@@ -13797,10 +13780,9 @@ mod tests {
         // count-source slot — but the submission leaves it unchanged, so there
         // is no violation to report.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -13808,7 +13790,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
-                ],
+                ]
             ),
             None,
             "CR 115.7d: an unchanged position is exempt from slot legality even \
@@ -13870,10 +13852,9 @@ mod tests {
         // both sides, proving legality rather than the CR 115.7d
         // unchanged-position exemption.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -13881,7 +13862,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(0)),
                     TargetRef::Player(PlayerId(1)),
-                ],
+                ]
             ),
             None,
             "P0 is a legal player_a and P1 a legal (opponent) player_b"
@@ -13892,10 +13873,9 @@ mod tests {
         // in. Slot 1 genuinely changes (P1 -> P0), so the unchanged-position
         // exemption does not apply.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(1)),
@@ -13903,7 +13883,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
-                ],
+                ]
             ),
             Some(1),
             "BASE: None (mana_multi_role(..)? bails unconditionally) — CR 115.7d: P0 is \
@@ -13915,10 +13895,9 @@ mod tests {
         // generalised arm): every position unchanged must remain exempt, even
         // though P0 is illegal in slot 1.
         assert_eq!(
-            retarget_slot_violation(
+            slot_violation_of(
                 &bindings,
                 &slot_pools,
-                &[],
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
@@ -13926,7 +13905,7 @@ mod tests {
                 &[
                     TargetRef::Player(PlayerId(1)),
                     TargetRef::Player(PlayerId(0)),
-                ],
+                ]
             ),
             None,
             "CR 115.7d: an unchanged position is exempt even though P0 is illegal in \
@@ -13951,12 +13930,11 @@ mod tests {
             .next()
             .is_none());
         assert_eq!(
-            retarget_slot_violation(
-                &[],
+            slot_violation_of(
                 &[],
                 &[],
                 &[TargetRef::Player(PlayerId(0))],
-                &[TargetRef::Player(PlayerId(1))],
+                &[TargetRef::Player(PlayerId(1))]
             ),
             None,
             "a zero-claim paired node (both filters context refs) must reproduce BASE's \

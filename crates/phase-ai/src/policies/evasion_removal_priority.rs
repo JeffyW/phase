@@ -1119,11 +1119,16 @@ mod tests {
                 target_slots: vec![CopyTargetSlot {
                     current: Some(TargetRef::Object(low)),
                     legal_alternatives: vec![TargetRef::Object(high)],
+                    address: None,
+                    can_keep: true,
                 }],
                 effect_kind: EffectKind::Destroy,
                 effect_source_id: None,
                 current_slot: 0,
                 paradigm_remaining_offers: None,
+                mode: None,
+                picks: None,
+                can_keep_rest: true,
             },
             candidates: vec![candidate_for(high)],
         };

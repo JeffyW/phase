@@ -3,12 +3,11 @@ use crate::types::ability::{
 };
 use crate::types::card::LayoutKind;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{CopyTargetSlot, GameState, WaitingFor};
+use crate::types::game_state::{CopyChoiceMode, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
-use crate::game::ability_utils::build_target_slots;
 use crate::game::casting;
 use crate::game::engine::{PriorityAnnouncementFacadeAccess, PriorityPrincipal};
 use crate::game::game_object::PreparedState;
@@ -223,45 +222,44 @@ pub(crate) fn open_copy_target_selection(
     controller: PlayerId,
     paradigm_remaining_offers: Option<Vec<ObjectId>>,
 ) -> Result<bool, String> {
-    // Snapshot the ability from the stack entry we just pushed so we can
-    // compute slots without holding a mutable borrow across `build_target_slots`.
-    let resolved = {
-        let Some(entry) = state.stack.iter().find(|e| e.id == copy_id) else {
-            return Err(format!("copy stack entry {copy_id:?} not found"));
-        };
-        let Some(ability) = entry.ability() else {
-            return Ok(false);
-        };
-        ability.clone()
-    };
-
-    let slots = build_target_slots(state, &resolved).map_err(|e| format!("{e:?}"))?;
-    if slots.is_empty() {
-        return Ok(false);
+    if !state.stack.iter().any(|e| e.id == copy_id) {
+        return Err(format!("copy stack entry {copy_id:?} not found"));
     }
-
     // CR 601.2c / CR 722.3c: This is a cast of a fresh copy, not a copied
-    // already-targeted spell. Do not seed "current" from the first legal
-    // target; that would make battlefield order look like an intentional
-    // target choice. The player must choose the target that completes the cast.
-    let target_slots: Vec<CopyTargetSlot> = slots
-        .iter()
-        .map(|slot| CopyTargetSlot {
-            current: None,
-            legal_alternatives: slot.legal_targets.clone(),
-        })
-        .collect();
-
-    state.waiting_for = WaitingFor::CopyRetarget {
+    // already-targeted spell, so the walk announces (nothing is kept, no
+    // "current" is seeded from battlefield order); every offered target comes
+    // from the production casting walk.
+    let walk = super::copy_choice::CopyWalk {
         player: controller,
         copy_id,
-        target_slots,
         effect_kind: crate::types::ability::EffectKind::CopySpell,
         effect_source_id: Some(copy_id),
-        current_slot: 0,
         paradigm_remaining_offers,
+        mode: CopyChoiceMode::Announce,
     };
-    Ok(true)
+    match super::copy_choice::walk_step(state, &walk, Vec::new()).map_err(|e| format!("{e:?}"))? {
+        Some(super::copy_choice::CopyWalkStep::Prompt(prompt)) => {
+            state.waiting_for = *prompt;
+            Ok(true)
+        }
+        Some(super::copy_choice::CopyWalkStep::Complete(picks)) if picks.is_empty() => Ok(false),
+        Some(super::copy_choice::CopyWalkStep::Complete(picks)) => {
+            // No slot needs a player choice (every slot auto-skipped): apply
+            // the production announcement assignment directly.
+            let post = super::copy_choice::finalized_copy_ability(state, &walk, picks)
+                .map_err(|e| format!("{e:?}"))?;
+            if let Some(ability) = state
+                .stack
+                .iter_mut()
+                .find(|e| e.id == copy_id)
+                .and_then(|entry| entry.ability_mut())
+            {
+                *ability = post;
+            }
+            Ok(false)
+        }
+        None => Ok(false),
+    }
 }
 
 fn cleanup_failed_prepared_copy_cast(state: &mut GameState, copy_id: ObjectId) {

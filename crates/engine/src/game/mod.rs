@@ -161,6 +161,7 @@ pub mod replacement;
 pub mod replay;
 pub(crate) mod resolution_prompt;
 pub mod restrictions;
+pub(crate) mod retarget_completion;
 pub mod room;
 pub(crate) mod sacrifice;
 pub mod sba;

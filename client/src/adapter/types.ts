@@ -2007,7 +2007,21 @@ export type TargetRef =
   | { Object: ObjectId }
   | { Player: PlayerId };
 
-export type CopyTargetSlot = { current?: TargetRef | null; legal_alternatives: TargetRef[] };
+/**
+ * One position of a copy target walk (CR 707.10c / CR 601.2c). `can_keep` is
+ * engine-derived: keeping this position's target (`ChooseTarget` with `null`)
+ * still completes. `address` names the chain position (absent on an
+ * announcement).
+ */
+export type CopyTargetSlot = {
+  current?: TargetRef | null;
+  legal_alternatives: TargetRef[];
+  address?: RetargetSlotAddress | null;
+  can_keep?: boolean;
+};
+
+/** Whether a copy target walk retargets an existing copy or announces a fresh one. */
+export type CopyChoiceMode = "Retarget" | "Announce";
 
 // ── Combat ───────────────────────────────────────────────────────────────
 
@@ -2697,7 +2711,7 @@ export type WaitingFor =
       track_exiled_by_source?: boolean;
     } }
   | { type: "DrawnThisTurnTopdeckChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; min_count: number; life_payment: number; source_id: ObjectId } }
-  | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; slots: RetargetSlotAddress[]; slot_pools: TargetRef[][]; legal_new_targets: TargetRef[] } }
+  | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; slots: RetargetSlotAddress[]; slot_pools: TargetRef[][]; legal_new_targets: TargetRef[]; keep_is_distinct?: boolean[] } }
   | { type: "ProliferateChoice"; data: { player: PlayerId; eligible: TargetRef[] } }
   | { type: "TimeTravelChoice"; data: { player: PlayerId; eligible: TargetRef[]; phase: "Remove" | "Add" } }
   | { type: "AssistChoosePlayer"; data: { player: PlayerId; candidates: PlayerId[]; max_generic: number; convoke_mode?: ConvokeMode } }
@@ -2819,7 +2833,7 @@ export type WaitingFor =
       all_kept: ObjectId[];
       scoped_players: PlayerId[];
     } }
-  | { type: "CopyRetarget"; data: { player: PlayerId; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number } }
+  | { type: "CopyRetarget"; data: { player: PlayerId; copy_id: ObjectId; target_slots: CopyTargetSlot[]; current_slot?: number; mode?: CopyChoiceMode | null; picks?: (TargetRef | null)[] | null; can_keep_rest?: boolean } }
   // CR 700.3 + CR 700.3a: Subject is partitioning their own eligible objects
   // into two piles for an `Effect::SeparateIntoPiles`. `player` is the
   // CR 608.2d + CR 700.3: Controller chooses which opponent separates piles (multiplayer).
@@ -3233,7 +3247,7 @@ export type GameAction =
   | { type: "ChooseRemoveCounterCostDistribution"; data: { distribution: CounterCostChoice[] } }
   | { type: "ChooseCounterMoveDistribution"; data: { selections: CounterMoveChoice[] } }
   | { type: "ChooseCountersToRemove"; data: { selections: CounterRemoveChoice[] } }
-  | { type: "RetargetSpell"; data: { new_targets: TargetRef[] } }
+  | { type: "RetargetSpell"; data: { new_targets: (TargetRef | null)[] } }
   | { type: "LearnDecision"; data: { choice: LearnOption } }
   | { type: "ChooseDungeon"; data: { dungeon: DungeonId } }
   | { type: "ChooseDungeonRoom"; data: { room_index: number } }

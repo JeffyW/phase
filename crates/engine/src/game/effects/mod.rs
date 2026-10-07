@@ -86,6 +86,7 @@ pub mod complete_player_action;
 pub mod conjure;
 pub mod connive;
 pub mod control_next_turn;
+pub(crate) mod copy_choice;
 pub(crate) mod copy_exception;
 pub mod copy_spell;
 pub mod copy_token_blocking;
