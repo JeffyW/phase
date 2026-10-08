@@ -1548,6 +1548,19 @@ fn resolve_source_attached_to(
     state: &GameState,
     source_id: ObjectId,
 ) -> Option<crate::game::game_object::AttachTarget> {
+    // CR 301.5c + CR 301.5f + CR 400.7: a source live on the battlefield answers
+    // only from its current attachment, which may be none. Its history — its own
+    // earlier departure (a blinked Equipment is a new object that returns
+    // unattached) or a departed host's record (Equipment whose host left
+    // "becomes unattached from that permanent but remains on the battlefield",
+    // CR 704.5n) — never names what it's attached to now.
+    if let Some(obj) = state
+        .objects
+        .get(&source_id)
+        .filter(|obj| obj.zone == Zone::Battlefield)
+    {
+        return obj.attached_to;
+    }
     if let Some(host) = state.objects.get(&source_id).and_then(|o| o.attached_to) {
         return Some(host);
     }
@@ -1565,18 +1578,7 @@ fn resolve_source_attached_to(
     // host is the departed object: it stays attached to "the object it was
     // attached to [that] no longer exists" until state-based actions put it into
     // the graveyard (CR 704.5m), and the host's departure record lists it. Only
-    // a source that has itself left the battlefield reads that history. A live
-    // source answers from its current attachment above: Equipment whose host
-    // left "becomes unattached from that permanent but remains on the
-    // battlefield" (CR 301.5c, CR 704.5n), and "equipped creature" is "whatever
-    // creature that permanent is attached to" (CR 301.5f), which is none.
-    if state
-        .objects
-        .get(&source_id)
-        .is_some_and(|obj| obj.zone == Zone::Battlefield)
-    {
-        return None;
-    }
+    // a source that has itself left the battlefield (above) reads that history.
     state
         .zone_changes_this_turn
         .iter()

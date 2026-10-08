@@ -6,10 +6,12 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
+use engine::types::ability::{Effect, PtValue, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::events::{GameEvent, Targeter};
+use engine::types::game_state::{StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::ManaCost;
+use engine::types::mana::{ManaColor, ManaCost};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -381,8 +383,6 @@ fn forsaken_wastes_hits_the_caster_without_commandeer() {
 /// PR and tracked for its own follow-up PR.
 #[test]
 fn interactive_payment_keeps_the_announcement_its_targeting_event_recorded() {
-    use engine::types::ability::TargetRef;
-    use engine::types::events::{GameEvent, Targeter};
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let wastes = scenario
@@ -452,7 +452,6 @@ fn interactive_payment_keeps_the_announcement_its_targeting_event_recorded() {
 /// proves the announcement lifecycle only.
 #[test]
 fn a_cancelled_cast_triggers_nothing_and_its_announcement_is_never_reused() {
-    use engine::types::ability::TargetRef;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let wastes = scenario
@@ -595,7 +594,6 @@ fn royal_decree_damages_the_tapper_of_a_departed_borrowed_mountain() {
 /// the targeter is the triggered ability, still P1's, so P1 sacrifices.
 #[test]
 fn lava_runner_punishes_the_cast_trigger_controller_not_the_new_spell_controller() {
-    use engine::types::ability::TargetRef;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let runner_id = scenario
@@ -672,7 +670,6 @@ enum SourceFate {
 /// optionally steals and/or bounces the Pyromancer. Returns which player lost
 /// a land when Runner's trigger resolved: (P0 lost, P1 lost).
 fn pyromancer_runner_board(theft: Theft, fate: SourceFate) -> (usize, usize) {
-    use engine::types::ability::TargetRef;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let runner_id = scenario
@@ -748,7 +745,6 @@ fn lava_runner_punishes_the_activator_whatever_happens_to_the_source() {
 /// the trigger stays P1's.
 #[test]
 fn lava_runner_punishes_the_trigger_controller_when_the_source_is_stolen() {
-    use engine::types::ability::TargetRef;
     for theft in [Theft::Stolen, Theft::Own] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -961,8 +957,6 @@ fn reality_smasher_asks_the_targeting_spells_current_controller() {
 /// resolves. CR 113.8: the targeter is P1's cast trigger, so P1 sacrifices.
 #[test]
 fn lava_runner_after_a_copied_chimera_exchange_punishes_the_trigger_controller() {
-    use engine::types::ability::TargetRef;
-    use engine::types::game_state::StackEntryKind;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let runner_id = scenario
@@ -1118,7 +1112,6 @@ const FRACTURED_LOYALTY: &str = "Enchant creature\nWhenever enchanted creature b
 /// gains control of the creature either way.
 #[test]
 fn fractured_loyalty_gives_the_creature_to_the_ability_controller() {
-    use engine::types::ability::TargetRef;
     for theft in [Theft::Own, Theft::Stolen] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -1185,7 +1178,6 @@ fn fractured_loyalty_gives_the_creature_to_the_ability_controller() {
 /// P0's trigger taps P0's own Victim, so P0 draws. Synthetic sentinel text.
 #[test]
 fn a_fresh_target_choice_names_its_own_controller_not_the_targeter() {
-    use engine::types::ability::TargetRef;
     const SENTINEL: &str = "Whenever this creature becomes the target of a spell or ability, tap target creature. Its controller draws a card.";
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -1253,8 +1245,6 @@ const EPHEMERATE: &str = "Exile target creature you control, then return it to t
 /// P1, not the returned permanent's controller P0. Control: no blink, P1.
 #[test]
 fn royal_decree_damages_the_tapped_incarnations_controller_after_a_blink() {
-    use engine::types::ability::TargetRef;
-    use engine::types::mana::ManaColor;
     for blink in [true, false] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -1328,7 +1318,6 @@ fn royal_decree_damages_the_tapped_incarnations_controller_after_a_blink() {
 /// positive.
 #[test]
 fn forsaken_wastes_ignores_a_cast_trigger_targeting_it() {
-    use engine::types::ability::TargetRef;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let wastes = scenario
@@ -1394,7 +1383,6 @@ fn forsaken_wastes_ignores_a_cast_trigger_targeting_it() {
 /// creature gets +2/+2. Synthetic Equipment text.
 #[test]
 fn an_unattached_equipment_does_not_pump_its_former_host() {
-    const RALLY_BLADE: &str = "{0}: Equipped creature gets +2/+2 until end of turn.\nEquip {0}";
     for blink in [true, false] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -1419,19 +1407,7 @@ fn an_unattached_equipment_does_not_pump_its_former_host() {
         // The accepted typed shape the finding names: a Pump whose target is
         // `TargetFilter::AttachedTo` (no Oracle wording lowers to it for an
         // Equipment; the parsed "{0}" ability's effect is replaced with it).
-        {
-            use engine::types::ability::{Effect, PtValue, TargetFilter};
-            let pump = Effect::Pump {
-                power: PtValue::Fixed(2),
-                toughness: PtValue::Fixed(2),
-                target: TargetFilter::AttachedTo,
-            };
-            let blade_obj = runner.state_mut().objects.get_mut(&blade).unwrap();
-            // Both the printed base and the derived list, so layer evaluation
-            // keeps the injected shape.
-            *std::sync::Arc::make_mut(&mut blade_obj.base_abilities)[0].effect = pump.clone();
-            *std::sync::Arc::make_mut(&mut blade_obj.abilities)[0].effect = pump;
-        }
+        inject_attached_to_pump(&mut runner, blade);
         if blink {
             runner.cast(ephemerate).target_object(bear).resolve();
             let blade_now = &runner.state().objects[&blade];
@@ -1443,6 +1419,100 @@ fn an_unattached_equipment_does_not_pump_its_former_host() {
                 "reach guard: the Bear returned"
             );
         }
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: blade,
+                ability_index: 0,
+            })
+            .expect("activate the Equipment's ability");
+        while !runner.state().stack.is_empty() {
+            resolve_one_declining(&mut runner);
+        }
+        runner.state_mut().layers_dirty.mark_full();
+        engine::game::layers::evaluate_layers(runner.state_mut());
+        let bear_now = &runner.state().objects[&bear];
+        let expected = if blink { (2, 2) } else { (4, 4) };
+        assert_eq!(
+            (bear_now.power.unwrap_or(0), bear_now.toughness.unwrap_or(0)),
+            expected,
+            "blink={blink}"
+        );
+    }
+}
+
+const RALLY_BLADE: &str = "{0}: Equipped creature gets +2/+2 until end of turn.\nEquip {0}";
+const FLICKER: &str =
+    "Exile target nontoken permanent, then return it to the battlefield under its owner's control.";
+
+/// Replace the Equipment's first ability's effect with the accepted typed
+/// `Pump { target: AttachedTo }`, in both the printed base and the derived
+/// list so layer evaluation keeps it.
+fn inject_attached_to_pump(runner: &mut GameRunner, blade: ObjectId) {
+    let pump = Effect::Pump {
+        power: PtValue::Fixed(2),
+        toughness: PtValue::Fixed(2),
+        target: TargetFilter::AttachedTo,
+    };
+    let blade_obj = runner.state_mut().objects.get_mut(&blade).unwrap();
+    *std::sync::Arc::make_mut(&mut blade_obj.base_abilities)[0].effect = pump.clone();
+    *std::sync::Arc::make_mut(&mut blade_obj.abilities)[0].effect = pump;
+}
+
+/// Pre-push review R1. CR 400.7 + CR 301.5c + CR 301.5f: Flicker on an attached
+/// Equipment returns it as a new object, unattached; "equipped creature" is
+/// whatever it is attached to now — nothing — so its own departure record
+/// (which kept the Bear) must not answer, and the Bear stays 2/2. Control: no
+/// blink, 4/4. Synthetic Equipment text; Flicker is verbatim.
+#[test]
+fn a_blinked_equipment_does_not_pump_its_former_host() {
+    for blink in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+        let blade = scenario
+            .add_artifact_from_oracle(P0, "Synthetic Rally Blade", RALLY_BLADE)
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let flicker = scenario
+            .add_spell_to_hand_from_oracle(P0, "Flicker", false, FLICKER)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.objects.get_mut(&blade).unwrap().attached_to = Some(bear.into());
+            state
+                .objects
+                .get_mut(&bear)
+                .unwrap()
+                .attachments
+                .push(blade);
+            state.layers_dirty.mark_full();
+        }
+        let incarnation_before = runner.state().objects[&blade].incarnation;
+        if blink {
+            runner.cast(flicker).target_object(blade).resolve();
+            let blade_now = &runner.state().objects[&blade];
+            assert_eq!(
+                blade_now.zone,
+                Zone::Battlefield,
+                "reach guard: it returned"
+            );
+            assert_ne!(
+                blade_now.incarnation, incarnation_before,
+                "reach guard: a new object"
+            );
+            assert_eq!(blade_now.attached_to, None, "it returns unattached");
+            assert!(
+                runner.state().zone_changes_this_turn.iter().any(|r| {
+                    r.object_id == blade
+                        && r.from_zone == Some(Zone::Battlefield)
+                        && r.attached_to == Some(bear.into())
+                }),
+                "reach guard: its departure record kept the former attachment"
+            );
+        }
+        inject_attached_to_pump(&mut runner, blade);
         runner
             .act(GameAction::ActivateAbility {
                 source_id: blade,
