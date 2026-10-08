@@ -29599,7 +29599,147 @@ impl GameState {
                     incarnation: Some(incarnation),
                     ..
                 } => Some((*object_id, incarnation)),
-                _ => None,
+                // Exhaustive on purpose: a new event that names an incarnation must
+                // decide here whether loop normalization renumbers it.
+                GameEvent::PermanentTapped {
+                    incarnation: None, ..
+                }
+                | GameEvent::GameStarted
+                | GameEvent::HiddenSearchViewed { .. }
+                | GameEvent::TurnStarted { .. }
+                | GameEvent::ExtraTurnCreated { .. }
+                | GameEvent::PhaseChanged { .. }
+                | GameEvent::PriorityPassed { .. }
+                | GameEvent::SpellCast { .. }
+                | GameEvent::Mutated { .. }
+                | GameEvent::Augmented { .. }
+                | GameEvent::Melded { .. }
+                | GameEvent::SpellCopied { .. }
+                | GameEvent::XValueChosen { .. }
+                | GameEvent::AbilityActivated { .. }
+                | GameEvent::LifeChanged { .. }
+                | GameEvent::ManaAdded { .. }
+                | GameEvent::TappedForMana { .. }
+                | GameEvent::ManaAbilityProduced { .. }
+                | GameEvent::ManaPoolEmptied { .. }
+                | GameEvent::ManaBurn { .. }
+                | GameEvent::ManaRecolored { .. }
+                | GameEvent::CreatureExerted { .. }
+                | GameEvent::CreatureEnlisted { .. }
+                | GameEvent::ArmyAmassed { .. }
+                | GameEvent::Foretold { .. }
+                | GameEvent::BecameForetold { .. }
+                | GameEvent::PlayerLost { .. }
+                | GameEvent::MulliganStarted
+                | GameEvent::CardsDrawn { .. }
+                | GameEvent::CardDrawn { .. }
+                | GameEvent::PermanentUntapped { .. }
+                | GameEvent::PermanentPhasedOut { .. }
+                | GameEvent::PermanentPhasedIn { .. }
+                | GameEvent::PlayerPhasedOut { .. }
+                | GameEvent::PlayerPhasedIn { .. }
+                | GameEvent::LandPlayed { .. }
+                | GameEvent::StackPushed { .. }
+                | GameEvent::StackResolved { .. }
+                | GameEvent::Discarded { .. }
+                | GameEvent::Milled { .. }
+                | GameEvent::DamageCleared { .. }
+                | GameEvent::GameOver { .. }
+                | GameEvent::ResolutionHalted { .. }
+                | GameEvent::DamageDealt { .. }
+                | GameEvent::DamagePrevented { .. }
+                | GameEvent::SpellCountered { .. }
+                | GameEvent::CounterAdded { .. }
+                | GameEvent::SagaChapterAbilityResolved { .. }
+                | GameEvent::ObjectIntensified { .. }
+                | GameEvent::Evolved { .. }
+                | GameEvent::CounterRemoved { .. }
+                | GameEvent::TokenCreated { .. }
+                | GameEvent::ObjectConjured { .. }
+                | GameEvent::CreatureDestroyed { .. }
+                | GameEvent::PermanentSacrificed { .. }
+                | GameEvent::ControllerChanged { .. }
+                | GameEvent::EffectResolved { .. }
+                | GameEvent::Unattached { .. }
+                | GameEvent::ContinuousEffectEnded { .. }
+                | GameEvent::AttackersDeclared { .. }
+                | GameEvent::BlockersDeclared { .. }
+                | GameEvent::AttackerBecameBlockedByEffect { .. }
+                | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
+                | GameEvent::CombatTaxPaid { .. }
+                | GameEvent::CombatTaxDeclined { .. }
+                | GameEvent::BecomesTarget { .. }
+                | GameEvent::VehicleCrewed { .. }
+                | GameEvent::Stationed { .. }
+                | GameEvent::Saddled { .. }
+                | GameEvent::ReplacementApplied { .. }
+                | GameEvent::Transformed { .. }
+                | GameEvent::Flipped { .. }
+                | GameEvent::Specialized { .. }
+                | GameEvent::DayNightChanged { .. }
+                | GameEvent::TurnedFaceUp { .. }
+                | GameEvent::TurnedFaceDown { .. }
+                | GameEvent::CardsRevealed { .. }
+                | GameEvent::ChosenNumbersRevealed { .. }
+                | GameEvent::CombatDamageDealtToPlayer { .. }
+                | GameEvent::PlayerEliminated { .. }
+                | GameEvent::CrimeCommitted { .. }
+                | GameEvent::Cycled { .. }
+                | GameEvent::PlayerPerformedAction { .. }
+                | GameEvent::CardPredicateGuessMade { .. }
+                | GameEvent::Regenerated { .. }
+                | GameEvent::CreatureSuspected { .. }
+                | GameEvent::CreatureNoLongerSuspected { .. }
+                | GameEvent::Detained { .. }
+                | GameEvent::BecamePrepared { .. }
+                | GameEvent::BecameUnprepared { .. }
+                | GameEvent::CaseSolved { .. }
+                | GameEvent::ClassLevelGained { .. }
+                | GameEvent::MonarchChanged { .. }
+                | GameEvent::CityBlessingGained { .. }
+                | GameEvent::EnduringStoryGained { .. }
+                | GameEvent::DieRolled { .. }
+                | GameEvent::DieRollIgnored { .. }
+                | GameEvent::StartingPlayerContest { .. }
+                | GameEvent::CoinFlipped { .. }
+                | GameEvent::RingTemptsYou { .. }
+                | GameEvent::RoomEntered { .. }
+                | GameEvent::RoomDoorUnlocked { .. }
+                | GameEvent::BecomesPlotted { .. }
+                | GameEvent::DungeonCompleted { .. }
+                | GameEvent::Planeswalked { .. }
+                | GameEvent::ChaosEnsued { .. }
+                | GameEvent::PlanarDieRolled { .. }
+                | GameEvent::SchemeSetInMotion { .. }
+                | GameEvent::SchemeAbandoned { .. }
+                | GameEvent::InitiativeTaken { .. }
+                | GameEvent::AttractionOpened { .. }
+                | GameEvent::ContraptionAssembled { .. }
+                | GameEvent::StickerPlaced { .. }
+                | GameEvent::AttractionsRolledToVisit { .. }
+                | GameEvent::AttractionVisited { .. }
+                | GameEvent::ContraptionCranked { .. }
+                | GameEvent::Firebend { .. }
+                | GameEvent::Airbend { .. }
+                | GameEvent::Earthbend { .. }
+                | GameEvent::Waterbend { .. }
+                | GameEvent::CompanionRevealed { .. }
+                | GameEvent::CompanionMovedToHand { .. }
+                | GameEvent::NinjutsuActivated { .. }
+                | GameEvent::KeywordAbilityActivated { .. }
+                | GameEvent::CreatureExploited { .. }
+                | GameEvent::EnergyChanged { .. }
+                | GameEvent::SpeedChanged { .. }
+                | GameEvent::PlayerCounterChanged { .. }
+                | GameEvent::ManaExpended { .. }
+                | GameEvent::Clash { .. }
+                | GameEvent::VoteCast { .. }
+                | GameEvent::VoteResolved { .. }
+                | GameEvent::PowerToughnessChanged { .. }
+                | GameEvent::CascadeMissed { .. }
+                | GameEvent::DebugActionUsed { .. }
+                | GameEvent::DebugPermissionGranted { .. }
+                | GameEvent::DebugPermissionRevoked { .. } => None,
             }
         }
         let mut present: std::collections::HashMap<ObjectId, Vec<u64>> =
@@ -38542,12 +38682,10 @@ mod tests {
     /// whose snapshot records its last controller. Two positions that differ
     /// only in how incarnations were allocated (3 vs 91, renumbered
     /// consistently in the event and the LKI key) are the same position.
-    /// Controls: a different departed controller, or an event that names the
-    /// live incarnation instead (no departed snapshot), stay unequal.
+    /// Controls: a different departed controller, or an event that names an
+    /// incarnation with no retained snapshot (the snapshot is for another), stay unequal.
     #[test]
     fn normalize_for_loop_canonicalizes_a_tapped_incarnation() {
-        use crate::types::ability::Effect;
-
         fn snapshot(controller: PlayerId) -> LKISnapshot {
             LKISnapshot {
                 name: "Prodigal Pyromancer".to_string(),
@@ -38631,13 +38769,10 @@ mod tests {
             ),
             "a different departed controller is a different position"
         );
-        let names_live = position(92, Some((91, PlayerId(1))));
+        let unmatched = position(92, Some((91, PlayerId(1))));
         assert!(
-            !loop_states_equal(
-                &early.normalize_for_loop(),
-                &names_live.normalize_for_loop()
-            ),
-            "an event naming the live incarnation is a different position"
+            !loop_states_equal(&early.normalize_for_loop(), &unmatched.normalize_for_loop()),
+            "an event naming an incarnation with no retained snapshot is a different position"
         );
     }
 
