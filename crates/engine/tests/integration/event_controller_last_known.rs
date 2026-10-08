@@ -1385,3 +1385,81 @@ fn forsaken_wastes_ignores_a_cast_trigger_targeting_it() {
     );
     assert_eq!(life(&runner, P1), p1, "P1 loses no life");
 }
+
+/// Maintainer round 3, finding 7. CR 301.5c + CR 301.5f + CR 704.5n: when an
+/// equipped creature is blinked, the Equipment becomes unattached and stays on
+/// the battlefield; "equipped creature" is whatever it is attached to now,
+/// which is nothing, so its "equipped creature gets +2/+2" ability does nothing
+/// to the returned creature (a new object, CR 400.7). Control: no blink, the
+/// creature gets +2/+2. Synthetic Equipment text.
+#[test]
+fn an_unattached_equipment_does_not_pump_its_former_host() {
+    const RALLY_BLADE: &str = "{0}: Equipped creature gets +2/+2 until end of turn.\nEquip {0}";
+    for blink in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+        let blade = scenario
+            .add_artifact_from_oracle(P0, "Synthetic Rally Blade", RALLY_BLADE)
+            .with_subtypes(vec!["Equipment"])
+            .id();
+        let ephemerate = free_spell(&mut scenario, P0, "Ephemerate", EPHEMERATE);
+        let mut runner = scenario.build();
+        {
+            let state = runner.state_mut();
+            state.objects.get_mut(&blade).unwrap().attached_to = Some(bear.into());
+            state
+                .objects
+                .get_mut(&bear)
+                .unwrap()
+                .attachments
+                .push(blade);
+            state.layers_dirty.mark_full();
+        }
+        // The accepted typed shape the finding names: a Pump whose target is
+        // `TargetFilter::AttachedTo` (no Oracle wording lowers to it for an
+        // Equipment; the parsed "{0}" ability's effect is replaced with it).
+        {
+            use engine::types::ability::{Effect, PtValue, TargetFilter};
+            let pump = Effect::Pump {
+                power: PtValue::Fixed(2),
+                toughness: PtValue::Fixed(2),
+                target: TargetFilter::AttachedTo,
+            };
+            let blade_obj = runner.state_mut().objects.get_mut(&blade).unwrap();
+            // Both the printed base and the derived list, so layer evaluation
+            // keeps the injected shape.
+            *std::sync::Arc::make_mut(&mut blade_obj.base_abilities)[0].effect = pump.clone();
+            *std::sync::Arc::make_mut(&mut blade_obj.abilities)[0].effect = pump;
+        }
+        if blink {
+            runner.cast(ephemerate).target_object(bear).resolve();
+            let blade_now = &runner.state().objects[&blade];
+            assert_eq!(blade_now.zone, Zone::Battlefield, "the Equipment stays");
+            assert_eq!(blade_now.attached_to, None, "and is unattached");
+            assert_eq!(
+                runner.state().objects[&bear].zone,
+                Zone::Battlefield,
+                "reach guard: the Bear returned"
+            );
+        }
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: blade,
+                ability_index: 0,
+            })
+            .expect("activate the Equipment's ability");
+        while !runner.state().stack.is_empty() {
+            resolve_one_declining(&mut runner);
+        }
+        runner.state_mut().layers_dirty.mark_full();
+        engine::game::layers::evaluate_layers(runner.state_mut());
+        let bear_now = &runner.state().objects[&bear];
+        let expected = if blink { (2, 2) } else { (4, 4) };
+        assert_eq!(
+            (bear_now.power.unwrap_or(0), bear_now.toughness.unwrap_or(0)),
+            expected,
+            "blink={blink}"
+        );
+    }
+}

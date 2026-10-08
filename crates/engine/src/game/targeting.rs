@@ -1561,32 +1561,31 @@ fn resolve_source_attached_to(
     {
         return Some(host);
     }
-    // CR 303.4c + CR 608.2h: when the host left first, the attachment's
-    // last-known host is the departed object: an Aura stays attached to "the
-    // object it was attached to [that] no longer exists" until state-based
-    // actions put it into the graveyard (CR 704.5m), while Equipment becomes
-    // unattached and stays on the battlefield (CR 704.5n). Either way the
-    // host's departure record lists its attachments. A same-id
-    // source that is again on the battlefield at a different incarnation is a
-    // new object (CR 400.7) and never inherits that host.
-    let live_source = state
+    // CR 303.4c + CR 608.2h: when the host left first, the Aura's last-known
+    // host is the departed object: it stays attached to "the object it was
+    // attached to [that] no longer exists" until state-based actions put it into
+    // the graveyard (CR 704.5m), and the host's departure record lists it. Only
+    // a source that has itself left the battlefield reads that history. A live
+    // source answers from its current attachment above: Equipment whose host
+    // left "becomes unattached from that permanent but remains on the
+    // battlefield" (CR 301.5c, CR 704.5n), and "equipped creature" is "whatever
+    // creature that permanent is attached to" (CR 301.5f), which is none.
+    if state
         .objects
         .get(&source_id)
-        .filter(|obj| obj.zone == Zone::Battlefield);
+        .is_some_and(|obj| obj.zone == Zone::Battlefield)
+    {
+        return None;
+    }
     state
         .zone_changes_this_turn
         .iter()
         .rev()
         .filter(|r| r.from_zone == Some(Zone::Battlefield))
         .find(|r| {
-            r.attachments.iter().any(|snapshot| {
-                snapshot.object_id == source_id
-                    && live_source.is_none_or(|obj| {
-                        snapshot
-                            .identity
-                            .is_some_and(|identity| identity.incarnation == obj.incarnation)
-                    })
-            })
+            r.attachments
+                .iter()
+                .any(|snapshot| snapshot.object_id == source_id)
         })
         .map(|r| crate::game::game_object::AttachTarget::Object(r.object_id))
 }
