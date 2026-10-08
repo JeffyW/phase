@@ -140,3 +140,78 @@ fn thunderblade_charge_triggers_from_the_graveyard_per_damaged_player() {
         0
     );
 }
+
+const SEVENTEEN_YEAR_CICADAS: &str = "Create ten 1/1 white Insect creature tokens with flying. Exile 17-Year Cicadas with seventeen time counters on it.\nSuspend 17\u{2014}{0} (Rather than cast this card from your hand, you may pay {0} and exile it with seventeen time counters on it. At the beginning of your upkeep, remove a time counter. When the last is removed, you may cast it without paying its mana cost.)\nWhenever you cast a spell, if this card is suspended, remove a time counter from it.";
+
+#[derive(Debug, Clone, Copy)]
+enum CicadasState {
+    /// In exile with time counters: suspended (CR 702.62b).
+    Suspended,
+    /// In exile without time counters: not suspended.
+    ExiledWithoutCounters,
+}
+
+/// Returns (time counters before, time counters after, cards P0 drew from the
+/// cast spell) after P0 casts a free "Draw a card." with Cicadas in `state`.
+fn cicadas_after_a_cast(state: CicadasState) -> (u32, u32, usize) {
+    use engine::types::counter::CounterType;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Drawn Card"]);
+    let cicadas = scenario
+        .add_spell_to_exile(P0, "17-Year Cicadas", false)
+        .from_oracle_text_with_keywords(&["Suspend"], SEVENTEEN_YEAR_CICADAS)
+        .id();
+    if let CicadasState::Suspended = state {
+        scenario.with_counter(cicadas, CounterType::Time, 5);
+    }
+    let draw = scenario
+        .add_spell_to_hand_from_oracle(P0, "Draw Spell", true, "Draw a card.")
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let time = |r: &GameRunner| {
+        r.state().objects[&cicadas]
+            .counters
+            .get(&CounterType::Time)
+            .copied()
+            .unwrap_or(0)
+    };
+    let before = time(&runner);
+    let library = runner.state().players[0].library.len();
+    runner.cast(draw).resolve();
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => break,
+        }
+    }
+    let drew = library - runner.state().players[0].library.len();
+    (before, time(&runner), drew)
+}
+
+/// CR 702.62b + CR 603.4 + CR 113.6: 17-Year Cicadas' standalone printed
+/// "Whenever you cast a spell, if this card is suspended, remove a time counter
+/// from it." functions from exile, through the whole-line dispatch (the full
+/// card text). Suspended with 5 time counters: casting a spell leaves 4.
+/// Control: in exile with no time counters it isn't suspended and nothing
+/// happens, while the cast spell still resolved.
+#[test]
+fn seventeen_year_cicadas_loses_a_time_counter_when_its_owner_casts_a_spell() {
+    let (before, after, drew) = cicadas_after_a_cast(CicadasState::Suspended);
+    assert_eq!(drew, 1, "reach guard: the cast spell resolved");
+    assert_eq!(
+        (before, after),
+        (5, 4),
+        "suspended: one time counter removed"
+    );
+
+    let (before, after, drew) = cicadas_after_a_cast(CicadasState::ExiledWithoutCounters);
+    assert_eq!(drew, 1, "reach guard: the cast spell resolved");
+    assert_eq!((before, after), (0, 0), "not suspended: no trigger");
+}
