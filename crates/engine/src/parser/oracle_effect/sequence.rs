@@ -1280,10 +1280,11 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
     // card ...") and the lead-in is severed into a failing `Unimplemented{face}`.
     let mut villainous_choice_sticky = false;
     // CR 603.7b + CR 608.2c: once a chunk opens an inline delayed trigger
-    // ("Whenever … this turn, …" / "Until …, whenever …, …"), the following
-    // sentences are that trigger's effect (The Last Ronin III: "…, put three
-    // +1/+1 counters on it. It gains trample, lifelink, and indestructible
-    // until end of turn."), so they stay in its chunk and reach the delayed
+    // ("Whenever … this turn, …" / "Until …, whenever …, …"), a following
+    // sentence whose subject is an anaphor for the trigger's referent is part
+    // of that trigger's effect (The Last Ronin III: "…, put three +1/+1
+    // counters on it. It gains trample, lifelink, and indestructible until end
+    // of turn."), so it stays in the trigger's chunk and reaches the delayed
     // parser with its anaphors bound. See `continues_inline_delayed_body`.
     let mut inline_delayed_sticky = false;
 
@@ -2483,27 +2484,30 @@ fn opens_inline_delayed_trigger(chunk_lower: &str) -> bool {
 }
 
 /// CR 608.2c: does the next sentence continue an open inline delayed trigger's
-/// effect? Every sentence does except one that opens another trigger ("When …",
-/// "Whenever …", "At …" — Acidic Dagger's second delayed trigger), restricts
-/// the enclosing activated ability ("Activate only …" — Zombie Boa), or
-/// carries its own delayed timing ("Sacrifice them at the beginning of the next
-/// end step." — Dalkovan Encampment). That last kind is a delayed installer of
-/// its own; the delayed-payload continuation classifier
-/// (`resolve_delayed_payload_placements`) decides whether it nests.
+/// effect at the TEXT level? Only when its subject is an anaphor for the
+/// trigger's own referent — "It gains trample …" (The Last Ronin III: the
+/// creature attacking alone), "If they can't, they sacrifice …" (Davriel: the
+/// attacking opponent). Read outside the trigger, that anaphor would bind the
+/// ability's source instead. Every other following sentence ("Draw a card.",
+/// "You may play it …", "Sacrifice them at the beginning of the next end
+/// step.") stays its own chunk and is placed by the delayed-payload
+/// continuation classifier (`resolve_delayed_payload_placements`), which nests
+/// it only when the payload introduced what it refers to.
 fn continues_inline_delayed_body(remainder_lower: &str) -> bool {
     let next_sentence = take_until::<_, _, OracleError<'_>>(".")
         .parse(remainder_lower)
         .map_or(remainder_lower, |(_, sentence)| sentence);
-    !remainder_lower.is_empty()
-        && alt((
-            tag::<_, _, OracleError<'_>>("when "),
-            tag("whenever "),
-            tag("at "),
-            tag("activate "),
-            tag("this ability "),
-        ))
-        .parse(remainder_lower)
-        .is_err()
+    let opens_with_subject_anaphor = alt((
+        tag::<_, _, OracleError<'_>>("it "),
+        tag("they "),
+        tag("he "),
+        tag("she "),
+        tag("if it "),
+        tag("if they "),
+    ))
+    .parse(remainder_lower)
+    .is_ok();
+    opens_with_subject_anaphor
         && !nom_primitives::scan_contains(next_sentence, "at the beginning of ")
         && !nom_primitives::scan_contains(next_sentence, "at end of combat")
 }
@@ -10019,6 +10023,10 @@ mod tests {
         assert_eq!(split_clause_sequence(boa).len(), 3, "{boa}");
         let dalkovan = "Whenever you attack this turn, create two 1/1 red Warrior creature tokens that are tapped and attacking. Sacrifice them at the beginning of the next end step.";
         assert_eq!(split_clause_sequence(dalkovan).len(), 2, "{dalkovan}");
+        let draught = "Until end of turn, whenever a creature an opponent controls blocks, draw a card. Draw a card.";
+        assert_eq!(split_clause_sequence(draught).len(), 2, "{draught}");
+        let waltz = "Until end of turn, whenever a creature you control dies, exile the top card of your library. You may play it until the end of your next turn.";
+        assert_eq!(split_clause_sequence(waltz).len(), 2, "{waltz}");
         let plain = "Draw a card. It gains flying until end of turn.";
         assert_eq!(split_clause_sequence(plain).len(), 2, "{plain}");
     }
