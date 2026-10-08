@@ -9957,7 +9957,7 @@ fn parse_that_is_core_type_suffix(text: &str) -> Option<(Vec<TypeFilter>, usize)
 /// Creature core type. Returns the bytes consumed (including leading whitespace).
 /// Returns `None` unless the clause names at least one recognized subtype, so
 /// color/supertype "that's …" relative clauses are left to their own parsers.
-fn parse_that_is_subtype_suffix(text: &str) -> Option<(TypeFilter, usize)> {
+pub(crate) fn parse_that_is_subtype_suffix(text: &str) -> Option<(TypeFilter, usize)> {
     let trimmed = text.trim_start();
     let leading_ws = text.len() - trimmed.len();
 
