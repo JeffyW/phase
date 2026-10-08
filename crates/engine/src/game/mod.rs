@@ -183,6 +183,7 @@ pub mod stickers;
 mod stickers_tests;
 pub mod target_occurrences;
 pub mod targeting;
+pub mod text_substitution;
 pub mod token_presets;
 pub mod topology;
 pub mod transform;
