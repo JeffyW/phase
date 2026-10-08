@@ -1682,3 +1682,172 @@ fn garruk_narrows_to_the_creature_attacking_an_opponent() {
         .keywords
         .contains(&engine::types::keywords::Keyword::Trample));
 }
+
+/// CR 605.3a + CR 605.3b + CR 608.2c: a mana ability activated to pay a cost
+/// mid-resolution resolves inline and is not a new resolution, so the outer
+/// "that color" survives it, even when the mana ability has a non-mana
+/// clause of its own. Synthetic Boa-shaped text; the {1} is paid by tapping a
+/// "{T}: Add {C}. You gain 1 life." artifact. Control: the same board with the
+/// cost paid from a floating {C}.
+#[test]
+fn boa_color_survives_an_inline_mana_ability_paying_its_cost() {
+    const TEXT: &str = "{0}: Choose a color. You may pay {1}. Whenever this creature becomes blocked by a creature of that color this turn, destroy that creature.";
+    for floated in [false, true] {
+        let mut scenario = board();
+        let boa = scenario
+            .add_creature_from_oracle(P0, "Synthetic Boa", 3, 3, TEXT)
+            .id();
+        scenario.add_artifact_from_oracle(P0, "Synthetic Prism", "{T}: Add {C}. You gain 1 life.");
+        if floated {
+            scenario.with_mana_pool(
+                P0,
+                vec![engine::types::mana::ManaUnit::new(
+                    engine::types::mana::ManaType::Colorless,
+                    ObjectId(0),
+                    false,
+                    vec![],
+                )],
+            );
+        }
+        let white = scenario
+            .add_creature(P1, "White Blocker", 1, 1)
+            .with_color(vec![ManaColor::White])
+            .id();
+        let red = scenario
+            .add_creature(P1, "Red Blocker", 1, 1)
+            .with_color(vec![ManaColor::Red])
+            .id();
+        let mut runner = scenario.build();
+        let life = runner.life(P0);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: boa,
+                ability_index: 0,
+            })
+            .expect("activate");
+        for _ in 0..32 {
+            match runner.state().waiting_for.clone() {
+                WaitingFor::NamedChoice { .. } => {
+                    runner
+                        .act(GameAction::ChooseOption {
+                            choice: "White".to_string(),
+                        })
+                        .expect("choose White");
+                }
+                WaitingFor::OptionalEffectChoice { .. } => {
+                    runner
+                        .act(GameAction::DecideOptionalEffect { accept: true })
+                        .expect("pay {1}");
+                }
+                WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                    runner.act(GameAction::PassPriority).expect("pass priority");
+                }
+                WaitingFor::Priority { .. } => break,
+                other => panic!("unexpected decision: {other:?}"),
+            }
+        }
+        let label = if floated {
+            "floated {C}"
+        } else {
+            "inline mana ability"
+        };
+        if !floated {
+            assert_eq!(runner.life(P0), life + 1, "reach guard: the Prism paid");
+        }
+        assert_eq!(
+            runner.state().delayed_triggers.len(),
+            1,
+            "[{label}] reach guard: one generator"
+        );
+        attack(&mut runner, &[boa], P1);
+        block(&mut runner, &[(white, boa), (red, boa)]);
+        if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+            drain_order_triggers_with_identity(runner.state_mut());
+        }
+        let firings = runner
+            .state()
+            .stack
+            .iter()
+            .filter(|entry| entry.source_id == boa)
+            .count();
+        assert_eq!(firings, 1, "[{label}] one firing: the white blocker");
+        settle(&mut runner, &[]);
+        assert_eq!(zone(&runner, white), Zone::Graveyard, "[{label}]");
+        assert_eq!(zone(&runner, red), Zone::Battlefield, "[{label}]");
+    }
+}
+
+/// CR 603.2c: two installed Jace +1 generators, P1 and P2 dealt combat
+/// damage → four firings, each resolving to one draw and one discard. Nothing is collected again afterwards (no re-fire through the end
+/// step). The second Jace is a non-legendary copy, as Jace's −5 makes.
+#[test]
+fn two_jace_generators_fire_once_per_damaged_player_each() {
+    let mut scenario = three_player_board();
+    let jace = scenario
+        .add_planeswalker_from_oracle(
+            P0,
+            "Jace, Cunning Castaway",
+            "Jace",
+            3,
+            JACE_CUNNING_CASTAWAY,
+        )
+        .as_legendary()
+        .id();
+    let copy = scenario
+        .add_planeswalker_from_oracle(P0, "Jace Copy", "Jace", 3, JACE_CUNNING_CASTAWAY)
+        .id();
+    let a1 = scenario.add_creature(P0, "Attacker A", 2, 2).id();
+    let a2 = scenario.add_creature(P0, "Attacker B", 2, 2).id();
+    let mut runner = scenario.build();
+    runner.activate(jace, 0).resolve();
+    runner.activate(copy, 0).resolve();
+    assert_eq!(runner.state().delayed_triggers.len(), 2, "reach guard");
+    let library_before = library(&runner, P0);
+    let graveyard = runner.state().players[0].graveyard.len();
+    drive_until(&mut runner, |r| {
+        matches!(r.state().waiting_for, WaitingFor::DeclareAttackers { .. })
+    });
+    runner
+        .declare_attackers(&[
+            (a1, AttackTarget::Player(PlayerId(1))),
+            (a2, AttackTarget::Player(P2)),
+        ])
+        .expect("declare attackers");
+    let fired = loop {
+        let fired = runner
+            .state()
+            .stack
+            .iter()
+            .filter(|entry| entry.source_id == jace || entry.source_id == copy)
+            .count();
+        if fired > 0 {
+            break fired;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::DeclareBlockers { .. } => {
+                runner
+                    .act(GameAction::DeclareBlockers {
+                        assignments: vec![],
+                    })
+                    .expect("no blockers");
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    };
+    assert_eq!(fired, 4, "two generators × two damaged players");
+    resolve_discarding(&mut runner);
+    assert_eq!(library_before - library(&runner, P0), 4, "four draws");
+    assert_eq!(
+        runner.state().players[0].graveyard.len() - graveyard,
+        4,
+        "four discards"
+    );
+    drive_until(&mut runner, |r| r.state().phase == Phase::End);
+    assert_eq!(library_before - library(&runner, P0), 4, "no re-fire");
+}
