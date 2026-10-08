@@ -50,6 +50,7 @@ use engine::types::interaction::{
 use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 pub(crate) const LIGHT_OF_JUDGMENT: &str =
@@ -3494,5 +3495,280 @@ fn you_control_dependent_target_binds_the_caster_not_an_earlier_player_target() 
         );
         assert_eq!(state.objects[&theirs].zone, Zone::Battlefield);
         assert_eq!(state.objects[&a].damage_marked, 5);
+    }
+}
+
+/// CR 109.5: on one board (creature A wears the caster's Equipment Mine and
+/// P1's Equipment Theirs), an earlier "target player" slot, then "target
+/// Equipment <qualifier> attached to that creature". "you control" is the
+/// caster (Mine) whatever player was targeted; "an opponent controls" is
+/// Theirs. Each is offered alone, the other refused, and the chosen Equipment
+/// is exiled. (The anaphoric "that player controls" form fails closed:
+/// `anaphoric_player_qualified_dependent_target_keeps_its_gap`.)
+#[test]
+fn qualified_dependent_target_binds_you_and_an_opponent_per_leg() {
+    let cases: [(&str, &str, PlayerId, bool); 4] = [
+        ("Target player", "you control", P1, true),
+        ("Target player", "you control", P0, true),
+        ("Target player", "an opponent controls", P1, false),
+        ("Target player", "an opponent controls", P0, false),
+    ];
+    for (head, qualifier, player, expect_mine) in cases {
+        let text = format!(
+            "{head} loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier} attached to that creature."
+        );
+        let label = format!("{head} / {qualifier} / {player:?}");
+        let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+        assert!(
+            unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+            "{label}: reach guard, parses supported"
+        );
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+        let mine = equipment(&mut scenario, P0, "Equipment Mine");
+        let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
+        let spell = free_spell(&mut scenario, "Probe", true, &text);
+        let mut runner = scenario.build();
+        attach::attach_to(runner.state_mut(), mine, a);
+        attach::attach_to(runner.state_mut(), theirs, a);
+        runner
+            .act(GameAction::CastSpell {
+                object_id: spell,
+                card_id: runner.state().objects[&spell].card_id,
+                targets: vec![],
+                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+            })
+            .expect("cast begins");
+        let mut slots_seen = 0;
+        for target in [TargetRef::Player(player), TargetRef::Object(a)] {
+            if !matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ) {
+                break;
+            }
+            slots_seen += 1;
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(target),
+                })
+                .unwrap_or_else(|e| panic!("{label}: announce: {e:?}"));
+        }
+        assert_eq!(
+            slots_seen, 2,
+            "{label}: reach: player and creature slots announced"
+        );
+        let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for else {
+            panic!(
+                "{label}: expected the Equipment slot, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        let (offered, refused) = if expect_mine {
+            (mine, theirs)
+        } else {
+            (theirs, mine)
+        };
+        assert_eq!(
+            selection.current_legal_targets,
+            vec![TargetRef::Object(offered)],
+            "{label}: the qualified Equipment alone"
+        );
+        assert!(
+            GameRunner::from_state(runner.state().clone())
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(refused)),
+                })
+                .is_err(),
+            "{label}: the other Equipment is refused"
+        );
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(offered)),
+            })
+            .expect("announce the qualified Equipment");
+        assert!(
+            !matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ),
+            "{label}: no further slot (no duplicate companion player slot)"
+        );
+        runner.advance_until_stack_empty();
+        let state = runner.state();
+        assert_eq!(state.objects[&offered].zone, Zone::Exile, "{label}: exiled");
+        assert_eq!(state.objects[&refused].zone, Zone::Battlefield, "{label}");
+        assert_eq!(state.objects[&a].damage_marked, 5, "{label}");
+    }
+}
+
+/// CR 608.2c + CR 115.10a: "that player controls" / "controlled by that
+/// player" after an earlier player target names that player, which no
+/// controller reference can express without announcing a new player target,
+/// so the clause keeps the strict `attached_to_qualifier` gap and no
+/// declared-slot referent is emitted. The supported "you control", "you own"
+/// and "an opponent controls" phrasings are the controls.
+#[test]
+fn anaphoric_player_qualified_dependent_target_keeps_its_gap() {
+    for (head, qualifier) in [
+        ("Target player", "that player controls"),
+        ("Target opponent", "that player controls"),
+        ("Target player", "controlled by that player"),
+    ] {
+        let text = format!(
+            "{head} loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier} attached to that creature."
+        );
+        let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+        let names = unimplemented_names(&[&parsed.abilities[0]]);
+        assert!(
+            !names.is_empty(),
+            "{head} / {qualifier}: the anaphoric clause fails closed, got {:?}",
+            chain(&parsed.abilities[0])
+        );
+        assert!(
+            !serde_json::to_string(&parsed.abilities[0])
+                .unwrap()
+                .contains("DeclaredTarget"),
+            "{head} / {qualifier}: no declared-slot referent"
+        );
+    }
+    for qualifier in ["you control", "you own", "an opponent controls"] {
+        let text = format!(
+            "Target player loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier} attached to that creature."
+        );
+        let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+        assert!(
+            unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+            "{qualifier}: control parses supported"
+        );
+        assert!(serde_json::to_string(&parsed.abilities[0])
+            .unwrap()
+            .contains("DeclaredTarget"));
+    }
+}
+
+/// CR 109.5 (typed composition, not printed Oracle): a mixed qualified `Or`
+/// leg set, "Equipment you control" OR "Equipment the target player controls",
+/// each attached to that creature. Each leg binds its own controller
+/// reference and the sets are unioned, so the offered set does not depend on
+/// the legs' order: with the companion player P1, both Mine (the caster's) and
+/// Theirs (P1's); with P0, Mine only. Equipment on another creature and loose
+/// Equipment are refused, and each offered choice resolves (exiled).
+#[test]
+fn mixed_qualified_or_binds_each_leg_independently_of_order() {
+    use engine::types::ability::ControllerRef;
+    const TEXT: &str = "Target player loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment you control attached to that creature.";
+    for you_first in [true, false] {
+        for companion in [P1, P0] {
+            let label = format!("you_first={you_first} companion={companion:?}");
+            let mut head = parse_oracle_text(TEXT, "Or Probe", &[], &types("Instant"), &[])
+                .abilities
+                .remove(0);
+            {
+                let mut tail = &mut head;
+                while !matches!(tail.effect.as_ref(), Effect::ChangeZone { .. }) {
+                    tail = tail.sub_ability.as_mut().expect("the exile node");
+                }
+                let Effect::ChangeZone { target, .. } = tail.effect.as_mut() else {
+                    unreachable!()
+                };
+                let TargetFilter::Typed(you) = target.clone() else {
+                    panic!("{label}: reach: a typed leg");
+                };
+                assert_eq!(you.controller, Some(ControllerRef::You), "{label}: reach");
+                let mut player = you.clone();
+                player.controller = Some(ControllerRef::TargetPlayer);
+                let (you, player) = (TargetFilter::Typed(you), TargetFilter::Typed(player));
+                *target = TargetFilter::Or {
+                    filters: if you_first {
+                        vec![you, player]
+                    } else {
+                        vec![player, you]
+                    },
+                };
+            }
+            for elect_theirs in [false, true] {
+                let mut scenario = GameScenario::new();
+                scenario.at_phase(Phase::PreCombatMain);
+                let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+                let b = scenario.add_creature(P1, "Creature B", 2, 7).id();
+                let mine = equipment(&mut scenario, P0, "Equipment Mine");
+                let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
+                let on_b = equipment(&mut scenario, P0, "Equipment On B");
+                let loose = equipment(&mut scenario, P1, "Equipment Loose");
+                let spell = scenario
+                    .add_spell_to_hand(P0, "Or Probe", true)
+                    .with_mana_cost(ManaCost::zero())
+                    .with_ability_definition(head.clone())
+                    .id();
+                let mut runner = scenario.build();
+                attach::attach_to(runner.state_mut(), mine, a);
+                attach::attach_to(runner.state_mut(), theirs, a);
+                attach::attach_to(runner.state_mut(), on_b, b);
+                runner
+                    .act(GameAction::CastSpell {
+                        object_id: spell,
+                        card_id: runner.state().objects[&spell].card_id,
+                        targets: vec![],
+                        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+                    })
+                    .expect("cast begins");
+                for target in [
+                    TargetRef::Player(P1),
+                    TargetRef::Object(a),
+                    TargetRef::Player(companion),
+                ] {
+                    runner
+                        .act(GameAction::ChooseTarget {
+                            target: Some(target),
+                        })
+                        .unwrap_or_else(|e| panic!("{label}: announce: {e:?}"));
+                }
+                let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for
+                else {
+                    panic!("{label}: expected the Equipment slot");
+                };
+                let mut offered = selection.current_legal_targets.clone();
+                offered.sort_by_key(|t| format!("{t:?}"));
+                let expected = if companion == P1 {
+                    vec![mine, theirs]
+                } else {
+                    vec![mine]
+                };
+                let mut want: Vec<TargetRef> =
+                    expected.iter().copied().map(TargetRef::Object).collect();
+                want.sort_by_key(|t| format!("{t:?}"));
+                assert_eq!(offered, want, "{label}: the union of the bound legs");
+                for refused in [on_b, loose] {
+                    assert!(
+                        GameRunner::from_state(runner.state().clone())
+                            .act(GameAction::ChooseTarget {
+                                target: Some(TargetRef::Object(refused)),
+                            })
+                            .is_err(),
+                        "{label}: not attached to A, refused"
+                    );
+                }
+                if elect_theirs && companion != P1 {
+                    continue;
+                }
+                let chosen = if elect_theirs { theirs } else { mine };
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(chosen)),
+                    })
+                    .expect("announce the Equipment");
+                runner.advance_until_stack_empty();
+                let state = runner.state();
+                assert_eq!(state.objects[&chosen].zone, Zone::Exile, "{label}: exiled");
+                for other in [mine, theirs, on_b, loose]
+                    .into_iter()
+                    .filter(|o| *o != chosen)
+                {
+                    assert_eq!(state.objects[&other].zone, Zone::Battlefield, "{label}");
+                }
+            }
+        }
     }
 }

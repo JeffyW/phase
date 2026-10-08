@@ -7531,29 +7531,39 @@ fn legal_targets_for_ability_filter_uncapped(
     // that names the targeted player ("that player controls") is enumerated
     // over the companion player slot's candidates.
     if crate::game::filter::filter_reads_declared_slot(filter) {
-        let names_target_player =
-            relative_kind == Some(crate::types::ability::ControllerRef::TargetPlayer);
-        let (enumeration_filter, players): (TargetFilter, Vec<PlayerId>) = match player_slot {
-            Some(player_slot) if names_target_player => (
-                rewrite_declared_target_player(filter, crate::types::ability::ControllerRef::You),
-                player_slot
-                    .legal_targets
-                    .iter()
-                    .filter_map(|target| match target {
-                        TargetRef::Player(player_id) => Some(*player_id),
-                        TargetRef::Object(_) => None,
-                    })
-                    .collect(),
-            ),
-            _ => (filter.clone(), vec![ability.controller]),
-        };
-        return union_over_declared_slot_candidates(
-            state,
-            ability,
-            &enumeration_filter,
-            existing_slots,
-            &players,
-        );
+        // CR 109.5: each leg binds its own controller reference, and the
+        // legs' sets are unioned.
+        let mut legal = Vec::new();
+        for leg in filter_or_legs(filter) {
+            let names_target_player = relative_controller_kind(leg)
+                == Some(crate::types::ability::ControllerRef::TargetPlayer);
+            let (enumeration_filter, players): (TargetFilter, Vec<PlayerId>) = match player_slot {
+                Some(player_slot) if names_target_player => (
+                    rewrite_declared_target_player(leg, crate::types::ability::ControllerRef::You),
+                    player_slot
+                        .legal_targets
+                        .iter()
+                        .filter_map(|target| match target {
+                            TargetRef::Player(player_id) => Some(*player_id),
+                            TargetRef::Object(_) => None,
+                        })
+                        .collect(),
+                ),
+                _ => (leg.clone(), vec![ability.controller]),
+            };
+            for target in union_over_declared_slot_candidates(
+                state,
+                ability,
+                &enumeration_filter,
+                existing_slots,
+                &players,
+            ) {
+                if !legal.contains(&target) {
+                    legal.push(target);
+                }
+            }
+        }
+        return legal;
     }
     let Some(player_slot) = player_slot else {
         if needs_ability_context {
@@ -7600,6 +7610,14 @@ fn legal_targets_for_ability_filter_uncapped(
     }
 
     legal_targets
+}
+
+/// The legs of a top-level `Or`, else the filter itself.
+fn filter_or_legs(filter: &TargetFilter) -> Vec<&TargetFilter> {
+    match filter {
+        TargetFilter::Or { filters } => filters.iter().collect(),
+        other => vec![other],
+    }
 }
 
 /// Returns the relative `ControllerRef` (`You` or `TargetPlayer`) embedded in
@@ -8250,15 +8268,7 @@ fn legal_targets_for_selected_slot(
             return Vec::new();
         }
         let relative_kind = relative_controller_kind(&bound_filter);
-        // CR 109.5: for a declared-slot referent, "you" stays the declaring
-        // controller; only a reference naming the targeted player is rebound
-        // to the selected player.
-        let rebinds_to_selected_player = match relative_kind {
-            Some(ControllerRef::TargetPlayer) => true,
-            Some(_) => !crate::game::filter::filter_reads_declared_slot(&bound_filter),
-            None => false,
-        };
-        let controller = if rebinds_to_selected_player {
+        let controller = if relative_kind.is_some() {
             relative_filter_controller(ability, selected_slots)
         } else {
             ability.controller
@@ -8267,7 +8277,7 @@ fn legal_targets_for_selected_slot(
             Some(ControllerRef::TargetPlayer) => {
                 rewrite_declared_target_player(&bound_filter, ControllerRef::You)
             }
-            _ => bound_filter,
+            _ => bound_filter.clone(),
         };
 
         // CR 601.2c + CR 603.3d: a filter qualified relative to an object chosen
@@ -8282,18 +8292,37 @@ fn legal_targets_for_selected_slot(
         // attached to that creature") names its antecedent by declared slot, so
         // it reads the whole selected-slot view by position — each prior choice
         // as an `Elected` (live) binding — rather than the first prior object.
-        if crate::game::filter::filter_reads_declared_slot(&enumeration_filter) {
+        //
+        // CR 109.5: each leg binds its own controller reference ("you" is the
+        // declaring controller; only a reference naming the targeted player
+        // reads the selected player), and the legs' sets are unioned.
+        if crate::game::filter::filter_reads_declared_slot(&bound_filter) {
             let view: Vec<Option<targeting::DeclaredSlotBinding>> = selected_slots
                 .iter()
                 .map(|slot| slot.clone().map(targeting::DeclaredSlotBinding::Elected))
                 .collect();
-            targeting::find_legal_targets_for_ability_with_view(
-                state,
-                &enumeration_filter,
-                ability,
-                controller,
-                &view,
-            )
+            let mut legal = Vec::new();
+            for leg in filter_or_legs(&bound_filter) {
+                let (leg_controller, leg_filter) = match relative_controller_kind(leg) {
+                    Some(ControllerRef::TargetPlayer) => (
+                        relative_filter_controller(ability, selected_slots),
+                        rewrite_declared_target_player(leg, ControllerRef::You),
+                    ),
+                    _ => (ability.controller, leg.clone()),
+                };
+                for target in targeting::find_legal_targets_for_ability_with_view(
+                    state,
+                    &leg_filter,
+                    ability,
+                    leg_controller,
+                    &view,
+                ) {
+                    if !legal.contains(&target) {
+                        legal.push(target);
+                    }
+                }
+            }
+            legal
         } else {
             let bound = target_filter_binds_prior_target(&enumeration_filter)
                 .then(|| bind_prior_object_targets(ability, selected_slots))

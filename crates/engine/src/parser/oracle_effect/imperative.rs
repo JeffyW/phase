@@ -10277,7 +10277,8 @@ pub(super) fn parse_destroy_ast(
         // CR 608.2k: thread `ctx` so bare "it"/"them" anaphors bind to the
         // triggering subject ("Whenever a creature dies, destroy it" class).
         let (target, rem) = parse_target_with_ctx(rest, ctx);
-        let (target, rem) = bind_attachment_qualifier(target, rem, ctx)?;
+        let phrase = &rest[..rest.len() - rem.len()];
+        let (target, rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(rem, text);
         return Some(ZoneCounterImperativeAst::Destroy { target, all: true });
@@ -10287,7 +10288,8 @@ pub(super) fn parse_destroy_ast(
     {
         // CR 608.2k: see comment above — anaphor binding via parse_target_with_ctx.
         let (target, rem) = parse_target_with_ctx(rest, ctx);
-        let (target, rem) = bind_attachment_qualifier(target, rem, ctx)?;
+        let phrase = &rest[..rest.len() - rem.len()];
+        let (target, rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(rem, text);
         return Some(ZoneCounterImperativeAst::Destroy { target, all: false });
@@ -10305,11 +10307,20 @@ pub(super) fn parse_destroy_ast(
 /// or a leg did not receive the prop. A remainder with no attachment qualifier passes through unchanged.
 pub(super) fn bind_attachment_qualifier<'a>(
     target: TargetFilter,
+    phrase: &str,
     rem: &'a str,
     ctx: &ParseContext,
 ) -> Option<(TargetFilter, &'a str)> {
     if !opens_attachment_qualifier(rem) {
         return Some((target, rem));
+    }
+    // CR 608.2c + CR 115.10a: "<type> that player controls attached to that
+    // creature" names the player an earlier clause targeted. No controller
+    // reference names a declared player slot without surfacing a new player
+    // target, and the target phrase's legacy `You` would read the caster, so
+    // the anaphoric shape fails closed (the strict `attached_to_qualifier` gap).
+    if names_anaphoric_player_controller(phrase) {
+        return None;
     }
     let (prop, after) = parse_attached_to_declared_referent(rem, ctx)?;
     if !legs_admit_declared_referent(&target) {
@@ -10320,6 +10331,22 @@ pub(super) fn bind_attachment_qualifier<'a>(
         std::slice::from_ref(&prop),
     );
     legs_carry(&bound, &prop).then_some((bound, after))
+}
+
+/// CR 608.2c: does `phrase` qualify control by an anaphoric earlier player
+/// ("that player controls", "controlled by that player", "that opponent
+/// controls")?
+fn names_anaphoric_player_controller(phrase: &str) -> bool {
+    let lower = phrase.to_lowercase();
+    nom_primitives::scan_at_word_boundaries(&lower, |input| {
+        let anaphor = || alt((tag("that player"), tag("that opponent")));
+        alt((
+            value((), pair(anaphor(), tag(" controls"))),
+            value((), pair(tag("controlled by "), anaphor())),
+        ))
+        .parse(input)
+    })
+    .is_some()
 }
 
 /// The admissible shape for a declared-slot attachment referent: a `Typed`
@@ -11181,11 +11208,12 @@ pub(super) fn parse_exile_ast(
     // path below.
     let (target_input, pre_lifted_counters) = super::split_counterless_enter_counters(rest_text);
     let (parsed_target, rem) = parse_target_with_ctx(target_input, ctx);
+    let target_phrase = &target_input[..target_input.len() - rem.len()];
     // CR 701.3a + CR 601.2c: "exile [up to one] target Equipment attached to that
     // creature" (Fiery Annihilation) — the qualifier binds the target to the
     // declared slot "that creature" names, or the clause fails closed. Dropping
     // it would widen the target to every Equipment.
-    let (parsed_target, rem) = bind_attachment_qualifier(parsed_target, rem, ctx)?;
+    let (parsed_target, rem) = bind_attachment_qualifier(parsed_target, target_phrase, rem, ctx)?;
     // CR 122.1 + CR 702.62: "exile … with N <type> counter(s) on it" lifts the
     // counter clause onto the exile ChangeZone's `enter_with_counters` so the
     // object enters Exile carrying them (Taigam, Master Opportunist: "exile the
