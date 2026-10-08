@@ -18707,6 +18707,7 @@ pub mod tests {
             Some(&GameEvent::PermanentTapped {
                 object_id: milled,
                 caused_by: None,
+                incarnation: None,
             }),
             EventContextSeedTiming::StackPush,
         );
@@ -30162,6 +30163,7 @@ pub mod tests {
             &[GameEvent::PermanentTapped {
                 object_id: tapped,
                 caused_by: None,
+                incarnation: None,
             }],
         );
         pending.collect(
@@ -30169,6 +30171,7 @@ pub mod tests {
             &[GameEvent::PermanentTapped {
                 object_id: tapped,
                 caused_by: None,
+                incarnation: None,
             }],
         );
 
@@ -30200,6 +30203,7 @@ pub mod tests {
             &[GameEvent::PermanentTapped {
                 object_id: cancelled_tap,
                 caused_by: None,
+                incarnation: None,
             }],
         );
         drop(cancelled);
@@ -30782,6 +30786,7 @@ pub mod tests {
         let event = GameEvent::PermanentTapped {
             object_id: tapped,
             caused_by: None,
+            incarnation: None,
         };
 
         // No taps recorded yet → false.
@@ -30818,6 +30823,7 @@ pub mod tests {
         let other_event = GameEvent::PermanentTapped {
             object_id: ObjectId(99),
             caused_by: None,
+            incarnation: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -30862,14 +30868,17 @@ pub mod tests {
             GameEvent::PermanentTapped {
                 object_id: a,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: b,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: a,
                 caused_by: None,
+                incarnation: None,
             },
         ];
         observe_object_taps(&mut state, &events);
@@ -30890,10 +30899,12 @@ pub mod tests {
             GameEvent::PermanentTapped {
                 object_id: tapped,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: tapped,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::CounterAdded {
                 object_id: countered,
@@ -32420,6 +32431,7 @@ pub mod tests {
         let event = GameEvent::PermanentTapped {
             object_id: subject,
             caused_by: None,
+            incarnation: None,
         };
 
         assert!(check_trigger_condition_with_source(
@@ -41137,6 +41149,7 @@ pub mod tests {
         let events = vec![GameEvent::PermanentTapped {
             object_id: victim,
             caused_by: Some(tapper),
+            incarnation: None,
         }];
 
         state.waiting_for = if settled {

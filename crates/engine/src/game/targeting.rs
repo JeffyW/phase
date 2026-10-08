@@ -1621,6 +1621,18 @@ pub(crate) fn event_referent_controller(state: &GameState, event: &GameEvent) ->
         });
     }
     let id = extract_source_from_event(event)?;
+    // CR 400.7 + CR 608.2h: a tap event names the incarnation that became
+    // tapped. If that permanent left and returned (a blink), the returned
+    // permanent is a new object; "that permanent's controller" is the departed
+    // one's controller as it last existed on the battlefield.
+    if let GameEvent::PermanentTapped {
+        incarnation: Some(incarnation),
+        ..
+    } = event
+    {
+        return crate::game::ability_utils::incarnation_controller(state, id, *incarnation)
+            .or_else(|| crate::game::ability_utils::last_known_permanent_controller(state, id));
+    }
     crate::game::ability_utils::last_known_permanent_controller(state, id)
 }
 
@@ -3611,6 +3623,7 @@ mod tests {
         let tapped = GameEvent::PermanentTapped {
             object_id: ObjectId(9),
             caused_by: None,
+            incarnation: None,
         };
 
         assert_eq!(extract_source_from_event(&milled), Some(ObjectId(7)));
@@ -3671,6 +3684,7 @@ mod tests {
             resolve(&GameEvent::PermanentTapped {
                 object_id: ObjectId(9),
                 caused_by: None,
+                incarnation: None,
             }),
             None
         );

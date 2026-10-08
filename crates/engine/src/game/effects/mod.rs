@@ -23211,6 +23211,7 @@ mod tests {
         let events = vec![GameEvent::PermanentTapped {
             object_id: creature,
             caused_by: None,
+            incarnation: None,
         }];
         let referent = parent_referent_context_from_events(&state, &events)
             .expect("a single tapped creature must be captured as the anaphoric referent");
@@ -23254,10 +23255,12 @@ mod tests {
             GameEvent::PermanentTapped {
                 object_id: a,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: b,
                 caused_by: None,
+                incarnation: None,
             },
         ];
         assert!(
@@ -23392,10 +23395,12 @@ mod tests {
             GameEvent::PermanentTapped {
                 object_id: creature,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: creature,
                 caused_by: None,
+                incarnation: None,
             },
         ];
         let referent = parent_referent_context_from_events(&state, &events)

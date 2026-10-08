@@ -2492,6 +2492,7 @@ pub(super) fn match_taps(
     if let GameEvent::PermanentTapped {
         object_id,
         caused_by,
+        ..
     } = event
     {
         // If valid_card is set, check the tapped object matches (e.g. "opponent's creature")
@@ -15308,6 +15309,7 @@ mod tests {
         let event = GameEvent::PermanentTapped {
             object_id: opp_creature,
             caused_by: Some(your_source),
+            incarnation: None,
         };
         assert!(match_taps(
             &event,
@@ -15347,6 +15349,7 @@ mod tests {
         let event = GameEvent::PermanentTapped {
             object_id: opp_creature,
             caused_by: None,
+            incarnation: None,
         };
         assert!(!match_taps(
             &event,
@@ -15386,6 +15389,7 @@ mod tests {
         let event = GameEvent::PermanentTapped {
             object_id: own_creature,
             caused_by: Some(trigger_src),
+            incarnation: None,
         };
         assert!(!match_taps(
             &event,
@@ -15426,6 +15430,7 @@ mod tests {
         let event = GameEvent::PermanentTapped {
             object_id: any_creature,
             caused_by: None,
+            incarnation: None,
         };
         assert!(match_taps(
             &event,
@@ -15445,6 +15450,7 @@ mod tests {
         let event2 = GameEvent::PermanentTapped {
             object_id: any_creature,
             caused_by: Some(opp_source),
+            incarnation: None,
         };
         assert!(match_taps(
             &event2,

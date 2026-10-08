@@ -1111,6 +1111,13 @@ pub enum GameEvent {
         /// `None` for self-initiated taps (mana abilities, attacking, crew, costs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caused_by: Option<ObjectId>,
+        /// CR 400.7 + CR 608.2h: the incarnation of the permanent that became
+        /// tapped. If it leaves the battlefield and returns before a trigger
+        /// that reads "that permanent's controller" resolves (Royal Decree vs.
+        /// a blink), the returned permanent is a new object; this names the one
+        /// that was tapped. `None` on legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        incarnation: Option<u64>,
     },
     /// CR 701.43a + CR 701.43d: A creature was exerted as it attacked. Fires the
     /// linked `TriggerMode::Exerted` "when you do" trigger (Combat Celebrant,
@@ -1971,6 +1978,24 @@ pub enum GameEvent {
         host: PlayerId,
         player_id: PlayerId,
     },
+}
+
+impl GameEvent {
+    /// CR 400.7 + CR 608.2h: a `PermanentTapped` event for `object_id`, stamped
+    /// with the incarnation of the permanent that is tapped now, so a later
+    /// "that permanent's controller" names this object even if it has left and
+    /// returned as a new one.
+    pub(crate) fn permanent_tapped(
+        state: &super::game_state::GameState,
+        object_id: ObjectId,
+        caused_by: Option<ObjectId>,
+    ) -> Self {
+        GameEvent::PermanentTapped {
+            object_id,
+            caused_by,
+            incarnation: state.objects.get(&object_id).map(|obj| obj.incarnation),
+        }
+    }
 }
 
 /// CR 603.2 + CR 702.59a: True when an off-zone trigger source was already

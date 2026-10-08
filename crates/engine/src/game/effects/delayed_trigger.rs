@@ -2185,6 +2185,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::PermanentTapped {
             object_id: ObjectId(7),
             caused_by: None,
+            incarnation: None,
         });
         assert_eq!(triggering_source_destination_zone(&state), None);
     }

@@ -1243,3 +1243,78 @@ fn a_fresh_target_choice_names_its_own_controller_not_the_targeter() {
     assert_eq!(hand(&runner, P0), p0 + 1, "the Victim's controller draws");
     assert_eq!(hand(&runner, P1), p1, "not the targeter");
 }
+
+const EPHEMERATE: &str = "Exile target creature you control, then return it to the battlefield under its owner's control.\nRebound (If you cast this spell from your hand, exile it as it resolves. At the beginning of your next upkeep, you may cast this card from exile without paying its mana cost.)";
+
+/// Maintainer round 3, finding 2. P1 controls P0's red Prodigal Pyromancer and
+/// taps it; Royal Decree triggers; P1 Ephemerates the Pyromancer in response,
+/// which returns it under its owner P0 as a new object (CR 400.7). CR 608.2h:
+/// "that permanent's controller" is the tapped permanent's last controller,
+/// P1, not the returned permanent's controller P0. Control: no blink, P1.
+#[test]
+fn royal_decree_damages_the_tapped_incarnations_controller_after_a_blink() {
+    use engine::types::ability::TargetRef;
+    use engine::types::mana::ManaColor;
+    for blink in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_enchantment_from_oracle(P0, "Royal Decree", ROYAL_DECREE);
+        let pyromancer = scenario
+            .add_creature_from_oracle(P0, "Prodigal Pyromancer", 1, 1, PRODIGAL_PYROMANCER)
+            .with_color(vec![ManaColor::Red])
+            .id();
+        let steal = free_spell(&mut scenario, P1, "Steal Creature", STEAL_CREATURE);
+        let ephemerate = free_spell(&mut scenario, P1, "Ephemerate", EPHEMERATE);
+        let mut runner = scenario.build();
+        stage_turn(&mut runner, P1);
+        runner.cast(steal).target_object(pyromancer).resolve();
+        assert_eq!(
+            runner.state().objects[&pyromancer].controller,
+            P1,
+            "reach guard: P1 controls P0's Pyromancer"
+        );
+        // It came under P1's control this turn; let it be tapped for a cost.
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&pyromancer)
+            .unwrap()
+            .summoning_sick = false;
+        stage_turn(&mut runner, P1);
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: pyromancer,
+                ability_index: 0,
+            })
+            .expect("tap the Pyromancer");
+        if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+            runner
+                .act(GameAction::SelectTargets {
+                    targets: vec![TargetRef::Player(P0)],
+                })
+                .expect("target P0");
+        }
+        drain_ordering(&mut runner);
+        assert_eq!(
+            runner.state().stack.len(),
+            2,
+            "reach guard: the Pyromancer ability and Decree's trigger"
+        );
+        if blink {
+            priority_to(&mut runner, P1);
+            runner.cast(ephemerate).target_object(pyromancer).commit();
+            resolve_one_declining(&mut runner);
+            let returned = &runner.state().objects[&pyromancer];
+            assert_eq!(returned.zone, Zone::Battlefield, "reach guard: returned");
+            assert_eq!(returned.controller, P0, "reach guard: under its owner");
+            assert!(!returned.tapped, "reach guard: a new, untapped object");
+        }
+        let before = (life(&runner, P0), life(&runner, P1));
+        resolve_one_declining(&mut runner);
+        assert_eq!(
+            (life(&runner, P0) - before.0, life(&runner, P1) - before.1),
+            (0, -1),
+            "P1, the tapped permanent's controller, takes 1 (blink={blink})"
+        );
+    }
+}

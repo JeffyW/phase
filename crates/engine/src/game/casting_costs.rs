@@ -14422,10 +14422,7 @@ fn auto_tap_mana_sources_inner(
                 )
                 .expect("auto-tap source must remain a live exact object")
                 {
-                    events.push(GameEvent::PermanentTapped {
-                        object_id: option.object_id,
-                        caused_by: None,
-                    });
+                    events.push(GameEvent::permanent_tapped(state, option.object_id, None));
                 }
                 // CR 305.6 + CR 605.3: tapping a basic land for mana activates its
                 // intrinsic mana ability. It never moves the land, so it carries no

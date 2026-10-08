@@ -818,6 +818,30 @@ pub(crate) fn last_known_permanent_controller(state: &GameState, id: ObjectId) -
         .or_else(|| obj_opt.map(|obj| obj.controller))
 }
 
+/// CR 400.7 + CR 608.2h: the controller of one specific incarnation of `id`:
+/// the live permanent's controller while that incarnation is still on the
+/// battlefield, else the incarnation-keyed last known information captured as
+/// it left. `None` when neither exists (the caller falls back to the bare-id
+/// authority, `last_known_permanent_controller`).
+pub(crate) fn incarnation_controller(
+    state: &GameState,
+    id: ObjectId,
+    incarnation: u64,
+) -> Option<PlayerId> {
+    if let Some(obj) = state
+        .objects
+        .get(&id)
+        .filter(|obj| obj.zone == Zone::Battlefield && obj.incarnation == incarnation)
+    {
+        return Some(obj.controller);
+    }
+    state
+        .lki_by_incarnation
+        .get(&id)
+        .and_then(|history| history.get(&incarnation))
+        .map(|lki| lki.controller)
+}
+
 /// CR 109.4 + CR 608.2c: Resolve the controller of an ability's first parent target.
 ///
 /// This is the canonical lookup for `ControllerRef::ParentTargetController` and

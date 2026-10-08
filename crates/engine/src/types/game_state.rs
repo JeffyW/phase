@@ -29162,6 +29162,16 @@ impl GameState {
                     referenced_lki.insert(ObjectIncarnationRef::of(*object_id, incarnation));
                 }
             }
+            // CR 400.7 + CR 608.2h: a tap event names the incarnation that was
+            // tapped; "that permanent's controller" reads its snapshot.
+            if let GameEvent::PermanentTapped {
+                object_id,
+                incarnation: Some(incarnation),
+                ..
+            } = event
+            {
+                referenced_lki.insert(ObjectIncarnationRef::of(*object_id, *incarnation));
+            }
         };
 
         for entry in &clone.stack {
