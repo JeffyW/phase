@@ -1317,12 +1317,22 @@ fn counter_added_fires_per_recipient(trig_def: &TriggerDefinition) -> bool {
     trig_def.batched && matches!(trig_def.mode, TriggerMode::CounterAdded)
 }
 
-/// CR 603.2c: this exact player-recipient phrasing fires once for each player
-/// recipient in a simultaneous damage event. Other recipient scopes retain
-/// their existing aggregate batching semantics.
-fn damage_done_once_by_controller_fires_per_player_recipient(trig_def: &TriggerDefinition) -> bool {
+/// CR 603.2c: a "one or more … deal damage to a player" trigger fires once for
+/// each player recipient in a simultaneous damage event. Both trigger modes that
+/// carry this wording qualify: the printed "Whenever one or more creatures you
+/// control deal combat damage to a player" lowers to
+/// `DamageDoneOnceByController`, and the same words in a delayed body ("…
+/// to a player this turn" — Jace, Cunning Castaway's +1) lower to `DamageDone`.
+/// Per the 2017-09-29 Jace ruling, damage to two players fires twice. Other
+/// recipient scopes keep their aggregate batching. The normalizer
+/// (`matching_damage_done_once_by_controller_event`) reads only the trigger's
+/// recipient, source, kind and amount fields, so it serves both modes.
+fn damage_fires_per_player_recipient(trig_def: &TriggerDefinition) -> bool {
     trig_def.batched
-        && matches!(trig_def.mode, TriggerMode::DamageDoneOnceByController)
+        && matches!(
+            trig_def.mode,
+            TriggerMode::DamageDoneOnceByController | TriggerMode::DamageDone
+        )
         && trig_def.valid_target == Some(TargetFilter::Player)
 }
 
@@ -1756,7 +1766,7 @@ fn trigger_firing_groups(
             active_suppress_triggers,
             conditions,
         ))
-    } else if damage_done_once_by_controller_fires_per_player_recipient(trig_def) {
+    } else if damage_fires_per_player_recipient(trig_def) {
         indexed_groups(
             matching_damage_done_once_by_controller_events_by_player_recipient(
                 state,
@@ -18205,19 +18215,13 @@ pub mod tests {
         let mut trigger = make_trigger(TriggerMode::DamageDoneOnceByController);
         trigger.batched = true;
         trigger.valid_target = Some(TargetFilter::Player);
-        assert!(damage_done_once_by_controller_fires_per_player_recipient(
-            &trigger
-        ));
+        assert!(damage_fires_per_player_recipient(&trigger));
 
         trigger.valid_target = Some(TargetFilter::Opponent);
-        assert!(!damage_done_once_by_controller_fires_per_player_recipient(
-            &trigger
-        ));
+        assert!(!damage_fires_per_player_recipient(&trigger));
 
         trigger.valid_target = Some(TargetFilter::Controller);
-        assert!(!damage_done_once_by_controller_fires_per_player_recipient(
-            &trigger
-        ));
+        assert!(!damage_fires_per_player_recipient(&trigger));
 
         trigger.valid_target = Some(TargetFilter::Or {
             filters: vec![
@@ -18228,21 +18232,22 @@ pub mod tests {
                 }),
             ],
         });
-        assert!(!damage_done_once_by_controller_fires_per_player_recipient(
-            &trigger
-        ));
+        assert!(!damage_fires_per_player_recipient(&trigger));
 
         trigger.valid_target = Some(TargetFilter::Player);
         trigger.batched = false;
-        assert!(!damage_done_once_by_controller_fires_per_player_recipient(
-            &trigger
-        ));
+        assert!(!damage_fires_per_player_recipient(&trigger));
 
         trigger.batched = true;
         trigger.mode = TriggerMode::DamageDoneOnce;
-        assert!(!damage_done_once_by_controller_fires_per_player_recipient(
-            &trigger
-        ));
+        assert!(!damage_fires_per_player_recipient(&trigger));
+
+        // The delayed body's wording (Jace, Cunning Castaway +1) lowers to
+        // DamageDone with the same recipient; it fires per player too.
+        trigger.mode = TriggerMode::DamageDone;
+        assert!(damage_fires_per_player_recipient(&trigger));
+        trigger.valid_target = Some(TargetFilter::Opponent);
+        assert!(!damage_fires_per_player_recipient(&trigger));
     }
 
     #[test]

@@ -1509,3 +1509,176 @@ fn boa_color_survives_an_intervening_number_choice() {
     assert_eq!(zone(&runner, white), Zone::Graveyard);
     assert_eq!(zone(&runner, red), Zone::Battlefield);
 }
+
+// ---- PLAN-m3 §D: per-player delayed damage, three players ----
+
+const JACE_CUNNING_CASTAWAY: &str = "+1: Whenever one or more creatures you control deal combat damage to a player this turn, draw a card, then discard a card.\n\u{2212}2: Create a 2/2 blue Illusion creature token with \"When this token becomes the target of a spell, sacrifice it.\"\n\u{2212}5: Create two tokens that are copies of Jace, except they're not legendary.";
+const P2: PlayerId = PlayerId(2);
+
+fn three_player_board() -> GameScenario {
+    let mut scenario = GameScenario::new_n_player(3, 9656);
+    scenario.at_phase(Phase::PreCombatMain);
+    let names: Vec<String> = (0..10).map(|i| format!("P0 Card {i}")).collect();
+    scenario.with_library_top(P0, &names.iter().map(String::as_str).collect::<Vec<_>>());
+    scenario
+}
+
+/// Pass priority (no attackers declared yet) until P0 may declare attackers,
+/// then declare `attacks`, decline every block, and stop once `source` has a
+/// firing on the stack or combat is over.
+fn declare_and_collect(
+    runner: &mut GameRunner,
+    attacks: &[(ObjectId, AttackTarget)],
+    source: ObjectId,
+) -> usize {
+    drive_until(runner, |r| {
+        matches!(r.state().waiting_for, WaitingFor::DeclareAttackers { .. })
+    });
+    runner
+        .declare_attackers(attacks)
+        .expect("declare attackers");
+    for _ in 0..64 {
+        let fired = runner
+            .state()
+            .stack
+            .iter()
+            .filter(|entry| entry.source_id == source)
+            .count();
+        if fired > 0 {
+            return fired;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::DeclareBlockers { .. } => {
+                runner
+                    .act(GameAction::DeclareBlockers {
+                        assignments: vec![],
+                    })
+                    .expect("no blockers");
+            }
+            WaitingFor::Priority { .. } if runner.state().phase == Phase::PostCombatMain => {
+                return 0;
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+    panic!("combat never finished");
+}
+
+/// Resolve the stack, discarding the first card offered at each discard prompt.
+fn resolve_discarding(runner: &mut GameRunner) {
+    for _ in 0..64 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::DiscardChoice { cards, count, .. } => {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: cards.into_iter().take(count).collect(),
+                    })
+                    .expect("discard");
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => return,
+        }
+    }
+    panic!("stack did not settle");
+}
+
+/// CR 603.2c + Jace, Cunning Castaway ruling (2017-09-29): the +1's delayed
+/// trigger fires once for EACH player dealt combat damage. Three players; P0's
+/// creatures hit P1 and P2 → two firings, two draws and two discards. Control:
+/// both hit P1 → one firing.
+#[test]
+fn jace_cunning_castaway_fires_once_per_damaged_player() {
+    for (defenders, expected) in [([P1, P2], 2usize), ([P1, P1], 1)] {
+        let mut scenario = three_player_board();
+        let jace = scenario
+            .add_planeswalker_from_oracle(
+                P0,
+                "Jace, Cunning Castaway",
+                "Jace",
+                3,
+                JACE_CUNNING_CASTAWAY,
+            )
+            .as_legendary()
+            .id();
+        let a1 = scenario.add_creature(P0, "Attacker A", 2, 2).id();
+        let a2 = scenario.add_creature(P0, "Attacker B", 2, 2).id();
+        let mut runner = scenario.build();
+        runner.activate(jace, 0).resolve();
+        assert_eq!(runner.state().delayed_triggers.len(), 1, "reach guard");
+        let library_before = library(&runner, P0);
+        let graveyard = runner.state().players[0].graveyard.len();
+        let fired = declare_and_collect(
+            &mut runner,
+            &[
+                (a1, AttackTarget::Player(defenders[0])),
+                (a2, AttackTarget::Player(defenders[1])),
+            ],
+            jace,
+        );
+        assert_eq!(fired, expected, "{defenders:?}: firings");
+        resolve_discarding(&mut runner);
+        assert_eq!(
+            library_before - library(&runner, P0),
+            expected,
+            "{defenders:?}: draws"
+        );
+        assert_eq!(
+            runner.state().players[0].graveyard.len() - graveyard,
+            expected,
+            "{defenders:?}: discards"
+        );
+    }
+}
+
+/// CR 603.2c + CR 608.2c: Garruk −4 in a three-player game. One attacker at P2
+/// (an opponent) and one at P1's planeswalker: one firing, and only the
+/// creature attacking an opponent is narrowed in (+2/+2 and trample).
+#[test]
+fn garruk_narrows_to_the_creature_attacking_an_opponent() {
+    let mut scenario = three_player_board();
+    let garruk = scenario
+        .add_planeswalker_from_oracle(P0, "Garruk, Curse Breaker", "Garruk", 5, GARRUK)
+        .as_legendary()
+        .id();
+    let walker = scenario
+        .add_planeswalker_from_oracle(P1, "Opposing Walker", "Walker", 5, "+1: You gain 1 life.")
+        .id();
+    let at_player = scenario.add_creature(P0, "At Player", 2, 2).id();
+    let at_walker = scenario.add_creature(P0, "At Walker", 2, 2).id();
+    let mut runner = scenario.build();
+    runner.activate(garruk, 2).resolve();
+    assert_eq!(runner.state().delayed_triggers.len(), 1, "reach guard");
+    let fired = declare_and_collect(
+        &mut runner,
+        &[
+            (at_player, AttackTarget::Player(P2)),
+            (at_walker, AttackTarget::Planeswalker(walker)),
+        ],
+        garruk,
+    );
+    assert_eq!(fired, 1, "one firing");
+    settle(&mut runner, &[]);
+    assert_eq!(pt(&mut runner, at_player), (4, 4), "attacking an opponent");
+    assert_eq!(
+        pt(&mut runner, at_walker),
+        (2, 2),
+        "attacking a planeswalker"
+    );
+    assert!(runner.state().objects[&at_player]
+        .keywords
+        .contains(&engine::types::keywords::Keyword::Trample));
+    assert!(!runner.state().objects[&at_walker]
+        .keywords
+        .contains(&engine::types::keywords::Keyword::Trample));
+}
