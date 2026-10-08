@@ -1980,3 +1980,36 @@ fn leviathan_and_righteous_cause_are_ordered_in_one_choice() {
     assert!(!lost, "gain first: P0 survives");
     assert_eq!(life, 1, "1 + 1 gained - 1 from Nekusar");
 }
+
+/// Maintainer round 3, finding 4. CR 603.4: a delayed body gated on the
+/// triggering object ("if it's a Wizard") has no fire-time check yet, so the
+/// shape fails closed instead of putting a respondable ability on the stack
+/// for a Bear. Control: a body-if that does bridge ("if you control an
+/// artifact") stays supported. Synthetic text; no printed card produces the
+/// failing shape.
+#[test]
+fn delayed_event_subject_intervening_if_fails_closed() {
+    let abilities = |text: &str| {
+        let mut scenario = board();
+        let spell = free_spell(&mut scenario, P0, "Synthetic Gate", true, text);
+        let runner = scenario.build();
+        format!("{:?}", runner.state().objects[&spell].abilities)
+    };
+    let gated =
+        abilities("Until end of turn, whenever a creature attacks, if it's a Wizard, draw a card.");
+    assert!(
+        gated.contains("delayed_event_subject_intervening_if"),
+        "the event-subject gate fails closed: {gated}"
+    );
+    let bridged = abilities(
+        "Until end of turn, whenever a creature you control attacks alone, if you control an artifact, draw a card.",
+    );
+    assert!(
+        bridged.contains("CreateDelayedTrigger"),
+        "reach guard: {bridged}"
+    );
+    assert!(
+        !bridged.contains("Unimplemented"),
+        "a bridged body-if stays supported: {bridged}"
+    );
+}

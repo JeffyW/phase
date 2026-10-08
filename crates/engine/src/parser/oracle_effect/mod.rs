@@ -2024,6 +2024,23 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::Delayed)
 }
 
+/// CR 603.4 + CR 608.2c: does this delayed body's intervening-if test the
+/// triggering object itself (a targetless `TargetMatchesFilter`, "if it's a
+/// Wizard"), through any `Not`/`And`/`Or`? Such a gate has no fire-time bridge
+/// (`delayed_intervening_if` declines it), so the shape fails closed.
+fn condition_reads_the_event_subject(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::TargetMatchesFilter {
+            subject_slot: None, ..
+        } => true,
+        AbilityCondition::Not { condition } => condition_reads_the_event_subject(condition),
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(condition_reads_the_event_subject)
+        }
+        _ => false,
+    }
+}
+
 fn try_parse_whenever_this_turn_from(
     tp: TextPair,
     unwindowed: UnwindowedWhenever,
@@ -2193,6 +2210,22 @@ fn try_parse_whenever_this_turn_from(
         AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::unimplemented("delayed_intervening_if_dropped", effect_text),
+        )
+    } else if inner
+        .condition
+        .as_ref()
+        .is_some_and(condition_reads_the_event_subject)
+    {
+        // CR 603.4: "The ability triggers only if it is; otherwise it does
+        // nothing." A delayed body gated on the triggering object ("…, if it's
+        // a Wizard, draw a card") is checked against each narrowed firing's
+        // subject only at resolution today: `delayed_intervening_if` declines
+        // the targetless `TargetMatchesFilter` bridge, so a false gate would
+        // still put a respondable ability on the stack. Fail the shape closed
+        // until that bridge exists. No printed card produces it.
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::unimplemented("delayed_event_subject_intervening_if", effect_text),
         )
     } else {
         inner
