@@ -322,3 +322,35 @@ fn the_locked_cost_survives_the_source_leaving_during_payment() {
         "finalized"
     );
 }
+
+/// Ancient Cellarspawn's second ability ("… target opponent loses life equal to
+/// the difference.") lost its stated subject and made its CONTROLLER lose the
+/// life. Until that subject is threaded through, the clause fails closed: the
+/// trigger carries an `Unimplemented` effect and a discounted cast no longer
+/// costs its controller life.
+#[test]
+fn the_second_ability_fails_closed_instead_of_hitting_its_controller() {
+    let (mut runner, demon) = board(P0, pool(1, 1), |s| {
+        creature_spell(s, P0, "Demon", vec!["Demon"], cost(2, 1))
+    });
+    let cellarspawn = runner
+        .state()
+        .objects
+        .values()
+        .find(|o| o.name == "Ancient Cellarspawn")
+        .expect("Cellarspawn");
+    let effects: Vec<_> = cellarspawn
+        .trigger_definitions
+        .iter_unchecked()
+        .filter_map(|entry| entry.definition().execute.as_deref())
+        .map(|execute| execute.effect.as_ref().clone())
+        .collect();
+    assert!(
+        matches!(effects.as_slice(), [Effect::Unimplemented { .. }]),
+        "{effects:?}"
+    );
+    let p0 = runner.life(P0);
+    runner.cast(demon).resolve();
+    assert_eq!(runner.state().objects[&demon].zone, Zone::Battlefield);
+    assert_eq!(runner.life(P0), p0, "the controller loses nothing");
+}

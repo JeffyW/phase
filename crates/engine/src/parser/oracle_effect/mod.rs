@@ -42759,6 +42759,30 @@ fn parse_effect_chain_ir_body(
             }
         };
 
+        // CR 608.2c: a clause that STATED its subject ("target opponent loses
+        // life equal to the difference" — Ancient Cellarspawn) has it peeled
+        // into `leading_subject_application`, and its quantity gap records only
+        // the bare predicate. The trigger-side "difference" rewrite binds that
+        // bare predicate to `ParentTarget`, which is right only for the
+        // anaphoric "they" (Lolth's emblem, whose peeled subject IS
+        // `ParentTarget`); for a stated subject it made the controller lose the
+        // life. Record the whole clause instead, so the rewrite can't claim it
+        // and the gap stays honest until the stated subject is threaded through.
+        let clause = match leading_subject_application.as_ref() {
+            Some(application)
+                if application.affected != TargetFilter::ParentTarget
+                    && clause.effect.unimplemented_description().is_some_and(
+                        crate::parser::oracle_trigger::is_difference_lose_life_gap,
+                    ) =>
+            {
+                parsed_clause(Effect::unimplemented(
+                    "difference_drops_stated_subject",
+                    text.trim(),
+                ))
+            }
+            _ => clause,
+        };
+
         // CR 608.2c + CR 109.4: After a `Choose(Player)` clause is finalized,
         // advance the chain's chosen-player counter exactly once. The index is
         // read (not mutated) inside `try_parse_choose_player_to_verb`, which is

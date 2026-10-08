@@ -1024,6 +1024,15 @@ fn difference_body_text(desc: Option<&str>) -> Option<String> {
     desc.map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
 }
 
+/// Is this gap description the "lose life equal to the difference" body the
+/// trigger-side rewrite would bind to `ParentTarget`? Shared with the effect
+/// layer, which fails a STATED-subject clause closed before it can reach the
+/// rewrite (see `oracle_effect`'s chunk loop).
+pub(crate) fn is_difference_lose_life_gap(desc: &str) -> bool {
+    difference_body_text(Some(desc))
+        .is_some_and(|body| parse_difference_lose_life_body(&body).is_ok())
+}
+
 fn parse_attack_verb(input: &str) -> OracleResult<'_, ()> {
     alt((
         value((), tag::<_, _, OracleError<'_>>("attack ")),
