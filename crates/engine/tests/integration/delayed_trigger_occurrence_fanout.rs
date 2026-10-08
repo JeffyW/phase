@@ -988,6 +988,461 @@ fn zombie_boa_generator_expires_at_end_of_turn() {
     assert_eq!(zone(&runner, white), Zone::Battlefield);
 }
 
+// ---- PLAN-m3 §C: condition timing in the shared firing authority ----
+
+const LAST_RONIN: &str = "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)\n\
+I \u{2014} Destroy all creatures.\n\
+II \u{2014} Mill four cards. When you do, return target creature card from your graveyard to your hand.\n\
+III \u{2014} Whenever a creature you control attacks alone this turn, put three +1/+1 counters on it. It gains trample, lifelink, and indestructible until end of turn.";
+const RECKLESS_BLAZE: &str = "Reckless Blaze deals 5 damage to each creature. Whenever a creature you control dealt damage this way dies this turn, add {R}.";
+const PYROCLASM: &str = "Pyroclasm deals 2 damage to each creature.";
+const ENTER_ATTACKING: &str =
+    "Create a 1/1 white Soldier creature token that's tapped and attacking.";
+
+/// Pass priority until the top stack item has resolved.
+fn resolve_top(runner: &mut GameRunner) {
+    let top = runner.state().stack.last().expect("a stack item").id;
+    for _ in 0..16 {
+        if !runner.state().stack.iter().any(|entry| entry.id == top) {
+            return;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("unexpected decision: {other:?}"),
+        }
+    }
+    panic!("the top item never resolved");
+}
+
+/// Put the Last Ronin on chapter III (installed on P0's turn 2) with the given
+/// P0 attackers, and declare them at P1. Returns the attackers' ids.
+fn last_ronin_attack(
+    attackers: usize,
+    extra: impl FnOnce(&mut GameScenario),
+) -> (GameRunner, Vec<ObjectId>) {
+    let mut scenario = board();
+    let saga = scenario
+        .add_enchantment_from_oracle(P0, "The Last Ronin", "")
+        .with_subtypes(vec!["Saga"])
+        .from_oracle_text(LAST_RONIN)
+        .id();
+    scenario.with_counter(saga, CounterType::Lore, 2);
+    let ids: Vec<ObjectId> = (0..attackers)
+        .map(|i| {
+            scenario
+                .add_creature(P0, &format!("Ronin Attacker {i}"), 2, 2)
+                .id()
+        })
+        .collect();
+    extra(&mut scenario);
+    let mut runner = scenario.build();
+    advance_sagas(&mut runner);
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach guard: chapter III installed"
+    );
+    attack(&mut runner, &ids, P1);
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    (runner, ids)
+}
+
+fn library(runner: &GameRunner, player: PlayerId) -> usize {
+    runner.state().players[player.0 as usize].library.len()
+}
+
+fn plus_one_counters(runner: &GameRunner, id: ObjectId) -> u32 {
+    runner.state().objects[&id]
+        .counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// CR 506.5 + CR 603.4: The Last Ronin III ("attacks alone") is a head
+/// qualifier on the delayed definition, decided at admission. One attacker
+/// fires; two attackers fire nothing (the collector used to ignore the head
+/// condition and fire for each attacker).
+#[test]
+fn last_ronin_fires_only_for_a_creature_attacking_alone() {
+    let (mut runner, ids) = last_ronin_attack(1, |_| {});
+    assert_eq!(runner.state().stack.len(), 1, "reach guard: it triggered");
+    settle(&mut runner, &[]);
+    assert_eq!(plus_one_counters(&runner, ids[0]), 3, "attacking alone");
+
+    let (mut runner, ids) = last_ronin_attack(2, |_| {});
+    assert!(runner.state().stack.is_empty(), "two attackers: no firing");
+    settle(&mut runner, &[]);
+    for id in ids {
+        assert_eq!(plus_one_counters(&runner, id), 0, "not attacking alone");
+    }
+}
+
+/// CR 506.5 + CR 508.4 + CR 603.4: "attacks alone" is part of the trigger
+/// event, not an intervening-if, so it is not rechecked on resolution. A
+/// creature put onto the battlefield attacking after the trigger fired (it was
+/// never declared as an attacker) does not stop the trigger from resolving.
+#[test]
+fn last_ronin_resolves_after_a_creature_enters_attacking() {
+    let (mut runner, ids) = last_ronin_attack(1, |scenario| {
+        free_spell(
+            scenario,
+            P0,
+            "Synthetic Reinforcement",
+            true,
+            ENTER_ATTACKING,
+        );
+    });
+    assert_eq!(runner.state().stack.len(), 1, "reach guard: it triggered");
+    let reinforcement = runner.state().players[0]
+        .hand
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Synthetic Reinforcement")
+        .expect("the reinforcement is in hand");
+    runner.cast(reinforcement).commit();
+    resolve_top(&mut runner);
+    assert_eq!(
+        runner.state().combat.as_ref().map(|c| c.attackers.len()),
+        Some(2),
+        "reach guard: a second creature is now attacking"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the Ronin trigger still waits"
+    );
+    settle(&mut runner, &[]);
+    assert_eq!(plus_one_counters(&runner, ids[0]), 3, "it still resolves");
+}
+
+/// CR 603.4: a delayed body intervening-if ("if you control an artifact") is
+/// checked when the trigger would fire AND rechecked on resolution, alongside
+/// the "attacks alone" head qualifier. Synthetic delayed text.
+#[test]
+fn delayed_attacks_alone_with_a_body_if_checks_the_body_twice() {
+    const TEXT: &str = "Until end of turn, whenever a creature you control attacks alone, if you control an artifact, draw a card.";
+    const SHATTER: &str = "Destroy target artifact.";
+    #[derive(Debug, Clone, Copy)]
+    enum Artifact {
+        Kept,
+        DestroyedInResponse,
+        Absent,
+    }
+    for case in [
+        Artifact::Kept,
+        Artifact::DestroyedInResponse,
+        Artifact::Absent,
+    ] {
+        let mut scenario = board();
+        let attacker = scenario.add_creature(P0, "Lone Attacker", 2, 2).id();
+        let relic = match case {
+            Artifact::Absent => None,
+            _ => Some(scenario.add_artifact_from_oracle(P0, "Relic", "").id()),
+        };
+        let spell = free_spell(&mut scenario, P0, "Synthetic Vigil", false, TEXT);
+        let shatter = free_spell(&mut scenario, P0, "Shatter", true, SHATTER);
+        let mut runner = scenario.build();
+        runner.cast(spell).resolve();
+        let library_before = library(&runner, P0);
+        attack(&mut runner, &[attacker], P1);
+        if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+            drain_order_triggers_with_identity(runner.state_mut());
+        }
+        match case {
+            Artifact::Absent => {
+                assert!(
+                    runner.state().stack.is_empty(),
+                    "{case:?}: a false body-if at fire time: no trigger"
+                );
+            }
+            Artifact::Kept => {
+                assert_eq!(runner.state().stack.len(), 1, "{case:?}: it triggered");
+            }
+            Artifact::DestroyedInResponse => {
+                assert_eq!(runner.state().stack.len(), 1, "{case:?}: it triggered");
+                runner
+                    .cast(shatter)
+                    .target_object(relic.expect("artifact"))
+                    .commit();
+                resolve_top(&mut runner);
+                assert_eq!(zone(&runner, relic.unwrap()), Zone::Graveyard);
+            }
+        }
+        settle(&mut runner, &[]);
+        let expected = match case {
+            Artifact::Kept => 1,
+            Artifact::DestroyedInResponse | Artifact::Absent => 0,
+        };
+        assert_eq!(
+            library_before - library(&runner, P0),
+            expected,
+            "{case:?}: cards drawn"
+        );
+    }
+}
+
+/// CR 508.5 + CR 603.4: an Attacks trigger's intervening-if reads each
+/// narrowed attack, not the whole declaration. "If it's a Wizard" with a Wizard
+/// and a Bear attacking draws exactly one card. Evaluated on the declaration,
+/// "it" names no single attacker and nothing would be drawn. Printed synthetic
+/// enchantment, through the authority the delayed collector shares.
+#[test]
+fn attack_intervening_if_reads_each_narrowed_attacker() {
+    const TEXT: &str = "Whenever a creature attacks, if it's a Wizard, draw a card.";
+    let mut scenario = board();
+    scenario.add_enchantment_from_oracle(P0, "Synthetic Academy", TEXT);
+    let wizard = typed(&mut scenario, P0, "Wizard", "Wizard");
+    let bear = typed(&mut scenario, P0, "Bear", "Bear");
+    let mut runner = scenario.build();
+    let drawn = hand(&runner, P0);
+    attack(&mut runner, &[wizard, bear], P1);
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    assert_eq!(runner.state().stack.len(), 1, "only the Wizard's firing");
+    settle(&mut runner, &[]);
+    assert_eq!(hand(&runner, P0), drawn + 1);
+}
+
+fn red_mana(runner: &GameRunner, player: PlayerId) -> usize {
+    runner.state().players[player.0 as usize]
+        .mana_pool
+        .mana
+        .iter()
+        .filter(|unit| unit.color == engine::types::mana::ManaType::Red)
+        .count()
+}
+
+/// CR 603.2 + CR 603.7b: Reckless Blaze's "a creature you control dealt
+/// damage this way dies" is decided at admission. P0's Bear dealt damage by
+/// the Blaze adds {R}; P1's creature isn't P0's; a token that entered after
+/// the Blaze and is then destroyed was not dealt damage this way.
+#[test]
+fn reckless_blaze_adds_mana_only_for_a_creature_it_damaged() {
+    let mut scenario = board();
+    let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let theirs = scenario.add_creature(P1, "Their Bear", 2, 2).id();
+    let blaze = free_spell(&mut scenario, P0, "Reckless Blaze", false, RECKLESS_BLAZE);
+    let token = free_spell(
+        &mut scenario,
+        P0,
+        "Token Maker",
+        true,
+        "Create a 2/2 black Zombie creature token.",
+    );
+    let murder = free_spell(
+        &mut scenario,
+        P0,
+        "Murder",
+        true,
+        "Destroy target creature.",
+    );
+    let mut runner = scenario.build();
+    runner.cast(blaze).resolve();
+    settle(&mut runner, &[]);
+    assert_eq!(zone(&runner, bear), Zone::Graveyard, "reach guard");
+    assert_eq!(zone(&runner, theirs), Zone::Graveyard, "reach guard");
+    assert_eq!(red_mana(&runner, P0), 1, "only P0's Bear");
+    runner.cast(token).resolve();
+    settle(&mut runner, &[]);
+    let zombie = runner
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Zombie")
+        .expect("reach guard: the Zombie entered");
+    runner.cast(murder).target_object(zombie).resolve();
+    settle(&mut runner, &[]);
+    assert!(
+        !runner.state().battlefield.contains(&zombie),
+        "reach guard: the Zombie died"
+    );
+    assert_eq!(
+        red_mana(&runner, P0),
+        1,
+        "the Zombie wasn't dealt damage this way"
+    );
+}
+
+// ---- PLAN-m2 §4: the delayed batch reuses the printed partition ----
+
+const MENDING_DELAYED: &str = "Until end of turn, whenever one or more creatures you control are dealt damage, you gain that much life.";
+const MENDING_PRINTED: &str =
+    "Whenever one or more creatures you control are dealt damage, you gain that much life.";
+
+/// CR 603.2c + CR 120.4b: a batched damage trigger sees the whole matching
+/// batch. Pyroclasm deals 2 to each of P0's two walls and to P1's wall: +4
+/// from both the delayed and the printed trigger, the opposing wall excluded.
+/// Control: only P1 has a wall, so nothing matches. Synthetic text.
+#[test]
+fn pyroclasm_batched_damage_reads_the_whole_matching_batch() {
+    for printed in [false, true] {
+        for own_walls in [2usize, 0] {
+            let label = format!(
+                "{} / {own_walls} own walls",
+                if printed { "printed" } else { "delayed" }
+            );
+            let mut scenario = board();
+            for i in 0..own_walls {
+                scenario.add_creature(P0, &format!("Own Wall {i}"), 0, 4);
+            }
+            scenario.add_creature(P1, "Their Wall", 0, 4);
+            let mending = if printed {
+                scenario.add_enchantment_from_oracle(P0, "Synthetic Mending", MENDING_PRINTED);
+                None
+            } else {
+                Some(free_spell(
+                    &mut scenario,
+                    P0,
+                    "Synthetic Mending",
+                    true,
+                    MENDING_DELAYED,
+                ))
+            };
+            let pyroclasm = free_spell(&mut scenario, P0, "Pyroclasm", false, PYROCLASM);
+            let mut runner = scenario.build();
+            if let Some(mending) = mending {
+                runner.cast(mending).resolve();
+            }
+            let life = runner.life(P0);
+            runner.cast(pyroclasm).resolve();
+            assert!(
+                runner.state().stack.len() <= 1,
+                "[{label}] at most one firing"
+            );
+            settle(&mut runner, &[]);
+            let expected = 2 * own_walls as i32;
+            assert_eq!(runner.life(P0), life + expected, "[{label}]");
+        }
+    }
+}
+
+/// Two installed generators each read the whole batch once: +8.
+#[test]
+fn two_batched_damage_generators_each_fire_once() {
+    let mut scenario = board();
+    scenario.add_creature(P0, "Own Wall A", 0, 4);
+    scenario.add_creature(P0, "Own Wall B", 0, 4);
+    let first = free_spell(&mut scenario, P0, "Mending A", true, MENDING_DELAYED);
+    let second = free_spell(&mut scenario, P0, "Mending B", true, MENDING_DELAYED);
+    let pyroclasm = free_spell(&mut scenario, P0, "Pyroclasm", false, PYROCLASM);
+    let mut runner = scenario.build();
+    runner.cast(first).resolve();
+    runner.cast(second).resolve();
+    assert_eq!(runner.state().delayed_triggers.len(), 2, "reach guard");
+    let life = runner.life(P0);
+    runner.cast(pyroclasm).commit();
+    resolve_top(&mut runner);
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    assert_eq!(runner.state().stack.len(), 2, "one firing per generator");
+    settle(&mut runner, &[]);
+    assert_eq!(runner.life(P0), life + 8);
+}
+
+/// CR 603.2c + CR 603.7b: a multi-fire delayed trigger fires for every
+/// matching event in one batch, not only the first. Real Shriveling Rot (mode
+/// two) + Pyroclasm: a P0 2/2 and a P1 2/2 die, and each controller loses 2.
+#[test]
+fn shriveling_rot_drains_every_dying_creatures_controller() {
+    let mut scenario = board();
+    let own = scenario.add_creature(P0, "Own Bear", 2, 2).id();
+    let theirs = scenario.add_creature(P1, "Their Bear", 2, 2).id();
+    let rot = free_spell(&mut scenario, P0, "Shriveling Rot", true, SHRIVELING_ROT);
+    let pyroclasm = free_spell(&mut scenario, P0, "Pyroclasm", false, PYROCLASM);
+    let mut runner = scenario.build();
+    runner.cast(rot).modes(&[1]).resolve();
+    runner.cast(pyroclasm).resolve();
+    settle(&mut runner, &[]);
+    assert_eq!(zone(&runner, own), Zone::Graveyard, "reach guard");
+    assert_eq!(zone(&runner, theirs), Zone::Graveyard, "reach guard");
+    assert_eq!(runner.life(P0), 18, "P0's creature died");
+    assert_eq!(runner.life(P1), 18, "P1's creature died");
+}
+
+/// Non-batched: "whenever a creature dies" draws once per death (two).
+/// Batched: "whenever one or more creatures die" draws once, and its raw
+/// members are consumed, so a later priority pass doesn't fire it again.
+/// Synthetic text.
+#[test]
+fn delayed_death_triggers_fire_per_death_or_once_per_batch() {
+    for (text, expected) in [
+        (
+            "Until end of turn, whenever a creature dies, draw a card.",
+            2,
+        ),
+        (
+            "Until end of turn, whenever one or more creatures die, draw a card.",
+            1,
+        ),
+    ] {
+        let mut scenario = board();
+        scenario.add_creature(P0, "Bear A", 2, 2);
+        scenario.add_creature(P1, "Bear B", 2, 2);
+        let watch = free_spell(&mut scenario, P0, "Synthetic Watch", true, text);
+        let pyroclasm = free_spell(&mut scenario, P0, "Pyroclasm", false, PYROCLASM);
+        let mut runner = scenario.build();
+        runner.cast(watch).resolve();
+        let library_before = library(&runner, P0);
+        runner.cast(pyroclasm).resolve();
+        settle(&mut runner, &[]);
+        assert_eq!(library_before - library(&runner, P0), expected, "{text}");
+        drive_until(&mut runner, |r| r.state().phase == Phase::End);
+        assert_eq!(
+            library_before - library(&runner, P0),
+            expected,
+            "{text}: no re-fire"
+        );
+    }
+}
+
+/// CR 603.2c: two equal-looking damage events in one batch are two
+/// occurrences, each consumed by its own ordinal. A synthetic spell deals 1
+/// damage to the same creature twice; "whenever a creature is dealt damage,
+/// you gain 1 life" gains 2, and never again.
+#[test]
+fn equal_looking_damage_events_are_separate_occurrences() {
+    let mut scenario = board();
+    let target = scenario.add_creature(P1, "Target", 0, 5).id();
+    let watch = free_spell(
+        &mut scenario,
+        P0,
+        "Synthetic Watch",
+        true,
+        "Until end of turn, whenever a creature is dealt damage, you gain 1 life.",
+    );
+    let twin = free_spell(
+        &mut scenario,
+        P0,
+        "Twin Ping",
+        true,
+        "Twin Ping deals 1 damage to target creature. Twin Ping deals 1 damage to that creature.",
+    );
+    let mut runner = scenario.build();
+    runner.cast(watch).resolve();
+    let life = runner.life(P0);
+    runner.cast(twin).target_object(target).resolve();
+    assert_eq!(
+        runner.state().objects[&target].damage_marked,
+        2,
+        "reach guard: two damage events"
+    );
+    settle(&mut runner, &[]);
+    assert_eq!(runner.life(P0), life + 2);
+    drive_until(&mut runner, |r| r.state().phase == Phase::End);
+    assert_eq!(runner.life(P0), life + 2, "no re-fire");
+}
+
 /// CR 105.4 + CR 608.2c: "that color" names the resolution's color choice
 /// even when another kind of choice (a number) comes between it and the
 /// generator. Synthetic Boa-shaped text: White, then 3, then one generator
