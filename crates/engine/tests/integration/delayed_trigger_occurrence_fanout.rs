@@ -1367,10 +1367,15 @@ fn pyroclasm_batched_damage_reads_the_whole_matching_batch() {
                 runner.cast(mending).resolve();
             }
             let life = runner.life(P0);
-            runner.cast(pyroclasm).resolve();
-            assert!(
-                runner.state().stack.len() <= 1,
-                "[{label}] at most one firing"
+            runner.cast(pyroclasm).commit();
+            resolve_top(&mut runner);
+            if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            assert_eq!(
+                runner.state().stack.len(),
+                usize::from(own_walls > 0),
+                "[{label}] exactly one firing for the whole batch, none without a match"
             );
             settle(&mut runner, &[]);
             let expected = 2 * own_walls as i32;
