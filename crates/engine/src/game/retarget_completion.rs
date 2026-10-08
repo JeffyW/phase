@@ -124,7 +124,7 @@ pub(crate) fn retarget_dependencies(filter: &TargetFilter) -> RetargetDeps {
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackSpell
         | TargetFilter::SpecificObject { .. }

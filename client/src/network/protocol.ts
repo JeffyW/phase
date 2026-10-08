@@ -106,15 +106,23 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  90 — game_setup and state_update carry GameState, whose attachment filters
+ *  92 — game_setup and state_update carry GameState, whose attachment filters
  *       are now one AttachedTo prop with a tagged `to` referent in place of the
  *       AttachedToSource / AttachedToRecipient / AttachedToPlayer tags. Both
- *       peers are browsers and neither validates the shape, so a v89 peer
+ *       peers are browsers and neither validates the shape, so a v91 peer
  *       would take the new shape with no decode error; first contact rejects
  *       the skew instead. The same state carries positional retarget picks
  *       (null keeps) and the engine-derived copy-walk keep and decline
  *       permissions.
- *       Bumped in lockstep with full-game protocol 108.
+ *       Bumped in lockstep with full-game protocol 110.
+ *  91 — GameState carries the CR 201.5a granter binding (ObjectScope
+ *       GrantingObject / SpecificObject, TargetFilter GrantingObject.bound,
+ *       PlayerFilter GrantingObjectCaster and the granting_object stamps).
+ *       Bumped with full-game protocol 109 so first contact rejects the skew.
+ *  90 — Serialized IllegalTargetsDisposition.StillResolves in GameState lets
+ *       the root ability resolve after its chosen target becomes illegal.
+ *       Older peers would silently apply ordinary non-resolution. Bumped
+ *       with full-game protocol 108.
  *  89 — game_setup and state_update carry GameState, whose exile-until
  *       loops now carry a match count, whose paused loop keeps its hits,
  *       whose zone choices can read ParentTargets, and whose spell context
@@ -556,7 +564,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 90 as const;
+export const WIRE_PROTOCOL_VERSION = 92 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

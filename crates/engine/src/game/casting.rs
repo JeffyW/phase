@@ -30,7 +30,7 @@ use crate::types::game_state::{
     PendingCostMoveResume, SneakPlacement, SpellCostSource, StackEntry, StackEntryKind,
     TargetEffectDetail, TargetSelectionSlot, WaitingFor,
 };
-use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
+use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
     ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSourceOutput,
@@ -51,10 +51,10 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::ability_utils::{
     ability_target_legality_needs_chosen_x, additional_cost_instead_spell_has_legal_targets,
-    assign_targets_in_chain, auto_select_targets, auto_select_targets_for_ability,
-    begin_target_selection, begin_target_selection_for_ability, build_resolved_from_def,
-    build_target_slots, build_target_slots_for_announcement, compute_unavailable_modes,
-    declared_targets_in_chain, filter_references_target_player,
+    assign_selected_slots_in_chain, assign_targets_in_chain, auto_select_targets,
+    auto_select_targets_for_ability, begin_target_selection, begin_target_selection_for_ability,
+    build_resolved_from_def, build_target_slots, build_target_slots_for_announcement,
+    compute_unavailable_modes, declared_targets_in_chain, filter_references_target_player,
     has_legal_target_assignment_for_ability, modal_choice_for_player,
     simple_legal_target_assignment_exists_for_ability, target_constraints_from_modal,
     unresolved_x_target_construction_error, TargetSlotBuildOutcome,
@@ -1318,6 +1318,7 @@ pub(crate) fn is_blocked_by_cant_play_lands(
                         // CR 603.4: not a zone-change intervening-`if`.
                         triggering_object: None,
                         declared_slot_view: None,
+                        granting_object: None,
                     },
                 ),
                 None => true,
@@ -3024,7 +3025,7 @@ fn matches_via_origin_scoped_branch(
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
@@ -19095,7 +19096,7 @@ fn continue_with_prepared(
             auto_select_targets_for_ability(state, &resolved, &target_slots, &target_constraints)?
         {
             let mut resolved = resolved;
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             emit_targeting_events(
                 state,
                 &declared_targets_in_chain(&resolved),
@@ -23278,6 +23279,7 @@ fn apply_mana_spell_grants(
                 // CR 603.4: not a zone-change intervening-`if`.
                 triggering_object: None,
                 declared_slot_view: None,
+                granting_object: None,
             };
             if !crate::game::filter::matches_target_filter(state, spell_id, filter, &filter_ctx) {
                 continue;
@@ -23592,16 +23594,7 @@ pub(crate) fn resolve_non_self_discard_requirement(
     player: PlayerId,
     source_id: ObjectId,
     cost: &AbilityCost,
-) -> Result<Option<(usize, Vec<ObjectId>)>, EngineError> {
-    resolve_non_self_discard_requirement_with_ability(state, player, source_id, cost, None)
-}
-
-pub(crate) fn resolve_non_self_discard_requirement_with_ability(
-    state: &GameState,
-    player: PlayerId,
-    source_id: ObjectId,
-    cost: &AbilityCost,
-    ability: Option<&ResolvedAbility>,
+    payer: DiscardCostPayer<'_>,
 ) -> Result<Option<(usize, Vec<ObjectId>)>, EngineError> {
     // The activation/casting path handles ANY `FromHand` discard selection mode; the
     // mana-ability path (see `mana_abilities::discard_cost_choice`) is the only caller
@@ -23611,29 +23604,41 @@ pub(crate) fn resolve_non_self_discard_requirement_with_ability(
     };
     // CR 107.3a: the ability carries the announced X that a "discard X cards"
     // count reads; without it X would resolve to 0 and the cost would be skipped.
-    let count = ability
-        .map_or_else(
-            || super::quantity::resolve_quantity(state, count, player, source_id),
-            |ability| super::quantity::resolve_quantity_with_targets(state, count, ability),
-        )
-        .max(0) as usize;
+    let count = match payer {
+        DiscardCostPayer::Ability(ability) => {
+            super::quantity::resolve_quantity_with_targets(state, count, ability)
+        }
+        DiscardCostPayer::Definition(_) => {
+            super::quantity::resolve_quantity(state, count, player, source_id)
+        }
+    }
+    .max(0) as usize;
     // CR 601.2h + CR 701.9a: A resolved zero-card discard is paid by doing nothing — never
     // surface a dead selection prompt for it.
     if count == 0 {
         return Ok(None);
     }
-    let eligible = ability.map_or_else(
-        || find_eligible_discard_targets(state, player, source_id, filter),
-        |ability| {
+    let eligible = match payer {
+        DiscardCostPayer::Ability(ability) => {
             find_eligible_discard_targets_for_ability(state, player, source_id, filter, ability)
-        },
-    );
+        }
+        DiscardCostPayer::Definition(granter) => {
+            find_eligible_discard_targets(state, player, source_id, granter, filter)
+        }
+    };
     if eligible.len() < count {
         return Err(EngineError::ActionNotAllowed(
             "Not enough cards in hand to discard".into(),
         ));
     }
     Ok(Some((count, eligible)))
+}
+
+/// Whose context a discard cost's filter reads: an announced ability's, or a mana
+/// ability's definition, which carries only its CR 201.5a granter stamp.
+pub(crate) enum DiscardCostPayer<'a> {
+    Ability(&'a ResolvedAbility),
+    Definition(Option<ObjectIncarnationRef>),
 }
 
 fn has_self_ref_discard_cost(cost: &AbilityCost) -> bool {
@@ -23897,12 +23902,16 @@ pub(super) fn find_targeted_remove_counter_cost(
     CounterCostSelection,
 )> {
     match cost {
+        // CR 601.2h: the granter with a fixed or ALL count involves no choice;
+        // `pay_ability_cost_inner` pays it.
         AbilityCost::RemoveCounter {
             count,
             counter_type,
             target: Some(target),
             selection,
-        } => Some((*count, counter_type, target, *selection)),
+        } if !matches!(target, TargetFilter::GrantingObject { .. }) => {
+            Some((*count, counter_type, target, *selection))
+        }
         AbilityCost::Composite { costs } => {
             costs.iter().find_map(find_targeted_remove_counter_cost)
         }
@@ -23919,11 +23928,13 @@ fn find_eligible_hand_cost_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     filter: Option<&TargetFilter>,
 ) -> Vec<ObjectId> {
     let effective_filter = super::cost_payability::cost_filter_before_x_announcement(filter);
     let filter_ref = effective_filter.as_ref();
-    let ctx = super::filter::FilterContext::from_source(state, source);
+    let ctx = super::filter::FilterContext::from_source(state, source)
+        .with_granting_object(granting_object);
     state
         .players
         .get(player.0 as usize)
@@ -23947,9 +23958,10 @@ pub(crate) fn find_eligible_discard_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     filter: Option<&TargetFilter>,
 ) -> Vec<ObjectId> {
-    find_eligible_hand_cost_targets(state, player, source, filter)
+    find_eligible_hand_cost_targets(state, player, source, granting_object, filter)
 }
 
 /// CR 118.3 + CR 602.2b: Select the hand cards that can pay an activated
@@ -23989,9 +24001,10 @@ pub(crate) fn find_eligible_reveal_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     filter: &TargetFilter,
 ) -> Vec<ObjectId> {
-    find_eligible_hand_cost_targets(state, player, source, Some(filter))
+    find_eligible_hand_cost_targets(state, player, source, granting_object, Some(filter))
 }
 
 /// CR 601.2b + CR 601.2h: Eligible cards for an `AbilityCost::Exile` payment
@@ -24003,6 +24016,7 @@ pub(crate) fn find_eligible_exile_for_cost_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     zone: ExileCostSourceZone,
     filter: Option<&TargetFilter>,
 ) -> Vec<ObjectId> {
@@ -24010,10 +24024,11 @@ pub(crate) fn find_eligible_exile_for_cost_targets(
     let filter_ref = effective_filter.as_ref();
     match zone {
         ExileCostSourceZone::Hand => {
-            find_eligible_hand_cost_targets(state, player, source, filter_ref)
+            find_eligible_hand_cost_targets(state, player, source, granting_object, filter_ref)
         }
         ExileCostSourceZone::Graveyard => {
-            let ctx = super::filter::FilterContext::from_source(state, source);
+            let ctx = super::filter::FilterContext::from_source(state, source)
+                .with_granting_object(granting_object);
             state
                 .players
                 .get(player.0 as usize)
@@ -24045,10 +24060,12 @@ pub(crate) fn find_eligible_unattach_for_cost_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     filter: &TargetFilter,
     n: u32,
 ) -> Vec<ObjectId> {
-    let ctx = super::filter::FilterContext::from_source(state, source);
+    let ctx = super::filter::FilterContext::from_source(state, source)
+        .with_granting_object(granting_object);
     state
         .battlefield
         .iter()
@@ -24311,9 +24328,11 @@ pub(crate) fn find_eligible_return_to_hand_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     filter: Option<&TargetFilter>,
 ) -> Vec<ObjectId> {
-    let ctx = super::filter::FilterContext::from_source(state, source);
+    let ctx = super::filter::FilterContext::from_source(state, source)
+        .with_granting_object(granting_object);
     state
         .battlefield
         .iter()
@@ -24365,11 +24384,13 @@ pub(crate) fn find_eligible_remove_counter_for_cost_targets(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     target: &TargetFilter,
     counter_type: &crate::types::counter::CounterMatch,
     count: u32,
 ) -> Vec<ObjectId> {
-    let ctx = super::filter::FilterContext::from_source(state, source);
+    let ctx = super::filter::FilterContext::from_source(state, source)
+        .with_granting_object(granting_object);
     state
         .battlefield
         .iter()
@@ -24391,10 +24412,12 @@ pub(super) fn find_eligible_tap_creatures_for_cost(
     state: &GameState,
     player: PlayerId,
     source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     cost: &AbilityCost,
     filter: &TargetFilter,
 ) -> Vec<ObjectId> {
-    let ctx = super::filter::FilterContext::from_source(state, source);
+    let ctx = super::filter::FilterContext::from_source(state, source)
+        .with_granting_object(granting_object);
     let exclude_source = requires_untapped(cost);
     state
         .battlefield
@@ -24992,6 +25015,20 @@ fn find_pay_life_cost(
     }
 }
 
+/// CR 201.5a: the granter stamped on the activated ability at `ability_index`.
+pub(crate) fn activated_ability_granting_object(
+    state: &GameState,
+    source_id: ObjectId,
+    ability_index: Option<usize>,
+) -> Option<ObjectIncarnationRef> {
+    state
+        .objects
+        .get(&source_id)?
+        .abilities
+        .get(ability_index?)?
+        .granting_object
+}
+
 /// CR 118.3: Find permanents controlled by `player` matching `filter` on the battlefield.
 /// The source is eligible when it matches the printed filter; "another" is
 /// represented by `FilterProp::Another` and enforced by `matches_target_filter`.
@@ -25008,6 +25045,7 @@ pub fn find_eligible_sacrifice_targets(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
     filter: &TargetFilter,
 ) -> Vec<ObjectId> {
     state
@@ -25031,7 +25069,8 @@ pub fn find_eligible_sacrifice_targets(
                 state,
                 id,
                 filter,
-                &super::filter::FilterContext::from_source_with_controller(source_id, player),
+                &super::filter::FilterContext::from_source_with_controller(source_id, player)
+                    .with_granting_object(granting_object),
             )
         })
         .collect()
@@ -26800,12 +26839,12 @@ fn activate_with_cost_carrier(
             // Courier's "Discard your hand" on an empty hand) is paid by doing nothing — the
             // helper returns `Ok(None)` so we FALL THROUGH to the following cost detection
             // rather than surfacing a dead `PayCost { count: 0 }`.
-            if let Some((count, eligible)) = resolve_non_self_discard_requirement_with_ability(
+            if let Some((count, eligible)) = resolve_non_self_discard_requirement(
                 state,
                 player,
                 source_id,
                 cost,
-                Some(&resolved),
+                DiscardCostPayer::Ability(&resolved),
             )? {
                 let mut pending_discard = PendingCast::for_activation(
                     source_id,
@@ -26928,6 +26967,7 @@ fn activate_with_cost_carrier(
                     state,
                     player,
                     source_id,
+                    ability_def.granting_object,
                     narrow_zone,
                     filter,
                 );
@@ -27033,8 +27073,13 @@ fn activate_with_cost_carrier(
             // Sacrifice above. Ordering matters for Composite costs: Sacrifice wins if both are
             // present, but no real cards combine them.
             if let Some((count, filter)) = find_return_to_hand_cost(cost) {
-                let eligible =
-                    find_eligible_return_to_hand_targets(state, player, source_id, filter);
+                let eligible = find_eligible_return_to_hand_targets(
+                    state,
+                    player,
+                    source_id,
+                    ability_def.granting_object,
+                    filter,
+                );
                 if eligible.len() < count as usize {
                     return Err(EngineError::ActionNotAllowed(
                         "No eligible permanents to return".into(),
@@ -27075,6 +27120,7 @@ fn activate_with_cost_carrier(
                     state,
                     player,
                     source_id,
+                    ability_def.granting_object,
                     target,
                     counter_type,
                     required_count,
@@ -27155,8 +27201,14 @@ fn activate_with_cost_carrier(
                         "Aggregate-power tap cost is not valid for this activation".into(),
                     )
                 })?;
-                let eligible =
-                    find_eligible_tap_creatures_for_cost(state, player, source_id, cost, filter);
+                let eligible = find_eligible_tap_creatures_for_cost(
+                    state,
+                    player,
+                    source_id,
+                    ability_def.granting_object,
+                    cost,
+                    filter,
+                );
                 if eligible.len() < count as usize {
                     return Err(EngineError::ActionNotAllowed(
                         "Not enough eligible creatures to tap".into(),
@@ -27244,7 +27296,7 @@ fn activate_with_cost_carrier(
             auto_select_targets_for_ability(state, &resolved, &target_slots, &target_constraints)?
         {
             let mut resolved = resolved;
-            assign_targets_in_chain(state, &mut resolved, &targets)?;
+            assign_selected_slots_in_chain(state, &mut resolved, &targets)?;
             // CR 602.2b + CR 601.2c: automatic target selection still
             // declares targets before any activation cost is paid.
             emit_targeting_events(
@@ -28529,9 +28581,9 @@ fn object_scope_reads_chosen_target(scope: &ObjectScope, read: TargetRead) -> bo
         // CR 115.1 + CR 601.2c: a declared target, of this ability or of its
         // chain root.
         ObjectScope::Target | ObjectScope::ChainRootTarget => read.includes_bindable(),
-        // Resolved through the effect-context referent, the cost-paid object, the
-        // triggering event, or a resolution-local set: none is the declared target
-        // list of this activation.
+        // A fixed incarnation, or resolved through the effect-context referent, the
+        // cost-paid object, the triggering event, or a resolution-local set: none is
+        // the declared target list of this activation.
         ObjectScope::Source
         | ObjectScope::Recipient
         | ObjectScope::EventSource
@@ -28542,7 +28594,9 @@ fn object_scope_reads_chosen_target(scope: &ObjectScope, read: TargetRead) -> bo
         | ObjectScope::EventTarget
         | ObjectScope::OtherRevealedCard
         | ObjectScope::OwnedLinkedExileCard
-        | ObjectScope::BatchSource => false,
+        | ObjectScope::BatchSource
+        | ObjectScope::GrantingObject
+        | ObjectScope::SpecificObject { .. } => false,
     }
 }
 
@@ -28622,6 +28676,7 @@ fn player_filter_reads_chosen_target(filter: &PlayerFilter, read: TargetRead) ->
         | PlayerFilter::OpponentOfTriggeringPlayer
         | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
         | PlayerFilter::VotedFor { .. }
+        | PlayerFilter::GrantingObjectCaster
         | PlayerFilter::ChosenPlayer { .. } => false,
     }
 }
@@ -28687,7 +28742,7 @@ fn target_filter_reads_chosen_target(filter: &TargetFilter, read: TargetRead) ->
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
-        | TargetFilter::GrantingObject
+        | TargetFilter::GrantingObject { .. }
         | TargetFilter::SourceOrPaired
         | TargetFilter::StackSpell
         | TargetFilter::SpecificObject { .. }
@@ -30284,7 +30339,8 @@ fn collect_static_activated_ability_cost_modifiers(
             let ctx = super::filter::FilterContext::from_source_with_controller(
                 tce.source_id,
                 tce.controller,
-            );
+            )
+            .with_granting_object(tce.granting_object);
             if let Some(applied) = resolve_one_reduce_ability_cost(
                 state,
                 &scope,
@@ -32565,18 +32621,19 @@ mod sacrifice_cost_context_identity_tests {
             .controller(ControllerRef::You)
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &you),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &you),
             vec![source, owned, stolen]
         );
         move_to_zone(runner.state_mut(), source, Zone::Graveyard, &mut vec![]);
         assert_eq!(runner.state().objects[&source].controller, P1);
         // CR 701.21a: P0 controls both eligible fodder even though only one is owned by P0.
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &you),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &you),
             vec![owned, stolen]
         );
         assert!(
-            !find_eligible_sacrifice_targets(runner.state(), P0, source, &you).contains(&foreign)
+            !find_eligible_sacrifice_targets(runner.state(), P0, source, None, &you)
+                .contains(&foreign)
         );
         let owned_by_payer: TargetFilter = TypedFilter::permanent()
             .properties(vec![FilterProp::Owned {
@@ -32584,13 +32641,15 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &owned_by_payer),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &owned_by_payer),
             vec![owned]
         );
         let opponent: TargetFilter = TypedFilter::permanent()
             .controller(ControllerRef::Opponent)
             .into();
-        assert!(find_eligible_sacrifice_targets(runner.state(), P0, source, &opponent).is_empty());
+        assert!(
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &opponent).is_empty()
+        );
         for filter in [
             TargetFilter::And {
                 filters: vec![you.clone(), TargetFilter::Any],
@@ -32603,7 +32662,7 @@ mod sacrifice_cost_context_identity_tests {
             },
         ] {
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![owned, stolen]
             );
         }
@@ -32611,6 +32670,7 @@ mod sacrifice_cost_context_identity_tests {
             runner.state(),
             P0,
             source,
+            None,
             &TargetFilter::SelfRef
         )
         .is_empty());
@@ -32727,7 +32787,7 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().controller(controller).into();
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![fodder]
             );
         }
@@ -32737,7 +32797,8 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().controller(controller).into();
             assert!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter).is_empty()
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter)
+                    .is_empty()
             );
         }
         let mut ability = ResolvedAbility::new(
@@ -32757,7 +32818,8 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().controller(controller).into();
             assert!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter).is_empty()
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter)
+                    .is_empty()
             );
             assert!(matches_target_filter(
                 runner.state(),
@@ -32773,7 +32835,8 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().controller(controller).into();
             assert!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter).is_empty()
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter)
+                    .is_empty()
             );
             assert!(matches_target_filter(
                 runner.state(),
@@ -32794,7 +32857,7 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().controller(controller).into();
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![fodder]
             );
         }
@@ -32809,10 +32872,14 @@ mod sacrifice_cost_context_identity_tests {
         let event_controller: TargetFilter = TypedFilter::creature()
             .controller(ControllerRef::EventTargetController)
             .into();
-        assert!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &event_controller)
-                .is_empty()
-        );
+        assert!(find_eligible_sacrifice_targets(
+            runner.state(),
+            P0,
+            source,
+            None,
+            &event_controller
+        )
+        .is_empty());
         assert!(matches_target_filter(
             runner.state(),
             fodder,
@@ -32830,7 +32897,7 @@ mod sacrifice_cost_context_identity_tests {
             .controller(ControllerRef::SourceChosenPlayer)
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &chosen),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &chosen),
             vec![fodder]
         );
         runner
@@ -32843,7 +32910,7 @@ mod sacrifice_cost_context_identity_tests {
             .controller(ControllerRef::EnchantedPlayer)
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &enchanted),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &enchanted),
             vec![fodder]
         );
         runner
@@ -32861,7 +32928,7 @@ mod sacrifice_cost_context_identity_tests {
             ])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &attached),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &attached),
             vec![fodder]
         );
         runner
@@ -32870,7 +32937,9 @@ mod sacrifice_cost_context_identity_tests {
             .get_mut(&fodder)
             .unwrap()
             .attached_to = None;
-        assert!(find_eligible_sacrifice_targets(runner.state(), P0, source, &attached).is_empty());
+        assert!(
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &attached).is_empty()
+        );
     }
 
     #[test]
@@ -32970,7 +33039,7 @@ mod sacrifice_cost_context_identity_tests {
             any_attachment(ControllerRef::You),
         ] {
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![goblin]
             );
         }
@@ -32979,7 +33048,7 @@ mod sacrifice_cost_context_identity_tests {
             any_attachment(ControllerRef::Opponent),
         ] {
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![elf]
             );
         }
@@ -32994,6 +33063,7 @@ mod sacrifice_cost_context_identity_tests {
             runner.state(),
             P0,
             source,
+            None,
             &named(ControllerRef::You)
         )
         .contains(&goblin));
@@ -33002,6 +33072,7 @@ mod sacrifice_cost_context_identity_tests {
                 runner.state(),
                 P0,
                 source,
+                None,
                 &named(ControllerRef::Opponent)
             ),
             vec![elf]
@@ -33013,7 +33084,7 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &prevalent),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &prevalent),
             vec![goblin]
         );
         let attached_to_payer: TargetFilter = TypedFilter::permanent()
@@ -33024,7 +33095,7 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &attached_to_payer),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &attached_to_payer),
             vec![on_you]
         );
         let matching_controller: TargetFilter = TypedFilter::creature()
@@ -33032,19 +33103,27 @@ mod sacrifice_cost_context_identity_tests {
                 player: Box::new(PlayerFilter::Controller),
             }])
             .into();
-        assert!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &matching_controller)
-                .contains(&goblin)
-        );
+        assert!(find_eligible_sacrifice_targets(
+            runner.state(),
+            P0,
+            source,
+            None,
+            &matching_controller
+        )
+        .contains(&goblin));
         let opponent_controller: TargetFilter = TypedFilter::creature()
             .properties(vec![FilterProp::ControllerMatches {
                 player: Box::new(PlayerFilter::Opponent),
             }])
             .into();
-        assert!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &opponent_controller)
-                .is_empty()
-        );
+        assert!(find_eligible_sacrifice_targets(
+            runner.state(),
+            P0,
+            source,
+            None,
+            &opponent_controller
+        )
+        .is_empty());
     }
 
     #[test]
@@ -33101,7 +33180,7 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().properties(vec![prop]).into();
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![attacker]
             );
         }
@@ -33115,7 +33194,8 @@ mod sacrifice_cost_context_identity_tests {
         ] {
             let filter: TargetFilter = TypedFilter::creature().properties(vec![prop]).into();
             assert!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter).is_empty()
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter)
+                    .is_empty()
             );
         }
         // CR 310.12a: A Siege's protector P1 is an opponent of its controller P0.
@@ -33125,7 +33205,7 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &protected),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &protected),
             vec![battle]
         );
         let self_protected: TargetFilter = TypedFilter::permanent()
@@ -33134,7 +33214,8 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &self_protected).is_empty()
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &self_protected)
+                .is_empty()
         );
     }
 
@@ -33162,18 +33243,19 @@ mod sacrifice_cost_context_identity_tests {
             .controller(ControllerRef::You)
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &you),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &you),
             vec![fodder]
         );
         let neutral: TargetFilter = TypedFilter::creature().into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &neutral),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &neutral),
             vec![fodder]
         );
         assert!(find_eligible_sacrifice_targets(
             runner.state(),
             P0,
             source,
+            None,
             &TargetFilter::SelfRef
         )
         .is_empty());
@@ -33225,7 +33307,7 @@ mod sacrifice_cost_context_identity_tests {
                 }])
                 .into();
             assert_eq!(
-                find_eligible_sacrifice_targets(runner.state(), P0, source, &filter),
+                find_eligible_sacrifice_targets(runner.state(), P0, source, None, &filter),
                 vec![expected]
             );
         }
@@ -33241,7 +33323,7 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &threshold),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &threshold),
             vec![payer_marked, opponent_marked]
         );
         let high_marked: TargetFilter = TypedFilter::creature()
@@ -33252,7 +33334,7 @@ mod sacrifice_cost_context_identity_tests {
             }])
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P0, source, &high_marked),
+            find_eligible_sacrifice_targets(runner.state(), P0, source, None, &high_marked),
             vec![payer_marked]
         );
     }
@@ -33276,14 +33358,14 @@ mod sacrifice_cost_context_identity_tests {
             .controller(ControllerRef::DefendingPlayer)
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P1, source, &defender),
+            find_eligible_sacrifice_targets(runner.state(), P1, source, None, &defender),
             vec![defender_fodder]
         );
         let source_controller: TargetFilter = TypedFilter::creature()
             .controller(ControllerRef::You)
             .into();
         assert_eq!(
-            find_eligible_sacrifice_targets(runner.state(), P1, source, &source_controller),
+            find_eligible_sacrifice_targets(runner.state(), P1, source, None, &source_controller),
             vec![defender_fodder]
         );
     }
