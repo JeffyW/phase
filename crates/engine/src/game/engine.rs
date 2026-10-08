@@ -9975,7 +9975,7 @@ fn emit_resolution_halt(state: &mut GameState, result: &mut ActionResult) {
 
 /// CR 707.10c / CR 601.2c: advance the copy target walk after a pick — the
 /// next prompt, or finalization once every position is decided.
-fn advance_copy_walk(
+pub(crate) fn advance_copy_walk(
     state: &mut GameState,
     walk: &effects::copy_choice::CopyWalk,
     picks: Vec<crate::game::retarget_completion::RetargetPick>,
@@ -15294,11 +15294,12 @@ fn apply_non_priority_pass_action(
             },
             GameAction::ChooseAnnouncingOpponent { opponent },
         ) => {
-            let (walk, _) = effects::copy_choice::walk_of(&state.waiting_for).ok_or_else(|| {
-                EngineError::InvalidAction("Copy target walk is not normalized".to_string())
-            })?;
+            let (walk, picks) =
+                effects::copy_choice::walk_of(&state.waiting_for).ok_or_else(|| {
+                    EngineError::InvalidAction("Copy target walk is not normalized".to_string())
+                })?;
             effects::copy_choice::elect_announcing_opponent(state, &walk, opponent)?;
-            advance_copy_walk(state, &walk, Vec::new(), &mut events)?;
+            advance_copy_walk(state, &walk, picks, &mut events)?;
             state.waiting_for.clone()
         }
         (

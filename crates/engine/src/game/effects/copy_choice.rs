@@ -172,17 +172,14 @@ pub(crate) fn walk_step(
         }
         CopyChoiceMode::Announce => {
             if let Some(election) = announcer_election(state, walk)? {
-                // An announcer is elected before any target is announced; a
-                // decided prefix with an unelected group is not a walk state.
-                if !picks.is_empty() {
-                    return Err(EngineError::InvalidAction(
-                        "Copy announcement has targets before its announcing opponent".to_string(),
-                    ));
-                }
+                // An announcer is elected before any target is announced. The
+                // one later election is CR 800.4g's replacement for an
+                // announcer who left the game (`replace_departed_copy_announcers`),
+                // which keeps the decided prefix.
                 // CR 601.2c + CR 707.12: the election is published only for a
                 // feasible announcement; a copy with no legal announcement
                 // fails here, before any prompt (restore: fail closed).
-                announcement(state, walk.copy_id, Vec::new())?;
+                announcement(state, walk.copy_id, picks.clone())?;
                 return Ok(Some(CopyWalkStep::Prompt(Box::new(
                     WaitingFor::CopyRetarget {
                         player: walk.player,
@@ -191,10 +188,10 @@ pub(crate) fn walk_step(
                         target_slots: Vec::new(),
                         effect_kind: walk.effect_kind,
                         effect_source_id: walk.effect_source_id,
-                        current_slot: 0,
+                        current_slot: picks.len(),
                         paradigm_remaining_offers: walk.paradigm_remaining_offers.clone(),
                         mode: Some(CopyChoiceMode::Announce),
-                        picks: Some(Vec::new()),
+                        picks: Some(picks),
                         can_keep_rest: false,
                         announcer_election: Some(election),
                     },
@@ -294,7 +291,8 @@ fn announcer_election(
 /// CR 601.2c + CR 115.1: answer the copy announcement's announcing-opponent
 /// election: record `opponent` on the first unassigned opponent-choice group
 /// of the copy on the stack (`assign_next_announcing_opponent`, the casting
-/// authority). The walk then continues from an empty prefix.
+/// authority). The walk then continues from its decided prefix (empty, unless
+/// this replaces an announcer who left the game).
 pub(crate) fn elect_announcing_opponent(
     state: &mut GameState,
     walk: &CopyWalk,
@@ -322,6 +320,90 @@ pub(crate) fn elect_announcing_opponent(
         ));
     }
     Ok(())
+}
+
+/// The `depth`-th link of `ability`'s sub-ability chain.
+fn chain_link_mut(ability: &mut ResolvedAbility, depth: usize) -> Option<&mut ResolvedAbility> {
+    let mut node = Some(ability);
+    for _ in 0..depth {
+        node = node?.sub_ability.as_deref_mut();
+    }
+    node
+}
+
+/// CR 800.4g + CR 601.2c + CR 115.1: when the player announcing an "of an
+/// opponent's choice" group of a copy's announcement leaves the game, the
+/// copy's controller chooses another player to make that choice, another
+/// opponent if possible. Every group whose announcer has left and which still
+/// owns an undecided slot loses its announcer: with exactly one choosable
+/// opponent it goes to that opponent (no decision); with two or more, the walk
+/// re-publishes the controller's announcing-opponent election. The decided
+/// prefix, the copy's controller and the walk are kept. Returns the walk and
+/// its picks to re-derive when anything changed; `None` otherwise (not a copy
+/// announcement, the copy's controller has left, or no undecided group lost
+/// its announcer).
+pub(crate) fn replace_departed_copy_announcers(
+    state: &mut GameState,
+) -> Result<Option<(CopyWalk, Vec<RetargetPick>)>, EngineError> {
+    use crate::game::players::{choosable_opponents, is_alive};
+    use crate::types::ability::TargetFilter;
+    let Some((walk, picks)) = walk_of(&state.waiting_for) else {
+        return Ok(None);
+    };
+    if walk.mode != CopyChoiceMode::Announce || !is_alive(state, walk.player) {
+        return Ok(None);
+    }
+    let Some(ability) = copy_ability(state, walk.copy_id)? else {
+        return Ok(None);
+    };
+    let baseline = build_target_slots(state, ability)?;
+    // A group's slots are the ones whose announcer changes when only that
+    // group's announcer is set to the controller (the CR 601.2c default).
+    let mut departed = Vec::new();
+    let mut node = Some(ability);
+    let mut depth = 0;
+    while let Some(link) = node {
+        let left = matches!(link.target_chooser, Some(TargetFilter::Opponent))
+            && link
+                .context
+                .announcing_opponent
+                .is_some_and(|announcer| !is_alive(state, announcer));
+        if left {
+            let mut probe = ability.clone();
+            let controller = probe.controller;
+            if let Some(probe_link) = chain_link_mut(&mut probe, depth) {
+                probe_link.context.announcing_opponent = Some(controller);
+            }
+            let probed = build_target_slots(state, &probe)?;
+            let owns_undecided = probed.len() != baseline.len()
+                || (picks.len()..baseline.len())
+                    .any(|slot| probed[slot].chooser != baseline[slot].chooser);
+            if owns_undecided {
+                departed.push(depth);
+            }
+        }
+        node = link.sub_ability.as_deref();
+        depth += 1;
+    }
+    if departed.is_empty() {
+        return Ok(None);
+    }
+    let replacement = match choosable_opponents(state, walk.player).as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    };
+    let ability = state
+        .stack
+        .iter_mut()
+        .find(|entry| entry.id == walk.copy_id)
+        .and_then(|entry| entry.ability_mut())
+        .ok_or_else(|| EngineError::InvalidAction("Copy is no longer on the stack".to_string()))?;
+    for depth in departed {
+        if let Some(link) = chain_link_mut(ability, depth) {
+            link.context.announcing_opponent = replacement;
+        }
+    }
+    Ok(Some((walk, picks)))
 }
 
 /// CR 707.10c / CR 601.2c: THE gate and advance for `ChooseTarget` — the
@@ -572,11 +654,13 @@ pub(crate) fn restore_copy_target_walk(state: &mut GameState) -> Result<(), Pers
         paradigm_remaining_offers,
         mode,
         picks,
+        announcer_election: persisted_election,
         ..
     } = &state.waiting_for
     else {
         return Ok(());
     };
+    let legacy_unelected_prefix = persisted_election.is_none();
     let malformed = |reason: String| PersistedRestoreError::InvalidCopyTargetWalk(reason);
     let (mode, picks) = match (mode, picks) {
         (Some(mode), Some(picks)) => (*mode, picks.clone()),
@@ -611,9 +695,11 @@ pub(crate) fn restore_copy_target_walk(state: &mut GameState) -> Result<(), Pers
     // "of an opponent's choice" group with no elected announcer (a save from
     // before the copy walk ran the election) cannot be resumed: the
     // election would have to precede the saved picks, and it is never
-    // inferred from seat order.
+    // inferred from seat order. A saved election prompt with a prefix is the
+    // CR 800.4g replacement of a departed announcer, and resumes.
     if mode == CopyChoiceMode::Announce
         && !picks.is_empty()
+        && legacy_unelected_prefix
         && announcer_election(state, &walk)
             .map_err(|error| malformed(format!("{error:?}")))?
             .is_some()

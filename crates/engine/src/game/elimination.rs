@@ -555,6 +555,23 @@ pub fn eliminate_players_simultaneously(
             debug_assert!(false, "scoped search elimination resume failed: {error}");
         }
 
+        // CR 800.4g: a copy announcement whose "of an opponent's choice"
+        // announcer left keeps its walk: the copy's controller chooses the
+        // replacement, and the decided prefix and continuation stay. Runs
+        // before the generic dead-actor repoint below, which would otherwise
+        // replace the walk with unrelated priority.
+        match super::effects::copy_choice::replace_departed_copy_announcers(state) {
+            Ok(Some((walk, picks))) => {
+                if let Err(error) = super::engine::advance_copy_walk(state, &walk, picks, events) {
+                    debug_assert!(false, "copy announcement replacement failed: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                debug_assert!(false, "copy announcement replacement failed: {error}");
+            }
+        }
+
         if let Some(waiting_pid) = state.waiting_for.acting_player() {
             if !players::is_alive(state, waiting_pid) {
                 let next = players::next_player(state, waiting_pid);

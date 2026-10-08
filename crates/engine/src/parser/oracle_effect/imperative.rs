@@ -10279,9 +10279,9 @@ pub(super) fn parse_destroy_ast(
         // triggering subject ("Whenever a creature dies, destroy it" class).
         let (target, rem) = parse_target_with_ctx(rest, ctx);
         let phrase = &rest[..rest.len() - rem.len()];
-        let (target, rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
+        let (target, _rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
         #[cfg(debug_assertions)]
-        assert_no_compound_remainder(rem, text);
+        assert_no_compound_remainder(_rem, text);
         return Some(ZoneCounterImperativeAst::Destroy { target, all: true });
     }
     if let Some((_, rest)) =
@@ -10290,7 +10290,7 @@ pub(super) fn parse_destroy_ast(
         // CR 608.2k: see comment above — anaphor binding via parse_target_with_ctx.
         let (target, rem) = parse_target_with_ctx(rest, ctx);
         let phrase = &rest[..rest.len() - rem.len()];
-        let (target, rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
+        let (target, _rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
         // CR 115.1a + CR 601.2c: a targeted destroy of a declared-slot referent
         // ("destroy target Equipment attached to that creature") has no
         // supported lowering (the chain's anaphor rewrite collapses it to the
@@ -10302,7 +10302,7 @@ pub(super) fn parse_destroy_ast(
             return None;
         }
         #[cfg(debug_assertions)]
-        assert_no_compound_remainder(rem, text);
+        assert_no_compound_remainder(_rem, text);
         return Some(ZoneCounterImperativeAst::Destroy { target, all: false });
     }
     None

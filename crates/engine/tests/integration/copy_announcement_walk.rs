@@ -693,3 +693,219 @@ fn legacy_announcement_with_targets_before_the_election_is_refused() {
         "control: the election-time save restores"
     );
 }
+
+/// The `n`-player Mizzix's Mastery -> Volcanic Offering copy after its
+/// announcing-opponent elections (`electees`, one per opponent-choice group),
+/// with P0's first land announced. P1 controls two nonbasic lands and two
+/// creatures. Returns (runner, copy, [land a, land b], [creature a, creature b]).
+fn copy_after_elections(
+    n: u8,
+    electees: [PlayerId; 2],
+) -> (GameRunner, ObjectId, [ObjectId; 2], [ObjectId; 2]) {
+    let mut s = GameScenario::new_n_player(n, 7);
+    s.at_phase(Phase::PreCombatMain);
+    let lands = [
+        s.add_land_from_oracle(P1, "P1 Nonbasic A", "").id(),
+        s.add_land_from_oracle(P1, "P1 Nonbasic B", "").id(),
+    ];
+    let creatures = [
+        s.add_creature(P1, "P1 Creature A", 3, 12).id(),
+        s.add_creature(P1, "P1 Creature B", 3, 12).id(),
+    ];
+    let offering = s
+        .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+        .from_oracle_text(VOLCANIC_OFFERING)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(mastery).target_object(offering).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards {
+        cards: vec![offering],
+    })
+    .expect("cast the copy");
+    let WaitingFor::CopyRetarget { copy_id, .. } = r.state().waiting_for else {
+        panic!("expected the copy walk, got {:?}", r.state().waiting_for);
+    };
+    for electee in electees {
+        assert!(
+            matches!(
+                r.state().waiting_for,
+                WaitingFor::CopyRetarget {
+                    player: P0,
+                    announcer_election: Some(_),
+                    ..
+                }
+            ),
+            "reach: the caster's election, got {:?}",
+            r.state().waiting_for
+        );
+        r.act(GameAction::ChooseAnnouncingOpponent { opponent: electee })
+            .expect("elect");
+    }
+    r.act(GameAction::ChooseTarget {
+        target: Some(TargetRef::Object(lands[0])),
+    })
+    .expect("P0 announces its land");
+    (r, copy_id, lands, creatures)
+}
+
+/// The current copy-announcement prompt: (answering player, the copy's
+/// controller, the decided prefix, whether it is an election).
+fn walk_prompt(r: &GameRunner) -> (PlayerId, PlayerId, Vec<Option<TargetRef>>, bool) {
+    match &r.state().waiting_for {
+        WaitingFor::CopyRetarget {
+            player,
+            controller,
+            picks,
+            current_slot,
+            mode,
+            announcer_election,
+            ..
+        } => {
+            assert_eq!(*mode, Some(CopyChoiceMode::Announce));
+            let picks = picks.clone().expect("an explicit prefix");
+            assert_eq!(*current_slot, picks.len(), "the cursor follows the prefix");
+            (
+                *player,
+                controller.unwrap_or(*player),
+                picks,
+                announcer_election.is_some(),
+            )
+        }
+        other => panic!("expected the copy announcement, got {other:?}"),
+    }
+}
+
+/// Answer the remaining announcement with `targets`, recording who answers.
+fn announce_rest(r: &mut GameRunner, targets: &[ObjectId]) -> Vec<PlayerId> {
+    targets
+        .iter()
+        .map(|target| {
+            let (player, controller, _, election) = walk_prompt(r);
+            assert!(!election);
+            assert_eq!(controller, P0, "the copy stays P0's");
+            r.act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(*target)),
+            })
+            .expect("the asked player announces");
+            player
+        })
+        .collect()
+}
+
+fn assert_offering_resolved(
+    r: &mut GameRunner,
+    copy: ObjectId,
+    lands: [ObjectId; 2],
+    creatures: [ObjectId; 2],
+) {
+    resolve_entry(r, copy);
+    assert!(
+        lands
+            .iter()
+            .all(|land| r.state().objects[land].zone == Zone::Graveyard),
+        "both announced lands are destroyed"
+    );
+    assert_eq!(
+        creatures.map(|c| r.state().objects[&c].damage_marked),
+        [7, 7]
+    );
+}
+
+/// CR 800.4g + CR 601.2c (three players): P2, elected to announce the copy's
+/// second land, concedes while answering. The copy's controller chooses
+/// another opponent; with P1 the only one left there is no decision, so P1
+/// answers at once. The walk, its decided prefix (P0's land) and the copy's
+/// controller are kept, it continues P1/P0/P1, and the copy resolves in full.
+#[test]
+fn copy_announcement_replaces_a_departed_announcer_and_keeps_the_prefix() {
+    let p2 = PlayerId(2);
+    let (mut r, copy, lands, creatures) = copy_after_elections(3, [p2, P1]);
+    assert_eq!(walk_prompt(&r).0, p2, "reach: P2 answers the second land");
+    r.act(GameAction::Concede { player_id: p2 })
+        .expect("P2 concedes");
+    let (player, controller, picks, election) = walk_prompt(&r);
+    assert_eq!(
+        (player, controller, picks, election),
+        (P1, P0, vec![Some(TargetRef::Object(lands[0]))], false),
+        "the remaining opponent answers; the prefix and controller are kept"
+    );
+    let restored = restore(r.state());
+    assert_eq!(restored.state().waiting_for, r.state().waiting_for);
+    r = restored;
+    let askers = announce_rest(&mut r, &[lands[1], creatures[0], creatures[1]]);
+    assert_eq!(askers, vec![P1, P0, P1]);
+    assert_offering_resolved(&mut r, copy, lands, creatures);
+}
+
+/// CR 800.4g + CR 601.2c (four players): P2 concedes while answering, and two
+/// opponents remain, so the copy's controller chooses the replacement: P0 is
+/// asked to elect between P1 and P3, with the decided prefix kept (no target
+/// may be announced meanwhile; a save restores to the same election). P3 is
+/// elected and announces the land; the walk continues and the copy resolves.
+#[test]
+fn copy_announcement_controller_elects_a_replacement_announcer() {
+    let (p2, p3) = (PlayerId(2), PlayerId(3));
+    let (mut r, copy, lands, creatures) = copy_after_elections(4, [p2, P1]);
+    assert_eq!(walk_prompt(&r).0, p2, "reach: P2 answers the second land");
+    r.act(GameAction::Concede { player_id: p2 })
+        .expect("P2 concedes");
+    let (player, controller, picks, election) = walk_prompt(&r);
+    assert_eq!(
+        (player, controller, picks, election),
+        (P0, P0, vec![Some(TargetRef::Object(lands[0]))], true),
+        "the copy's controller elects; the prefix is kept"
+    );
+    let WaitingFor::CopyRetarget {
+        announcer_election: Some(election),
+        ..
+    } = &r.state().waiting_for
+    else {
+        unreachable!()
+    };
+    assert_eq!(election.candidates, vec![P1, p3], "another opponent");
+    assert!(
+        GameRunner::from_state(r.state().clone())
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(lands[1])),
+            })
+            .is_err(),
+        "no target is announced mid-election"
+    );
+    let restored = restore(r.state());
+    assert_eq!(restored.state().waiting_for, r.state().waiting_for);
+    r = restored;
+    r.act(GameAction::ChooseAnnouncingOpponent { opponent: p3 })
+        .expect("P0 elects P3");
+    let askers = announce_rest(&mut r, &[lands[1], creatures[0], creatures[1]]);
+    assert_eq!(askers, vec![p3, P0, P1]);
+    assert_offering_resolved(&mut r, copy, lands, creatures);
+}
+
+/// CR 800.4g control (four players): P2 announced the copy's second land and
+/// then concedes while P3 answers the second creature. P2's choice is already
+/// made, so nothing is re-asked: the prompt is unchanged, the walk completes
+/// with P2's land, and the copy resolves.
+#[test]
+fn a_departed_announcer_whose_choice_is_made_is_not_replaced() {
+    let (p2, p3) = (PlayerId(2), PlayerId(3));
+    let (mut r, copy, lands, creatures) = copy_after_elections(4, [p2, p3]);
+    let askers = announce_rest(&mut r, &[lands[1], creatures[0]]);
+    assert_eq!(askers, vec![p2, P0]);
+    assert_eq!(
+        walk_prompt(&r).0,
+        p3,
+        "reach: P3 answers the second creature"
+    );
+    let before = r.state().waiting_for.clone();
+    r.act(GameAction::Concede { player_id: p2 })
+        .expect("P2 concedes");
+    assert_eq!(r.state().waiting_for, before, "the walk is unchanged");
+    assert_eq!(announce_rest(&mut r, &[creatures[1]]), vec![p3]);
+    assert_offering_resolved(&mut r, copy, lands, creatures);
+}
