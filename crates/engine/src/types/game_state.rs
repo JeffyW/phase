@@ -29298,7 +29298,73 @@ impl GameState {
         // while which spell each targeter names is preserved. Ranked AFTER
         // pruning, so discarded history cannot shift the surviving ranks.
         clone.canonicalize_spell_announcements_for_loop();
+        // CR 104.4b + CR 400.7: an incarnation is monotonic identity too. Renumber
+        // the retained LKI keys and every trigger event that names one, per
+        // object, by rank — after pruning, so discarded history cannot shift it.
+        clone.canonicalize_lki_incarnations_for_loop();
         clone
+    }
+
+    /// See `normalize_for_loop`. Per object, rank-based over the retained
+    /// `lki_by_incarnation` keys and the incarnations trigger events name
+    /// (`ZoneChanged` entries and stamped `PermanentTapped` taps), so two
+    /// positions minted at different times compare equal while which
+    /// incarnation each event names — and its snapshot — is preserved.
+    fn canonicalize_lki_incarnations_for_loop(&mut self) {
+        fn named_incarnation(event: &mut GameEvent) -> Option<(ObjectId, &mut u64)> {
+            match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } => record
+                    .entered_incarnation
+                    .as_mut()
+                    .map(|incarnation| (*object_id, incarnation)),
+                GameEvent::PermanentTapped {
+                    object_id,
+                    incarnation: Some(incarnation),
+                    ..
+                } => Some((*object_id, incarnation)),
+                _ => None,
+            }
+        }
+        let mut present: std::collections::HashMap<ObjectId, Vec<u64>> =
+            std::collections::HashMap::new();
+        for (object_id, history) in self.lki_by_incarnation.iter() {
+            present
+                .entry(*object_id)
+                .or_default()
+                .extend(history.keys().copied());
+        }
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let Some((object_id, incarnation)) = named_incarnation(event) {
+                present.entry(object_id).or_default().push(*incarnation);
+            }
+        });
+        for incarnations in present.values_mut() {
+            incarnations.sort_unstable();
+            incarnations.dedup();
+        }
+        let canonical = |object_id: ObjectId, incarnation: u64| {
+            let rank = present[&object_id]
+                .binary_search(&incarnation)
+                .expect("every incarnation was collected above");
+            rank as u64 + 1
+        };
+        self.lki_by_incarnation = std::mem::take(&mut self.lki_by_incarnation)
+            .into_iter()
+            .map(|(object_id, history)| {
+                let history = history
+                    .into_iter()
+                    .map(|(incarnation, snapshot)| (canonical(object_id, incarnation), snapshot))
+                    .collect();
+                (object_id, history)
+            })
+            .collect();
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let Some((object_id, incarnation)) = named_incarnation(event) {
+                *incarnation = canonical(object_id, *incarnation);
+            }
+        });
     }
 
     /// The spell announcements named by `BecomesTarget` targeters on every
@@ -38167,13 +38233,21 @@ mod tests {
             loop_states_equal(&normalized_a, &normalized_b),
             "irrelevant incarnation history must not block loop recurrence"
         );
+        let retained: Vec<u64> = normalized_a.lki_by_incarnation[&entrant]
+            .keys()
+            .copied()
+            .collect();
+        let named = match &normalized_a.stack[0].kind {
+            StackEntryKind::TriggeredAbility {
+                trigger_event: Some(GameEvent::ZoneChanged { record, .. }),
+                ..
+            } => record.entered_incarnation,
+            other => panic!("unexpected stack entry {other:?}"),
+        };
         assert_eq!(
-            normalized_a.lki_by_incarnation[&entrant]
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![referenced_incarnation],
-            "the trigger-referenced incarnation remains available"
+            (retained.len(), named),
+            (1, retained.first().copied()),
+            "the trigger-referenced incarnation remains available (canonically renumbered)"
         );
 
         let mut changed_reference = a;
@@ -38185,6 +38259,110 @@ mod tests {
         assert!(
             !loop_states_equal(&normalized_a, &changed_reference.normalize_for_loop()),
             "different LKI for a still-referenced incarnation remains meaningful"
+        );
+    }
+
+    /// Pre-push review R3. CR 104.4b + CR 400.7 + CR 608.2h: a Royal Decree
+    /// trigger on the stack names the tapped Pyromancer's departed incarnation,
+    /// whose snapshot records its last controller. Two positions that differ
+    /// only in how incarnations were allocated (3 vs 91, renumbered
+    /// consistently in the event and the LKI key) are the same position.
+    /// Controls: a different departed controller, or an event that names the
+    /// live incarnation instead (no departed snapshot), stay unequal.
+    #[test]
+    fn normalize_for_loop_canonicalizes_a_tapped_incarnation() {
+        use crate::types::ability::Effect;
+
+        fn snapshot(controller: PlayerId) -> LKISnapshot {
+            LKISnapshot {
+                name: "Prodigal Pyromancer".to_string(),
+                token_image_ref: None,
+                power: Some(1),
+                toughness: Some(1),
+                base_power: Some(1),
+                base_toughness: Some(1),
+                mana_value: 3,
+                controller,
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: Vec::new(),
+                supertypes: Vec::new(),
+                keywords: Vec::new(),
+                colors: vec![ManaColor::Red],
+                chosen_attributes: Vec::new(),
+                counters: HashMap::new(),
+                tapped: true,
+                is_suspected: false,
+                attachments: Vec::new(),
+            }
+        }
+
+        let pyromancer = ObjectId(50);
+        let decree = ObjectId(5);
+        let position = |incarnation: u64, departed: Option<(u64, PlayerId)>| {
+            let mut state = GameState::new_two_player(7);
+            state.stack.push_back(StackEntry {
+                id: ObjectId(20),
+                source_id: decree,
+                controller: PlayerId(0),
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: decree,
+                    ability: Box::new(ResolvedAbility::new(
+                        Effect::DealDamage {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                            target: TargetFilter::ParentTargetController,
+                            damage_source: None,
+                            excess: None,
+                        },
+                        vec![],
+                        decree,
+                        PlayerId(0),
+                    )),
+                    condition: None,
+                    trigger_event: Some(GameEvent::PermanentTapped {
+                        object_id: pyromancer,
+                        caused_by: None,
+                        incarnation: Some(incarnation),
+                    }),
+                    description: None,
+                    source_name: String::new(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            });
+            if let Some((key, controller)) = departed {
+                state
+                    .lki_by_incarnation
+                    .entry(pyromancer)
+                    .or_default()
+                    .insert(key, snapshot(controller));
+            }
+            state
+        };
+
+        let early = position(3, Some((3, PlayerId(1))));
+        let late = position(91, Some((91, PlayerId(1))));
+        assert_ne!(early, late, "reach guard: the raw positions differ");
+        assert!(
+            loop_states_equal(&early.normalize_for_loop(), &late.normalize_for_loop()),
+            "consistently renumbered incarnations are the same position"
+        );
+        let other_controller = position(91, Some((91, PlayerId(0))));
+        assert!(
+            !loop_states_equal(
+                &early.normalize_for_loop(),
+                &other_controller.normalize_for_loop()
+            ),
+            "a different departed controller is a different position"
+        );
+        let names_live = position(92, Some((91, PlayerId(1))));
+        assert!(
+            !loop_states_equal(
+                &early.normalize_for_loop(),
+                &names_live.normalize_for_loop()
+            ),
+            "an event naming the live incarnation is a different position"
         );
     }
 
