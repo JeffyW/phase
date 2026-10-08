@@ -5578,9 +5578,7 @@ fn build_trigger_item(
 ) -> ParsedItem {
     // CR 603.8: StateCondition triggers use the priority pipeline, not the
     // event-based trigger registry — they are supported.
-    let mode_supported = !matches!(&trig.mode, TriggerMode::Unknown(_))
-        && (trigger_registry.contains_key(&trig.mode)
-            || matches!(&trig.mode, TriggerMode::StateCondition));
+    let mode_supported = trigger_mode_is_supported(&trig.mode, trigger_registry);
     let mut children = Vec::new();
     if let Some(execute) = &trig.execute {
         children.push(build_ability_item(
@@ -5756,6 +5754,18 @@ fn build_ability_item(
             payload_traversal,
         ));
     });
+
+    // CR 603.7: the event a delayed trigger waits for is a trigger condition in
+    // its own right; project it with the trigger-item builder, so a mode that
+    // can't fire shows as an unsupported child, matching the aggregate gap.
+    for trigger in delayed_trigger_definitions(&def.effect) {
+        children.push(build_trigger_item(
+            trigger,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ));
+    }
 
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
         children.push(build_ability_item(
@@ -7575,22 +7585,21 @@ fn trigger_mode_is_supported(
         && (trigger_registry.contains_key(mode) || matches!(mode, TriggerMode::StateCondition))
 }
 
-/// CR 603.7: the trigger modes a delayed trigger this effect creates is
-/// waiting for. A delayed "whenever"/"when next" trigger whose mode can't fire
-/// (Priority Boarding's and Touch of Moonglove's unrecognised events) never
-/// does anything, so the ability that creates it isn't supported.
-fn delayed_trigger_modes(effect: &Effect) -> Vec<&TriggerMode> {
+/// CR 603.7: the trigger definitions a delayed trigger this effect creates is
+/// waiting for: a "whenever ? this turn" event, or a "when next" event and its
+/// alternative. Phase- and zone-change-bound conditions carry none.
+fn delayed_trigger_definitions(effect: &Effect) -> Vec<&TriggerDefinition> {
     let Effect::CreateDelayedTrigger { condition, .. } = effect else {
         return Vec::new();
     };
     match condition {
-        DelayedTriggerCondition::WheneverEvent { trigger, .. } => vec![&trigger.mode],
+        DelayedTriggerCondition::WheneverEvent { trigger, .. } => vec![trigger.as_ref()],
         DelayedTriggerCondition::WhenNextEvent {
             trigger,
             or_trigger,
             ..
-        } => std::iter::once(&trigger.mode)
-            .chain(or_trigger.iter().map(|t| &t.mode))
+        } => std::iter::once(trigger.as_ref())
+            .chain(or_trigger.as_deref())
             .collect(),
         DelayedTriggerCondition::AtNextPhase { .. }
         | DelayedTriggerCondition::AtNextPhaseForPlayer { .. }
@@ -7601,6 +7610,17 @@ fn delayed_trigger_modes(effect: &Effect) -> Vec<&TriggerMode> {
         | DelayedTriggerCondition::WhenEntersBattlefield { .. }
         | DelayedTriggerCondition::WhenDiesOrExiled { .. } => Vec::new(),
     }
+}
+
+/// CR 603.7: the trigger modes a delayed trigger this effect creates is
+/// waiting for. A delayed "whenever"/"when next" trigger whose mode can't fire
+/// (Priority Boarding's and Touch of Moonglove's unrecognised events) never
+/// does anything, so the ability that creates it isn't supported.
+fn delayed_trigger_modes(effect: &Effect) -> Vec<&TriggerMode> {
+    delayed_trigger_definitions(effect)
+        .into_iter()
+        .map(|trigger| &trigger.mode)
+        .collect()
 }
 
 fn truncate_label(text: &str, max: usize) -> &str {
@@ -13693,6 +13713,45 @@ mod tests {
             &static_registry,
             super::TokenStaticTraversal::Include,
         ));
+
+        // Maintainer round 3, finding 6: the parse tree projects the delayed
+        // event as a trigger child carrying the same support verdict, so the
+        // display never shows only supported nodes beside an aggregate gap.
+        let trigger_children = |face: &CardFace| -> Vec<bool> {
+            super::build_ability_item(
+                &face.abilities[0],
+                &trigger_registry,
+                &static_registry,
+                super::TokenStaticTraversal::Include,
+            )
+            .children
+            .iter()
+            .filter(|child| matches!(child.category, super::ParseCategory::Trigger))
+            .map(|child| child.supported)
+            .collect()
+        };
+        assert_eq!(trigger_children(&unknown), [false], "unsupported child");
+        assert_eq!(trigger_children(&registered), [true], "supported child");
+
+        // Both `WhenNextEvent` alternatives are projected.
+        let mut when_next = registered.clone();
+        if let Effect::CreateDelayedTrigger { condition, .. } =
+            when_next.abilities[0].effect.as_mut()
+        {
+            *condition = DelayedTriggerCondition::WhenNextEvent {
+                trigger: Box::new(TriggerDefinition::new(TriggerMode::SpellCast)),
+                or_trigger: Some(Box::new(TriggerDefinition::new(TriggerMode::Unknown(
+                    "Whenever you reveal a card this way".to_string(),
+                )))),
+                lifetime: Default::default(),
+            };
+        }
+        assert_eq!(
+            trigger_children(&when_next),
+            [true, false],
+            "the main and alternative events"
+        );
+        assert!(!super::card_face_gaps(&when_next).is_empty());
     }
 
     /// An explicit Exile origin can retrieve the intended set when it is still
