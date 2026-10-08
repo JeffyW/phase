@@ -1154,3 +1154,144 @@ fn an_unannounceable_copy_after_a_departure_ceases_to_exist() {
         [0, 0]
     );
 }
+
+const YOUNG_PYROMANCER: &str =
+    "Whenever you cast an instant or sorcery spell, create a 1/1 red Elemental creature token.";
+
+fn elementals(r: &GameRunner) -> usize {
+    r.state()
+        .battlefield
+        .iter()
+        .filter(|id| {
+            r.state().objects[id].controller == P0
+                && r.state().objects[id]
+                    .card_types
+                    .subtypes
+                    .iter()
+                    .any(|s| s == "Elemental")
+        })
+        .count()
+}
+
+/// P0's cast history: (spells cast this turn, P0's turn records, P0's game count).
+fn cast_history(r: &GameRunner) -> (u8, usize, u32) {
+    let s = r.state();
+    (
+        s.spells_cast_this_turn,
+        s.spells_cast_this_turn_by_player
+            .get(&P0)
+            .map_or(0, |h| h.len()),
+        s.spells_cast_this_game.get(&P0).copied().unwrap_or(0),
+    )
+}
+
+/// Probe board (CR 601.2e + CR 707.12 + CR 733.1, three players): P0 controls
+/// Young Pyromancer. Mizzix's Mastery is cast (its Pyromancer trigger
+/// resolves: one Elemental), then the Volcanic Offering copy is cast; P2 owns
+/// the only nonbasic land A, which P0 announces first, and P2 concedes while
+/// answering. The copy can no longer be announced, so its cast is illegal
+/// (CR 601.2e): it ceases to exist (CR 704.5e) and no ability triggers from it
+/// (CR 733.1: no second Elemental), while Mastery's own trigger already made
+/// its Elemental. Control: A owned by the surviving P1, the announcement
+/// completes legally, and the Offering cast adds one Elemental and one cast
+/// record.
+///
+/// Known limitation (PR body, "Found, not fixed"): the aborted copy's cast
+/// stays in the turn and game cast history and counts, because the CR 733
+/// journal has no retraction edit. The cast-history assertion below records
+/// that current behaviour.
+#[test]
+fn an_aborted_copy_cast_retracts_its_cast_observers() {
+    let p2 = PlayerId(2);
+    for a_owner in [p2, P1] {
+        let label = format!("A owned by {a_owner:?}");
+        let mut s = GameScenario::new_n_player(3, 7);
+        s.at_phase(Phase::PreCombatMain);
+        s.add_creature_from_oracle(P0, "Young Pyromancer", 2, 1, YOUNG_PYROMANCER);
+        let a = s.add_land_from_oracle(a_owner, "Nonbasic A", "").id();
+        let creatures = [
+            s.add_creature(P1, "P1 Creature A", 3, 12).id(),
+            s.add_creature(P1, "P1 Creature B", 3, 12).id(),
+        ];
+        let offering = s
+            .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+            .from_oracle_text(VOLCANIC_OFFERING)
+            .id();
+        let mastery = s
+            .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+            .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut r = s.build();
+        r.cast(mastery).target_object(offering).commit();
+        // Resolve Mastery's Pyromancer trigger, then reach the copy offer.
+        pass_to_choice(&mut r);
+        assert_eq!(elementals(&r), 1, "{label}: reach: Mastery's Elemental");
+        let baseline = cast_history(&r);
+        assert_eq!(baseline.1, 1, "{label}: reach: Mastery is P0's one cast");
+        r.act(GameAction::SelectCards {
+            cards: vec![offering],
+        })
+        .expect("cast the copy");
+        let WaitingFor::CopyRetarget { copy_id: copy, .. } = r.state().waiting_for else {
+            panic!(
+                "{label}: expected the copy walk, got {:?}",
+                r.state().waiting_for
+            );
+        };
+        elect(&mut r, [p2, P1]);
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(a)),
+        })
+        .expect("P0 announces A");
+        assert_eq!(
+            walk_prompt(&r),
+            (p2, P0, vec![Some(TargetRef::Object(a))], false),
+            "{label}: reach: P2 answers, P0's copy, prefix [A]"
+        );
+        assert!(
+            matches!(r.state().waiting_for, WaitingFor::CopyRetarget { copy_id, .. } if copy_id == copy)
+        );
+        if a_owner == P1 {
+            // Control: the announcement completes legally.
+            let askers = announce_rest(&mut r, &[a, creatures[0], creatures[1]]);
+            assert_eq!(askers, vec![p2, P0, P1], "{label}");
+        } else {
+            r.act(GameAction::Concede { player_id: p2 })
+                .expect("P2 concedes");
+            assert!(
+                !r.state().stack.iter().any(|entry| entry.id == copy),
+                "{label}: the copy is gone"
+            );
+            assert!(
+                !r.state().deferred_triggers.iter().any(|parked| parked
+                    .trigger_events
+                    .iter()
+                    .any(|event| matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy))),
+                "{label}: no observer of the undone cast stays parked"
+            );
+        }
+        for _ in 0..64 {
+            if r.state().stack.is_empty() && r.state().deferred_triggers.is_empty() {
+                break;
+            }
+            r.act(GameAction::PassPriority).expect("resolve");
+        }
+        assert!(r.state().stack.is_empty(), "{label}: the stack drains");
+        assert_eq!(r.state().objects[&mastery].zone, Zone::Exile, "{label}");
+        let extra_elementals = if a_owner == P1 { 1 } else { 0 };
+        // The cast is recorded either way: the aborted copy's record is the
+        // disclosed residue; the control's is a real cast.
+        let casts = 1;
+        assert_eq!(elementals(&r), 1 + extra_elementals, "{label}: Elementals");
+        assert_eq!(
+            cast_history(&r),
+            (
+                baseline.0 + casts,
+                baseline.1 + casts as usize,
+                baseline.2 + casts as u32
+            ),
+            "{label}: cast history"
+        );
+    }
+}

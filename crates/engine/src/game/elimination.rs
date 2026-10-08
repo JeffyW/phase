@@ -561,7 +561,8 @@ pub fn eliminate_players_simultaneously(
         // (`reconcile_copy_announcement_after_departure`). Runs before the
         // generic dead-actor repoint below, which would otherwise replace the
         // walk with unrelated priority. CR 601.2e: when no legal announcement
-        // remains, the copy's cast is illegal and the copy ceases to exist.
+        // remains, the copy's cast is illegal; CR 704.5e: the copy ceases to
+        // exist (`abandon_copy_walk`).
         let announcement =
             super::effects::copy_choice::walk_of(&state.waiting_for).map(|(walk, _)| walk);
         let unannounceable =

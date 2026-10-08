@@ -10023,13 +10023,30 @@ fn finalize_copy_walk(
 
 /// CR 601.2e + CR 707.12: a copy announcement that can no longer be completed
 /// (no legal announcement remains after a player left the game) is an illegal
-/// cast: the game returns to before it was proposed, so the copy ceases to
-/// exist, and the effect that offered it continues as it would after the walk.
+/// cast: the game returns to before it was proposed. CR 704.5e: the copy,
+/// off the stack, ceases to exist. CR 733.1: no ability triggers as a result
+/// of the undone cast, so the observers its `SpellCast` parked are retracted.
+/// The effect that offered the copy then continues as it would after the walk.
+/// (The cast-history entry the cast recorded is not retracted; disclosed.)
 pub(crate) fn abandon_copy_walk(
     state: &mut GameState,
     walk: &effects::copy_choice::CopyWalk,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    let (retracted, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.deferred_triggers)
+        .into_iter()
+        .partition(|context| {
+            context.trigger_events.iter().any(|event| {
+                matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == walk.copy_id)
+            })
+        });
+    state.deferred_triggers = kept;
+    for context in retracted {
+        crate::game::lifecycle::record_delayed_terminal(
+            context.firing(),
+            crate::game::lifecycle::DelayedTerminalDisposition::Removed,
+        );
+    }
     effects::prepare::cleanup_failed_prepared_copy_cast(state, walk.copy_id);
     complete_copy_walk_effect(state, walk, events)
 }
