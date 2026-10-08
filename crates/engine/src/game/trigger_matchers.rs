@@ -2857,6 +2857,7 @@ pub(super) fn match_becomes_target(
     let GameEvent::BecomesTarget {
         target,
         source_id: targeting_spell_id,
+        targeter,
         ..
     } = event
     else {
@@ -2866,18 +2867,38 @@ pub(super) fn match_becomes_target(
     // CR 115.1a + CR 115.1b: Trigger text like "of a spell" and "of an Aura spell"
     // constrains the targeting source to matching stack spell characteristics.
     if let Some(source_filter) = &trigger.valid_source {
+        // CR 601.2c + CR 113.8: the event records what targeted, as it was
+        // announced. A spell targeter is the spell entry carrying that
+        // announcement; an ability targeter is never a spell, even when its
+        // source is a spell on the stack (Elder Deep-Fiend's cast trigger). A
+        // legacy event without a targeter falls back to the id lookup.
+        let is_targeter = |entry: &&crate::types::game_state::StackEntry| {
+            let id_matches =
+                entry.id == *targeting_spell_id || entry.source_id == *targeting_spell_id;
+            let is_spell = matches!(
+                entry.kind,
+                crate::types::game_state::StackEntryKind::Spell { .. }
+            );
+            match targeter {
+                None => id_matches,
+                Some(crate::types::events::Targeter::Ability(_)) => id_matches && !is_spell,
+                Some(crate::types::events::Targeter::Spell(announcement)) => {
+                    is_spell
+                        && entry.id == *targeting_spell_id
+                        && state
+                            .objects
+                            .get(&entry.id)
+                            .is_some_and(|obj| obj.spell_announcement == Some(*announcement))
+                }
+            }
+        };
         // First, try to find the entry on the stack (normal case)
-        let targeting_entry = state.stack.iter().find(|entry| {
-            entry.id == *targeting_spell_id || entry.source_id == *targeting_spell_id
-        });
+        let targeting_entry = state.stack.iter().find(is_targeter);
         // CR 608.2: A resolving spell or ability follows its resolution steps even
         // after the local stack entry has been popped and saved in `resolving_stack_entry`.
         // Triggered abilities can emit BecomesTarget events during that effect execution.
-        let targeting_entry = targeting_entry.or_else(|| {
-            state.resolving_stack_entry.as_ref().filter(|entry| {
-                entry.id == *targeting_spell_id || entry.source_id == *targeting_spell_id
-            })
-        });
+        let targeting_entry =
+            targeting_entry.or_else(|| state.resolving_stack_entry.as_ref().filter(is_targeter));
         let Some(targeting_entry) = targeting_entry else {
             return false;
         };

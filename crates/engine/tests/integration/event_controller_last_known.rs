@@ -1318,3 +1318,70 @@ fn royal_decree_damages_the_tapped_incarnations_controller_after_a_blink() {
         );
     }
 }
+
+/// Maintainer round 3, finding 3. Elder Deep-Fiend's cast trigger is an
+/// ABILITY, even though its source is a spell on the stack. CR 115.1 + CR
+/// 113.8: Forsaken Wastes ("becomes the target of a spell") does not trigger
+/// when that ability targets it, so P1 loses no life. Lava Runner's "spell or
+/// ability" row above keeps the positive for abilities;
+/// `forsaken_wastes_hits_the_caster_without_commandeer` keeps the spell
+/// positive.
+#[test]
+fn forsaken_wastes_ignores_a_cast_trigger_targeting_it() {
+    use engine::types::ability::TargetRef;
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let wastes = scenario
+        .add_enchantment_from_oracle(P0, "Forsaken Wastes", FORSAKEN_WASTES)
+        .id();
+    let fiend = scenario
+        .add_creature_to_hand_from_oracle(P1, "Elder Deep-Fiend", 5, 6, ELDER_DEEP_FIEND)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    let card_id = runner.state().objects[&fiend].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: fiend,
+            card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("cast Elder Deep-Fiend");
+    let mut targeted = false;
+    for _ in 0..6 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection { .. } => {
+                targeted = true;
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(wastes)],
+                    })
+                    .expect("target Forsaken Wastes");
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        targeted,
+        "reach guard: the cast trigger targeted the Wastes"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "Deep-Fiend and its cast trigger only; no Wastes trigger"
+    );
+    let p1 = life(&runner, P1);
+    while !runner.state().stack.is_empty() {
+        resolve_one_declining(&mut runner);
+    }
+    assert!(
+        runner.state().objects[&wastes].tapped,
+        "reach guard: the cast trigger resolved and tapped the Wastes"
+    );
+    assert_eq!(life(&runner, P1), p1, "P1 loses no life");
+}
