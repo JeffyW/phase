@@ -106,8 +106,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  92 — GameState carries the CR 601.2a spell announcement and the
- *       BecomesTarget targeter. Bumped with full-game protocol 110.
+ *  93 — GameState carries the CR 601.2a spell announcement and the
+ *       BecomesTarget targeter. Bumped with full-game protocol 111.
  *  91 — GameState carries the CR 201.5a granter binding (ObjectScope
  *       GrantingObject / SpecificObject, TargetFilter GrantingObject.bound,
  *       PlayerFilter GrantingObjectCaster and the granting_object stamps).
@@ -557,7 +557,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 92 as const;
+export const WIRE_PROTOCOL_VERSION = 93 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
