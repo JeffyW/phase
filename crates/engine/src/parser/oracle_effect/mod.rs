@@ -2071,18 +2071,31 @@ fn try_parse_whenever_this_turn_from(
     // in a later same-turn extra combat (CR 500.8) after the prepared copy was cast
     // and the creature unprepared (CR 722.3c) — rare, and not separately gated
     // because the engine has no per-combat delayed-trigger purge primitive.
-    let window_split =
-        DELAYED_TRIGGER_WINDOWS
-            .iter()
-            .fold(None::<(TextPair, TextPair)>, |best, window| {
-                match (best, tp.rsplit_around(window)) {
-                    (Some((b, _)), Some((nb, na))) if nb.lower.len() > b.lower.len() => {
-                        Some((nb, na))
-                    }
-                    (None, Some((nb, na))) => Some((nb, na)),
-                    (best, _) => best,
+    // CR 603.7b: the window terminates the trigger CONDITION, which lies in the
+    // first sentence. The clause can carry later sentences of the same delayed
+    // body (`split_clause_sequence` keeps them with the head), and one of those
+    // may itself say "this turn, ", so the search is confined to the first
+    // sentence and the effect is everything after the window.
+    let first_sentence_len = take_until::<_, _, OracleError<'_>>(". ")
+        .parse(tp.lower)
+        .map_or(tp.lower.len(), |(_, first)| first.len());
+    let (first_sentence, _) = tp.split_at(first_sentence_len);
+    let window_split = DELAYED_TRIGGER_WINDOWS
+        .iter()
+        .fold(None::<(usize, usize)>, |best, window| {
+            match (best, first_sentence.rsplit_around(window)) {
+                (Some((b, _)), Some((nb, _))) if nb.lower.len() > b => {
+                    Some((nb.lower.len(), window.len()))
                 }
-            });
+                (None, Some((nb, _))) => Some((nb.lower.len(), window.len())),
+                (best, _) => best,
+            }
+        })
+        .map(|(before_len, window_len)| {
+            let (before, _) = tp.split_at(before_len);
+            let (_, after) = tp.split_at(before_len + window_len);
+            (before, after)
+        });
 
     // CR 603.7b: When no "this turn" / "this combat" infix window is
     // present, the duration was supplied as a consumed PREFIX ("Until end of

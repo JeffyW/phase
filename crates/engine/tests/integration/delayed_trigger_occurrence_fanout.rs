@@ -1085,6 +1085,57 @@ fn last_ronin_fires_only_for_a_creature_attacking_alone() {
     }
 }
 
+/// CR 608.2c + CR 611.2a: The Last Ronin III's second sentence ("It gains
+/// trample, lifelink, and indestructible until end of turn.") is part of the
+/// delayed trigger's effect and "it" is the creature attacking alone, not the
+/// Saga. The attacker gains all three; a creature that didn't attack doesn't;
+/// the keywords end with the turn.
+#[test]
+fn last_ronin_grants_its_keywords_to_the_lone_attacker_until_end_of_turn() {
+    use engine::types::keywords::Keyword;
+    let mut bystander = None;
+    let (mut runner, ids) = last_ronin_attack(1, |scenario| {
+        bystander = Some(scenario.add_creature(P0, "Bystander", 2, 2).id());
+    });
+    let bystander = bystander.expect("bystander");
+    settle(&mut runner, &[]);
+    let keywords = |r: &mut GameRunner, id: ObjectId| {
+        r.state_mut().layers_dirty.mark_full();
+        engine::game::layers::evaluate_layers(r.state_mut());
+        let object = &r.state().objects[&id];
+        [Keyword::Trample, Keyword::Lifelink, Keyword::Indestructible]
+            .map(|keyword| object.keywords.contains(&keyword))
+    };
+    assert_eq!(
+        plus_one_counters(&runner, ids[0]),
+        3,
+        "reach guard: counters"
+    );
+    assert_eq!(
+        keywords(&mut runner, ids[0]),
+        [true; 3],
+        "the lone attacker"
+    );
+    assert_eq!(
+        keywords(&mut runner, bystander),
+        [false; 3],
+        "not the bystander"
+    );
+    let saga_keywords = runner
+        .state()
+        .objects
+        .values()
+        .find(|o| o.name == "The Last Ronin")
+        .map(|o| o.keywords.contains(&Keyword::Indestructible));
+    assert_ne!(saga_keywords, Some(true), "not the Saga");
+    drive_until(&mut runner, |r| r.state().turn_number > 2);
+    assert_eq!(
+        keywords(&mut runner, ids[0]),
+        [false; 3],
+        "until end of turn"
+    );
+}
+
 /// CR 506.5 + CR 508.4 + CR 603.4: "attacks alone" is part of the trigger
 /// event, not an intervening-if, so it is not rechecked on resolution. A
 /// creature put onto the battlefield attacking after the trigger fired (it was
