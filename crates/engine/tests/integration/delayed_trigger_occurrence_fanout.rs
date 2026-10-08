@@ -772,36 +772,38 @@ fn batched_damage_trigger_that_much_reads_the_damage_not_the_headcount() {
     }
 }
 
-/// False Cure: "that player" is the player who gained life — P1 loses life and
-/// P0, the caster, doesn't. (The amount is out of scope here: "2 life for each
-/// 1 life they gained" currently parses as a fixed 2, disclosed separately.)
+/// False Cure: "that player loses 2 life for each 1 life they gained." The
+/// player who gained life loses twice what they gained (CR 119.3: +2 → −4),
+/// in either orientation; the other player is unaffected.
 #[test]
-fn false_cure_punishes_the_player_who_gains_life() {
-    let mut scenario = board();
-    let cure = free_spell(&mut scenario, P0, "False Cure", true, FALSE_CURE);
-    let gift = free_spell(
-        &mut scenario,
-        P0,
-        "Gift",
-        true,
-        "Target player gains 2 life.",
-    );
-    let mut runner = scenario.build();
-    runner.cast(cure).resolve();
-    let gift_outcome = runner.cast(gift).target_player(P1).resolve();
-    assert!(
-        gift_outcome.events().iter().any(|e| matches!(
-            e,
-            engine::types::events::GameEvent::LifeChanged { player_id, amount: 2, .. }
-                if *player_id == P1
-        )),
-        "reach guard: P1 gained 2 life"
-    );
-    settle(&mut runner, &[]);
-    assert!(runner.life(P1) < 22, "the gaining player loses life");
-    assert_eq!(runner.life(P0), 20, "the caster doesn't");
+fn false_cure_takes_twice_the_gain_from_the_player_who_gained() {
+    for gainer in [P1, P0] {
+        let other = if gainer == P0 { P1 } else { P0 };
+        let mut scenario = board();
+        let cure = free_spell(&mut scenario, P0, "False Cure", true, FALSE_CURE);
+        let gift = free_spell(
+            &mut scenario,
+            P0,
+            "Gift",
+            true,
+            "Target player gains 2 life.",
+        );
+        let mut runner = scenario.build();
+        runner.cast(cure).resolve();
+        let gift_outcome = runner.cast(gift).target_player(gainer).resolve();
+        assert!(
+            gift_outcome.events().iter().any(|e| matches!(
+                e,
+                engine::types::events::GameEvent::LifeChanged { player_id, amount: 2, .. }
+                    if *player_id == gainer
+            )),
+            "reach guard: {gainer:?} gained 2 life"
+        );
+        settle(&mut runner, &[]);
+        assert_eq!(runner.life(gainer), 20 + 2 - 4, "{gainer:?}: +2 then -4");
+        assert_eq!(runner.life(other), 20, "{other:?} is unaffected");
+    }
 }
-
 /// The Mirari Conjecture III: each instant cast is copied once.
 #[test]
 fn mirari_conjecture_copies_each_instant_once() {
