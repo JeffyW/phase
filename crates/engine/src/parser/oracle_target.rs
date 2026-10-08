@@ -9840,7 +9840,7 @@ fn parse_relative_subtype_leg(input: &str) -> Option<(String, &str)> {
 /// A list is closed only by an "or" leg, so a comma run that never
 /// closes ("a Demon, Zombies you control ...") is not read as a list: the result
 /// rolls back to the legs up to the last closing conjunction, or to the first leg.
-fn parse_relative_subtype_list(input: &str) -> Option<(Vec<String>, usize)> {
+pub(crate) fn parse_relative_subtype_list(input: &str) -> Option<(Vec<String>, usize)> {
     let (first, mut rest) = parse_relative_subtype_leg(input)?;
     let mut subtypes = vec![first];
     let mut closed = (1usize, rest);

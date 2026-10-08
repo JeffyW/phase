@@ -210,10 +210,13 @@ fn comma_inside_if_creature_subtype_list(lower: &str, comma_idx: usize) -> bool 
             .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
 }
 
-/// CR 205.3m: the byte span of the type phrase in a "<player> control(s)
-/// [a/an] <type list>" presence condition, or `None` when the text is not this
-/// shape. A lexical span like [`target_anaphoric_subtype_span`]: it can only
-/// prevent a wrong comma split.
+/// CR 205.3m: the byte span of a CLOSED subtype list ("a Fish, Octopus, …, or
+/// Whale") in a "<player> control(s) [a/an] <list>" presence condition, or
+/// `None` when the text is not this shape. A lexical span like
+/// [`target_anaphoric_subtype_span`]: it can only prevent a wrong comma split.
+/// Only a list of two or more legs closed by "or" counts, so the comma that ends
+/// a one-type condition ("If you control a creature, creatures you control gain
+/// …") is still the condition's boundary.
 fn controls_type_span(lower: &str, after_prefix: &str) -> Option<(usize, usize)> {
     let (after_subject, _) = alt((
         tag::<_, _, OracleError<'_>>("you control "),
@@ -221,19 +224,14 @@ fn controls_type_span(lower: &str, after_prefix: &str) -> Option<(usize, usize)>
     ))
     .parse(after_prefix)
     .ok()?;
-    let (after_article, _) = opt(nom_primitives::parse_article)
-        .parse(after_subject)
-        .ok()?;
-    let (filter, remainder) =
-        crate::parser::oracle_target::parse_type_phrase_folding(after_article);
-    if remainder.len() == after_article.len() || matches!(filter, TargetFilter::Any) {
+    let (subtypes, consumed) =
+        crate::parser::oracle_target::parse_relative_subtype_list(after_subject)?;
+    if subtypes.len() < 2 {
         return None;
     }
-    let start = lower.len() - after_article.len();
-    let end = lower.len() - remainder.len();
-    Some((start, end))
+    let start = lower.len() - after_subject.len();
+    Some((start, start + consumed))
 }
-
 /// CR 205.3m: Find the byte span of the subtype-disjunction predicate in a
 /// target-anaphoric "<subject> is a <subtype list>" condition. Returns the
 /// `[start, end)` offsets (relative to `lower`) of the parsed type phrase, or
