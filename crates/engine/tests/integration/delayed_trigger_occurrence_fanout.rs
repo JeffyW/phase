@@ -987,3 +987,70 @@ fn zombie_boa_generator_expires_at_end_of_turn() {
     settle(&mut runner, &[]);
     assert_eq!(zone(&runner, white), Zone::Battlefield);
 }
+
+/// CR 105.4 + CR 608.2c: "that color" names the resolution's color choice
+/// even when another kind of choice (a number) comes between it and the
+/// generator. Synthetic Boa-shaped text: White, then 3, then one generator
+/// that destroys the white blocker only.
+#[test]
+fn boa_color_survives_an_intervening_number_choice() {
+    const TEXT: &str = "{0}: Choose a color. Choose a number between 1 and 3. Whenever this creature becomes blocked by a creature of that color this turn, destroy that creature.";
+    let mut scenario = board();
+    let boa = scenario
+        .add_creature_from_oracle(P0, "Synthetic Boa", 3, 3, TEXT)
+        .id();
+    let white = scenario
+        .add_creature(P1, "White Blocker", 1, 1)
+        .with_color(vec![ManaColor::White])
+        .id();
+    let red = scenario
+        .add_creature(P1, "Red Blocker", 1, 1)
+        .with_color(vec![ManaColor::Red])
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: boa,
+            ability_index: 0,
+        })
+        .expect("activate");
+    let mut answers = vec!["White", "3"].into_iter();
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::NamedChoice { .. } => {
+                let choice = answers.next().expect("only two choices").to_string();
+                runner
+                    .act(GameAction::ChooseOption { choice })
+                    .expect("answer the choice");
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        answers.next().is_none(),
+        "reach guard: both choices were asked"
+    );
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach guard: one generator"
+    );
+    attack(&mut runner, &[boa], P1);
+    block(&mut runner, &[(white, boa), (red, boa)]);
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        drain_order_triggers_with_identity(runner.state_mut());
+    }
+    let firings = runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id == boa)
+        .count();
+    assert_eq!(firings, 1, "one firing: the white blocker");
+    settle(&mut runner, &[]);
+    assert_eq!(zone(&runner, white), Zone::Graveyard);
+    assert_eq!(zone(&runner, red), Zone::Battlefield);
+}

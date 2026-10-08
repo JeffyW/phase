@@ -2676,7 +2676,9 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
 /// See the becomes-target rebind above. Walks the trigger's effect chain (modes,
 /// else branches, sub links) and rewrites player-reference
 /// `ParentTargetController` leaves, including the unless-payer slot and a
-/// `GiveControl` recipient.
+/// `GiveControl` recipient. Like the damage rebind, it stops after a link that
+/// introduces a freshly chosen object target, whose controller a later "its
+/// controller" then names (CR 608.2c).
 fn rebind_parent_target_controller_to_targeter(ability: &mut AbilityDefinition) {
     for mode in &mut ability.mode_abilities {
         rebind_parent_target_controller_to_targeter(mode);
@@ -2697,6 +2699,13 @@ fn rebind_parent_target_controller_to_targeter(ability: &mut AbilityDefinition) 
         }
         if let Some(unless) = link.unless_pay.as_mut() {
             rebind_parent_target_controller_filter_to_targeter(&mut unless.payer);
+        }
+        // CR 608.2c: a link that introduces a freshly chosen object target
+        // ("tap target creature. Its controller draws a card") rebinds a later
+        // "its controller" to that choice, so the walk stops here, as the
+        // damage rebind's does.
+        if introduces_chosen_object_target(link.effect.as_ref()) {
+            break;
         }
         node = link.sub_ability.as_deref_mut();
     }

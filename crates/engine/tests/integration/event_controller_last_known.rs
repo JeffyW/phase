@@ -443,8 +443,13 @@ fn interactive_payment_keeps_the_announcement_its_targeting_event_recorded() {
     );
 }
 
-/// CR 733.1: a cast backed out at payment is undone — no Wastes trigger, the
-/// announcement is cleared, and a later cast gets a fresh one.
+/// CR 733.1: a cast backed out at payment is undone — its announcement is
+/// cleared, and a later cast gets a fresh one.
+///
+/// Scope: the absent Wastes trigger is NOT an independent rollback witness.
+/// Manual payment never collects the cast's becomes-target trigger anyway (the
+/// pre-existing interactive-payment defect disclosed on the PR), so this row
+/// proves the announcement lifecycle only.
 #[test]
 fn a_cancelled_cast_triggers_nothing_and_its_announcement_is_never_reused() {
     use engine::types::ability::TargetRef;
@@ -1172,4 +1177,69 @@ fn fractured_loyalty_gives_the_creature_to_the_ability_controller() {
             "{theft:?}: the activator (P1) gains control"
         );
     }
+}
+
+/// CR 608.2c: a becomes-target trigger that chooses a fresh object target
+/// ("tap target creature. Its controller draws a card.") reads that choice's
+/// controller, not the targeter's. P1's Pyromancer targets P0's sentinel;
+/// P0's trigger taps P0's own Victim, so P0 draws. Synthetic sentinel text.
+#[test]
+fn a_fresh_target_choice_names_its_own_controller_not_the_targeter() {
+    use engine::types::ability::TargetRef;
+    const SENTINEL: &str = "Whenever this creature becomes the target of a spell or ability, tap target creature. Its controller draws a card.";
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["P0 Card A", "P0 Card B"]);
+    scenario.with_library_top(P1, &["P1 Card A", "P1 Card B"]);
+    let sentinel = scenario
+        .add_creature_from_oracle(P0, "Synthetic Sentinel", 3, 3, SENTINEL)
+        .id();
+    let victim = scenario.add_creature(P0, "Victim", 2, 2).id();
+    let pyromancer = scenario
+        .add_creature_from_oracle(P1, "Prodigal Pyromancer", 1, 1, PRODIGAL_PYROMANCER)
+        .id();
+    let mut runner = scenario.build();
+    stage_turn(&mut runner, P1);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: pyromancer,
+            ability_index: 0,
+        })
+        .expect("activate");
+    if let WaitingFor::TargetSelection { .. } = runner.state().waiting_for {
+        runner
+            .act(GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(sentinel)],
+            })
+            .expect("target the sentinel");
+    }
+    for _ in 0..4 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Object(victim)],
+                    })
+                    .expect("P0 taps its own Victim");
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        2,
+        "reach guard: ability + trigger"
+    );
+    let hand = |r: &GameRunner, p: PlayerId| r.state().players[p.0 as usize].hand.len();
+    let (p0, p1) = (hand(&runner, P0), hand(&runner, P1));
+    resolve_one_declining(&mut runner);
+    assert!(
+        runner.state().objects[&victim].tapped,
+        "reach guard: Victim tapped"
+    );
+    assert_eq!(hand(&runner, P0), p0 + 1, "the Victim's controller draws");
+    assert_eq!(hand(&runner, P1), p1, "not the targeter");
 }

@@ -1561,10 +1561,12 @@ fn resolve_source_attached_to(
     {
         return Some(host);
     }
-    // CR 303.4c + CR 608.2h: when the host left first, the Aura/Equipment stays
-    // attached to "the object it was attached to [that] no longer exists" until
-    // state-based actions move it, so its last-known host is the departed
-    // object. The host's departure record lists its attachments. A same-id
+    // CR 303.4c + CR 608.2h: when the host left first, the attachment's
+    // last-known host is the departed object: an Aura stays attached to "the
+    // object it was attached to [that] no longer exists" until state-based
+    // actions put it into the graveyard (CR 704.5m), while Equipment becomes
+    // unattached and stays on the battlefield (CR 704.5n). Either way the
+    // host's departure record lists its attachments. A same-id
     // source that is again on the battlefield at a different incarnation is a
     // new object (CR 400.7) and never inherits that host.
     let live_source = state

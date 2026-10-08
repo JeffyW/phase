@@ -21608,6 +21608,17 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_color_this_resolution: Option<crate::types::mana::ManaColor>,
 
+    /// CR 105.4 + CR 608.2c: the colour the current resolution's most recent
+    /// colour choice named, persisting or not ("Choose a color. … a creature
+    /// of that color"). Unlike last_named_choice, a later choice of another
+    /// kind (a number, a player) doesn't overwrite it, and a parked
+    /// continuation doesn't clear it; unlike chosen_color_this_resolution,
+    /// a non-persisting chooser writes it, so its readers are only those that
+    /// name "that color" within the same resolution. Cleared at every
+    /// top-level resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_color_this_resolution: Option<crate::types::mana::ManaColor>,
+
     /// CR 608.2c + CR 123.1: the sticker the current resolution's most recent
     /// PutSticker instruction placed ("that sticker"). Cleared at every
     /// top-level resolution and at the start of every PutSticker instruction,
@@ -27701,6 +27712,7 @@ impl GameState {
             last_named_choice: None,
             chosen_counter_kind_this_resolution: None,
             chosen_color_this_resolution: None,
+            named_color_this_resolution: None,
             placed_sticker_this_resolution: None,
             last_chosen_damage_source: None,
             all_creature_types: Vec::new(),
@@ -28822,6 +28834,7 @@ impl GameState {
         // loop pre-filter fingerprint.
         self.chosen_counter_kind_this_resolution.hash(&mut h);
         self.chosen_color_this_resolution.hash(&mut h);
+        self.named_color_this_resolution.hash(&mut h);
         // CR 608.2c: "that sticker" can change what a following instruction
         // reads (phase-2 quantity), so distinct live values must not share a
         // loop pre-filter fingerprint.
@@ -29206,28 +29219,55 @@ impl GameState {
                 (!history.is_empty()).then_some((object_id, history))
             })
             .collect();
+        // CR 104.4b + CR 608.2h: records no live spell-cast trigger and no
+        // announcement-bound targeting event can reach are history, not
+        // position. Prune them the same way as `lki_by_incarnation`, against the
+        // set captured above before it was cleared, plus every departure whose
+        // spell a `BecomesTarget` targeter still names (the targeter authority,
+        // `targeting::event_referent_controller`, reads that record).
+        let targeted_announcements = clone.targeter_spell_announcements();
+        clone.departed_stack_spells = std::mem::take(&mut clone.departed_stack_spells)
+            .into_iter()
+            .filter_map(|(object_id, mut history)| {
+                history.retain(|incarnation, record| {
+                    retained_departed_spells
+                        .contains(&ObjectIncarnationRef::of(object_id, *incarnation))
+                        || record
+                            .object
+                            .spell_announcement
+                            .is_some_and(|announcement| {
+                                targeted_announcements.contains(&announcement)
+                            })
+                });
+                (!history.is_empty()).then_some((object_id, history))
+            })
+            .collect();
         // CR 104.4b + CR 601.2a: a spell's announcement is monotonic identity,
         // not position. Renumber every announcement by its rank among those
         // the position carries, on the spell objects, the departure records,
         // and the `BecomesTarget` targeters on every trigger-event carrier, so
         // two positions minted at different times still confirm as a repeat
-        // while which spell each targeter names is preserved.
+        // while which spell each targeter names is preserved. Ranked AFTER
+        // pruning, so discarded history cannot shift the surviving ranks.
         clone.canonicalize_spell_announcements_for_loop();
-
-        // CR 104.4b + CR 608.2h: records no live spell-cast trigger can reach are
-        // history, not position — prune the same way as `lki_by_incarnation`,
-        // against the set captured above before it was cleared.
-        clone.departed_stack_spells = std::mem::take(&mut clone.departed_stack_spells)
-            .into_iter()
-            .filter_map(|(object_id, mut history)| {
-                history.retain(|incarnation, _| {
-                    retained_departed_spells
-                        .contains(&ObjectIncarnationRef::of(object_id, *incarnation))
-                });
-                (!history.is_empty()).then_some((object_id, history))
-            })
-            .collect();
         clone
+    }
+
+    /// The spell announcements named by `BecomesTarget` targeters on every
+    /// trigger-event carrier that can still resume or resolve.
+    fn targeter_spell_announcements(&mut self) -> HashSet<SpellAnnouncement> {
+        use crate::types::events::Targeter;
+        let mut named = HashSet::new();
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let GameEvent::BecomesTarget {
+                targeter: Some(Targeter::Spell(announcement)),
+                ..
+            } = event
+            {
+                named.insert(*announcement);
+            }
+        });
+        named
     }
 
     /// See `normalize_for_loop`. Rank-based, so the mapping depends only on
@@ -30370,6 +30410,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         last_named_choice: _,
         chosen_counter_kind_this_resolution: _,
         chosen_color_this_resolution: _,
+        named_color_this_resolution: _,
         placed_sticker_this_resolution: _,
         last_chosen_damage_source: _,
         all_creature_types: _,
@@ -30750,6 +30791,7 @@ impl PartialEq for GameState {
             && self.chosen_counter_kind_this_resolution
                 == other.chosen_counter_kind_this_resolution
             && self.chosen_color_this_resolution == other.chosen_color_this_resolution
+            && self.named_color_this_resolution == other.named_color_this_resolution
             && self.placed_sticker_this_resolution == other.placed_sticker_this_resolution
             && self.last_revealed_ids == other.last_revealed_ids
             && self.private_look_ids == other.private_look_ids
@@ -37602,13 +37644,147 @@ mod tests {
         }
         let early = position(3, 4, 3).normalize_for_loop();
         let late = position(91, 92, 91).normalize_for_loop();
-        assert!(early == late, "minted at different times, same position");
+        assert!(
+            loop_states_equal(&early, &late),
+            "minted at different times, same position"
+        );
         let other_referent = position(91, 92, 92).normalize_for_loop();
         assert!(
-            early != other_referent,
+            !loop_states_equal(&early, &other_referent),
             "a targeter naming the other spell is a different position"
         );
         assert_eq!(early.next_spell_announcement, 0);
+    }
+
+    fn announced_departure(
+        spell: ObjectId,
+        announcement: u64,
+        controller: PlayerId,
+    ) -> DepartedStackSpell {
+        let mut object = GameObject::new(
+            spell,
+            CardId(spell.0),
+            controller,
+            "Departed Spell".to_string(),
+            Zone::Graveyard,
+        );
+        object.controller = controller;
+        object.spell_announcement = Some(SpellAnnouncement(announcement));
+        DepartedStackSpell {
+            entry: StackEntry {
+                id: spell,
+                source_id: spell,
+                controller,
+                kind: StackEntryKind::ActivatedAbility {
+                    source_id: spell,
+                    ability: Box::new(ResolvedAbility::new(
+                        Effect::NoOp,
+                        vec![],
+                        spell,
+                        controller,
+                    )),
+                },
+            },
+            object: Box::new(object),
+        }
+    }
+
+    fn pending_targeting_trigger(targeter_names: u64, source: ObjectId) -> GameState {
+        use crate::types::events::Targeter;
+        let mut state = GameState::new_two_player(7);
+        state.pending_trigger = Some(Box::new(crate::game::triggers::PendingTrigger {
+            source_id: ObjectId(602),
+            controller: PlayerId(0),
+            condition: None,
+            ability: Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(602),
+                PlayerId(0),
+            )),
+            timestamp: 0,
+            target_constraints: Vec::new(),
+            distribute: None,
+            trigger_event: Some(GameEvent::BecomesTarget {
+                target: crate::types::ability::TargetRef::Object(ObjectId(602)),
+                source_id: source,
+                source_controller: PlayerId(1),
+                targeter: Some(Targeter::Spell(SpellAnnouncement(targeter_names))),
+            }),
+            modal: None,
+            mode_abilities: vec![],
+            description: None,
+            may_trigger_origin: None,
+            subject_match_count: None,
+            die_result: None,
+            provenance: None,
+        }));
+        state
+    }
+
+    /// CR 104.4b + CR 608.2h: a departure record a pending targeting event's
+    /// targeter still names is position, not history. Two positions that differ
+    /// only in that departed spell's last controller (the answer the targeter
+    /// authority reads) stay distinguishable after normalization.
+    #[test]
+    fn normalize_for_loop_keeps_the_departure_a_targeter_names() {
+        let position = |last_controller: PlayerId| {
+            let mut state = pending_targeting_trigger(5, ObjectId(610));
+            state.departed_stack_spells.insert(
+                ObjectId(610),
+                im::HashMap::from_iter([(
+                    1,
+                    announced_departure(ObjectId(610), 5, last_controller),
+                )]),
+            );
+            state.normalize_for_loop()
+        };
+        let p0 = position(PlayerId(0));
+        assert_eq!(
+            p0.departed_stack_spells
+                .get(&ObjectId(610))
+                .map(|records| records.len()),
+            Some(1),
+            "the named record is retained"
+        );
+        assert!(
+            !loop_states_equal(&p0, &position(PlayerId(1))),
+            "a different last controller is a different position"
+        );
+    }
+
+    /// CR 104.4b: announcements are ranked AFTER unreachable history is pruned,
+    /// so an unreferenced older departure can't shift the surviving ranks.
+    #[test]
+    fn normalize_for_loop_ranks_announcements_after_pruning() {
+        let position = |first: u64, stale_departure: bool| {
+            let mut state = GameState::new_two_player(7);
+            for (id, announcement) in [(ObjectId(600), first), (ObjectId(601), first + 1)] {
+                let mut object = GameObject::new(
+                    id,
+                    CardId(id.0),
+                    PlayerId(0),
+                    "Loop Spell".to_string(),
+                    Zone::Stack,
+                );
+                object.spell_announcement = Some(SpellAnnouncement(announcement));
+                state.objects.insert(id, object);
+            }
+            if stale_departure {
+                state.departed_stack_spells.insert(
+                    ObjectId(620),
+                    im::HashMap::from_iter([(
+                        1,
+                        announced_departure(ObjectId(620), first - 1, PlayerId(0)),
+                    )]),
+                );
+            }
+            state.normalize_for_loop()
+        };
+        assert!(
+            loop_states_equal(&position(1, false), &position(2, true)),
+            "pruned history does not shift the live spells' ranks"
+        );
     }
 
     /// CR 601.2a: the announcement, its allocator and the event's targeter

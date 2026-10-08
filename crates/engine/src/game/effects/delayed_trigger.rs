@@ -653,14 +653,15 @@ pub fn resolve(
                 source_context.identity.reference.incarnation = obj.incarnation;
             }
         }
-        // CR 105.4 + CR 608.2d: "of that color" in the condition names THIS
+        // CR 105.4 + CR 608.2c: "of that color" in the condition names THIS
         // resolution's color choice (Zombie Boa: "Choose a color. Whenever …
-        // blocked by a creature of that color this turn"). A non-persisting
-        // choice lives only in the resolution's `last_named_choice`, so it is
-        // captured into this generator's own source snapshot here, at
-        // creation: each generator keeps the color chosen for it, and a later
-        // activation's choice cannot repaint an earlier generator.
-        if let Some(crate::types::ability::ChoiceValue::Color(color)) = state.last_named_choice {
+        // blocked by a creature of that color this turn"). The answer is read
+        // from the resolution-scoped `named_color_this_resolution`, which a
+        // later choice of another kind cannot overwrite, and captured into this
+        // generator's own source snapshot here, at creation: each generator
+        // keeps the color chosen for it, and a later activation's choice
+        // cannot repaint an earlier generator.
+        if let Some(color) = state.named_color_this_resolution {
             let reads_chosen_color = condition_filter_groups(&mut condition)
                 .iter()
                 .flatten()
