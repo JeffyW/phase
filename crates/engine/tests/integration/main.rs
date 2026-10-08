@@ -1350,6 +1350,7 @@ mod squirrel_mob_dynamic_pump;
 mod stack_ability_kind_axis;
 mod stack_entry_node_reach;
 mod stack_object_keyword_grants;
+mod state_trigger_source_anaphor_recheck_and_self_suppression;
 mod statecraft_damage_prevention;
 mod std_counters_grammar_axes;
 mod std_dynqty_a_damage_mod_runtime;
@@ -1881,4 +1882,5 @@ mod welcome_the_dead;
 #[cfg(feature = "test-support")]
 mod owned_you_target_authority;
 
+mod base_pt_designation_filter;
 mod exile_origin_target_acquisition;
