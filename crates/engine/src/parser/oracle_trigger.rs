@@ -21935,6 +21935,12 @@ fn try_parse_discard_trigger(
             {
                 Some(TargetFilter::Typed(tf))
             }
+            // CR 205.3 + CR 701.9: a type list ("an Island, Pirate, or Vehicle
+            // card" — Mary Read and Anne Bonny) reads as an `Or` of its legs;
+            // collapsing it to `Card` made every discard qualify.
+            TargetFilter::Or { filters } if !filters.is_empty() => {
+                Some(TargetFilter::Or { filters })
+            }
             _ => Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Card))),
         }
     }

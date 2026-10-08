@@ -203,6 +203,35 @@ fn comma_inside_if_creature_subtype_list(lower: &str, comma_idx: usize) -> bool 
     // the span ends where `parse_type_phrase_folding` stops consuming type words.
     target_anaphoric_subtype_span(lower, after_prefix)
         .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
+        // CR 205.3m + CR 608.2c: "if you control a Fish, Octopus, Otter, Seal,
+        // Serpent, or Whale, draw a card" (Unagi's Spray) — the same list commas
+        // inside a control-presence condition.
+        || controls_type_span(lower, after_prefix)
+            .is_some_and(|(start, end)| (start..end).contains(&comma_idx))
+}
+
+/// CR 205.3m: the byte span of the type phrase in a "<player> control(s)
+/// [a/an] <type list>" presence condition, or `None` when the text is not this
+/// shape. A lexical span like [`target_anaphoric_subtype_span`]: it can only
+/// prevent a wrong comma split.
+fn controls_type_span(lower: &str, after_prefix: &str) -> Option<(usize, usize)> {
+    let (after_subject, _) = alt((
+        tag::<_, _, OracleError<'_>>("you control "),
+        tag("an opponent controls "),
+    ))
+    .parse(after_prefix)
+    .ok()?;
+    let (after_article, _) = opt(nom_primitives::parse_article)
+        .parse(after_subject)
+        .ok()?;
+    let (filter, remainder) =
+        crate::parser::oracle_target::parse_type_phrase_folding(after_article);
+    if remainder.len() == after_article.len() || matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+    let start = lower.len() - after_article.len();
+    let end = lower.len() - remainder.len();
+    Some((start, end))
 }
 
 /// CR 205.3m: Find the byte span of the subtype-disjunction predicate in a

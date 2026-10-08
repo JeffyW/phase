@@ -1364,6 +1364,7 @@ mod strategic_betrayal_6505;
 mod strefan_maurer_progenitor;
 mod strider_ranger_of_the_north;
 mod subject_anchored_optional_announcer;
+mod subtype_list_seams;
 mod summer_bloom_5979;
 mod summon_leviathan_subtype_list_triggers;
 mod sun_droplet_remove_counter_infeasible_4776;
