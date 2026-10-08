@@ -10291,6 +10291,16 @@ pub(super) fn parse_destroy_ast(
         let (target, rem) = parse_target_with_ctx(rest, ctx);
         let phrase = &rest[..rest.len() - rem.len()];
         let (target, rem) = bind_attachment_qualifier(target, phrase, rem, ctx)?;
+        // CR 115.1a + CR 601.2c: a targeted destroy of a declared-slot referent
+        // ("destroy target Equipment attached to that creature") has no
+        // supported lowering (the chain's anaphor rewrite collapses it to the
+        // creature) and no printed producer, so it keeps the strict gap. The
+        // untargeted resolution choice (Light of Judgment) passes through.
+        if crate::game::filter::filter_reads_declared_slot(&target)
+            && nom_primitives::scan_contains(&phrase.to_lowercase(), "target ")
+        {
+            return None;
+        }
         #[cfg(debug_assertions)]
         assert_no_compound_remainder(rem, text);
         return Some(ZoneCounterImperativeAst::Destroy { target, all: false });

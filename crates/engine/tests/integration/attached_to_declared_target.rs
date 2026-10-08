@@ -3498,108 +3498,113 @@ fn you_control_dependent_target_binds_the_caster_not_an_earlier_player_target() 
     }
 }
 
-/// CR 109.5: on one board (creature A wears the caster's Equipment Mine and
-/// P1's Equipment Theirs), an earlier "target player" slot, then "target
-/// Equipment <qualifier> attached to that creature". "you control" is the
-/// caster (Mine) whatever player was targeted; "an opponent controls" is
-/// Theirs. Each is offered alone, the other refused, and the chosen Equipment
-/// is exiled. (The anaphoric "that player controls" form fails closed:
-/// `anaphoric_player_qualified_dependent_target_keeps_its_gap`.)
+/// CR 109.5 + CR 108.3 + CR 115.1a: an earlier "target player" slot, then
+/// "Exile up to one target Equipment <qualifier> attached to that creature", on one board where creature A wears Mine (the caster's), Theirs
+/// (P1's) and Lent (owned by the caster, controlled by P1). "you control" is
+/// {Mine} whatever player was targeted; "an opponent controls" is {Theirs,
+/// Lent}; "you own" is {Mine, Lent}. Exactly that set is offered, the rest are
+/// refused, and the chosen Equipment alone is exiled. (Every other qualifier
+/// fails closed: `unadmitted_qualified_dependent_target_keeps_its_gap`; the
+/// targeted Destroy shape too: `targeted_declared_slot_destroy_keeps_its_gap`.)
 #[test]
-fn qualified_dependent_target_binds_you_and_an_opponent_per_leg() {
-    let cases: [(&str, &str, PlayerId, bool); 4] = [
-        ("Target player", "you control", P1, true),
-        ("Target player", "you control", P0, true),
-        ("Target player", "an opponent controls", P1, false),
-        ("Target player", "an opponent controls", P0, false),
-    ];
-    for (head, qualifier, player, expect_mine) in cases {
-        let text = format!(
-            "{head} loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier} attached to that creature."
-        );
-        let label = format!("{head} / {qualifier} / {player:?}");
-        let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
-        assert!(
-            unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
-            "{label}: reach guard, parses supported"
-        );
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
-        let mine = equipment(&mut scenario, P0, "Equipment Mine");
-        let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
-        let spell = free_spell(&mut scenario, "Probe", true, &text);
-        let mut runner = scenario.build();
-        attach::attach_to(runner.state_mut(), mine, a);
-        attach::attach_to(runner.state_mut(), theirs, a);
-        runner
-            .act(GameAction::CastSpell {
-                object_id: spell,
-                card_id: runner.state().objects[&spell].card_id,
-                targets: vec![],
-                payment_mode: engine::types::game_state::CastPaymentMode::Auto,
-            })
-            .expect("cast begins");
-        let mut slots_seen = 0;
-        for target in [TargetRef::Player(player), TargetRef::Object(a)] {
-            if !matches!(
-                runner.state().waiting_for,
-                WaitingFor::TargetSelection { .. }
-            ) {
-                break;
+fn admitted_qualified_dependent_exile_target_binds_each_qualifier() {
+    {
+        let verb = "Exile";
+        for qualifier in ["you control", "an opponent controls", "you own"] {
+            for player in [P1, P0] {
+                let text = format!(
+                    "Target player loses 1 life. ~ deals 5 damage to target creature. {verb} up to one target Equipment {qualifier} attached to that creature."
+                );
+                let label = format!("{verb} / {qualifier} / {player:?}");
+                let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+                assert!(
+                    unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+                    "{label}: reach guard, parses supported"
+                );
+                let mut scenario = GameScenario::new();
+                scenario.at_phase(Phase::PreCombatMain);
+                let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+                let mine = equipment(&mut scenario, P0, "Equipment Mine");
+                let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
+                let lent = equipment(&mut scenario, P0, "Equipment Lent");
+                let spell = free_spell(&mut scenario, "Probe", true, &text);
+                let mut runner = scenario.build();
+                {
+                    let obj = runner.state_mut().objects.get_mut(&lent).unwrap();
+                    obj.base_controller = Some(P1);
+                    obj.controller = P1;
+                }
+                for equipment in [mine, theirs, lent] {
+                    attach::attach_to(runner.state_mut(), equipment, a);
+                }
+                runner
+                    .act(GameAction::CastSpell {
+                        object_id: spell,
+                        card_id: runner.state().objects[&spell].card_id,
+                        targets: vec![],
+                        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+                    })
+                    .expect("cast begins");
+                for target in [TargetRef::Player(player), TargetRef::Object(a)] {
+                    runner
+                        .act(GameAction::ChooseTarget {
+                            target: Some(target),
+                        })
+                        .unwrap_or_else(|e| panic!("{label}: announce: {e:?}"));
+                }
+                let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for
+                else {
+                    panic!(
+                        "{label}: expected the Equipment slot, got {:?}",
+                        runner.state().waiting_for
+                    );
+                };
+                let offered: Vec<ObjectId> = match qualifier {
+                    "you control" => vec![mine],
+                    "an opponent controls" => vec![theirs, lent],
+                    _ => vec![mine, lent],
+                };
+                assert_eq!(
+                    sorted(selection.current_legal_targets.clone()),
+                    sorted(offered.iter().copied().map(TargetRef::Object).collect()),
+                    "{label}: exactly the qualified Equipment on A"
+                );
+                for refused in [mine, theirs, lent]
+                    .into_iter()
+                    .filter(|e| !offered.contains(e))
+                {
+                    assert!(
+                        GameRunner::from_state(runner.state().clone())
+                            .act(GameAction::ChooseTarget {
+                                target: Some(TargetRef::Object(refused)),
+                            })
+                            .is_err(),
+                        "{label}: unqualified Equipment refused"
+                    );
+                }
+                let chosen = *offered.last().unwrap();
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(chosen)),
+                    })
+                    .expect("announce the qualified Equipment");
+                assert!(
+                    !matches!(
+                        runner.state().waiting_for,
+                        WaitingFor::TargetSelection { .. }
+                    ),
+                    "{label}: no further slot (no duplicate companion player slot)"
+                );
+                runner.advance_until_stack_empty();
+                let state = runner.state();
+                assert_eq!(state.objects[&chosen].zone, Zone::Exile, "{label}: exiled");
+                for other in [mine, theirs, lent].into_iter().filter(|e| *e != chosen) {
+                    assert_eq!(state.objects[&other].zone, Zone::Battlefield, "{label}");
+                }
+                assert_eq!(state.objects[&a].damage_marked, 5, "{label}");
+                assert_eq!(state.objects[&a].zone, Zone::Battlefield, "{label}");
             }
-            slots_seen += 1;
-            runner
-                .act(GameAction::ChooseTarget {
-                    target: Some(target),
-                })
-                .unwrap_or_else(|e| panic!("{label}: announce: {e:?}"));
         }
-        assert_eq!(
-            slots_seen, 2,
-            "{label}: reach: player and creature slots announced"
-        );
-        let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for else {
-            panic!(
-                "{label}: expected the Equipment slot, got {:?}",
-                runner.state().waiting_for
-            );
-        };
-        let (offered, refused) = if expect_mine {
-            (mine, theirs)
-        } else {
-            (theirs, mine)
-        };
-        assert_eq!(
-            selection.current_legal_targets,
-            vec![TargetRef::Object(offered)],
-            "{label}: the qualified Equipment alone"
-        );
-        assert!(
-            GameRunner::from_state(runner.state().clone())
-                .act(GameAction::ChooseTarget {
-                    target: Some(TargetRef::Object(refused)),
-                })
-                .is_err(),
-            "{label}: the other Equipment is refused"
-        );
-        runner
-            .act(GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(offered)),
-            })
-            .expect("announce the qualified Equipment");
-        assert!(
-            !matches!(
-                runner.state().waiting_for,
-                WaitingFor::TargetSelection { .. }
-            ),
-            "{label}: no further slot (no duplicate companion player slot)"
-        );
-        runner.advance_until_stack_empty();
-        let state = runner.state();
-        assert_eq!(state.objects[&offered].zone, Zone::Exile, "{label}: exiled");
-        assert_eq!(state.objects[&refused].zone, Zone::Battlefield, "{label}");
-        assert_eq!(state.objects[&a].damage_marked, 5, "{label}");
     }
 }
 
@@ -3703,6 +3708,7 @@ fn typed_exile_probe(shape: impl Fn(TypedFilter) -> TargetFilter) -> AbilityDefi
 /// attached to A; On B (P0) attached to B; Loose (P1) unattached.
 struct TypedBoard {
     runner: GameRunner,
+    spell: ObjectId,
     a: ObjectId,
     mine: ObjectId,
     theirs: ObjectId,
@@ -3710,9 +3716,8 @@ struct TypedBoard {
     loose: ObjectId,
 }
 
-/// Casts the typed probe and announces P1 and creature A, answering a
-/// companion player slot (if one is surfaced) with `companion`.
-fn cast_typed_probe(head: &AbilityDefinition, companion: PlayerId) -> TypedBoard {
+/// The typed probe's board, before casting.
+fn typed_board(head: &AbilityDefinition) -> TypedBoard {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
@@ -3730,14 +3735,20 @@ fn cast_typed_probe(head: &AbilityDefinition, companion: PlayerId) -> TypedBoard
     attach::attach_to(runner.state_mut(), mine, a);
     attach::attach_to(runner.state_mut(), theirs, a);
     attach::attach_to(runner.state_mut(), on_b, b);
-    runner
-        .act(GameAction::CastSpell {
-            object_id: spell,
-            card_id: runner.state().objects[&spell].card_id,
-            targets: vec![],
-            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
-        })
-        .expect("cast begins");
+    TypedBoard {
+        runner,
+        spell,
+        a,
+        mine,
+        theirs,
+        on_b,
+        loose,
+    }
+}
+
+/// Answers the walk from creature A on: P1, then A, then a companion player
+/// slot (if one is surfaced) with `companion`.
+fn announce_player_and_host(runner: &mut GameRunner, a: ObjectId, companion: PlayerId) {
     for target in [TargetRef::Player(P1), TargetRef::Object(a)] {
         runner
             .act(GameAction::ChooseTarget {
@@ -3759,14 +3770,69 @@ fn cast_typed_probe(head: &AbilityDefinition, companion: PlayerId) -> TypedBoard
                 .expect("announce the companion player");
         }
     }
-    TypedBoard {
-        runner,
-        a,
-        mine,
-        theirs,
-        on_b,
-        loose,
-    }
+}
+
+/// Casts the typed probe and announces P1 and creature A, answering a
+/// companion player slot (if one is surfaced) with `companion`.
+fn cast_typed_probe(head: &AbilityDefinition, companion: PlayerId) -> TypedBoard {
+    let mut board = typed_board(head);
+    let (spell, a) = (board.spell, board.a);
+    board
+        .runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id: board.runner.state().objects[&spell].card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("cast begins");
+    announce_player_and_host(&mut board.runner, a, companion);
+    board
+}
+
+/// CR 601.2c: the typed probe announced as a populated chain (P1, creature A,
+/// the companion player on the Equipment node), the slots built on it, and the
+/// object candidates of the Equipment slot. A populated chain is how a
+/// relative player reference reads its player while slots are built.
+fn populated_probe(
+    board: &TypedBoard,
+    head: &AbilityDefinition,
+    companion: PlayerId,
+) -> (
+    engine::types::ability::ResolvedAbility,
+    Vec<engine::types::game_state::TargetSelectionSlot>,
+    Vec<TargetRef>,
+) {
+    use engine::game::ability_utils::{build_resolved_from_def, build_target_slots};
+    let mut announced = build_resolved_from_def(head, board.spell, P0);
+    announced.targets = vec![TargetRef::Player(P1)];
+    let creature = announced
+        .sub_ability
+        .as_mut()
+        .expect("reach: creature node");
+    creature.targets = vec![TargetRef::Object(board.a)];
+    let equipment = creature
+        .sub_ability
+        .as_mut()
+        .expect("reach: Equipment node");
+    equipment.targets = vec![TargetRef::Player(companion)];
+    let slots = build_target_slots(board.runner.state(), &announced).expect("slots build");
+    let offered = slots
+        .iter()
+        .filter(|slot| {
+            matches!(
+                slot.effect_kind,
+                engine::types::ability::EffectKind::ChangeZone
+            )
+        })
+        .flat_map(|slot| {
+            slot.legal_targets
+                .iter()
+                .filter(|t| matches!(t, TargetRef::Object(_)))
+                .cloned()
+        })
+        .collect();
+    (announced, slots, offered)
 }
 
 fn sorted(mut targets: Vec<TargetRef>) -> Vec<TargetRef> {
@@ -3800,6 +3866,7 @@ fn flat_qualified_or_offers_the_same_union_in_either_order() {
             let label = format!("you_first={you_first} elect_theirs={elect_theirs}");
             let TypedBoard {
                 mut runner,
+                spell: _,
                 a,
                 mine,
                 theirs,
@@ -3849,8 +3916,9 @@ type ShapeFn = Box<dyn Fn(TypedFilter) -> TargetFilter>;
 
 /// CR 109.5 + CR 601.2c (typed compositions, not printed Oracle): a
 /// declared-slot referent binds only a flat admitted leg or a flat `Or` of
-/// them. A leg naming a target player, or a nested `Or`/`And` composite, has
-/// no binding authority yet, so the slot offers no candidates and accepts
+/// them. A leg naming a target player, as its controller or as its owner
+/// (`Owned { TargetPlayer | TargetOpponent }`), or a nested `Or`/`And`
+/// composite, has no binding authority yet, so the slot offers no candidates and accepts
 /// none (no guessed binding), whichever player is the companion; the
 /// optional slot is declined and nothing is exiled.
 #[test]
@@ -3866,7 +3934,21 @@ fn unbindable_declared_slot_shapes_offer_no_candidates() {
         leg.controller = None;
         TargetFilter::Typed(leg)
     };
+    let owned_by = |you: &TypedFilter, owner: ControllerRef| {
+        let mut leg = you.clone();
+        leg.controller = None;
+        leg.properties.push(FilterProp::Owned { controller: owner });
+        TargetFilter::Typed(leg)
+    };
     let shapes: Vec<(&str, ShapeFn)> = vec![
+        (
+            "Owned{TargetPlayer}",
+            Box::new(move |you| owned_by(&you, ControllerRef::TargetPlayer)),
+        ),
+        (
+            "Owned{TargetOpponent}",
+            Box::new(move |you| owned_by(&you, ControllerRef::TargetOpponent)),
+        ),
         (
             "standalone TargetPlayer",
             Box::new(move |you| target_player(&you)),
@@ -3914,9 +3996,18 @@ fn unbindable_declared_slot_shapes_offer_no_candidates() {
     for (name, shape) in &shapes {
         let head = typed_exile_probe(shape);
         for companion in [P1, P0] {
+            if name.contains("TargetOpponent") && companion == P0 {
+                continue;
+            }
             let label = format!("{name} companion={companion:?}");
+            let (_, _, populated) = populated_probe(&typed_board(&head), &head, companion);
+            assert!(
+                populated.is_empty(),
+                "{label}: no candidates on a populated chain, got {populated:?}"
+            );
             let TypedBoard {
                 mut runner,
+                spell: _,
                 a,
                 mine,
                 theirs,
@@ -3958,4 +4049,199 @@ fn unbindable_declared_slot_shapes_offer_no_candidates() {
             );
         }
     }
+}
+
+/// CR 108.3 + CR 109.5 + CR 601.2c (typed composition, not printed Oracle):
+/// an unqualified-controller leg owned by the target player or opponent
+/// (`Owned { TargetPlayer | TargetOpponent }`) has no binding authority, like
+/// a target-player controller. On a populated chain (where the reference reads
+/// the announced player) the Equipment slot offers nothing at construction
+/// and at selection, every Equipment is refused, and nothing is exiled. The
+/// declaring owner's `Owned { You }` is the control on the same route: it
+/// offers the caster's Equipment on every candidate host at construction,
+/// Mine alone at selection, and exiles Mine.
+#[test]
+fn relatively_owned_declared_slot_target_offers_nothing_on_a_populated_chain() {
+    use engine::game::ability_utils::begin_target_selection_for_ability;
+    use engine::types::ability::ControllerRef;
+    for owner in [
+        ControllerRef::TargetPlayer,
+        ControllerRef::TargetOpponent,
+        ControllerRef::You,
+    ] {
+        let admitted = owner == ControllerRef::You;
+        let head = typed_exile_probe(|you| {
+            let mut leg = you;
+            leg.controller = None;
+            leg.properties.push(FilterProp::Owned {
+                controller: owner.clone(),
+            });
+            TargetFilter::Typed(leg)
+        });
+        for companion in [P1, P0] {
+            if owner == ControllerRef::TargetOpponent && companion == P0 {
+                continue;
+            }
+            let label = format!("Owned{{{owner:?}}} companion={companion:?}");
+            let mut board = typed_board(&head);
+            let (announced, slots, offered) = populated_probe(&board, &head, companion);
+            let expected: Vec<TargetRef> = if admitted {
+                vec![TargetRef::Object(board.mine)]
+            } else {
+                vec![]
+            };
+            // Construction unions over every candidate of the declared slot
+            // (A and B); selection narrows to the chosen host.
+            let constructed: Vec<TargetRef> = if admitted {
+                sorted(vec![
+                    TargetRef::Object(board.mine),
+                    TargetRef::Object(board.on_b),
+                ])
+            } else {
+                vec![]
+            };
+            assert_eq!(sorted(offered), constructed, "{label}: slot construction");
+
+            let (spell, a) = (board.spell, board.a);
+            let runner = &mut board.runner;
+            runner
+                .act(GameAction::CastSpell {
+                    object_id: spell,
+                    card_id: runner.state().objects[&spell].card_id,
+                    targets: vec![],
+                    payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+                })
+                .expect("cast begins");
+            let progress =
+                begin_target_selection_for_ability(runner.state(), &announced, &slots, &[])
+                    .expect("reach: populated selection begins");
+            let WaitingFor::TargetSelection {
+                pending_cast,
+                target_slots,
+                selection,
+                ..
+            } = &mut runner.state_mut().waiting_for
+            else {
+                panic!("{label}: reach: the production pending cast");
+            };
+            *pending_cast.ability = announced;
+            *target_slots = slots;
+            *selection = progress;
+            announce_player_and_host(runner, a, companion);
+            let at_equipment: Vec<TargetRef> = match &runner.state().waiting_for {
+                WaitingFor::TargetSelection { selection, .. } => selection
+                    .current_legal_targets
+                    .iter()
+                    .filter(|t| matches!(t, TargetRef::Object(_)))
+                    .cloned()
+                    .collect(),
+                _ => vec![],
+            };
+            assert_eq!(at_equipment, expected, "{label}: selection");
+            let all = [board.mine, board.theirs, board.on_b, board.loose];
+            for equipment in all {
+                let accepted = matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::TargetSelection { .. }
+                ) && GameRunner::from_state(runner.state().clone())
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(equipment)),
+                    })
+                    .is_ok();
+                assert_eq!(
+                    accepted,
+                    admitted && equipment == board.mine,
+                    "{label}: {equipment:?} acceptance"
+                );
+            }
+            if let WaitingFor::TargetSelection { pending_cast, .. } =
+                &mut runner.state_mut().waiting_for
+            {
+                // The populated seeds were the probe's context; the commit
+                // appends the walk's own choices.
+                let mut node = Some(pending_cast.ability.as_mut());
+                while let Some(ability) = node {
+                    ability.targets.clear();
+                    node = ability.sub_ability.as_deref_mut();
+                }
+                let chosen = admitted.then_some(TargetRef::Object(board.mine));
+                runner
+                    .act(GameAction::ChooseTarget { target: chosen })
+                    .unwrap_or_else(|e| panic!("{label}: commit: {e:?}"));
+            }
+            runner.advance_until_stack_empty();
+            let state = runner.state();
+            for equipment in all {
+                let exiled = admitted && equipment == board.mine;
+                assert_eq!(
+                    state.objects[&equipment].zone,
+                    if exiled {
+                        Zone::Exile
+                    } else {
+                        Zone::Battlefield
+                    },
+                    "{label}: {equipment:?}"
+                );
+            }
+        }
+    }
+}
+
+/// CR 115.1a + CR 601.2c: a targeted destroy of a declared-slot referent
+/// ("Destroy [up to one] target Equipment [you control | an opponent controls
+/// | you own] attached to that creature") has no supported lowering and no
+/// printed producer, so the whole clause keeps its strict gap: no destroy
+/// effect and no declared-slot referent. Light of Judgment's untargeted
+/// "Destroy up to one Equipment attached to that creature" is the control.
+#[test]
+fn targeted_declared_slot_destroy_keeps_its_gap() {
+    for head in ["Destroy target", "Destroy up to one target"] {
+        for qualifier in ["", "you control ", "an opponent controls ", "you own "] {
+            let label = format!("{head} / {qualifier}");
+            let text = format!(
+                "Target player loses 1 life. ~ deals 5 damage to target creature. {head} Equipment {qualifier}attached to that creature."
+            );
+            let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+            let gaps: Vec<(String, String)> = chain(&parsed.abilities[0])
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::Unimplemented { name, description } => {
+                        Some((name.clone(), description.clone().unwrap_or_default()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                gaps,
+                vec![(
+                    "unparsed_verb_arguments".to_string(),
+                    format!("Destroy target Equipment {qualifier}attached to that creature"),
+                )],
+                "{label}: the whole clause is the strict gap"
+            );
+            assert!(
+                chain(&parsed.abilities[0])
+                    .iter()
+                    .all(|effect| !matches!(effect, Effect::Destroy { .. })),
+                "{label}: no inert destroy"
+            );
+            assert!(
+                !serde_json::to_string(&parsed.abilities[0])
+                    .unwrap()
+                    .contains("DeclaredTarget"),
+                "{label}: no declared-slot referent"
+            );
+        }
+    }
+    let parsed = parse_oracle_text(
+        "Target player loses 1 life. ~ deals 5 damage to target creature. Destroy up to one Equipment attached to that creature.",
+        "Probe",
+        &[],
+        &types("Instant"),
+        &[],
+    );
+    assert!(
+        unimplemented_names(&[&parsed.abilities[0]]).is_empty(),
+        "the untargeted resolution choice stays supported"
+    );
 }

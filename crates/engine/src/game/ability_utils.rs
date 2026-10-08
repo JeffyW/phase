@@ -7577,10 +7577,13 @@ fn legal_targets_for_ability_filter_uncapped(
 /// CR 109.5 + CR 601.2c: the shapes a declared-slot attachment referent
 /// binds — a flat `Typed` filter, or a flat `Or` of them, whose controller is
 /// unqualified, "you" (the ability's controller) or "an opponent" (relative to
-/// it). No controller reference yet names an earlier declared player slot, so
-/// a leg naming a target player, or a nested `Or`/`And` composite, offers no
-/// candidates rather than a guessed binding.
+/// it), and whose properties read no other target position than the declared
+/// slots (`retarget_dependencies`: an `Owned { TargetPlayer }` leg is refused
+/// like a `TargetPlayer` controller). No controller reference yet names an
+/// earlier declared player slot, so a leg reading a target player, or a nested
+/// `Or`/`And` composite, offers no candidates rather than a guessed binding.
 fn declared_slot_filter_is_bindable(filter: &TargetFilter) -> bool {
+    use crate::game::retarget_completion::{retarget_dependencies, RetargetDeps};
     use crate::types::ability::ControllerRef;
     let leg_binds = |leg: &TargetFilter| {
         matches!(
@@ -7590,7 +7593,7 @@ fn declared_slot_filter_is_bindable(filter: &TargetFilter) -> bool {
                     tf.controller,
                     None | Some(ControllerRef::You) | Some(ControllerRef::Opponent)
                 )
-        )
+        ) && retarget_dependencies(leg) != RetargetDeps::AllPositions
     };
     match filter {
         TargetFilter::Typed(_) => leg_binds(filter),
