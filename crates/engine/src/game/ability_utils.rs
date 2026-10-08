@@ -7486,6 +7486,22 @@ fn legal_targets_for_ability_filter_uncapped(
         return Vec::new();
     }
     let filter = &bound_filter;
+    // CR 601.2c + CR 701.3a: a declared-slot attachment referent is unioned
+    // over every candidate of the slot it names (no selection exists yet);
+    // the interactive walk narrows it to the object actually chosen. CR 109.5:
+    // only a bindable shape is enumerated, under the declaring controller.
+    if crate::game::filter::filter_reads_declared_slot(filter) {
+        if !declared_slot_filter_is_bindable(filter) {
+            return Vec::new();
+        }
+        return union_over_declared_slot_candidates(
+            state,
+            ability,
+            filter,
+            existing_slots,
+            &[ability.controller],
+        );
+    }
     let relative_kind = relative_controller_kind(filter);
     if relative_kind.is_none() {
         // CR 601.2c + CR 603.3d: at slot-build time no selection has been made
@@ -7497,18 +7513,6 @@ fn legal_targets_for_ability_filter_uncapped(
             if let Some(prior) = first_prior_object_slot(existing_slots) {
                 return union_over_prior_object_candidates(state, ability, filter, prior);
             }
-        }
-        // CR 601.2c + CR 701.3a: a declared-slot attachment referent is unioned
-        // over every candidate of the slot it names (no selection exists yet);
-        // the interactive walk narrows it to the object actually chosen.
-        if crate::game::filter::filter_reads_declared_slot(filter) {
-            return union_over_declared_slot_candidates(
-                state,
-                ability,
-                filter,
-                existing_slots,
-                &[ability.controller],
-            );
         }
         if needs_ability_context {
             return targeting::find_legal_targets_for_ability(state, filter, ability);
@@ -7523,48 +7527,6 @@ fn legal_targets_for_ability_filter_uncapped(
                 .iter()
                 .all(|target| matches!(target, TargetRef::Player(_)))
     });
-    // CR 601.2c + CR 701.3a + CR 109.5: a controller- or owner-relative
-    // declared-slot referent ("target Equipment you control attached to that
-    // creature") composes both enumerations: the referent's candidates, each
-    // under every player the relative scope can name. CR 109.5: "you" is the
-    // declaring controller, never an earlier target player; only a reference
-    // that names the targeted player ("that player controls") is enumerated
-    // over the companion player slot's candidates.
-    if crate::game::filter::filter_reads_declared_slot(filter) {
-        // CR 109.5: each leg binds its own controller reference, and the
-        // legs' sets are unioned.
-        let mut legal = Vec::new();
-        for leg in filter_or_legs(filter) {
-            let names_target_player = relative_controller_kind(leg)
-                == Some(crate::types::ability::ControllerRef::TargetPlayer);
-            let (enumeration_filter, players): (TargetFilter, Vec<PlayerId>) = match player_slot {
-                Some(player_slot) if names_target_player => (
-                    rewrite_declared_target_player(leg, crate::types::ability::ControllerRef::You),
-                    player_slot
-                        .legal_targets
-                        .iter()
-                        .filter_map(|target| match target {
-                            TargetRef::Player(player_id) => Some(*player_id),
-                            TargetRef::Object(_) => None,
-                        })
-                        .collect(),
-                ),
-                _ => (leg.clone(), vec![ability.controller]),
-            };
-            for target in union_over_declared_slot_candidates(
-                state,
-                ability,
-                &enumeration_filter,
-                existing_slots,
-                &players,
-            ) {
-                if !legal.contains(&target) {
-                    legal.push(target);
-                }
-            }
-        }
-        return legal;
-    }
     let Some(player_slot) = player_slot else {
         if needs_ability_context {
             return targeting::find_legal_targets_for_ability(state, filter, ability);
@@ -7612,11 +7574,28 @@ fn legal_targets_for_ability_filter_uncapped(
     legal_targets
 }
 
-/// The legs of a top-level `Or`, else the filter itself.
-fn filter_or_legs(filter: &TargetFilter) -> Vec<&TargetFilter> {
+/// CR 109.5 + CR 601.2c: the shapes a declared-slot attachment referent
+/// binds — a flat `Typed` filter, or a flat `Or` of them, whose controller is
+/// unqualified, "you" (the ability's controller) or "an opponent" (relative to
+/// it). No controller reference yet names an earlier declared player slot, so
+/// a leg naming a target player, or a nested `Or`/`And` composite, offers no
+/// candidates rather than a guessed binding.
+fn declared_slot_filter_is_bindable(filter: &TargetFilter) -> bool {
+    use crate::types::ability::ControllerRef;
+    let leg_binds = |leg: &TargetFilter| {
+        matches!(
+            leg,
+            TargetFilter::Typed(tf)
+                if matches!(
+                    tf.controller,
+                    None | Some(ControllerRef::You) | Some(ControllerRef::Opponent)
+                )
+        )
+    };
     match filter {
-        TargetFilter::Or { filters } => filters.iter().collect(),
-        other => vec![other],
+        TargetFilter::Typed(_) => leg_binds(filter),
+        TargetFilter::Or { filters } => filters.iter().all(leg_binds),
+        _ => false,
     }
 }
 
@@ -8293,36 +8272,24 @@ fn legal_targets_for_selected_slot(
         // it reads the whole selected-slot view by position — each prior choice
         // as an `Elected` (live) binding — rather than the first prior object.
         //
-        // CR 109.5: each leg binds its own controller reference ("you" is the
-        // declaring controller; only a reference naming the targeted player
-        // reads the selected player), and the legs' sets are unioned.
+        // CR 109.5: "you" is the declaring controller; a shape with no binding
+        // authority offers nothing.
         if crate::game::filter::filter_reads_declared_slot(&bound_filter) {
-            let view: Vec<Option<targeting::DeclaredSlotBinding>> = selected_slots
-                .iter()
-                .map(|slot| slot.clone().map(targeting::DeclaredSlotBinding::Elected))
-                .collect();
-            let mut legal = Vec::new();
-            for leg in filter_or_legs(&bound_filter) {
-                let (leg_controller, leg_filter) = match relative_controller_kind(leg) {
-                    Some(ControllerRef::TargetPlayer) => (
-                        relative_filter_controller(ability, selected_slots),
-                        rewrite_declared_target_player(leg, ControllerRef::You),
-                    ),
-                    _ => (ability.controller, leg.clone()),
-                };
-                for target in targeting::find_legal_targets_for_ability_with_view(
+            if !declared_slot_filter_is_bindable(&bound_filter) {
+                Vec::new()
+            } else {
+                let view: Vec<Option<targeting::DeclaredSlotBinding>> = selected_slots
+                    .iter()
+                    .map(|slot| slot.clone().map(targeting::DeclaredSlotBinding::Elected))
+                    .collect();
+                targeting::find_legal_targets_for_ability_with_view(
                     state,
-                    &leg_filter,
+                    &bound_filter,
                     ability,
-                    leg_controller,
+                    ability.controller,
                     &view,
-                ) {
-                    if !legal.contains(&target) {
-                        legal.push(target);
-                    }
-                }
+                )
             }
-            legal
         } else {
             let bound = target_filter_binds_prior_target(&enumeration_filter)
                 .then(|| bind_prior_object_targets(ability, selected_slots))

@@ -1,11 +1,12 @@
 use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until, take_while1};
-use nom::character::complete::{one_of, space0, space1, u8 as parse_u8};
+use nom::character::complete::{one_of, satisfy, space0, space1, u8 as parse_u8};
 use nom::combinator::{
     all_consuming, eof, map, map_res, not, opt, peek, recognize, rest, value, verify,
 };
 use nom::error::ParseError;
+use nom::multi::separated_list0;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
@@ -10312,14 +10313,28 @@ pub(super) fn bind_attachment_qualifier<'a>(
     ctx: &ParseContext,
 ) -> Option<(TargetFilter, &'a str)> {
     if !opens_attachment_qualifier(rem) {
-        return Some((target, rem));
+        // CR 109.5 + CR 608.2c: a control or ownership qualifier the target
+        // phrase left unconsumed ahead of an attachment qualifier ("Equipment
+        // controlled by those players attached to that creature") would widen
+        // the target if dropped, so the clause fails closed.
+        let words = qualifier_words(rem);
+        let unconsumed_qualifier = words
+            .iter()
+            .position(|word| *word == QualifierWord::Attached)
+            .is_some_and(|at| {
+                words[..at]
+                    .iter()
+                    .any(|word| matches!(word, QualifierWord::Admitted | QualifierWord::Unadmitted))
+            });
+        return (!unconsumed_qualifier).then_some((target, rem));
     }
-    // CR 608.2c + CR 115.10a: "<type> that player controls attached to that
-    // creature" names the player an earlier clause targeted. No controller
-    // reference names a declared player slot without surfacing a new player
-    // target, and the target phrase's legacy `You` would read the caster, so
-    // the anaphoric shape fails closed (the strict `attached_to_qualifier` gap).
-    if names_anaphoric_player_controller(phrase) {
+    // CR 109.5 + CR 608.2c: the declared attachment referent admits exactly
+    // "you control", "you own" and "an opponent controls". Any other control
+    // or ownership qualifier ("they control", "that player controls",
+    // "controlled by those opponents") names a player no controller reference
+    // binds yet (the legacy encoding would read the caster), so the clause
+    // fails closed and stays unparsed.
+    if qualifier_words(phrase).contains(&QualifierWord::Unadmitted) {
         return None;
     }
     let (prop, after) = parse_attached_to_declared_referent(rem, ctx)?;
@@ -10333,20 +10348,66 @@ pub(super) fn bind_attachment_qualifier<'a>(
     legs_carry(&bound, &prop).then_some((bound, after))
 }
 
-/// CR 608.2c: does `phrase` qualify control by an anaphoric earlier player
-/// ("that player controls", "controlled by that player", "that opponent
-/// controls")?
-fn names_anaphoric_player_controller(phrase: &str) -> bool {
-    let lower = phrase.to_lowercase();
-    nom_primitives::scan_at_word_boundaries(&lower, |input| {
-        let anaphor = || alt((tag("that player"), tag("that opponent")));
-        alt((
-            value((), pair(anaphor(), tag(" controls"))),
-            value((), pair(tag("controlled by "), anaphor())),
-        ))
-        .parse(input)
-    })
-    .is_some()
+/// One word of a qualified target phrase, classified against the declared
+/// attachment referent's control/ownership allow-list.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QualifierWord {
+    /// "you control", "you own" or "an opponent controls".
+    Admitted,
+    /// Any other control or ownership word.
+    Unadmitted,
+    /// "attached", opening the referent qualifier itself.
+    Attached,
+    Other,
+}
+
+fn qualifier_word(input: &str) -> OracleResult<'_, QualifierWord> {
+    let word_end = || not(satisfy(|c: char| c.is_alphanumeric()));
+    alt((
+        value(
+            QualifierWord::Admitted,
+            terminated(
+                alt((
+                    tag("you control"),
+                    tag("you own"),
+                    tag("an opponent controls"),
+                )),
+                word_end(),
+            ),
+        ),
+        value(
+            QualifierWord::Unadmitted,
+            terminated(
+                alt((
+                    tag("controlled"),
+                    tag("controller"),
+                    tag("controls"),
+                    tag("control"),
+                    tag("owned"),
+                    tag("owner"),
+                    tag("owns"),
+                    tag("own"),
+                )),
+                word_end(),
+            ),
+        ),
+        value(
+            QualifierWord::Attached,
+            terminated(tag("attached"), word_end()),
+        ),
+        value(QualifierWord::Other, take_while1(|c: char| c != ' ')),
+    ))
+    .parse(input)
+}
+
+/// The words of `text`, classified by [`qualifier_word`].
+fn qualifier_words(text: &str) -> Vec<QualifierWord> {
+    let lower = text.to_lowercase();
+    let words = match separated_list0(space1, qualifier_word).parse(lower.trim_start()) {
+        Ok((_, words)) => words,
+        Err(_) => Vec::new(),
+    };
+    words
 }
 
 /// The admissible shape for a declared-slot attachment referent: a `Typed`

@@ -3603,35 +3603,62 @@ fn qualified_dependent_target_binds_you_and_an_opponent_per_leg() {
     }
 }
 
-/// CR 608.2c + CR 115.10a: "that player controls" / "controlled by that
-/// player" after an earlier player target names that player, which no
-/// controller reference can express without announcing a new player target,
-/// so the clause keeps the strict `attached_to_qualifier` gap and no
-/// declared-slot referent is emitted. The supported "you control", "you own"
-/// and "an opponent controls" phrasings are the controls.
+/// CR 109.5 + CR 608.2c: a qualified dependent target admits exactly "you
+/// control", "you own" and "an opponent controls". Every other control or
+/// ownership qualifier ("they control", "that player controls", "controlled
+/// by those opponents") names a player no controller reference binds yet, so
+/// the whole clause keeps its strict gap (`unparsed_verb_arguments`, as Light
+/// of Judgment's clause had before this class): no declared-slot referent and
+/// no widened, unqualified Equipment target, for exile and destroy alike. The three admitted
+/// phrasings are the controls.
 #[test]
-fn anaphoric_player_qualified_dependent_target_keeps_its_gap() {
+fn unadmitted_qualified_dependent_target_keeps_its_gap() {
     for (head, qualifier) in [
         ("Target player", "that player controls"),
         ("Target opponent", "that player controls"),
+        ("Target opponent", "that opponent controls"),
         ("Target player", "controlled by that player"),
+        ("Target player", "they control"),
+        ("Target player", "controlled by those players"),
+        ("Target opponent", "controlled by those opponents"),
     ] {
-        let text = format!(
-            "{head} loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment {qualifier} attached to that creature."
-        );
-        let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
-        let names = unimplemented_names(&[&parsed.abilities[0]]);
-        assert!(
-            !names.is_empty(),
-            "{head} / {qualifier}: the anaphoric clause fails closed, got {:?}",
-            chain(&parsed.abilities[0])
-        );
-        assert!(
-            !serde_json::to_string(&parsed.abilities[0])
-                .unwrap()
-                .contains("DeclaredTarget"),
-            "{head} / {qualifier}: no declared-slot referent"
-        );
+        for verb in ["Exile", "Destroy"] {
+            let text = format!(
+                "{head} loses 1 life. ~ deals 5 damage to target creature. {verb} up to one target Equipment {qualifier} attached to that creature."
+            );
+            let parsed = parse_oracle_text(&text, "Probe", &[], &types("Instant"), &[]);
+            let gaps: Vec<(String, String)> = chain(&parsed.abilities[0])
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::Unimplemented { name, description } => {
+                        Some((name.clone(), description.clone().unwrap_or_default()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let label = format!("{verb} / {head} / {qualifier}");
+            assert_eq!(
+                gaps,
+                vec![(
+                    "unparsed_verb_arguments".to_string(),
+                    format!("{verb} target Equipment {qualifier} attached to that creature"),
+                )],
+                "{label}: the whole clause is the strict gap"
+            );
+            assert!(
+                chain(&parsed.abilities[0]).iter().all(|effect| !matches!(
+                    effect,
+                    Effect::ChangeZone { .. } | Effect::Destroy { .. }
+                )),
+                "{label}: no widened exile or destroy"
+            );
+            assert!(
+                !serde_json::to_string(&parsed.abilities[0])
+                    .unwrap()
+                    .contains("DeclaredTarget"),
+                "{label}: no declared-slot referent"
+            );
+        }
     }
     for qualifier in ["you control", "you own", "an opponent controls"] {
         let text = format!(
@@ -3648,127 +3675,287 @@ fn anaphoric_player_qualified_dependent_target_keeps_its_gap() {
     }
 }
 
-/// CR 109.5 (typed composition, not printed Oracle): a mixed qualified `Or`
-/// leg set, "Equipment you control" OR "Equipment the target player controls",
-/// each attached to that creature. Each leg binds its own controller
-/// reference and the sets are unioned, so the offered set does not depend on
-/// the legs' order: with the companion player P1, both Mine (the caster's) and
-/// Theirs (P1's); with P0, Mine only. Equipment on another creature and loose
-/// Equipment are refused, and each offered choice resolves (exiled).
-#[test]
-fn mixed_qualified_or_binds_each_leg_independently_of_order() {
+/// The parsed "Target player loses 1 life. ~ deals 5 damage to target
+/// creature. Exile up to one target Equipment you control attached to that
+/// creature." with its exile target's filter replaced by `shape(you_leg)`.
+fn typed_exile_probe(shape: impl Fn(TypedFilter) -> TargetFilter) -> AbilityDefinition {
     use engine::types::ability::ControllerRef;
     const TEXT: &str = "Target player loses 1 life. ~ deals 5 damage to target creature. Exile up to one target Equipment you control attached to that creature.";
+    let mut head = parse_oracle_text(TEXT, "Typed Probe", &[], &types("Instant"), &[])
+        .abilities
+        .remove(0);
+    let mut tail = &mut head;
+    while !matches!(tail.effect.as_ref(), Effect::ChangeZone { .. }) {
+        tail = tail.sub_ability.as_mut().expect("the exile node");
+    }
+    let Effect::ChangeZone { target, .. } = tail.effect.as_mut() else {
+        unreachable!()
+    };
+    let TargetFilter::Typed(you) = target.clone() else {
+        panic!("reach: a typed leg");
+    };
+    assert_eq!(you.controller, Some(ControllerRef::You), "reach");
+    *target = shape(you);
+    head
+}
+
+/// The typed probe's board: creatures A and B (P1); Mine (P0) and Theirs (P1)
+/// attached to A; On B (P0) attached to B; Loose (P1) unattached.
+struct TypedBoard {
+    runner: GameRunner,
+    a: ObjectId,
+    mine: ObjectId,
+    theirs: ObjectId,
+    on_b: ObjectId,
+    loose: ObjectId,
+}
+
+/// Casts the typed probe and announces P1 and creature A, answering a
+/// companion player slot (if one is surfaced) with `companion`.
+fn cast_typed_probe(head: &AbilityDefinition, companion: PlayerId) -> TypedBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
+    let b = scenario.add_creature(P1, "Creature B", 2, 7).id();
+    let mine = equipment(&mut scenario, P0, "Equipment Mine");
+    let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
+    let on_b = equipment(&mut scenario, P0, "Equipment On B");
+    let loose = equipment(&mut scenario, P1, "Equipment Loose");
+    let spell = scenario
+        .add_spell_to_hand(P0, "Typed Probe", true)
+        .with_mana_cost(ManaCost::zero())
+        .with_ability_definition(head.clone())
+        .id();
+    let mut runner = scenario.build();
+    attach::attach_to(runner.state_mut(), mine, a);
+    attach::attach_to(runner.state_mut(), theirs, a);
+    attach::attach_to(runner.state_mut(), on_b, b);
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id: runner.state().objects[&spell].card_id,
+            targets: vec![],
+            payment_mode: engine::types::game_state::CastPaymentMode::Auto,
+        })
+        .expect("cast begins");
+    for target in [TargetRef::Player(P1), TargetRef::Object(a)] {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(target),
+            })
+            .expect("announce");
+    }
+    if let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for {
+        if !selection.current_legal_targets.is_empty()
+            && selection
+                .current_legal_targets
+                .iter()
+                .all(|t| matches!(t, TargetRef::Player(_)))
+        {
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Player(companion)),
+                })
+                .expect("announce the companion player");
+        }
+    }
+    TypedBoard {
+        runner,
+        a,
+        mine,
+        theirs,
+        on_b,
+        loose,
+    }
+}
+
+fn sorted(mut targets: Vec<TargetRef>) -> Vec<TargetRef> {
+    targets.sort_by_key(|t| format!("{t:?}"));
+    targets
+}
+
+/// CR 109.5 (typed composition, not printed Oracle): a flat `Or` of admitted
+/// legs, "Equipment you control" OR "Equipment an opponent controls", each
+/// attached to that creature, binds both legs to the ability's controller and
+/// unions them, so the offered set does not depend on the legs' order: Mine
+/// and Theirs. Equipment on another creature and loose Equipment are refused,
+/// and each offered choice resolves (exiled).
+#[test]
+fn flat_qualified_or_offers_the_same_union_in_either_order() {
+    use engine::types::ability::ControllerRef;
     for you_first in [true, false] {
-        for companion in [P1, P0] {
-            let label = format!("you_first={you_first} companion={companion:?}");
-            let mut head = parse_oracle_text(TEXT, "Or Probe", &[], &types("Instant"), &[])
-                .abilities
-                .remove(0);
-            {
-                let mut tail = &mut head;
-                while !matches!(tail.effect.as_ref(), Effect::ChangeZone { .. }) {
-                    tail = tail.sub_ability.as_mut().expect("the exile node");
-                }
-                let Effect::ChangeZone { target, .. } = tail.effect.as_mut() else {
-                    unreachable!()
-                };
-                let TargetFilter::Typed(you) = target.clone() else {
-                    panic!("{label}: reach: a typed leg");
-                };
-                assert_eq!(you.controller, Some(ControllerRef::You), "{label}: reach");
-                let mut player = you.clone();
-                player.controller = Some(ControllerRef::TargetPlayer);
-                let (you, player) = (TargetFilter::Typed(you), TargetFilter::Typed(player));
-                *target = TargetFilter::Or {
-                    filters: if you_first {
-                        vec![you, player]
-                    } else {
-                        vec![player, you]
-                    },
-                };
-            }
-            for elect_theirs in [false, true] {
-                let mut scenario = GameScenario::new();
-                scenario.at_phase(Phase::PreCombatMain);
-                let a = scenario.add_creature(P1, "Creature A", 2, 7).id();
-                let b = scenario.add_creature(P1, "Creature B", 2, 7).id();
-                let mine = equipment(&mut scenario, P0, "Equipment Mine");
-                let theirs = equipment(&mut scenario, P1, "Equipment Theirs");
-                let on_b = equipment(&mut scenario, P0, "Equipment On B");
-                let loose = equipment(&mut scenario, P1, "Equipment Loose");
-                let spell = scenario
-                    .add_spell_to_hand(P0, "Or Probe", true)
-                    .with_mana_cost(ManaCost::zero())
-                    .with_ability_definition(head.clone())
-                    .id();
-                let mut runner = scenario.build();
-                attach::attach_to(runner.state_mut(), mine, a);
-                attach::attach_to(runner.state_mut(), theirs, a);
-                attach::attach_to(runner.state_mut(), on_b, b);
-                runner
-                    .act(GameAction::CastSpell {
-                        object_id: spell,
-                        card_id: runner.state().objects[&spell].card_id,
-                        targets: vec![],
-                        payment_mode: engine::types::game_state::CastPaymentMode::Auto,
-                    })
-                    .expect("cast begins");
-                for target in [
-                    TargetRef::Player(P1),
-                    TargetRef::Object(a),
-                    TargetRef::Player(companion),
-                ] {
-                    runner
-                        .act(GameAction::ChooseTarget {
-                            target: Some(target),
-                        })
-                        .unwrap_or_else(|e| panic!("{label}: announce: {e:?}"));
-                }
-                let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for
-                else {
-                    panic!("{label}: expected the Equipment slot");
-                };
-                let mut offered = selection.current_legal_targets.clone();
-                offered.sort_by_key(|t| format!("{t:?}"));
-                let expected = if companion == P1 {
-                    vec![mine, theirs]
+        let head = typed_exile_probe(|you| {
+            let mut opponent = you.clone();
+            opponent.controller = Some(ControllerRef::Opponent);
+            let (you, opponent) = (TargetFilter::Typed(you), TargetFilter::Typed(opponent));
+            TargetFilter::Or {
+                filters: if you_first {
+                    vec![you, opponent]
                 } else {
-                    vec![mine]
-                };
-                let mut want: Vec<TargetRef> =
-                    expected.iter().copied().map(TargetRef::Object).collect();
-                want.sort_by_key(|t| format!("{t:?}"));
-                assert_eq!(offered, want, "{label}: the union of the bound legs");
-                for refused in [on_b, loose] {
+                    vec![opponent, you]
+                },
+            }
+        });
+        for elect_theirs in [false, true] {
+            let label = format!("you_first={you_first} elect_theirs={elect_theirs}");
+            let TypedBoard {
+                mut runner,
+                a,
+                mine,
+                theirs,
+                on_b,
+                loose,
+            } = cast_typed_probe(&head, P1);
+            let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for else {
+                panic!("{label}: expected the Equipment slot");
+            };
+            assert_eq!(
+                sorted(selection.current_legal_targets.clone()),
+                sorted(vec![TargetRef::Object(mine), TargetRef::Object(theirs)]),
+                "{label}: the union of the bound legs"
+            );
+            for refused in [on_b, loose] {
+                assert!(
+                    GameRunner::from_state(runner.state().clone())
+                        .act(GameAction::ChooseTarget {
+                            target: Some(TargetRef::Object(refused)),
+                        })
+                        .is_err(),
+                    "{label}: not attached to A, refused"
+                );
+            }
+            let chosen = if elect_theirs { theirs } else { mine };
+            runner
+                .act(GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(chosen)),
+                })
+                .expect("announce the Equipment");
+            runner.advance_until_stack_empty();
+            let state = runner.state();
+            assert_eq!(state.objects[&chosen].zone, Zone::Exile, "{label}: exiled");
+            for other in [mine, theirs, on_b, loose]
+                .into_iter()
+                .filter(|o| *o != chosen)
+            {
+                assert_eq!(state.objects[&other].zone, Zone::Battlefield, "{label}");
+            }
+            assert_eq!(state.objects[&a].damage_marked, 5, "{label}");
+        }
+    }
+}
+
+/// Builds a typed exile-target shape from the parsed "you control" leg.
+type ShapeFn = Box<dyn Fn(TypedFilter) -> TargetFilter>;
+
+/// CR 109.5 + CR 601.2c (typed compositions, not printed Oracle): a
+/// declared-slot referent binds only a flat admitted leg or a flat `Or` of
+/// them. A leg naming a target player, or a nested `Or`/`And` composite, has
+/// no binding authority yet, so the slot offers no candidates and accepts
+/// none (no guessed binding), whichever player is the companion; the
+/// optional slot is declined and nothing is exiled.
+#[test]
+fn unbindable_declared_slot_shapes_offer_no_candidates() {
+    use engine::types::ability::ControllerRef;
+    let target_player = |you: &TypedFilter| {
+        let mut leg = you.clone();
+        leg.controller = Some(ControllerRef::TargetPlayer);
+        TargetFilter::Typed(leg)
+    };
+    let unqualified = |you: &TypedFilter| {
+        let mut leg = you.clone();
+        leg.controller = None;
+        TargetFilter::Typed(leg)
+    };
+    let shapes: Vec<(&str, ShapeFn)> = vec![
+        (
+            "standalone TargetPlayer",
+            Box::new(move |you| target_player(&you)),
+        ),
+        (
+            "flat Or[You, TargetPlayer]",
+            Box::new(move |you| TargetFilter::Or {
+                filters: vec![TargetFilter::Typed(you.clone()), target_player(&you)],
+            }),
+        ),
+        (
+            "nested Or[Or[You, TargetPlayer]]",
+            Box::new(move |you| TargetFilter::Or {
+                filters: vec![TargetFilter::Or {
+                    filters: vec![TargetFilter::Typed(you.clone()), target_player(&you)],
+                }],
+            }),
+        ),
+        (
+            "And[Or[You, TargetPlayer], unqualified]",
+            Box::new(move |you| TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Or {
+                        filters: vec![TargetFilter::Typed(you.clone()), target_player(&you)],
+                    },
+                    unqualified(&you),
+                ],
+            }),
+        ),
+        (
+            "And[TargetPlayer, You]",
+            Box::new(move |you| TargetFilter::And {
+                filters: vec![target_player(&you), TargetFilter::Typed(you)],
+            }),
+        ),
+        (
+            "nested Or[Or[You]]",
+            Box::new(move |you| TargetFilter::Or {
+                filters: vec![TargetFilter::Or {
+                    filters: vec![TargetFilter::Typed(you)],
+                }],
+            }),
+        ),
+    ];
+    for (name, shape) in &shapes {
+        let head = typed_exile_probe(shape);
+        for companion in [P1, P0] {
+            let label = format!("{name} companion={companion:?}");
+            let TypedBoard {
+                mut runner,
+                a,
+                mine,
+                theirs,
+                on_b,
+                loose,
+            } = cast_typed_probe(&head, companion);
+            if let WaitingFor::TargetSelection { selection, .. } = &runner.state().waiting_for {
+                assert!(
+                    selection.current_legal_targets.is_empty(),
+                    "{label}: no candidates, got {:?}",
+                    selection.current_legal_targets
+                );
+                for refused in [mine, theirs, on_b, loose] {
                     assert!(
                         GameRunner::from_state(runner.state().clone())
                             .act(GameAction::ChooseTarget {
                                 target: Some(TargetRef::Object(refused)),
                             })
                             .is_err(),
-                        "{label}: not attached to A, refused"
+                        "{label}: refused"
                     );
                 }
-                if elect_theirs && companion != P1 {
-                    continue;
-                }
-                let chosen = if elect_theirs { theirs } else { mine };
                 runner
-                    .act(GameAction::ChooseTarget {
-                        target: Some(TargetRef::Object(chosen)),
-                    })
-                    .expect("announce the Equipment");
-                runner.advance_until_stack_empty();
-                let state = runner.state();
-                assert_eq!(state.objects[&chosen].zone, Zone::Exile, "{label}: exiled");
-                for other in [mine, theirs, on_b, loose]
-                    .into_iter()
-                    .filter(|o| *o != chosen)
-                {
-                    assert_eq!(state.objects[&other].zone, Zone::Battlefield, "{label}");
-                }
+                    .act(GameAction::ChooseTarget { target: None })
+                    .unwrap_or_else(|e| panic!("{label}: decline: {e:?}"));
             }
+            runner.advance_until_stack_empty();
+            let state = runner.state();
+            for equipment in [mine, theirs, on_b, loose] {
+                assert_eq!(
+                    state.objects[&equipment].zone,
+                    Zone::Battlefield,
+                    "{label}: nothing exiled"
+                );
+            }
+            assert_eq!(
+                state.objects[&a].damage_marked, 5,
+                "{label}: the damage applies"
+            );
         }
     }
 }
