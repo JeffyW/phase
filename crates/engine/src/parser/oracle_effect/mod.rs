@@ -2006,7 +2006,28 @@ fn whenever_event_expiry_from_duration(duration: &Duration) -> Option<WheneverEv
     }
 }
 
+/// Where an inline "whenever" clause without a "this turn"/"this combat" window
+/// came from, which decides whether it can be a delayed trigger at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnwindowedWhenever {
+    /// Inside an effect chain, after the outer dispatch consumed a leading
+    /// stated duration ("Until end of turn, whenever …" — The Sea Devils III).
+    /// The bare remainder is a delayed trigger.
+    Delayed,
+    /// A whole spell line that opens with "Whenever". With no window, it is a
+    /// printed triggered ability that functions from the zone its own text names,
+    /// such as a graveyard (CR 113.6 + CR 113.6m), not a delayed one.
+    PrintedLine,
+}
+
 fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
+    try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::Delayed)
+}
+
+fn try_parse_whenever_this_turn_from(
+    tp: TextPair,
+    unwindowed: UnwindowedWhenever,
+) -> Option<ParsedEffectClause> {
     // CR 603.7b: capture a leading stated duration as the delayed trigger's
     // EXPIRY (its own lifetime), not the enclosing clause's duration. This runs
     // at the head so it precedes the outer `strip_leading_duration` dispatch site,
@@ -2078,6 +2099,10 @@ fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
         // explicit "this turn"/"this combat" window. Without it, "at the beginning
         // of [phase]" is a printed trigger and must not be intercepted here.
         None if is_phase_form => return None,
+        // CR 113.6m + CR 603.7b: a standalone spell line with no window and no
+        // consumed duration is a printed trigger (Killian's Confidence,
+        // Thunderblade Charge: graveyard abilities), not a delayed one.
+        None if unwindowed == UnwindowedWhenever::PrintedLine && leading.is_none() => return None,
         None => {
             let boundary = crate::parser::oracle_trigger::find_effect_boundary(tp.lower)?;
             let (before, _) = tp.split_at(boundary);
@@ -2902,7 +2927,7 @@ pub(crate) fn try_parse_temporal_delayed_trigger_ability(
 ) -> Option<AbilityIr> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
-    let clause = try_parse_whenever_this_turn(tp)
+    let clause = try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::PrintedLine)
         .or_else(|| try_parse_when_next_event(tp))
         .or_else(|| try_parse_copy_next_spell_when_cast(tp))
         .or_else(|| try_parse_at_next_phase_delayed_trigger(text, kind))?;

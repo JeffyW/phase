@@ -1227,6 +1227,7 @@ mod prepared_state_serde;
 mod primo_unbounded_fractal_counters;
 mod printed_ability_order;
 mod printed_damage_prevention_survives_turn;
+mod printed_spell_graveyard_triggers;
 mod proctor_of_potential_restriction;
 mod proliferate_zero_counter;
 mod promise_of_loyalty;
