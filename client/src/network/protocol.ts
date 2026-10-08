@@ -106,15 +106,19 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  92 — game_setup and state_update carry GameState, whose attachment filters
+ *  93 — game_setup and state_update carry GameState, whose attachment filters
  *       are now one AttachedTo prop with a tagged `to` referent in place of the
  *       AttachedToSource / AttachedToRecipient / AttachedToPlayer tags. Both
- *       peers are browsers and neither validates the shape, so a v91 peer
+ *       peers are browsers and neither validates the shape, so a v92 peer
  *       would take the new shape with no decode error; first contact rejects
  *       the skew instead. The same state carries positional retarget picks
  *       (null keeps) and the engine-derived copy-walk keep and decline
  *       permissions.
- *       Bumped in lockstep with full-game protocol 110.
+ *       Bumped in lockstep with full-game protocol 111.
+ *  92 — GameState carries a deferred spell delivery for a spell paused on its
+ *       own free-cast window. Older peers would leave the spell on the stack
+ *       in no zone. The same bump adds the SpellCopyOrderChoice prompt.
+ *       Bumped with full-game protocol 110.
  *  91 — GameState carries the CR 201.5a granter binding (ObjectScope
  *       GrantingObject / SpecificObject, TargetFilter GrantingObject.bound,
  *       PlayerFilter GrantingObjectCaster and the granting_object stamps).
@@ -564,7 +568,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 92 as const;
+export const WIRE_PROTOCOL_VERSION = 93 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

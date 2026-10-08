@@ -60,27 +60,35 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 110 — `FilterProp`'s three attachment-referent siblings
+/// 111 — `FilterProp`'s three attachment-referent siblings
 ///      (`AttachedToSource`, `AttachedToRecipient`, `AttachedToPlayer`) are one
 ///      parameterized prop, `{"type":"AttachedTo","to":{"type":"Source"}}`
 ///      (`to` is an internally tagged `AttachmentReferent`: `Source`,
 ///      `Recipient`, `Player { player }`, and the new `DeclaredTarget { slot }`
 ///      for "attached to that creature", CR 701.3a + CR 303.4b). Serialization
 ///      writes only the new shape; deserialization still accepts the three old
-///      tags (`filter_prop_from_value`), so a v110 peer reads v109 state but a
-///      v109 peer cannot parse a v110 `GameState` holding any attachment
+///      tags (`filter_prop_from_value`), so a v111 peer reads v110 state but a
+///      v110 peer cannot parse a v111 `GameState` holding any attachment
 ///      filter — an unconditional PARSE bump. The same version also makes
 ///      retarget choices positional (CR 115.7d + CR 707.10c):
 ///      `GameAction::RetargetSpell.new_targets` is `[TargetRef | null]` (`null`
-///      keeps a position's target, a bare target chooses it, so a v109 bare
+///      keeps a position's target, a bare target chooses it, so a v110 bare
 ///      vector still decodes as all-chosen), `RetargetChoice` gains
 ///      `keep_is_distinct`, `CopyTargetSlot` gains `address`, `can_keep` and
 ///      `can_decline`, and `CopyRetarget` gains `controller` (the copy's
 ///      controller when an announcement slot's chooser answers), `mode`,
 ///      `picks`, `can_keep_rest` and `announcer_election` (a copy
-///      announcement's announcing-opponent election) (all serde default). A v109 peer cannot parse a `null` pick, and the client renders
+///      announcement's announcing-opponent election) (all serde default). A v110 peer cannot parse a `null` pick, and the client renders
 ///      the keep permissions only from the engine's fields. Lobby messages are
-///      unchanged, and P2P moves in lockstep (wire 92).
+///      unchanged, and P2P moves in lockstep (wire 93).
+/// 110 — `GameState.deferred_spell_delivery` holds a resolving spell's move to
+///       its zone while it is paused on its own free-cast window (CR 608.2n +
+///       CR 608.2g: Finale of Promise, Collected Conjuring). An older peer
+///       would leave the spell on the stack in no zone after the window, so
+///       full-game and P2P refuse the mismatch (wire 92). The same bump adds
+///       `WaitingFor::SpellCopyOrderChoice` and
+///       `PendingRepeatIteration.copy_order_fixed` (CR 405.3: the controller
+///       orders a batch of spell copies).
 /// 109 — CR 201.5a granter binding: `ObjectScope::GrantingObject` and
 ///      `ObjectScope::SpecificObject`, `TargetFilter::GrantingObject { bound }`,
 ///      `PlayerFilter::GrantingObjectCaster`, plus the `granting_object` stamp on
@@ -915,7 +923,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 110;
+pub const PROTOCOL_VERSION: u32 = 111;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2170,12 +2178,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 110);
+        assert_eq!(PROTOCOL_VERSION, 111);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 109);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 110);
     }
 
     #[test]

@@ -210,12 +210,12 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 110 — FilterProp's attachment-referent siblings (AttachedToSource,
+ * 111 — FilterProp's attachment-referent siblings (AttachedToSource,
  *      AttachedToRecipient, AttachedToPlayer) are one AttachedTo prop with a
  *      tagged `to` referent (Source, Recipient, Player, DeclaredTarget) — see
- *      PROTOCOL_VERSION's own `/// 110` entry in
+ *      PROTOCOL_VERSION's own `/// 111` entry in
  *      crates/lobby-broker/src/protocol.rs. This client hands server frames to
- *      JSON.parse, so a v109 client would take the new shape with no decode
+ *      JSON.parse, so a v110 client would take the new shape with no decode
  *      error; the exact-match version check at connect refuses the pairing
  *      instead. The same version makes retarget picks positional:
  *      RetargetSpell.new_targets is (TargetRef | null)[] (null keeps), and the
@@ -225,6 +225,10 @@ export class NativeEngineVersionMismatchError extends Error {
  *      controller when a slot's chooser answers, and
  *      CopyRetarget.announcer_election carries a copy announcement's
  *      announcing-opponent election.
+ * 110 — GameState.deferredSpellDelivery holds a resolving spell's move to
+ *       its zone while it is paused on its own free-cast window. Older peers
+ *       would leave the spell on the stack in no zone; P2P moves in lockstep
+ *       (wire 92).
  * 109 — CR 201.5a granter binding: ObjectScope gains GrantingObject and
  *      SpecificObject, TargetFilter.GrantingObject gains `bound`, PlayerFilter
  *      gains GrantingObjectCaster, and ability, trigger, static, replacement, spell and
@@ -724,7 +728,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 110;
+export const PROTOCOL_VERSION = 111;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

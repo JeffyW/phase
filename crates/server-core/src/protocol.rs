@@ -3348,11 +3348,17 @@ mod tests {
 
     /// `FilterProp`'s attachment-referent siblings are one parameterized
     /// `FilterProp::AttachedTo { to: AttachmentReferent }` (CR 701.3a + CR
-    /// 303.4b); a v109 peer cannot parse the `"AttachedTo"` tag carried in
+    /// 303.4b); a v110 peer cannot parse the `"AttachedTo"` tag carried in
     /// `GameState` ability definitions, so it must be refused before it
-    /// receives v110 state. v110 also carries the positional retarget wire
+    /// receives v111 state. v111 also carries the positional retarget wire
     /// (`RetargetSpell` `null` keeps, engine-derived copy-walk keep
-    /// permissions), which a v109 peer cannot parse or render.
+    /// permissions), which a v110 peer cannot parse or render.
+    /// `GameState.deferred_spell_delivery` (CR 608.2n + CR 608.2g) is new in
+    /// serialized state. A v109 peer would leave a spell paused on its own
+    /// free-cast window on the stack in no zone, so the handshake must refuse
+    /// the mismatch before it receives v110 state. The same version adds
+    /// `WaitingFor::SpellCopyOrderChoice` and
+    /// `PendingRepeatIteration.copy_order_fixed` (CR 405.3).
     /// The CR 201.5a granter binding adds `ObjectScope::GrantingObject` /
     /// `ObjectScope::SpecificObject`, `TargetFilter::GrantingObject { bound }`,
     /// `PlayerFilter::GrantingObjectCaster` and the `granting_object` stamp; v108 state
@@ -3428,8 +3434,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_110_for_attached_to_referent() {
-        assert_eq!(PROTOCOL_VERSION, 110);
+    fn protocol_version_is_111_for_attached_to_referent() {
+        assert_eq!(PROTOCOL_VERSION, 111);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3440,7 +3446,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_110_for_attached_to_referent` stays
+    /// `protocol_version_is_111_for_attached_to_referent` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
