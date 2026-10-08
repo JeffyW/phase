@@ -10018,6 +10018,29 @@ fn finalize_copy_walk(
     ) {
         *ability = post;
     }
+    complete_copy_walk_effect(state, walk, events)
+}
+
+/// CR 601.2e + CR 707.12: a copy announcement that can no longer be completed
+/// (no legal announcement remains after a player left the game) is an illegal
+/// cast: the game returns to before it was proposed, so the copy ceases to
+/// exist, and the effect that offered it continues as it would after the walk.
+pub(crate) fn abandon_copy_walk(
+    state: &mut GameState,
+    walk: &effects::copy_choice::CopyWalk,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    effects::prepare::cleanup_failed_prepared_copy_cast(state, walk.copy_id);
+    complete_copy_walk_effect(state, walk, events)
+}
+
+/// The copy walk's effect is done: emit its completion, drain copy observers,
+/// hand priority back to the walk's controller and resume the continuation.
+fn complete_copy_walk_effect(
+    state: &mut GameState,
+    walk: &effects::copy_choice::CopyWalk,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
     let player = walk.player;
     let paradigm_remaining_offers = walk.paradigm_remaining_offers.clone();
     events.push(GameEvent::EffectResolved {

@@ -555,20 +555,29 @@ pub fn eliminate_players_simultaneously(
             debug_assert!(false, "scoped search elimination resume failed: {error}");
         }
 
-        // CR 800.4g: a copy announcement whose "of an opponent's choice"
-        // announcer left keeps its walk: the copy's controller chooses the
-        // replacement, and the decided prefix and continuation stay. Runs
-        // before the generic dead-actor repoint below, which would otherwise
-        // replace the walk with unrelated priority.
-        match super::effects::copy_choice::replace_departed_copy_announcers(state) {
-            Ok(Some((walk, picks))) => {
-                if let Err(error) = super::engine::advance_copy_walk(state, &walk, picks, events) {
-                    debug_assert!(false, "copy announcement replacement failed: {error}");
+        // CR 800.4a + CR 800.4g: a copy announcement is reconciled with the
+        // players still in the game: its prefix is replayed on the current
+        // board, and the copy's controller chooses the replacement announcer
+        // (`reconcile_copy_announcement_after_departure`). Runs before the
+        // generic dead-actor repoint below, which would otherwise replace the
+        // walk with unrelated priority. CR 601.2e: when no legal announcement
+        // remains, the copy's cast is illegal and the copy ceases to exist.
+        let announcement =
+            super::effects::copy_choice::walk_of(&state.waiting_for).map(|(walk, _)| walk);
+        let unannounceable =
+            match super::effects::copy_choice::reconcile_copy_announcement_after_departure(state) {
+                Ok(Some((walk, picks))) => {
+                    super::engine::advance_copy_walk(state, &walk, picks, events)
+                        .is_err()
+                        .then_some(walk)
                 }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                debug_assert!(false, "copy announcement replacement failed: {error}");
+                Ok(None) => None,
+                // The announcement's slots cannot be built on the current board.
+                Err(_) => announcement,
+            };
+        if let Some(walk) = unannounceable {
+            if let Err(error) = super::engine::abandon_copy_walk(state, &walk, events) {
+                tracing::error!(%error, "an unannounceable copy was not abandoned");
             }
         }
 

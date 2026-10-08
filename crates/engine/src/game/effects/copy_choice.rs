@@ -29,8 +29,9 @@ use crate::game::casting_costs::{
     assign_next_announcing_opponent, next_announcing_opponent_choice,
 };
 use crate::game::engine::EngineError;
+use crate::game::players::{choosable_opponents, is_alive};
 use crate::game::retarget_completion::{RetargetPick, RetargetSearch};
-use crate::types::ability::{EffectKind, ResolvedAbility};
+use crate::types::ability::{EffectKind, ResolvedAbility, TargetFilter};
 use crate::types::game_state::{
     AnnouncerElection, CopyChoiceMode, CopyTargetSlot, GameState, PersistedRestoreError,
     TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
@@ -174,8 +175,9 @@ pub(crate) fn walk_step(
             if let Some(election) = announcer_election(state, walk)? {
                 // An announcer is elected before any target is announced. The
                 // one later election is CR 800.4g's replacement for an
-                // announcer who left the game (`replace_departed_copy_announcers`),
-                // which keeps the decided prefix.
+                // announcer who left the game
+                // (`reconcile_copy_announcement_after_departure`), which keeps
+                // the decided prefix.
                 // CR 601.2c + CR 707.12: the election is published only for a
                 // feasible announcement; a copy with no legal announcement
                 // fails here, before any prompt (restore: fail closed).
@@ -331,22 +333,53 @@ fn chain_link_mut(ability: &mut ResolvedAbility, depth: usize) -> Option<&mut Re
     node
 }
 
-/// CR 800.4g + CR 601.2c + CR 115.1: when the player announcing an "of an
-/// opponent's choice" group of a copy's announcement leaves the game, the
-/// copy's controller chooses another player to make that choice, another
-/// opponent if possible. Every group whose announcer has left and which still
-/// owns an undecided slot loses its announcer: with exactly one choosable
-/// opponent it goes to that opponent (no decision); with two or more, the walk
-/// re-publishes the controller's announcing-opponent election. The decided
-/// prefix, the copy's controller and the walk are kept. Returns the walk and
-/// its picks to re-derive when anything changed; `None` otherwise (not a copy
-/// announcement, the copy's controller has left, or no undecided group lost
-/// its announcer).
-pub(crate) fn replace_departed_copy_announcers(
+/// CR 707.10c / CR 601.2c: the longest prefix of `picks` the walk still
+/// accepts on the current board. Each pick is replayed through the walk's own
+/// gate and advance in published form (the casting walk's auto-advances
+/// included); the replay stops at the first pick the board refuses, so the
+/// walk re-asks from there (an unfinished choice stays its chooser's). Shared
+/// by restore and the departure reconciliation.
+fn replay_decided_picks(
+    state: &GameState,
+    walk: &CopyWalk,
+    picks: &[RetargetPick],
+) -> Vec<RetargetPick> {
+    let mut accepted: Vec<RetargetPick> = Vec::with_capacity(picks.len());
+    loop {
+        match published_picks(state, walk, accepted.clone()) {
+            Ok(published) if picks.starts_with(&published) => accepted = published,
+            _ => break,
+        }
+        let Some(pick) = picks.get(accepted.len()) else {
+            break;
+        };
+        match advance_walk(state, walk, &accepted, pick) {
+            Ok(next) if next.len() > accepted.len() && picks.starts_with(&next) => {
+                accepted = next;
+            }
+            _ => break,
+        }
+    }
+    accepted
+}
+
+/// CR 800.4a + CR 800.4g + CR 601.2c + CR 115.1: reconcile a copy
+/// announcement with the players still in the game. `None` when the prompt
+/// is not a copy announcement or the copy's controller has left; otherwise
+/// the walk and the decided prefix to re-derive the prompt from:
+/// - CR 800.4a: the departed player's objects left the game, so the decided
+///   prefix is replayed on the current board (`replay_decided_picks`) and is
+///   re-asked from the first pick it refuses.
+/// - CR 800.4g: each "of an opponent's choice" group that still owns an
+///   undecided slot and has no announcer in the game (its announcer left, or a
+///   replacement election is still open) goes to the only choosable opponent
+///   when one remains; with two or more its announcer is cleared, and the
+///   re-derived walk asks the copy's controller through the
+///   announcing-opponent election, rebuilt against the remaining opponents.
+///   A group whose slots are all decided is not re-asked.
+pub(crate) fn reconcile_copy_announcement_after_departure(
     state: &mut GameState,
 ) -> Result<Option<(CopyWalk, Vec<RetargetPick>)>, EngineError> {
-    use crate::game::players::{choosable_opponents, is_alive};
-    use crate::types::ability::TargetFilter;
     let Some((walk, picks)) = walk_of(&state.waiting_for) else {
         return Ok(None);
     };
@@ -356,19 +389,20 @@ pub(crate) fn replace_departed_copy_announcers(
     let Some(ability) = copy_ability(state, walk.copy_id)? else {
         return Ok(None);
     };
+    let picks = replay_decided_picks(state, &walk, &picks);
     let baseline = build_target_slots(state, ability)?;
     // A group's slots are the ones whose announcer changes when only that
     // group's announcer is set to the controller (the CR 601.2c default).
-    let mut departed = Vec::new();
+    let mut unanswered = Vec::new();
     let mut node = Some(ability);
     let mut depth = 0;
     while let Some(link) = node {
-        let left = matches!(link.target_chooser, Some(TargetFilter::Opponent))
+        let needs_announcer = matches!(link.target_chooser, Some(TargetFilter::Opponent))
             && link
                 .context
                 .announcing_opponent
-                .is_some_and(|announcer| !is_alive(state, announcer));
-        if left {
+                .is_none_or(|announcer| !is_alive(state, announcer));
+        if needs_announcer {
             let mut probe = ability.clone();
             let controller = probe.controller;
             if let Some(probe_link) = chain_link_mut(&mut probe, depth) {
@@ -379,14 +413,11 @@ pub(crate) fn replace_departed_copy_announcers(
                 || (picks.len()..baseline.len())
                     .any(|slot| probed[slot].chooser != baseline[slot].chooser);
             if owns_undecided {
-                departed.push(depth);
+                unanswered.push(depth);
             }
         }
         node = link.sub_ability.as_deref();
         depth += 1;
-    }
-    if departed.is_empty() {
-        return Ok(None);
     }
     let replacement = match choosable_opponents(state, walk.player).as_slice() {
         [only] => Some(*only),
@@ -398,7 +429,7 @@ pub(crate) fn replace_departed_copy_announcers(
         .find(|entry| entry.id == walk.copy_id)
         .and_then(|entry| entry.ability_mut())
         .ok_or_else(|| EngineError::InvalidAction("Copy is no longer on the stack".to_string()))?;
-    for depth in departed {
+    for depth in unanswered {
         if let Some(link) = chain_link_mut(ability, depth) {
             link.context.announcing_opponent = replacement;
         }
@@ -708,24 +739,7 @@ pub(crate) fn restore_copy_target_walk(state: &mut GameState) -> Result<(), Pers
             copy_id: walk.copy_id,
         });
     }
-    // Replay: each saved pick must be the walk's own answer at its position,
-    // in published form (the casting walk's auto-advances included).
-    let mut accepted: Vec<RetargetPick> = Vec::with_capacity(picks.len());
-    loop {
-        match published_picks(state, &walk, accepted.clone()) {
-            Ok(published) if picks.starts_with(&published) => accepted = published,
-            _ => break,
-        }
-        let Some(pick) = picks.get(accepted.len()) else {
-            break;
-        };
-        match advance_walk(state, &walk, &accepted, pick) {
-            Ok(next) if next.len() > accepted.len() && picks.starts_with(&next) => {
-                accepted = next;
-            }
-            _ => break,
-        }
-    }
+    let accepted = replay_decided_picks(state, &walk, &picks);
     match walk_step(state, &walk, accepted.clone()) {
         Ok(Some(CopyWalkStep::Prompt(prompt))) => {
             state.waiting_for = *prompt;

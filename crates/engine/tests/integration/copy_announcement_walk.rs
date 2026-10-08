@@ -909,3 +909,248 @@ fn a_departed_announcer_whose_choice_is_made_is_not_replaced() {
     assert_eq!(announce_rest(&mut r, &[creatures[1]]), vec![p3]);
     assert_offering_resolved(&mut r, copy, lands, creatures);
 }
+
+/// The `n`-player Mizzix's Mastery -> Volcanic Offering copy at its first
+/// announcing-opponent election. Nonbasic land A is owned and controlled by
+/// `land_a_owner`, land B by P1; P1 controls two creatures (toughness 12).
+/// Returns (runner, copy, [A, B], [creature a, creature b]).
+fn offering_copy_at_election(
+    n: u8,
+    land_a_owner: PlayerId,
+) -> (GameRunner, ObjectId, [ObjectId; 2], [ObjectId; 2]) {
+    let mut s = GameScenario::new_n_player(n, 7);
+    s.at_phase(Phase::PreCombatMain);
+    let lands = [
+        s.add_land_from_oracle(land_a_owner, "Nonbasic A", "").id(),
+        s.add_land_from_oracle(P1, "Nonbasic B", "").id(),
+    ];
+    let creatures = [
+        s.add_creature(P1, "P1 Creature A", 3, 12).id(),
+        s.add_creature(P1, "P1 Creature B", 3, 12).id(),
+    ];
+    let offering = s
+        .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+        .from_oracle_text(VOLCANIC_OFFERING)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(mastery).target_object(offering).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards {
+        cards: vec![offering],
+    })
+    .expect("cast the copy");
+    let WaitingFor::CopyRetarget {
+        copy_id,
+        announcer_election: Some(_),
+        ..
+    } = r.state().waiting_for
+    else {
+        panic!(
+            "expected the first election, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    (r, copy_id, lands, creatures)
+}
+
+fn elect(r: &mut GameRunner, electees: [PlayerId; 2]) {
+    for electee in electees {
+        r.act(GameAction::ChooseAnnouncingOpponent { opponent: electee })
+            .expect("elect");
+    }
+}
+
+/// Probe board 1 (CR 800.4a + CR 800.4g, three players): P2, elected to
+/// announce the copy's second land, owns land A, which P0 announced first.
+/// P2 concedes while answering: A leaves the game with its owner, so P0's
+/// pick of A is no longer an answerable choice. The copy walk keeps going (no
+/// panic, no fallback to Priority): the prefix is replayed on the current
+/// board and re-asked from the first pick it refuses, the land group goes to
+/// P1, the only remaining opponent, and the copy stays P0's and resolves.
+/// Control: A owned by the surviving P1 keeps the prefix `[A]`, and P1
+/// replaces P2.
+#[test]
+fn a_prefix_pick_owned_by_the_departed_announcer_is_re_asked() {
+    for a_owner in [PlayerId(2), P1] {
+        let label = format!("A owned by {a_owner:?}");
+        let p2 = PlayerId(2);
+        let (mut r, copy, [a, b], creatures) = offering_copy_at_election(3, a_owner);
+        elect(&mut r, [p2, P1]);
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(a)),
+        })
+        .expect("P0 announces A");
+        assert_eq!(
+            walk_prompt(&r),
+            (p2, P0, vec![Some(TargetRef::Object(a))], false),
+            "{label}: reach: P2 answers, the copy is P0's, the prefix is [A]"
+        );
+        r.act(GameAction::Concede { player_id: p2 })
+            .expect("P2 concedes");
+        let (player, controller, picks, election) = walk_prompt(&r);
+        assert_eq!(controller, P0, "{label}: the copy stays P0's");
+        assert!(!election, "{label}: one opponent remains, no election");
+        let rest: Vec<ObjectId> = if a_owner == P1 {
+            assert_eq!(
+                (player, picks),
+                (P1, vec![Some(TargetRef::Object(a))]),
+                "{label}: the prefix is kept and P1 replaces P2"
+            );
+            vec![b, creatures[0], creatures[1]]
+        } else {
+            assert_eq!(
+                (player, picks),
+                (P0, vec![]),
+                "{label}: A left the game, so the walk re-asks P0's first land"
+            );
+            vec![b, b, creatures[0], creatures[1]]
+        };
+        let askers = announce_rest(&mut r, &rest);
+        if a_owner == P1 {
+            assert_eq!(askers, vec![P1, P0, P1], "{label}");
+        } else {
+            assert_eq!(askers, vec![P0, P1, P0, P1], "{label}");
+        }
+        resolve_entry(&mut r, copy);
+        let destroyed = if a_owner == P1 { vec![a, b] } else { vec![b] };
+        assert!(
+            destroyed
+                .iter()
+                .all(|land| r.state().objects[land].zone == Zone::Graveyard),
+            "{label}: the announced lands are destroyed"
+        );
+        assert_eq!(
+            creatures.map(|c| r.state().objects[&c].damage_marked),
+            [7, 7],
+            "{label}"
+        );
+    }
+}
+
+/// Probe board 2 (CR 800.4g, four players): P2 concedes while answering, so P0
+/// is asked to elect a replacement from [P1, P3]; before P0 answers, P3
+/// concedes too. The election is rebuilt against the players still in the
+/// game: P1 is the only opponent left, so it is assigned with no prompt, P1
+/// announces the second land, and the copy resolves. Control: P0 elects P3,
+/// and then P3 concedes while answering; P1 replaces P3 the same way.
+#[test]
+fn a_second_departure_rebuilds_the_replacement_election() {
+    let (p2, p3) = (PlayerId(2), PlayerId(3));
+    for elect_p3_first in [false, true] {
+        let label = format!("elect P3 first: {elect_p3_first}");
+        let (mut r, copy, lands, creatures) = offering_copy_at_election(4, P1);
+        elect(&mut r, [p2, P1]);
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(lands[0])),
+        })
+        .expect("P0 announces its land");
+        r.act(GameAction::Concede { player_id: p2 })
+            .expect("P2 concedes");
+        let prefix = vec![Some(TargetRef::Object(lands[0]))];
+        assert_eq!(
+            walk_prompt(&r),
+            (P0, P0, prefix.clone(), true),
+            "{label}: reach: P0's replacement election, prefix kept"
+        );
+        let WaitingFor::CopyRetarget {
+            copy_id,
+            announcer_election: Some(election),
+            ..
+        } = &r.state().waiting_for
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (*copy_id, election.candidates.clone()),
+            (copy, vec![P1, p3])
+        );
+        if elect_p3_first {
+            r.act(GameAction::ChooseAnnouncingOpponent { opponent: p3 })
+                .expect("P0 elects P3");
+            assert_eq!(walk_prompt(&r).0, p3, "{label}: reach: P3 answers");
+        }
+        r.act(GameAction::Concede { player_id: p3 })
+            .expect("P3 concedes");
+        assert_eq!(
+            walk_prompt(&r),
+            (P1, P0, prefix, false),
+            "{label}: P1, the only opponent left, answers; no stale election"
+        );
+        let askers = announce_rest(&mut r, &[lands[1], creatures[0], creatures[1]]);
+        assert_eq!(askers, vec![P1, P0, P1], "{label}");
+        assert_offering_resolved(&mut r, copy, lands, creatures);
+    }
+}
+
+/// CR 800.4a + CR 601.2e (three players): P2 owns the only nonbasic land A,
+/// which P0 announced first; P2 concedes while answering. A leaves the game
+/// with its owner and no nonbasic land remains, so the copy can no longer be
+/// announced: its cast is illegal and the copy ceases to exist (no panic, no
+/// stranded prompt). Mizzix's Mastery finishes resolving and is exiled, and
+/// nothing is destroyed or damaged.
+#[test]
+fn an_unannounceable_copy_after_a_departure_ceases_to_exist() {
+    let p2 = PlayerId(2);
+    let mut s = GameScenario::new_n_player(3, 7);
+    s.at_phase(Phase::PreCombatMain);
+    let a = s.add_land_from_oracle(p2, "Nonbasic A", "").id();
+    let creatures = [
+        s.add_creature(P1, "P1 Creature A", 3, 12).id(),
+        s.add_creature(P1, "P1 Creature B", 3, 12).id(),
+    ];
+    let offering = s
+        .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+        .from_oracle_text(VOLCANIC_OFFERING)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(mastery).target_object(offering).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards {
+        cards: vec![offering],
+    })
+    .expect("cast the copy");
+    let WaitingFor::CopyRetarget { copy_id: copy, .. } = r.state().waiting_for else {
+        panic!("expected the copy walk, got {:?}", r.state().waiting_for);
+    };
+    elect(&mut r, [p2, P1]);
+    r.act(GameAction::ChooseTarget {
+        target: Some(TargetRef::Object(a)),
+    })
+    .expect("P0 announces A");
+    assert_eq!(
+        walk_prompt(&r),
+        (p2, P0, vec![Some(TargetRef::Object(a))], false),
+        "reach: P2 answers the second land"
+    );
+    r.act(GameAction::Concede { player_id: p2 })
+        .expect("P2 concedes");
+    assert!(
+        !matches!(r.state().waiting_for, WaitingFor::CopyRetarget { .. }),
+        "no stranded announcement: {:?}",
+        r.state().waiting_for
+    );
+    assert!(
+        !r.state().stack.iter().any(|entry| entry.id == copy),
+        "the copy ceased to exist"
+    );
+    resolve_entry(&mut r, mastery);
+    assert_eq!(
+        r.state().objects[&mastery].zone,
+        Zone::Exile,
+        "Mastery resolves"
+    );
+    assert_eq!(
+        creatures.map(|c| r.state().objects[&c].damage_marked),
+        [0, 0]
+    );
+}

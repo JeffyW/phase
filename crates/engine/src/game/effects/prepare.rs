@@ -263,7 +263,7 @@ pub(crate) fn open_copy_target_selection(
     }
 }
 
-fn cleanup_failed_prepared_copy_cast(state: &mut GameState, copy_id: ObjectId) {
+pub(crate) fn cleanup_failed_prepared_copy_cast(state: &mut GameState, copy_id: ObjectId) {
     // Defensive cleanup for any failed cast attempt after synthesizing the
     // ephemeral copy object. The predicate filters on a unique id, so this
     // removes at most ONE entry — routed through the shared stack-removal
