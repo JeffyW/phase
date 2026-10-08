@@ -1904,3 +1904,79 @@ fn two_jace_generators_fire_once_per_damaged_player_each() {
     drive_until(&mut runner, |r| r.state().phase == Phase::End);
     assert_eq!(library_before - library(&runner, P0), 4, "no re-fire");
 }
+
+// ---- Maintainer round 3, finding 1: one ordering choice per declaration ----
+
+const NEKUSAR: &str = "At the beginning of each player's draw step, that player draws an additional card.\nWhenever an opponent draws a card, Nekusar deals 1 damage to that player.";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FirstToResolve {
+    LeviathanDraw,
+    RighteousCauseGain,
+}
+
+/// P0 controls Summon: Leviathan (chapter II installed) and Righteous Cause;
+/// P1 controls Nekusar, the Mindrazer. P0 is at 1 life and attacks with one
+/// Octopus. Returns (whether P0 lost the game, P0's life) after P0 orders the
+/// declaration's two triggers so that `first` resolves first.
+fn leviathan_and_righteous_cause_ordered(first: FirstToResolve) -> (bool, i32) {
+    let mut scenario = board();
+    add_leviathan(&mut scenario, 1);
+    scenario.add_enchantment_from_oracle(P0, "Righteous Cause", RIGHTEOUS_CAUSE);
+    scenario
+        .add_creature_from_oracle(P1, "Nekusar, the Mindrazer", 2, 4, NEKUSAR)
+        .as_legendary();
+    let octopus = typed(&mut scenario, P0, "Octopus", "Octopus");
+    let mut runner = scenario.build();
+    advance_sagas(&mut runner);
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "reach guard: chapter II installed"
+    );
+    runner.state_mut().players[0].life = 1;
+
+    attack(&mut runner, &[octopus], P1);
+    let WaitingFor::OrderTriggers { player, triggers } = runner.state().waiting_for.clone() else {
+        panic!(
+            "the delayed and printed triggers share one ordering choice: {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, P0);
+    let index_of = |name: &str| {
+        triggers
+            .iter()
+            .position(|t| t.source_name == name)
+            .unwrap_or_else(|| panic!("{name} is in the ordering choice: {triggers:?}"))
+    };
+    let (draw, gain) = (index_of("Summon: Leviathan"), index_of("Righteous Cause"));
+    assert_eq!(triggers.len(), 2, "exactly the two triggers: {triggers:?}");
+    // Index 0 is placed first (bottom of the group), so it resolves last.
+    let order = match first {
+        FirstToResolve::LeviathanDraw => vec![gain, draw],
+        FirstToResolve::RighteousCauseGain => vec![draw, gain],
+    };
+    runner
+        .act(GameAction::OrderTriggers { order })
+        .expect("submit the order");
+    settle(&mut runner, &[]);
+    (runner.state().game_end.is_some(), runner.life(P0))
+}
+
+/// CR 603.3b: Summon: Leviathan's delayed chapter II trigger and Righteous
+/// Cause's printed trigger fire from the same attack declaration, so P0 orders
+/// them in one choice, and the order matters with an opposing Nekusar. Draw
+/// first: Nekusar's 1 damage resolves above the life gain and P0, at 1 life,
+/// loses. Gain first: P0 goes to 2, then takes 1 and survives at 1.
+#[test]
+fn leviathan_and_righteous_cause_are_ordered_in_one_choice() {
+    let (lost, _) = leviathan_and_righteous_cause_ordered(FirstToResolve::LeviathanDraw);
+    assert!(
+        lost,
+        "draw first: Nekusar's damage kills P0 before the gain"
+    );
+    let (lost, life) = leviathan_and_righteous_cause_ordered(FirstToResolve::RighteousCauseGain);
+    assert!(!lost, "gain first: P0 survives");
+    assert_eq!(life, 1, "1 + 1 gained - 1 from Nekusar");
+}

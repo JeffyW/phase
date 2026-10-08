@@ -7068,12 +7068,18 @@ enum TriggerOrderingDisposition {
 enum DelayedTriggerEventScope {
     Any,
     PhaseChangedOnly,
+    /// CR 603.3b: an attack or block declaration's settlement. Every delayed
+    /// trigger matching the declaration batch joins the printed triggers in one
+    /// ordering choice (Summon: Leviathan II/III beside Righteous Cause). Like
+    /// `PhaseChangedOnly`, it closes no unrelated reflexive: a declaration is not
+    /// the creating batch of any reflexive delayed trigger.
+    DeclarationSettlement,
 }
 
 impl DelayedTriggerEventScope {
     fn accepts(self, event: &GameEvent) -> bool {
         match self {
-            Self::Any => true,
+            Self::Any | Self::DeclarationSettlement => true,
             Self::PhaseChangedOnly => matches!(event, GameEvent::PhaseChanged { .. }),
         }
     }
@@ -13505,7 +13511,8 @@ fn terminalize_unmatched_reflexives_for_closed_batch(
         }
         let expires = match scope {
             DelayedTriggerEventScope::Any => is_reflexive_lifetime(&delayed.condition),
-            DelayedTriggerEventScope::PhaseChangedOnly => {
+            DelayedTriggerEventScope::PhaseChangedOnly
+            | DelayedTriggerEventScope::DeclarationSettlement => {
                 reflexive_coin_flip_resolved_without_match(
                     &delayed.condition,
                     events,
@@ -13753,6 +13760,27 @@ pub(crate) fn process_triggers_with_delayed_phase_events(
         state,
         normal_pending,
         delayed_events,
+        events_out,
+    )
+}
+
+/// CR 603.3b + CR 508.3a + CR 509.3a: settle an attack or block declaration.
+/// The printed triggers and every delayed trigger the declaration batch fires
+/// (Summon: Leviathan's chapter II/III beside Righteous Cause) are collected
+/// into ONE batch, so each controller orders them together. The delayed
+/// collector's consumed raw occurrences are recorded as for any other combined
+/// batch, so the later priority pass does not fire them a second time.
+pub(crate) fn process_triggers_with_delayed_declaration_events(
+    state: &mut GameState,
+    events: &[GameEvent],
+    events_out: &mut Vec<GameEvent>,
+) -> TriggerBatchOutcome {
+    let normal_pending = collect_triggers_for_batch(state, events);
+    process_collected_triggers_with_delayed_events_scoped(
+        state,
+        normal_pending,
+        events,
+        DelayedTriggerEventScope::DeclarationSettlement,
         events_out,
     )
 }
