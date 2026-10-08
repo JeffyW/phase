@@ -181,3 +181,51 @@ fn unagis_spray_condition_holds_the_whole_list() {
         );
     }
 }
+
+const RAKDOS_THE_SHOWSTOPPER: &str = "Flying, trample\nWhen Rakdos enters, flip a coin for each creature that isn't a Demon, Devil, or Imp. Destroy each creature whose coin comes up tails.";
+
+/// CR 705.1: Rakdos, the Showstopper's per-creature coin flip isn't modelled,
+/// and the destroy clause used to drop "whose coin comes up tails" and destroy
+/// EVERY creature. The clause now fails closed: the trigger carries the gap,
+/// and Rakdos entering destroys nothing.
+#[test]
+fn rakdos_the_showstopper_fails_closed_instead_of_destroying_everything() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let theirs = scenario
+        .add_creature(engine::game::scenario::P1, "Their Bear", 2, 2)
+        .id();
+    let rakdos = scenario
+        .add_creature_to_hand(P0, "Rakdos, the Showstopper", 6, 6)
+        .with_subtypes(vec!["Demon"])
+        .from_oracle_text_with_keywords(&["Flying", "Trample"], RAKDOS_THE_SHOWSTOPPER)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    let debug = format!(
+        "{:?}",
+        runner.state().objects[&rakdos]
+            .trigger_definitions
+            .iter_unchecked()
+            .map(|entry| entry.definition().execute.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(debug.contains("per_object_coin_flip_outcome"), "{debug}");
+    runner.cast(rakdos).resolve();
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&rakdos].zone,
+        Zone::Battlefield,
+        "reach guard"
+    );
+    assert_eq!(runner.state().objects[&bear].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&theirs].zone, Zone::Battlefield);
+}

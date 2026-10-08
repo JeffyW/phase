@@ -10362,6 +10362,15 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     if counter_unless_payment_is_unsupported(text) {
         return parsed_unless_payment_unsupported_clause(text);
     }
+    // CR 705.1 + CR 608.2c: a set chosen by each object's own coin flip ("Destroy
+    // each creature whose coin comes up tails" — Rakdos, the Showstopper; "each
+    // player whose coin comes up tails" — Goblin Assassin, Mana Clash) needs a
+    // per-object flip outcome the engine doesn't model. The type phrase would
+    // otherwise stop before the relative clause and drop it silently, applying
+    // the effect to EVERY object, so the clause fails closed.
+    if nom_primitives::scan_contains(&text.to_ascii_lowercase(), "whose coin comes up") {
+        return parsed_clause(Effect::unimplemented("per_object_coin_flip_outcome", text));
+    }
     // CR 102.2 + CR 102.3 + CR 608.2c: "For each opponent, choose [up to one]
     // <type> that player controls" — the controller chooses one permanent per
     // opponent (Ultimate Magic: Meteor). Lowers to `ChooseFromZone { zone_owner:
