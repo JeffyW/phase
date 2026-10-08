@@ -210,10 +210,14 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 111 — CR 601.2a spell announcement: GameObject gains spell_announcement,
+ * 110 — GameState.deferredSpellDelivery holds a resolving spell's move to
+ *       its zone while it is paused on its own free-cast window. Older peers
+ *       would leave the spell on the stack in no zone; P2P moves in lockstep
+ *       (wire 92).
+ * 112 — CR 601.2a spell announcement: GameObject gains spell_announcement,
  *      GameState gains next_spell_announcement, and GameEvent BecomesTarget
- *      gains the targeter that announced the target. A v109 peer cannot
- *      deserialize the new state. P2P moves in lockstep to wire 93.
+ *      gains the targeter that announced the target. A v111 peer cannot
+ *      deserialize the new state. P2P moves in lockstep to wire 94.
  * 109 — CR 201.5a granter binding: ObjectScope gains GrantingObject and
  *      SpecificObject, TargetFilter.GrantingObject gains `bound`, PlayerFilter
  *      gains GrantingObjectCaster, and ability, trigger, static, replacement, spell and
@@ -713,7 +717,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 111;
+export const PROTOCOL_VERSION = 112;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

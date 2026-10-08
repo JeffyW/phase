@@ -3348,7 +3348,7 @@ mod tests {
 
     /// The CR 601.2a spell announcement adds `GameObject::spell_announcement`,
     /// `GameState::next_spell_announcement` and `GameEvent::BecomesTarget.targeter`;
-    /// a v110 peer cannot decode v111 state, so it must be refused before state
+    /// a v111 peer cannot decode v112 state, so it must be refused before state
     /// delivery.
     /// The CR 201.5a granter binding adds `ObjectScope::GrantingObject` /
     /// `ObjectScope::SpecificObject`, `TargetFilter::GrantingObject { bound }`,
@@ -3425,8 +3425,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_111_for_spell_announcement() {
-        assert_eq!(PROTOCOL_VERSION, 111);
+    fn protocol_version_is_112_for_spell_announcement() {
+        assert_eq!(PROTOCOL_VERSION, 112);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3437,7 +3437,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_111_for_spell_announcement` stays
+    /// `protocol_version_is_112_for_spell_announcement` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
