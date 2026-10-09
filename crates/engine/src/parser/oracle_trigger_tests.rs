@@ -37880,6 +37880,26 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
         json.contains("becomes_target_object_controller_antecedent"),
         "a distant Otherwise's object controller fails closed: {json}"
     );
+    // Complementary reveal conditions attach an `else_ability` with no
+    // "Otherwise" clause; the assembled else reads the body whole: fails closed.
+    let complementary = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, reveal the top card of your library. If it's a land card, tap target artifact. If it isn't a land card, that creature's controller draws a card.",
+        "Synthetic Complementary Watcher",
+    );
+    assert_eq!(
+        complementary.mode,
+        TriggerMode::BecomesTarget,
+        "reach guard"
+    );
+    let json = serde_json::to_string(&complementary).expect("trigger serializes");
+    assert!(
+        json.contains("\"else_ability\"") && json.contains("RevealedHasCardType"),
+        "reach guard: the complementary conditions assemble an else branch: {json}"
+    );
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "a complementary-condition else body's object controller fails closed: {json}"
+    );
 
     // A modal body is scoped by the same traversal, mode by mode: the fresh
     // target in the first mode stops the rewrite there, so the mode stays

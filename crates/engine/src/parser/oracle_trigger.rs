@@ -2696,7 +2696,12 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // the references the rewrite below would transform count: the unless payer,
     // and the body up to the same fresh-choice boundary the rebind stops at.
     if def.mode == TriggerMode::BecomesTarget {
-        if becomes_target_rewrite_reaches_an_object_controller(ir, def.unless_pay.is_some()) {
+        let has_else = def.execute.as_deref().is_some_and(assembled_body_has_else);
+        if becomes_target_rewrite_reaches_an_object_controller(
+            ir,
+            def.unless_pay.is_some(),
+            has_else,
+        ) {
             if let Some(execute) = def.execute.as_deref_mut() {
                 *execute.effect = Effect::unimplemented(
                     "becomes_target_object_controller_antecedent",
@@ -2724,6 +2729,17 @@ fn targeter_rebind_stops_before(effect: &Effect) -> bool {
     matches!(effect, Effect::CreateDelayedTrigger { .. })
 }
 
+/// Whether an assembled ability carries an `else_ability` anywhere the
+/// targeter rebind walks: its modes, its sub-ability chain, or nested branches.
+fn assembled_body_has_else(ability: &AbilityDefinition) -> bool {
+    ability.else_ability.is_some()
+        || ability.mode_abilities.iter().any(assembled_body_has_else)
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(assembled_body_has_else)
+}
+
 /// How far the targeter rebind's reach extends through one effect chain.
 enum TargeterRebindReach {
     /// A reached clause names an object's controller.
@@ -2742,8 +2758,18 @@ enum TargeterRebindReach {
 /// each mode independently, then the root chain; a reflexive body continues the
 /// chain its printed parent instruction starts. The unless payer is always
 /// rewritten, so its "unless …" phrase always counts. Vote and pile bodies have
-/// no clause chain and are read whole (conservative: fail closed).
-fn becomes_target_rewrite_reaches_an_object_controller(ir: &TriggerIr, has_unless: bool) -> bool {
+/// no clause chain and are read whole (conservative: fail closed), and so is a
+/// body whose assembled definition carries an `else_ability` by any route (an
+/// "Otherwise", or complementary reveal conditions), which the rebind visits
+/// before that link's stop.
+fn becomes_target_rewrite_reaches_an_object_controller(
+    ir: &TriggerIr,
+    has_unless: bool,
+    has_else: bool,
+) -> bool {
+    if has_else {
+        return names_an_object_controller(&ir.source_text);
+    }
     if has_unless
         && super::oracle_nom::primitives::scan_at_word_boundaries(
             &ir.source_text.to_lowercase(),
