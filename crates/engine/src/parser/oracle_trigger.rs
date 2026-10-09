@@ -22,7 +22,9 @@ use super::oracle_ir::context::{
     ConditionObjectAntecedent, ParseContext, TriggerConditionScope, TriggerZoneChangeProvenance,
 };
 use super::oracle_ir::doc::PrintedTriggerIndex;
-use super::oracle_ir::effect_chain::{DieResultBranchIr, EffectChainIr};
+use super::oracle_ir::effect_chain::{
+    ClauseDisposition, ClauseIr, DieResultBranchIr, EffectChainIr,
+};
 use super::oracle_ir::trigger::{
     effect_chain_has_terminal_roll_die, FirstTimeLimit, ReflexiveParent, ReflexiveParentIr,
     TriggerBody, TriggerIr, TriggerModifiers, TriggerNodeIr,
@@ -2742,7 +2744,6 @@ enum TargeterRebindReach {
 /// rewritten, so its "unless …" phrase always counts. Vote and pile bodies have
 /// no clause chain and are read whole (conservative: fail closed).
 fn becomes_target_rewrite_reaches_an_object_controller(ir: &TriggerIr, has_unless: bool) -> bool {
-    use super::oracle_ir::trigger::ReflexiveParent;
     if has_unless
         && super::oracle_nom::primitives::scan_at_word_boundaries(
             &ir.source_text.to_lowercase(),
@@ -2797,30 +2798,30 @@ fn targeter_rebind_modes_reach(modes: &[super::oracle_ir::effect_chain::ModalMod
 
 /// One chain, clause by clause, in the order the rebind walks its links.
 fn targeter_rebind_chain_reach(chain: &EffectChainIr) -> TargeterRebindReach {
-    use super::oracle_ir::effect_chain::ClauseDisposition;
-    let names_here = |clause: &super::oracle_ir::effect_chain::ClauseIr| {
+    let names_here = |clause: &ClauseIr| {
         clause
             .source
             .fragment()
             .is_some_and(names_an_object_controller)
     };
-    for (index, clause) in chain.clauses.iter().enumerate() {
+    // CR 608.2c: an "Otherwise, …" clause lowers onto the most recent
+    // conditional's def as its `else_ability`, which the rebind visits before
+    // that link's fresh-choice stop, wherever the conditional sits. A chain
+    // holding one is read whole (conservative: fail closed).
+    if chain.clauses.iter().any(|clause| {
+        matches!(
+            clause.disposition,
+            ClauseDisposition::BranchOtherwise { .. }
+        )
+    }) && chain.clauses.iter().any(names_here)
+    {
+        return TargeterRebindReach::NamesObjectController;
+    }
+    for clause in &chain.clauses {
         if targeter_rebind_stops_before(&clause.parsed.effect) {
             return TargeterRebindReach::Stops;
         }
         if names_here(clause) {
-            return TargeterRebindReach::NamesObjectController;
-        }
-        // CR 608.2c: an "Otherwise, …" clause lowers onto this clause's def as
-        // its `else_ability`, which the rebind visits BEFORE this link's
-        // fresh-choice stop, so it is read here first.
-        if chain.clauses[index + 1..]
-            .iter()
-            .take_while(|later| {
-                matches!(later.disposition, ClauseDisposition::BranchOtherwise { .. })
-            })
-            .any(names_here)
-        {
             return TargeterRebindReach::NamesObjectController;
         }
         let mut link = Some((&clause.parsed.effect, clause.parsed.sub_ability.as_deref()));

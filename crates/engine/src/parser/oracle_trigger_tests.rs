@@ -37868,6 +37868,18 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
         json.contains("becomes_target_object_controller_antecedent"),
         "the else body's object controller fails closed: {json}"
     );
+    // An "Otherwise" binds to the most recent conditional even across an
+    // intervening clause, so a chain holding one is read whole: fails closed.
+    let distant = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, tap target artifact if you control an Island. You gain 1 life. Otherwise, that creature's controller draws a card.",
+        "Synthetic Distant Otherwise Watcher",
+    );
+    assert_eq!(distant.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&distant).expect("trigger serializes");
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "a distant Otherwise's object controller fails closed: {json}"
+    );
 
     // A modal body is scoped by the same traversal, mode by mode: the fresh
     // target in the first mode stops the rewrite there, so the mode stays
