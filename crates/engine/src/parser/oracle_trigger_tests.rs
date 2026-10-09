@@ -37856,6 +37856,19 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
         "the chosen creature's controller keeps its parent-target reading: {json}"
     );
 
+    // An "Otherwise" body is visited before the conditional link's fresh-choice
+    // stop, as the rebind visits `else_ability` first: it fails closed.
+    let otherwise = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, tap target artifact if you control an Island. Otherwise, that creature's controller draws a card.",
+        "Synthetic Otherwise Watcher",
+    );
+    assert_eq!(otherwise.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&otherwise).expect("trigger serializes");
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "the else body's object controller fails closed: {json}"
+    );
+
     // A modal body is scoped by the same traversal, mode by mode: the fresh
     // target in the first mode stops the rewrite there, so the mode stays
     // supported with its Tap and Draw.

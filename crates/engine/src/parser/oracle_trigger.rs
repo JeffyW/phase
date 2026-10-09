@@ -2797,14 +2797,29 @@ fn targeter_rebind_modes_reach(modes: &[super::oracle_ir::effect_chain::ModalMod
 
 /// One chain, clause by clause, in the order the rebind walks its links.
 fn targeter_rebind_chain_reach(chain: &EffectChainIr) -> TargeterRebindReach {
-    for clause in &chain.clauses {
-        if targeter_rebind_stops_before(&clause.parsed.effect) {
-            return TargeterRebindReach::Stops;
-        }
-        if clause
+    use super::oracle_ir::effect_chain::ClauseDisposition;
+    let names_here = |clause: &super::oracle_ir::effect_chain::ClauseIr| {
+        clause
             .source
             .fragment()
             .is_some_and(names_an_object_controller)
+    };
+    for (index, clause) in chain.clauses.iter().enumerate() {
+        if targeter_rebind_stops_before(&clause.parsed.effect) {
+            return TargeterRebindReach::Stops;
+        }
+        if names_here(clause) {
+            return TargeterRebindReach::NamesObjectController;
+        }
+        // CR 608.2c: an "Otherwise, …" clause lowers onto this clause's def as
+        // its `else_ability`, which the rebind visits BEFORE this link's
+        // fresh-choice stop, so it is read here first.
+        if chain.clauses[index + 1..]
+            .iter()
+            .take_while(|later| {
+                matches!(later.disposition, ClauseDisposition::BranchOtherwise { .. })
+            })
+            .any(names_here)
         {
             return TargeterRebindReach::NamesObjectController;
         }

@@ -31,7 +31,7 @@ use super::card_type::{CoreType, Supertype};
 use super::counter::{counter_map_serde, CounterMatch, CounterType};
 use super::events::{
     EventAttachmentSnapshot, EventCombatSnapshot, EventObjectHistorySnapshot,
-    EventObjectRelationSnapshot, EventObjectSnapshot, GameEvent, PlayerActionKind,
+    EventObjectRelationSnapshot, EventObjectSnapshot, GameEvent, PlayerActionKind, Targeter,
 };
 use super::format::{FormatConfig, ZoneScope};
 use super::identifiers::{
@@ -29793,7 +29793,6 @@ impl GameState {
     /// The spell announcements named by `BecomesTarget` targeters on every
     /// trigger-event carrier that can still resume or resolve.
     fn targeter_spell_announcements(&mut self) -> HashSet<SpellAnnouncement> {
-        use crate::types::events::Targeter;
         let mut named = HashSet::new();
         self.for_each_trigger_event_carrier_mut(&mut |event| {
             if let GameEvent::BecomesTarget {
@@ -29811,7 +29810,6 @@ impl GameState {
     /// the relative order of the announcements present, which is the same for
     /// two positions with the same structure minted at different times.
     fn canonicalize_spell_announcements_for_loop(&mut self) {
-        use crate::types::events::Targeter;
         let mut present: Vec<SpellAnnouncement> = Vec::new();
         for (_, object) in self.objects.iter() {
             present.extend(object.spell_announcement);
@@ -30027,6 +30025,17 @@ impl GameState {
     /// share every other conjunct, including `WaitingFor::Priority{active_player}`, which is
     /// what keeps the ring homogeneous for `analysis::resource::ring_delta_signature`.
     pub(crate) fn record_loop_detect_sample(&mut self) {
+        // CR 104.4b + CR 732.2a: the restricted normalization contract. A beat
+        // holding an unsettled delivery carrier is never sampled, and it breaks
+        // the ring's contiguity like the settle sampler's own `else` clear, so
+        // no route (strict equality, growth cover, or `ring_delta_signature`'s
+        // bounded offer) certifies a period across it.
+        if !self.is_loop_comparable() {
+            self.loop_detect_ring.clear();
+            // CR 603.5: the answers belong to the window the ring just lost.
+            self.loop_answer_journal = None;
+            return;
+        }
         if self.loop_detect_ring.len() == LOOP_DETECT_RING_CAP {
             self.loop_detect_ring.pop_front();
         }
@@ -38219,7 +38228,6 @@ mod tests {
     /// different spell than the other position's targeter stays distinguishable.
     #[test]
     fn normalize_for_loop_canonicalizes_spell_announcements_by_rank() {
-        use crate::types::events::Targeter;
         fn position(spell_a: u64, spell_b: u64, targeter_names: u64) -> GameState {
             let mut state = GameState::new_two_player(7);
             for (id, announcement) in [(ObjectId(600), spell_a), (ObjectId(601), spell_b)] {
@@ -38312,7 +38320,6 @@ mod tests {
     }
 
     fn pending_targeting_trigger(targeter_names: u64, source: ObjectId) -> GameState {
-        use crate::types::events::Targeter;
         let mut state = GameState::new_two_player(7);
         state.pending_trigger = Some(Box::new(crate::game::triggers::PendingTrigger {
             source_id: ObjectId(602),
@@ -38414,7 +38421,6 @@ mod tests {
     /// "no announcement" (which matches nothing) and a zero allocator.
     #[test]
     fn spell_announcement_and_targeter_round_trip() {
-        use crate::types::events::Targeter;
         let mut state = GameState::new_two_player(7);
         let mut object = GameObject::new(
             ObjectId(700),
@@ -39006,7 +39012,6 @@ mod tests {
     /// position.
     #[test]
     fn normalize_for_loop_reaches_a_stack_resolution_fence_event() {
-        use crate::types::events::Targeter;
         fn position(disenchant: u64, fence_names: u64) -> GameState {
             let mut state = GameState::new_two_player(7);
             let mut object = GameObject::new(
@@ -39103,6 +39108,37 @@ mod tests {
         assert!(
             !loop_states_equal(&normalized, &normalized.clone()),
             "an unsettled carrier is never loop-equal, even to itself"
+        );
+
+        // Every certification route reads the sample ring, so the sampler is
+        // gated too. Reach guard: three settled beats with a steady life delta
+        // certify a bounded offer.
+        let mut ring = GameState::new_two_player(7);
+        for life in [40, 39, 38] {
+            ring.players[1].life = life;
+            ring.record_loop_detect_sample();
+        }
+        assert_eq!(
+            ring.loop_detect_ring.len(),
+            3,
+            "reach guard: settled beats sample"
+        );
+        assert!(
+            crate::analysis::resource::ring_delta_signature(&ring).is_some(),
+            "reach guard: a steady settled ring certifies"
+        );
+        // An unsettled beat records no sample and breaks the ring, so nothing
+        // is certified from it.
+        ring.players[1].life = 37;
+        ring.deferred_entry_events = unsettled.deferred_entry_events.clone();
+        ring.record_loop_detect_sample();
+        assert!(
+            ring.loop_detect_ring.is_empty(),
+            "no sample from an unsettled beat"
+        );
+        assert!(
+            crate::analysis::resource::ring_delta_signature(&ring).is_none(),
+            "no shortcut is certified across an unsettled beat"
         );
     }
 
