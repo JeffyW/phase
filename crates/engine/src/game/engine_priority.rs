@@ -300,7 +300,19 @@ fn run_post_action_pipeline_from_with_policy(
             triggers::collect_triggers_into_deferred(state, &filtered_events);
         } else if announced_cast_batch && state.game_end.is_none() {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
-            triggers::collect_delayed_triggers_into_deferred(state, &delayed_trigger_events);
+            // CR 603.2c: an occurrence a collector already claimed (a copy's
+            // SpellCast, latched when its announcement completed) is not
+            // collected again by the delayed collector.
+            let delayed_input: Vec<_> = triggers::filter_consumed_trigger_events_from(
+                events,
+                event_start,
+                triggers::TriggerCollectionRequester::Delayed,
+                &consumed_trigger_events,
+            )
+            .into_iter()
+            .filter(|event| delayed_trigger_events.contains(event))
+            .collect();
+            triggers::collect_delayed_triggers_into_deferred(state, &delayed_input);
         } else if state.game_end.is_none() {
             // CR 104.1: only while the game is still going. Once this action
             // has recorded a result on `GameState::game_end` (e.g. a CR 104.4b
@@ -400,6 +412,18 @@ fn run_post_action_pipeline_from_with_policy(
             // than being ordered before its final cast trigger is collected.
             if state.pending_resolution_completion.is_some() || announced_cast_batch {
                 triggers::collect_triggers_into_deferred(state, &sba_events);
+                if announced_cast_batch {
+                    // CR 603.2 + CR 603.3b: the SBA events' delayed observers
+                    // join the same batch, before the drain can open an
+                    // ordering prompt that would skip the bottom delayed scan.
+                    let delayed_sba_events = triggers::filter_consumed_trigger_events_from(
+                        events,
+                        events_before,
+                        triggers::TriggerCollectionRequester::Delayed,
+                        &consumed_trigger_events,
+                    );
+                    triggers::collect_delayed_triggers_into_deferred(state, &delayed_sba_events);
+                }
             } else {
                 triggers::process_triggers(state, &sba_events);
             }
@@ -459,6 +483,19 @@ fn run_post_action_pipeline_from_with_policy(
             || announced_cast_batch
         {
             triggers::collect_triggers_into_deferred(state, &unconsumed_exile_return_events);
+            if announced_cast_batch {
+                // CR 603.2 + CR 603.3b: as for SBA events, the exile returns'
+                // delayed observers join the batch before the drain.
+                let delayed_exile_return_events = triggers::filter_consumed_trigger_events(
+                    &exile_return_events,
+                    triggers::TriggerCollectionRequester::Delayed,
+                    &consumed_exile_return_events,
+                );
+                triggers::collect_delayed_triggers_into_deferred(
+                    state,
+                    &delayed_exile_return_events,
+                );
+            }
         } else {
             let mut normal_pending = state
                 .deferred_triggers

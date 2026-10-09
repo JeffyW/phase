@@ -1526,3 +1526,77 @@ fn a_resolution_s_parked_observers_join_the_copy_cast_batch() {
         "the group is put on the stack while the copy is still on it"
     );
 }
+
+const MAGNIVORE: &str = "Haste\nMagnivore's power and toughness are each equal to the number of sorcery cards in all graveyards.";
+const MAKE_YOUR_MARK: &str = "Target creature gets +1/+0 until end of turn. When that creature dies this turn, create a 3/2 red and white Spirit creature token.";
+
+/// CR 603.2 + CR 603.3b + CR 704.3: a delayed observer of a state-based
+/// action that follows a finished copy-casting resolution joins the same
+/// ordering group as the copy's cast observers. Make Your Mark set up "when
+/// Magnivore dies this turn"; Mizzix's Mastery exiles Grapeshot, the only
+/// sorcery in a graveyard, so Magnivore is 0/0 once the resolution ends, and
+/// the Grapeshot copy is announced at P1 (Storm). Magnivore dies to the
+/// state-based check of that action, and the delayed trigger and Storm are
+/// ordered together before anyone gets priority.
+#[test]
+fn an_sba_delayed_observer_joins_the_copy_cast_batch() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let magnivore = s
+        .add_creature_from_oracle(P0, "Magnivore", 0, 0, MAGNIVORE)
+        .id();
+    let mark = s
+        .add_spell_to_hand_from_oracle(P0, "Make Your Mark", true, MAKE_YOUR_MARK)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let grapeshot = s
+        .add_spell_to_graveyard(P0, "Grapeshot", false)
+        .from_oracle_text_with_keywords(&["Storm"], GRAPESHOT)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(mark).target_object(magnivore).commit();
+    resolve_entry(&mut r, mark);
+    assert_eq!(
+        r.state().objects[&magnivore].zone,
+        Zone::Battlefield,
+        "reach: Magnivore lives while Grapeshot is in the graveyard"
+    );
+    r.cast(mastery).target_object(grapeshot).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards {
+        cards: vec![grapeshot],
+    })
+    .expect("cast the Grapeshot copy");
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::CopyRetarget { .. }),
+        "reach: the copy announcement, got {:?}",
+        r.state().waiting_for
+    );
+    r.act(GameAction::ChooseTarget {
+        target: Some(TargetRef::Player(P1)),
+    })
+    .expect("announce P1");
+    assert_ne!(
+        r.state().objects[&magnivore].zone,
+        Zone::Battlefield,
+        "reach: Magnivore died to the state-based check"
+    );
+    let WaitingFor::OrderTriggers { triggers, .. } = &r.state().waiting_for else {
+        panic!(
+            "expected one ordering group before priority, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    let mut group: Vec<String> = triggers.iter().map(|s| s.source_name.clone()).collect();
+    group.sort();
+    assert_eq!(
+        group,
+        vec!["Grapeshot".to_string(), "Make Your Mark".to_string()],
+        "Storm and the delayed death trigger share the ordering group"
+    );
+}
