@@ -10034,10 +10034,58 @@ fn finalize_copy_walk(
     }
     // CR 601.2i + CR 707.12: a cast copy's announcement is complete, so the
     // copy becomes cast now. A copy of a spell (Retarget) is not cast.
+    let mut collected_cast_observers = false;
     if walk.mode == crate::types::game_state::CopyChoiceMode::Announce {
+        let cast_start = events.len();
         super::casting_costs::commit_copy_cast(state, walk.copy_id, walk.player, events)?;
+        collected_cast_observers = collect_copy_cast_observers(state, events, cast_start);
     }
-    complete_copy_walk_effect(state, walk, events)
+    complete_copy_walk_effect(state, walk, events)?;
+    // CR 603.3b + CR 117.5: once the offering resolution has finished, the
+    // latched cast observers go on the stack at the post-announcement boundary
+    // (above the announced copies), where the post-action scan would have put
+    // them.
+    if collected_cast_observers
+        && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.resolving_stack_entry.is_none()
+    {
+        if let Some(wf) =
+            triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
+        {
+            state.waiting_for = wf;
+        }
+    }
+    Ok(())
+}
+
+/// CR 603.2 + CR 702.40a: a cast trigger triggers when the spell becomes
+/// cast, so the observers of a copy's `SpellCast` (`events[cast_start..]`)
+/// are collected now, before the effect that offered the copy resumes and can
+/// cast more spells: Storm counts the spells cast before this one. They stay
+/// parked in `deferred_triggers` (put on the stack at the next priority, as
+/// before), and their occurrences are claimed so the post-action scan does
+/// not collect them a second time (CR 603.2c).
+fn collect_copy_cast_observers(
+    state: &mut GameState,
+    events: &[GameEvent],
+    cast_start: usize,
+) -> bool {
+    let cast_events = &events[cast_start..];
+    if cast_events.is_empty() {
+        return false;
+    }
+    triggers::collect_triggers_into_deferred(state, cast_events);
+    triggers::collect_delayed_triggers_into_deferred(state, cast_events);
+    state
+        .consumed_before_priority_trigger_events
+        .extend(
+            (cast_start..events.len()).map(|index| triggers::ConsumedTriggerEventOccurrence {
+                event: events[index].clone(),
+                occurrence: triggers::trigger_event_occurrence(events, index),
+                scope: triggers::ConsumedTriggerEventScope::AllCollectors,
+            }),
+        );
+    true
 }
 
 /// CR 601.2e + CR 707.12: a copy announcement that can no longer be completed
@@ -10047,11 +10095,36 @@ fn finalize_copy_walk(
 /// announcement completes), so there is no cast record, observer or latch to
 /// undo; CR 704.5e: the copy, off the stack, ceases to exist. The effect that
 /// offered the copy then continues as it would after the walk.
+///
+/// A copy restored from a save made before casts were committed at
+/// announcement completion is already stamped as cast: its parked cast
+/// observers are retracted here (CR 733.1: no ability triggers from an undone
+/// action). Its cast-history entry is not reversed (disclosed).
 pub(crate) fn abandon_copy_walk(
     state: &mut GameState,
     walk: &effects::copy_choice::CopyWalk,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    let legacy_committed = state
+        .objects
+        .get(&walk.copy_id)
+        .is_some_and(|copy| copy.cast_occurrence.is_some());
+    if legacy_committed {
+        let (retracted, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut state.deferred_triggers)
+            .into_iter()
+            .partition(|context| {
+                context.trigger_events.iter().any(|event| {
+                    matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == walk.copy_id)
+                })
+            });
+        state.deferred_triggers = kept;
+        for context in retracted {
+            crate::game::lifecycle::record_delayed_terminal(
+                context.firing(),
+                crate::game::lifecycle::DelayedTerminalDisposition::Removed,
+            );
+        }
+    }
     effects::prepare::cleanup_failed_prepared_copy_cast(state, walk.copy_id);
     complete_copy_walk_effect(state, walk, events)
 }
@@ -26373,5 +26446,110 @@ mod dandan_read_sweep_tests {
                 "shared={shared}: the pile no longer holds the stripped id"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod legacy_copy_announcement_tests {
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use crate::types::ability::TargetRef;
+    use crate::types::mana::ManaCost;
+    use crate::types::phase::Phase;
+
+    const MIZZIXS_MASTERY: &str = "Exile target card that's an instant or sorcery from your graveyard. For each card exiled this way, copy it, and you may cast the copy without paying its mana cost. Exile Mizzix's Mastery.";
+    const VOLCANIC_OFFERING: &str = "Destroy target nonbasic land you don't control and target nonbasic land of an opponent's choice you don't control.\nVolcanic Offering deals 7 damage to target creature you don't control and 7 damage to target creature of an opponent's choice you don't control.";
+    const YOUNG_PYROMANCER: &str =
+        "Whenever you cast an instant or sorcery spell, create a 1/1 red Elemental creature token.";
+
+    fn elementals(r: &GameRunner) -> usize {
+        r.state()
+            .battlefield
+            .iter()
+            .filter(|id| {
+                r.state().objects[id]
+                    .card_types
+                    .subtypes
+                    .iter()
+                    .any(|s| s == "Elemental")
+            })
+            .count()
+    }
+
+    /// CR 601.2e + CR 733.1 (restored legacy save): a copy announcement saved
+    /// before casts were committed at announcement completion is already
+    /// stamped as cast, with its cast observers parked. When the copy is
+    /// abandoned (P2, who owns the only nonbasic land P0 announced, concedes
+    /// mid-announcement), those observers are retracted: Young Pyromancer
+    /// makes no token for it. Control: the same legacy state with the
+    /// retraction disabled is checked by the revert leg.
+    #[test]
+    fn abandoning_a_legacy_committed_copy_retracts_its_parked_observers() {
+        let p2 = crate::types::player::PlayerId(2);
+        let mut s = GameScenario::new_n_player(3, 7);
+        s.at_phase(Phase::PreCombatMain);
+        s.add_creature_from_oracle(P0, "Young Pyromancer", 2, 1, YOUNG_PYROMANCER);
+        let a = s.add_land_from_oracle(p2, "Nonbasic A", "").id();
+        s.add_creature(P1, "P1 Creature A", 3, 12);
+        s.add_creature(P1, "P1 Creature B", 3, 12);
+        let offering = s
+            .add_spell_to_graveyard(P0, "Volcanic Offering", true)
+            .from_oracle_text(VOLCANIC_OFFERING)
+            .id();
+        let mastery = s
+            .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+            .from_oracle_text(MIZZIXS_MASTERY)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut r = s.build();
+        r.cast(mastery).target_object(offering).commit();
+        for _ in 0..32 {
+            if !matches!(r.state().waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
+            r.act(GameAction::PassPriority).expect("pass");
+        }
+        assert_eq!(elementals(&r), 1, "reach: Mastery's Elemental");
+        r.act(GameAction::SelectCards {
+            cards: vec![offering],
+        })
+        .expect("cast the copy");
+        let WaitingFor::CopyRetarget { copy_id: copy, .. } = r.state().waiting_for else {
+            panic!("expected the copy walk, got {:?}", r.state().waiting_for);
+        };
+        for electee in [p2, P1] {
+            r.act(GameAction::ChooseAnnouncingOpponent { opponent: electee })
+                .expect("elect");
+        }
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(a)),
+        })
+        .expect("P0 announces A");
+        // The legacy state: the copy was cast before its walk, so it is
+        // stamped and its cast observers are parked.
+        let mut cast_events = Vec::new();
+        crate::game::casting_costs::commit_copy_cast(r.state_mut(), copy, P0, &mut cast_events)
+            .expect("legacy commit");
+        crate::game::triggers::collect_triggers_into_deferred(r.state_mut(), &cast_events);
+        assert!(
+            r.state().deferred_triggers.iter().any(|parked| parked
+                .trigger_events
+                .iter()
+                .any(|event| matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy))),
+            "reach: the legacy copy's Pyromancer trigger is parked"
+        );
+        r.act(GameAction::Concede { player_id: p2 })
+            .expect("P2 concedes");
+        assert!(
+            !r.state().stack.iter().any(|entry| entry.id == copy),
+            "the copy is gone"
+        );
+        for _ in 0..64 {
+            if r.state().stack.is_empty() && r.state().deferred_triggers.is_empty() {
+                break;
+            }
+            r.act(GameAction::PassPriority).expect("resolve");
+        }
+        assert_eq!(elementals(&r), 1, "no Elemental for the abandoned copy");
     }
 }

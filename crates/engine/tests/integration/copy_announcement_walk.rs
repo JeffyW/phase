@@ -1319,3 +1319,113 @@ fn an_aborted_copy_is_never_cast() {
         );
     }
 }
+
+const GRAPESHOT: &str = "Grapeshot deals 1 damage to any target.\nStorm (When you cast this spell, copy it for each spell cast before it this turn. You may choose new targets for the copies.)";
+const DARK_RITUAL: &str = "Add {B}{B}{B}.";
+
+/// CR 702.40a + CR 603.2 + CR 601.2i: overloaded Mizzix's Mastery exiles
+/// Grapeshot and Dark Ritual and casts their copies in the chosen order.
+/// Grapeshot's copy becomes cast when its announcement (P1) completes, and its
+/// Storm trigger triggers then, counting the spells cast before it: with
+/// Grapeshot first that is Mastery alone (one Storm copy, 2 damage to P1),
+/// even though the Ritual copy is cast later in the same resolution. Control:
+/// Ritual first, so Storm counts Mastery and the Ritual (two copies, 3 damage).
+#[test]
+fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
+    for grapeshot_first in [true, false] {
+        let label = format!("Grapeshot first: {grapeshot_first}");
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let grapeshot = s
+            .add_spell_to_graveyard(P0, "Grapeshot", false)
+            .from_oracle_text_with_keywords(&["Storm"], GRAPESHOT)
+            .id();
+        let ritual = s
+            .add_spell_to_graveyard(P0, "Dark Ritual", true)
+            .from_oracle_text(DARK_RITUAL)
+            .id();
+        let mastery = s
+            .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+            .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut r = s.build();
+        let p1_life = |r: &GameRunner| r.state().players.iter().find(|p| p.id == P1).unwrap().life;
+        let life_before = p1_life(&r);
+        // Overload {5}{R}{R}{R}.
+        {
+            let pool = &mut r
+                .state_mut()
+                .players
+                .iter_mut()
+                .find(|p| p.id == P0)
+                .unwrap()
+                .mana_pool;
+            for _ in 0..8 {
+                pool.add(engine::types::mana::ManaUnit::new(
+                    engine::types::mana::ManaType::Red,
+                    ObjectId(0),
+                    false,
+                    vec![],
+                ));
+            }
+        }
+        begin_cast(&mut r, mastery);
+        assert!(
+            matches!(
+                r.state().waiting_for,
+                WaitingFor::AlternativeCastChoice { .. }
+            ),
+            "{label}: reach: overload is offered, got {:?}",
+            r.state().waiting_for
+        );
+        r.act(GameAction::ChooseAlternativeCast {
+            choice: engine::types::actions::AlternativeCastDecision::Alternative,
+        })
+        .expect("overload");
+        pass_to_choice(&mut r);
+        let order = if grapeshot_first {
+            vec![grapeshot, ritual]
+        } else {
+            vec![ritual, grapeshot]
+        };
+        r.act(GameAction::SelectCards { cards: order })
+            .expect("cast both copies");
+        for _ in 0..64 {
+            match r.state().waiting_for.clone() {
+                WaitingFor::CopyRetarget {
+                    mode: Some(CopyChoiceMode::Announce),
+                    ..
+                } => {
+                    r.act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Player(P1)),
+                    })
+                    .expect("announce P1 for Grapeshot");
+                }
+                WaitingFor::CopyRetarget { .. } => {
+                    r.act(GameAction::KeepAllCopyTargets)
+                        .expect("Storm copies keep their target");
+                }
+                WaitingFor::Priority { .. } => {
+                    if r.state().stack.is_empty() && r.state().deferred_triggers.is_empty() {
+                        break;
+                    }
+                    r.act(GameAction::PassPriority).expect("resolve");
+                }
+                other => panic!("{label}: unexpected prompt {other:?}"),
+            }
+        }
+        assert!(r.state().stack.is_empty(), "{label}: the stack drains");
+        assert_eq!(
+            r.state().objects[&mastery].zone,
+            Zone::Exile,
+            "{label}: reach"
+        );
+        let expected = if grapeshot_first { 2 } else { 3 };
+        assert_eq!(
+            life_before - p1_life(&r),
+            expected,
+            "{label}: Grapeshot damage"
+        );
+    }
+}

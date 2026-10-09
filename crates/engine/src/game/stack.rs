@@ -5614,6 +5614,7 @@ mod tests {
     use crate::game::game_object::BackFaceData;
     use crate::game::triggers::{check_delayed_triggers, PendingTrigger};
     use crate::game::zones::{self, create_object, move_to_zone};
+    use crate::types::ability::{AttachSelection, AttachmentReferent, FilterProp};
     use crate::types::ability::{
         CastingPermission, ControllerRef, CopyRetargetPermission, CostPaidObjectSnapshot, Effect,
         ModalChoice, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef, TypeFilter,
@@ -5646,9 +5647,6 @@ mod tests {
     /// C's own slot 0 destroys C's Equipment.
     #[test]
     fn untargeted_reader_gets_no_information_from_an_unjudged_tail() {
-        use crate::types::ability::{
-            AttachSelection, AttachmentReferent, FilterProp, TypeFilter, TypedFilter,
-        };
         let artifact = || TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact));
         let creature_filter = || TargetFilter::Typed(TypedFilter::creature());
         // (C's declaring filter, slot read, [C's Equipment destroyed, G's destroyed])
