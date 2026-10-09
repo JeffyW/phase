@@ -29861,6 +29861,26 @@ impl GameState {
         });
     }
 
+    /// CR 104.4b + CR 732.2a: the restricted loop-normalization contract.
+    /// `for_each_trigger_event_carrier_mut` normalizes every carrier live at a
+    /// settled Priority sample. A state that still holds an unsettled delivery
+    /// carrier — a zone-change or batch-delivery frame, a player-scope sacrifice
+    /// completion, a discard or combat-lifelink batch, deferred entry events, or
+    /// undispatched attack/blocker declaration events — is not loop-comparable:
+    /// it never compares equal, so no draw or shortcut is certified from it.
+    pub(crate) fn is_loop_comparable(&self) -> bool {
+        !self.resolution_stack.holds_unsettled_delivery_frame()
+            && self.pending_player_scope_sacrifice_choice.is_none()
+            && self.pending_discard_batch.is_none()
+            && self.pending_combat_lifelink.is_none()
+            && self.deferred_entry_events.is_empty()
+            && self.pending_attack_trigger_events.is_empty()
+            && self
+                .combat
+                .as_ref()
+                .is_none_or(|combat| combat.pending_blocker_declaration_events.is_empty())
+    }
+
     /// Every trigger-event carrier that can still resume or resolve: the stack,
     /// pending/deferred/ordering triggers, current and batched trigger events,
     /// every parked resolution frame, and a paused triggered mana ability. The
@@ -29908,6 +29928,19 @@ impl GameState {
         for events in self.stack_trigger_event_batches.values_mut() {
             events.iter_mut().for_each(&mut *f);
         }
+        // CR 117.3d + CR 117.4: a stack-resolution session fences each triggered
+        // entry with its captured trigger event.
+        if let Some(session) = self.stack_resolution_session.as_mut() {
+            for fence in session.entries.iter_mut() {
+                if let StackResolutionEntryProvenance::TriggeredAbility(provenance) =
+                    &mut fence.provenance
+                {
+                    if let Some(event) = provenance.trigger_event.as_mut() {
+                        f(event);
+                    }
+                }
+            }
+        }
         // Every parked frame, not only the active one: an optional frame's
         // singular and plural events, a continuation's trigger contexts.
         self.resolution_stack.for_each_retained_trigger_event_mut(f);
@@ -29932,6 +29965,9 @@ impl GameState {
                     context_events(context, f);
                 }
                 batch.delayed_events.iter_mut().for_each(&mut *f);
+                for consumed in batch.delayed_consumed.iter_mut() {
+                    f(&mut consumed.event);
+                }
             }
             match &mut resume.outer_resume {
                 ManaTriggerFixedPointResume::Parent => {}
@@ -30633,7 +30669,9 @@ const LOOP_DETECT_RING_CAP: usize = 16;
 /// equality. Only a true match permits a draw, so the cheap `loop_fingerprint`
 /// can never cause a wrongful draw.
 pub(crate) fn loop_states_equal(a: &GameState, b: &GameState) -> bool {
-    a == b
+    a.is_loop_comparable()
+        && b.is_loop_comparable()
+        && a == b
         && a.stack_trigger_firings == b.stack_trigger_firings
         && objects_content_eq(&a.objects, &b.objects)
 }
@@ -38958,6 +38996,114 @@ mod tests {
                 "[copy_chosen={copy_chosen}] a different referent controller is a different position"
             );
         }
+    }
+
+    /// Maintainer round 4 re-check. CR 104.4b + CR 601.2a: a stack-resolution
+    /// session fences each triggered entry with its trigger event. Disenchant
+    /// (600) targets Forsaken Wastes (602), whose trigger is fenced; two
+    /// positions whose Disenchant was announced at 3 vs 91 normalize equal. A
+    /// fence naming a different announcement than the spell's is a different
+    /// position.
+    #[test]
+    fn normalize_for_loop_reaches_a_stack_resolution_fence_event() {
+        use crate::types::events::Targeter;
+        fn position(disenchant: u64, fence_names: u64) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            let mut object = GameObject::new(
+                ObjectId(600),
+                CardId(600),
+                PlayerId(0),
+                "Disenchant".to_string(),
+                Zone::Stack,
+            );
+            object.spell_announcement = Some(SpellAnnouncement(disenchant));
+            state.objects.insert(ObjectId(600), object);
+            state.next_spell_announcement = disenchant;
+            let entry = StackEntry {
+                id: ObjectId(20),
+                source_id: ObjectId(602),
+                controller: PlayerId(1),
+                kind: StackEntryKind::TriggeredAbility {
+                    source_id: ObjectId(602),
+                    ability: Box::new(ResolvedAbility::new(
+                        Effect::NoOp,
+                        vec![],
+                        ObjectId(602),
+                        PlayerId(1),
+                    )),
+                    condition: None,
+                    trigger_event: Some(GameEvent::BecomesTarget {
+                        target: crate::types::ability::TargetRef::Object(ObjectId(602)),
+                        source_id: ObjectId(600),
+                        source_controller: PlayerId(0),
+                        targeter: Some(Targeter::Spell(SpellAnnouncement(fence_names))),
+                    }),
+                    description: None,
+                    source_name: "Forsaken Wastes".to_string(),
+                    subject_match_count: None,
+                    die_result: None,
+                    provenance: None,
+                },
+            };
+            state.stack_resolution_session = Some(StackResolutionSession {
+                entries: vec![StackResolutionEntryFence::capture(&entry)],
+                cursor: 0,
+                representatives: [PlayerId(0)].into_iter().collect(),
+                verified_pass_representatives: BTreeSet::new(),
+                budget: StackResolutionBudget::Unlimited,
+                policy: StackResolutionPolicy::Committed,
+                auto_pass_overlay: StackResolutionAutoPassOverlay {
+                    baseline: BTreeMap::new(),
+                },
+            });
+            state
+        }
+        let early = position(3, 3);
+        let late = position(91, 91);
+        assert_ne!(early, late, "reach guard: the raw positions differ");
+        assert!(
+            loop_states_equal(&early.normalize_for_loop(), &late.normalize_for_loop()),
+            "a fenced trigger event renumbered with its spell is the same position"
+        );
+        let other_referent = position(91, 92);
+        assert!(
+            !loop_states_equal(
+                &early.normalize_for_loop(),
+                &other_referent.normalize_for_loop()
+            ),
+            "a fence naming a different announcement is a different position"
+        );
+    }
+
+    /// Maintainer round 4 re-check. CR 104.4b: the restricted normalization
+    /// contract. A state still holding an unsettled delivery carrier (here,
+    /// deferred entry events) is not loop-comparable: it never compares equal,
+    /// even with an identical copy of itself.
+    #[test]
+    fn an_unsettled_delivery_carrier_makes_the_state_not_loop_comparable() {
+        let settled = GameState::new_two_player(7);
+        assert!(settled.is_loop_comparable());
+        assert!(
+            loop_states_equal(
+                &settled.normalize_for_loop(),
+                &settled.clone().normalize_for_loop()
+            ),
+            "reach guard: a settled state equals its copy"
+        );
+        let mut unsettled = settled.clone();
+        unsettled
+            .deferred_entry_events
+            .push(GameEvent::PermanentTapped {
+                object_id: ObjectId(50),
+                caused_by: None,
+                incarnation: Some(3),
+            });
+        assert!(!unsettled.is_loop_comparable());
+        let normalized = unsettled.normalize_for_loop();
+        assert!(
+            !loop_states_equal(&normalized, &normalized.clone()),
+            "an unsettled carrier is never loop-equal, even to itself"
+        );
     }
 
     /// CR 104.4b (issue #6877): two states differing only in the

@@ -2715,14 +2715,34 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     def
 }
 
+/// CR 608.2c: the targeter rebind's stop rule BEFORE a link: a delayed trigger
+/// body is its own trigger, so its references aren't this event's. Shared by
+/// the rebind and the antecedent guard.
+fn targeter_rebind_stops_before(effect: &Effect) -> bool {
+    matches!(effect, Effect::CreateDelayedTrigger { .. })
+}
+
+/// How far the targeter rebind's reach extends through one effect chain.
+enum TargeterRebindReach {
+    /// A reached clause names an object's controller.
+    NamesObjectController,
+    /// The rebind stops inside this chain (a fresh object choice, or a delayed
+    /// trigger), so nothing after it is reached.
+    Stops,
+    /// The whole chain is reached and names no object controller.
+    Continues,
+}
+
 /// CR 608.2c: whether an object-controller antecedent sits where the
-/// becomes-target rewrite would reach it. The body's clauses are read in order
-/// and the walk stops after the first clause that introduces a freshly chosen
-/// object target (`introduces_chosen_object_target`, the rebind's own
-/// boundary): a later "that creature's controller" names that choice. The
-/// unless payer is always rewritten, so its "unless …" phrase always counts.
-/// A body that isn't a plain effect chain falls back to its whole text.
+/// becomes-target rewrite would reach it. The noun exists only in the clause
+/// text, so this walks the trigger IR with the rebind's own traversal shape and
+/// stop rules (`targeter_rebind_stops_before`, `introduces_chosen_object_target`):
+/// each mode independently, then the root chain; a reflexive body continues the
+/// chain its printed parent instruction starts. The unless payer is always
+/// rewritten, so its "unless …" phrase always counts. Vote and pile bodies have
+/// no clause chain and are read whole (conservative: fail closed).
 fn becomes_target_rewrite_reaches_an_object_controller(ir: &TriggerIr, has_unless: bool) -> bool {
+    use super::oracle_ir::trigger::ReflexiveParent;
     if has_unless
         && super::oracle_nom::primitives::scan_at_word_boundaries(
             &ir.source_text.to_lowercase(),
@@ -2732,46 +2752,99 @@ fn becomes_target_rewrite_reaches_an_object_controller(ir: &TriggerIr, has_unles
     {
         return true;
     }
-    let Some(TriggerBody::EffectChain(chain)) = &ir.body else {
-        return names_an_object_controller(&ir.source_text);
-    };
+    let names =
+        |reach: TargeterRebindReach| matches!(reach, TargeterRebindReach::NamesObjectController);
+    match &ir.body {
+        None => false,
+        Some(TriggerBody::EffectChain(chain)) => names(targeter_rebind_chain_reach(chain)),
+        Some(TriggerBody::Modal(modal)) => {
+            targeter_rebind_modes_reach(&modal.modes)
+                || names(targeter_rebind_chain_reach(&modal.marker))
+        }
+        Some(TriggerBody::Reflexive(reflexive)) => {
+            let parent = match &reflexive.parent {
+                ReflexiveParent::MayPay { payment_chain, .. } => payment_chain.as_ref(),
+                ReflexiveParent::Mandatory { instruction } => Some(instruction),
+            };
+            match parent.map(targeter_rebind_chain_reach) {
+                Some(TargeterRebindReach::NamesObjectController) => true,
+                Some(TargeterRebindReach::Stops) => false,
+                Some(TargeterRebindReach::Continues) | None => {
+                    names(targeter_rebind_chain_reach(&reflexive.effect_chain))
+                        || reflexive.modal.as_ref().is_some_and(|modal| {
+                            targeter_rebind_modes_reach(&modal.modes)
+                                || names(targeter_rebind_chain_reach(&modal.marker))
+                        })
+                }
+            }
+        }
+        Some(TriggerBody::Vote(_)) | Some(TriggerBody::Pile(_)) => {
+            names_an_object_controller(&ir.source_text)
+        }
+    }
+}
+
+/// Each mode is walked independently, as the rebind recurses into
+/// `mode_abilities`.
+fn targeter_rebind_modes_reach(modes: &[super::oracle_ir::effect_chain::ModalModeIr]) -> bool {
+    modes.iter().any(|mode| {
+        matches!(
+            targeter_rebind_chain_reach(&mode.ability.body),
+            TargeterRebindReach::NamesObjectController
+        )
+    })
+}
+
+/// One chain, clause by clause, in the order the rebind walks its links.
+fn targeter_rebind_chain_reach(chain: &EffectChainIr) -> TargeterRebindReach {
     for clause in &chain.clauses {
+        if targeter_rebind_stops_before(&clause.parsed.effect) {
+            return TargeterRebindReach::Stops;
+        }
         if clause
             .source
             .fragment()
             .is_some_and(names_an_object_controller)
         {
-            return true;
+            return TargeterRebindReach::NamesObjectController;
         }
         let mut link = Some((&clause.parsed.effect, clause.parsed.sub_ability.as_deref()));
+        let mut first = true;
         while let Some((effect, sub)) = link {
-            if introduces_chosen_object_target(effect) {
-                return false;
+            if (!first && targeter_rebind_stops_before(effect))
+                || introduces_chosen_object_target(effect)
+            {
+                return TargeterRebindReach::Stops;
             }
+            first = false;
             link = sub.map(|sub| (sub.effect.as_ref(), sub.sub_ability.as_deref()));
         }
     }
-    false
+    TargeterRebindReach::Continues
 }
 
 /// CR 608.2c: whether `text` names an object's controller explicitly — "that
-/// creature's controller", "the artifact creature token's controller" — rather
-/// than a spell or ability's ("that spell's", "that spell or ability's") or the
-/// pronoun "its controller". Compositional: `that|the`, a noun phrase, then
-/// `'s controller`; only a spell or ability head noun is exempt.
+/// creature's controller", "that non-Human creature's controller", "the 1/1
+/// creature token's controller" — rather than a spell or ability's ("that
+/// spell's", "that spell or ability's") or the pronoun "its controller". The
+/// noun-phrase extent is `subject.rs`'s own: `that|the`, everything up to
+/// `'s controller`. Only a spell or ability head noun is exempt.
 fn names_an_object_controller(text: &str) -> bool {
-    let lower = text.to_lowercase();
+    let lower = text.to_lowercase().replace('\u{2019}', "'");
     super::oracle_nom::primitives::scan_at_word_boundaries(&lower, |i| {
-        terminated(
-            preceded(
-                alt((tag("that "), tag("the "))),
-                nom::combinator::verify(separated_list1(space1, alpha1), |words: &Vec<&str>| {
-                    words
-                        .last()
-                        .is_some_and(|head| !matches!(*head, "spell" | "ability"))
-                }),
+        nom::combinator::verify(
+            terminated(
+                preceded(
+                    alt((tag("that "), tag("the "))),
+                    take_until("'s controller"),
+                ),
+                tag("'s controller"),
             ),
-            alt((tag("'s controller"), tag("\u{2019}s controller"))),
+            |noun: &str| {
+                noun.rsplit(' ')
+                    .next()
+                    .is_some_and(|head| !matches!(head, "spell" | "ability"))
+            },
         )
         .parse(i)
     })
@@ -2790,7 +2863,7 @@ fn rebind_parent_target_controller_to_targeter(ability: &mut AbilityDefinition) 
     }
     let mut node = Some(ability);
     while let Some(link) = node {
-        if matches!(link.effect.as_ref(), Effect::CreateDelayedTrigger { .. }) {
+        if targeter_rebind_stops_before(link.effect.as_ref()) {
             break;
         }
         if let Some(else_ability) = link.else_ability.as_deref_mut() {

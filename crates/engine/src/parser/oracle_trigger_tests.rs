@@ -37812,6 +37812,18 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
             "Synthetic Bare Token Watcher",
             "Whenever a token becomes the target of a spell, that token's controller draws a card.",
         ),
+        (
+            "Synthetic Non-Human Watcher",
+            "Whenever a creature becomes the target of a spell, that non-Human creature's controller draws a card.",
+        ),
+        (
+            "Synthetic Assembly-Worker Watcher",
+            "Whenever an Assembly-Worker becomes the target of a spell, that Assembly-Worker's controller draws a card.",
+        ),
+        (
+            "Synthetic Stat Token Watcher",
+            "Whenever a creature token becomes the target of a spell, that 1/1 creature token's controller draws a card.",
+        ),
     ] {
         let def = parse_trigger_line(text, name);
         assert_eq!(def.mode, TriggerMode::BecomesTarget, "{name}: reach guard");
@@ -37842,6 +37854,31 @@ fn becomes_target_object_controller_antecedent_fails_closed() {
     assert!(
         json.contains("ParentTargetController") && !json.contains("TriggeringSpellController"),
         "the chosen creature's controller keeps its parent-target reading: {json}"
+    );
+
+    // A modal body is scoped by the same traversal, mode by mode: the fresh
+    // target in the first mode stops the rewrite there, so the mode stays
+    // supported with its Tap and Draw.
+    let modal = parse_oracle_text(
+        "Whenever this enchantment becomes the target of a spell or ability, choose one \u{2014}\n\u{2022} Tap target creature. That creature's controller draws a card.\n\u{2022} You gain 1 life.",
+        "Synthetic Modal Watcher",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let trigger = modal
+        .triggers
+        .iter()
+        .find(|trigger| trigger.mode == TriggerMode::BecomesTarget)
+        .expect("reach guard: the becomes-target trigger parses");
+    let json = serde_json::to_string(trigger).expect("trigger serializes");
+    assert!(
+        json.contains("\"Tap\"") && json.contains("\"Draw\""),
+        "the modal mode keeps its Tap and Draw: {json}"
+    );
+    assert!(
+        !json.contains("Unimplemented"),
+        "the modal body stays supported: {json}"
     );
 
     for (name, text) in [
