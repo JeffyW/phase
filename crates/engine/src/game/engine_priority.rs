@@ -557,7 +557,11 @@ fn run_post_action_pipeline_from_with_policy(
                     delayed_scan_start,
                     &mut consumed_trigger_events,
                 );
-                triggers::collect_delayed_triggers_into_deferred(state, &delayed_input);
+                triggers::collect_unclaimed_delayed_triggers_into_deferred(
+                    state,
+                    events,
+                    &delayed_input,
+                );
                 delayed_scan_start = events.len();
                 DeferredTriggerDrainPolicy::SettledPriority
             } else {
@@ -595,7 +599,7 @@ fn run_post_action_pipeline_from_with_policy(
         delayed_scan_start,
         &mut consumed_trigger_events,
     );
-    let delayed_events = triggers::check_delayed_triggers(state, &delayed_input);
+    let delayed_events = triggers::check_delayed_triggers(state, &delayed_input.events);
     events.extend(delayed_events);
     state.consumed_before_priority_trigger_events.clear();
 
@@ -643,17 +647,19 @@ fn run_post_action_pipeline_from_with_policy(
 /// claims still in the pass ledger are folded into `consumed` first. The
 /// announced-cast batch and the final scan both read through here; the final
 /// scan starts where the batch's scan ended, so no occurrence is scanned twice
-/// whatever ordinals the batch's own claims carry.
+/// whatever ordinals the batch's own claims carry. The kept events remember
+/// their buffer positions, so a claim the batch's scan publishes is the
+/// full-buffer occurrence it matched (CR 603.2c).
 fn unclaimed_delayed_trigger_input(
     state: &mut GameState,
     events: &[GameEvent],
     start: usize,
     consumed: &mut Vec<triggers::ConsumedTriggerEventOccurrence>,
-) -> Vec<GameEvent> {
+) -> triggers::UnclaimedTriggerEvents {
     consumed.extend(std::mem::take(
         &mut state.consumed_before_priority_trigger_events,
     ));
-    triggers::filter_consumed_trigger_events_from(
+    triggers::unclaimed_trigger_events_from(
         events,
         start,
         triggers::TriggerCollectionRequester::Delayed,

@@ -11375,22 +11375,86 @@ pub(crate) fn filter_consumed_trigger_events_from(
     requester: TriggerCollectionRequester,
     consumed: &[ConsumedTriggerEventOccurrence],
 ) -> Vec<GameEvent> {
-    events[event_start..]
+    unclaimed_trigger_events_from(events, event_start, requester, consumed).events
+}
+
+/// The unclaimed occurrences of an action buffer's suffix, each remembered at
+/// its position in the full buffer, so a claim a collector makes over the
+/// shortened list can be published as the full-buffer occurrence it is.
+pub(crate) struct UnclaimedTriggerEvents {
+    pub(crate) events: Vec<GameEvent>,
+    positions: Vec<usize>,
+}
+
+impl UnclaimedTriggerEvents {
+    /// CR 603.2c: the full-buffer identity of a claim made over `self.events`.
+    fn full_buffer_claim(
+        &self,
+        buffer: &[GameEvent],
+        claim: ConsumedTriggerEventOccurrence,
+    ) -> ConsumedTriggerEventOccurrence {
+        let position = self
+            .events
+            .iter()
+            .zip(&self.positions)
+            .filter(|(event, _)| **event == claim.event)
+            .nth(claim.occurrence)
+            .map(|(_, position)| *position)
+            .expect("a claim names an occurrence of the scanned events");
+        ConsumedTriggerEventOccurrence {
+            occurrence: trigger_event_occurrence(buffer, position),
+            ..claim
+        }
+    }
+}
+
+/// [`filter_consumed_trigger_events_from`], keeping each kept event's position
+/// in `events`.
+pub(crate) fn unclaimed_trigger_events_from(
+    events: &[GameEvent],
+    event_start: usize,
+    requester: TriggerCollectionRequester,
+    consumed: &[ConsumedTriggerEventOccurrence],
+) -> UnclaimedTriggerEvents {
+    let (positions, events): (Vec<usize>, Vec<GameEvent>) = events[event_start..]
         .iter()
         .enumerate()
         .filter_map(|(offset, event)| {
-            let occurrence = trigger_event_occurrence(events, event_start + offset);
+            let position = event_start + offset;
+            let occurrence = trigger_event_occurrence(events, position);
             if !consumed.iter().any(|consumed| {
                 consumed.event == *event
                     && consumed.occurrence == occurrence
                     && consumed.scope.consumes(requester)
             }) {
-                Some(event.clone())
+                Some((position, event.clone()))
             } else {
                 None
             }
         })
-        .collect()
+        .unzip();
+    UnclaimedTriggerEvents { events, positions }
+}
+
+/// CR 603.2 + CR 603.2c + CR 603.7: [`collect_delayed_triggers_into_deferred`]
+/// over the unclaimed occurrences of `buffer`, publishing each claim at its
+/// full-buffer occurrence so a later filter over `buffer` reads it exactly.
+pub(crate) fn collect_unclaimed_delayed_triggers_into_deferred(
+    state: &mut GameState,
+    buffer: &[GameEvent],
+    unclaimed: &UnclaimedTriggerEvents,
+) {
+    let DelayedTriggerMatch {
+        contexts: pending,
+        consumed: consumed_events,
+        ..
+    } = collect_matching_delayed_triggers(state, &unclaimed.events, DelayedTriggerEventScope::Any);
+    state.deferred_triggers.extend(pending);
+    state.consumed_before_priority_trigger_events.extend(
+        consumed_events
+            .into_iter()
+            .map(|claim| unclaimed.full_buffer_claim(buffer, claim)),
+    );
 }
 
 pub(crate) fn filter_consumed_trigger_events(
@@ -26529,6 +26593,74 @@ pub mod tests {
             filtered,
             vec![events[2].clone()],
             "the suffix-local first upkeep is globally the second occurrence"
+        );
+    }
+
+    /// CR 603.2c: a delayed scan over the unclaimed occurrences publishes its
+    /// claim at the full-buffer occurrence. With the first of two equal
+    /// upkeep events claimed, the delayed trigger takes the second, and its
+    /// claim names occurrence 1, not the shortened list's 0.
+    #[test]
+    fn unclaimed_delayed_scan_publishes_full_buffer_occurrences() {
+        let mut state = setup();
+        let controller = PlayerId(0);
+        let source = create_object(
+            &mut state,
+            CardId(0x0603_2C01),
+            controller,
+            "Delayed Upkeep Source".to_string(),
+            Zone::Battlefield,
+        );
+        state.delayed_triggers.push(DelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase {
+                phase: Phase::Upkeep,
+            },
+            ability: Box::new(ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                source,
+                controller,
+            )),
+            controller,
+            source_id: source,
+            one_shot: true,
+            provenance: DelayedInstallIdentity::LegacyDelayed,
+        });
+        let upkeep = GameEvent::PhaseChanged {
+            phase: Phase::Upkeep,
+        };
+        let events = vec![upkeep.clone(), upkeep.clone()];
+        let claimed = [ConsumedTriggerEventOccurrence {
+            event: upkeep.clone(),
+            occurrence: 0,
+            scope: ConsumedTriggerEventScope::AllCollectors,
+        }];
+        let unclaimed = unclaimed_trigger_events_from(
+            &events,
+            0,
+            TriggerCollectionRequester::Delayed,
+            &claimed,
+        );
+        assert_eq!(unclaimed.events, vec![upkeep.clone()], "reach: E#1 is left");
+
+        collect_unclaimed_delayed_triggers_into_deferred(&mut state, &events, &unclaimed);
+
+        assert_eq!(
+            state.deferred_triggers.len(),
+            1,
+            "reach: the delayed trigger fired"
+        );
+        assert_eq!(
+            state.consumed_before_priority_trigger_events,
+            vec![ConsumedTriggerEventOccurrence {
+                event: upkeep,
+                occurrence: 1,
+                scope: ConsumedTriggerEventScope::AllCollectors,
+            }],
+            "the published claim is E#1 of the full buffer"
         );
     }
 
