@@ -106,15 +106,18 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  101 — game_setup and state_update carry GameState, whose attachment filters
+ *  103 — game_setup and state_update carry GameState, whose attachment filters
  *       are now one AttachedTo prop with a tagged `to` referent in place of the
  *       AttachedToSource / AttachedToRecipient / AttachedToPlayer tags. Both
- *       peers are browsers and neither validates the shape, so a v100 peer
+ *       peers are browsers and neither validates the shape, so a v102 peer
  *       would take the new shape with no decode error; first contact rejects
  *       the skew instead. The same state carries positional retarget picks
  *       (null keeps) and the engine-derived copy-walk keep and decline
  *       permissions.
- *       Bumped in lockstep with full-game protocol 119.
+ *       Bumped in lockstep with full-game protocol 121. (Reserved as 101 while under review; it landed after 102, so 101 stays unused.)
+ *  102 — GameState carries the CR 601.2a spell announcement and the
+ *       BecomesTarget targeter. Bumped with full-game protocol 120. (101 is
+ *       reserved for the Legends of Jidoor PR.)
  *  100 — game_setup and state_update carry GameState, whose ability and trigger
  *       conditions now carry a ManaColorSpent color as SpentColor (word or symbol
  *       provenance). A v99 peer cannot deserialize the tagged color, so first
@@ -602,7 +605,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 101 as const;
+export const WIRE_PROTOCOL_VERSION = 103 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

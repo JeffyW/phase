@@ -3972,15 +3972,32 @@ pub fn build_llm_decision_request(
         });
         let request = match request {
             Ok(request) => request,
-            Err(error) => return Ok(to_js(&serde_json::json!({ "error": error.to_string() }))),
+            // The kind rides along so a forced move (one legal option, which is
+            // never put to a provider) reads as `unsupportedDecision` — the
+            // heuristic plays it — rather than as a failure charged to the seat.
+            Err(error) => {
+                return Ok(to_js(
+                    &serde_json::json!({ "error": error.to_string(), "errorKind": error }),
+                ))
+            }
         };
         let http = match phase_llm::build_chat_request(&endpoint, &request.prompt) {
             Ok(http) => http,
-            Err(error) => return Ok(to_js(&serde_json::json!({ "error": error.to_string() }))),
+            // The kind rides along so the caller can tell "this provider cannot
+            // be asked this decision" (a forced move put to Jev) from a
+            // misconfigured endpoint, and only count the latter against the seat.
+            Err(error) => {
+                return Ok(to_js(
+                    &serde_json::json!({ "error": error.to_string(), "errorKind": error }),
+                ))
+            }
         };
         Ok(to_js(&serde_json::json!({
             "fingerprint": request.fingerprint,
             "optionCount": request.option_count,
+            // Prompt size, so the effect of history compaction can be measured
+            // for every provider, including those that report no token counts.
+            "promptChars": request.prompt.char_count(),
             "request": http,
         })))
     })?
@@ -4002,26 +4019,35 @@ pub fn get_ai_action_proposal_from_llm_response(
     response_body: &str,
 ) -> Result<JsValue, JsValue> {
     let provider = phase_llm::LlmProvider::from_label(provider_label);
+    // What the provider reports having spent, whether or not the reply is
+    // usable: a refused reply still consumed the prompt. Diagnostic only.
+    let usage = phase_llm::token_usage(provider, response_body);
     with_state_mut(|state| {
         engine::game::layers::flush_layers(state);
         let semantic_owner = ai_semantic_owner(state, PlayerId(player_id));
         let contract = AiDecisionContract::issue(state, semantic_owner);
 
         // Status-aware: a non-2xx response is refused however its body parses,
-        // so a gateway or proxy error cannot masquerade as a decision.
-        let completion = match phase_llm::completion_from_response(provider, status, response_body)
-        {
-            Ok(text) => text,
-            Err(error) => return Ok(llm_failure(&error)),
-        };
-        let selection = match phase_llm::select_action(state, &contract, fingerprint, &completion) {
+        // so a gateway or proxy error cannot masquerade as a decision. The reply
+        // is read against the options THIS contract issues, never against
+        // whatever the provider claims it was offered.
+        let selection = match phase_llm::select_action_from_response(
+            state,
+            &contract,
+            fingerprint,
+            phase_llm::LlmReply {
+                provider,
+                status,
+                body: response_body,
+            },
+        ) {
             Ok(selection) => selection,
-            Err(error) => return Ok(llm_failure(&error)),
+            Err(error) => return Ok(llm_failure(&error, usage)),
         };
         // Same admission check `mint_ai_action_proposal` performs, inlined so the
         // reasoning can ride alongside the proposal in one payload.
         if !contract.contains_action(state, &selection.action) {
-            return Ok(llm_failure(&phase_llm::LlmError::StaleDecision));
+            return Ok(llm_failure(&phase_llm::LlmError::StaleDecision, usage));
         }
         let actor = contract.authorized_actor;
         let token = AI_PROPOSALS.with(|registry| registry.borrow_mut().insert(contract));
@@ -4035,17 +4061,19 @@ pub fn get_ai_action_proposal_from_llm_response(
                 "action": selection.action,
             },
             "reasoning": selection.reasoning,
+            "usage": usage,
         })))
     })?
 }
 
 /// The tagged failure an LLM decision returns so the caller can both fall back
 /// and tell the player why.
-fn llm_failure(error: &phase_llm::LlmError) -> JsValue {
+fn llm_failure(error: &phase_llm::LlmError, usage: Option<phase_llm::TokenUsage>) -> JsValue {
     to_js(&serde_json::json!({
         "proposal": serde_json::Value::Null,
         "error": error.to_string(),
         "errorKind": error,
+        "usage": usage,
     }))
 }
 

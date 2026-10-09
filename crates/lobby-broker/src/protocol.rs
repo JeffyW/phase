@@ -60,27 +60,32 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 119 — `FilterProp`'s three attachment-referent siblings
+/// 121 — `FilterProp`'s three attachment-referent siblings
 ///      (`AttachedToSource`, `AttachedToRecipient`, `AttachedToPlayer`) are one
 ///      parameterized prop, `{"type":"AttachedTo","to":{"type":"Source"}}`
 ///      (`to` is an internally tagged `AttachmentReferent`: `Source`,
 ///      `Recipient`, `Player { player }`, and the new `DeclaredTarget { slot }`
 ///      for "attached to that creature", CR 701.3a + CR 303.4b). Serialization
 ///      writes only the new shape; deserialization still accepts the three old
-///      tags (`filter_prop_from_value`), so a v119 peer reads v118 state but a
-///      v118 peer cannot parse a v119 `GameState` holding any attachment
+///      tags (`filter_prop_from_value`), so a v121 peer reads v120 state but a
+///      v120 peer cannot parse a v121 `GameState` holding any attachment
 ///      filter — an unconditional PARSE bump. The same version also makes
 ///      retarget choices positional (CR 115.7d + CR 707.10c):
 ///      `GameAction::RetargetSpell.new_targets` is `[TargetRef | null]` (`null`
-///      keeps a position's target, a bare target chooses it, so a v118 bare
+///      keeps a position's target, a bare target chooses it, so a v120 bare
 ///      vector still decodes as all-chosen), `RetargetChoice` gains
 ///      `keep_is_distinct`, `CopyTargetSlot` gains `address`, `can_keep` and
 ///      `can_decline`, and `CopyRetarget` gains `controller` (the copy's
 ///      controller when an announcement slot's chooser answers), `mode`,
 ///      `picks`, `can_keep_rest` and `announcer_election` (a copy
-///      announcement's announcing-opponent election) (all serde default). A v118 peer cannot parse a `null` pick, and the client renders
+///      announcement's announcing-opponent election) (all serde default). A v120 peer cannot parse a `null` pick, and the client renders
 ///      the keep permissions only from the engine's fields. Lobby messages are
-///      unchanged, and P2P moves in lockstep (wire 101).
+///      unchanged, and P2P moves in lockstep (wire 103).
+///      (Reserved as 119 while under review; it landed after 120, so 119 stays unused.)
+/// 120 — CR 601.2a spell announcement: `GameObject::spell_announcement`,
+///      `GameState::next_spell_announcement` and the `targeter` on
+///      `GameEvent::BecomesTarget`. A v119 peer cannot deserialize the new
+///      state. P2P moves to wire 102. (119/101 is reserved for the Legends of Jidoor PR.)
 /// 118 — `AbilityCondition::ManaColorSpent` and `TriggerCondition::ManaColorSpent` retype `color` from `ManaColor` to `SpentColor` (`ColorWord` or `ManaSymbol`, CR 612.2), serialized in the ability and trigger definitions of `GameState`. A v117 peer cannot deserialize the tagged color and would rewrite a printed mana symbol under a color-word text change. Full-game peers and P2P move in lockstep (wire 100); no lobby carrier names it.
 /// 117 — `DerivedViews` gains `shared_piles`, the engine-published seat whose `Player` container stores a shared library and graveyard (a shared-zone format's piles), omitted for a per-player format. A v116 peer drops the key and renders per-seat piles for a state whose other seat's containers are empty. Full-game peers and P2P move in lockstep (wire 99); no lobby carrier names it.
 /// 116 — `RESOLUTION_STATE_WIRE_VERSION` 4 to 5: the multi-draw resolution frame gains the simultaneous-draw `dealer` (a shared-library format's in-game simultaneous draw), serialized in `GameState`'s resolution frames and omitted when absent. A v115 peer refuses the version-5 resolution state. Full-game peers and P2P move in lockstep (wire 98); no lobby carrier names it.
@@ -931,7 +936,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 119;
+pub const PROTOCOL_VERSION: u32 = 121;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2188,12 +2193,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 119);
+        assert_eq!(PROTOCOL_VERSION, 121);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 118);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 120);
     }
 
     #[test]

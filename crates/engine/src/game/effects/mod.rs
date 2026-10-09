@@ -14832,6 +14832,8 @@ fn reset_top_level_resolution_state(state: &mut GameState) {
     // CR 608.2d: same reasoning, one axis over — a new top-level
     // resolution cannot inherit a prior resolution's announced colour.
     state.chosen_color_this_resolution = None;
+    // CR 608.2c: nor a prior resolution's "that color".
+    state.named_color_this_resolution = None;
     // CR 608.2c: "that sticker" names a sticker this resolution's own PutSticker
     // instruction placed; a new top-level resolution cannot inherit a prior one's.
     state.placed_sticker_this_resolution = None;
@@ -23443,6 +23445,7 @@ mod tests {
         let events = vec![GameEvent::PermanentTapped {
             object_id: creature,
             caused_by: None,
+            incarnation: None,
         }];
         let referent = parent_referent_context_from_events(&state, &events)
             .expect("a single tapped creature must be captured as the anaphoric referent");
@@ -23486,10 +23489,12 @@ mod tests {
             GameEvent::PermanentTapped {
                 object_id: a,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: b,
                 caused_by: None,
+                incarnation: None,
             },
         ];
         assert!(
@@ -23624,10 +23629,12 @@ mod tests {
             GameEvent::PermanentTapped {
                 object_id: creature,
                 caused_by: None,
+                incarnation: None,
             },
             GameEvent::PermanentTapped {
                 object_id: creature,
                 caused_by: None,
+                incarnation: None,
             },
         ];
         let referent = parent_referent_context_from_events(&state, &events)
