@@ -37792,19 +37792,56 @@ fn chain_creates_reflexive_ability_descends_nested_definitions() {
 /// synthetic grammar control; Forsaken Wastes is verbatim (Scryfall).
 #[test]
 fn becomes_target_object_controller_antecedent_fails_closed() {
-    let object = parse_trigger_line(
-        "Whenever a creature becomes the target of a spell or ability, that creature's controller draws a card.",
-        "Synthetic Watcher",
+    // The maintainer's synthetic line, then compound noun phrases: the guard
+    // reads `that|the` + any noun phrase + `'s controller`, exempting only a
+    // spell or ability head noun.
+    for (name, text) in [
+        (
+            "Synthetic Watcher",
+            "Whenever a creature becomes the target of a spell or ability, that creature's controller draws a card.",
+        ),
+        (
+            "Synthetic Token Watcher",
+            "Whenever a creature becomes the target of a spell or ability, that creature token's controller draws a card.",
+        ),
+        (
+            "Synthetic Artifact Watcher",
+            "Whenever an artifact creature becomes the target of a spell, that artifact creature's controller draws a card.",
+        ),
+        (
+            "Synthetic Bare Token Watcher",
+            "Whenever a token becomes the target of a spell, that token's controller draws a card.",
+        ),
+    ] {
+        let def = parse_trigger_line(text, name);
+        assert_eq!(def.mode, TriggerMode::BecomesTarget, "{name}: reach guard");
+        let json = serde_json::to_string(&def).expect("trigger serializes");
+        assert!(
+            json.contains("becomes_target_object_controller_antecedent"),
+            "{name}: the explicit object-controller body fails closed: {json}"
+        );
+        assert!(
+            !json.contains("TriggeringSpellController"),
+            "{name}: no targeter rewrite for the object's controller: {json}"
+        );
+    }
+
+    // After a fresh object-target choice the rebind stops, so "that creature"
+    // names the chosen creature and the guard doesn't fire: the body stays
+    // supported and the chosen creature's controller is not rewritten.
+    let fresh = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, tap target creature. That creature's controller draws a card.",
+        "Synthetic Fresh Choice",
     );
-    assert_eq!(object.mode, TriggerMode::BecomesTarget, "reach guard");
-    let json = serde_json::to_string(&object).expect("trigger serializes");
+    assert_eq!(fresh.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&fresh).expect("trigger serializes");
     assert!(
-        json.contains("becomes_target_object_controller_antecedent"),
-        "the explicit creature-controller body fails closed: {json}"
+        !json.contains("becomes_target_object_controller_antecedent"),
+        "past the fresh-choice boundary the guard doesn't fire: {json}"
     );
     assert!(
-        !json.contains("TriggeringSpellController"),
-        "no targeter rewrite for the creature's controller: {json}"
+        json.contains("ParentTargetController") && !json.contains("TriggeringSpellController"),
+        "the chosen creature's controller keeps its parent-target reading: {json}"
     );
 
     for (name, text) in [

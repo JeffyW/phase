@@ -8637,6 +8637,94 @@ pub enum ManaAbilityResume {
     },
 }
 
+/// CR 104.4b: the trigger events (and deferred cost events) a paused payment
+/// resume retains, for `GameState::for_each_trigger_event_carrier_mut`.
+/// Exhaustive on purpose: a variant that starts retaining an event must be
+/// visited here.
+fn visit_cost_move_resume_events(
+    resume: &mut PendingCostMoveResume,
+    f: &mut impl FnMut(&mut GameEvent),
+) {
+    match resume {
+        PendingCostMoveResume::SacrificeForCost {
+            deferred_cost_events,
+            ..
+        } => deferred_cost_events.iter_mut().for_each(&mut *f),
+        PendingCostMoveResume::CollectEvidencePayment { resume, .. } => match resume.as_mut() {
+            CollectEvidenceResume::ManaAbility {
+                pending_mana_ability,
+            } => visit_pending_mana_ability_events(pending_mana_ability, f),
+            CollectEvidenceResume::Casting { .. } | CollectEvidenceResume::Effect { .. } => {}
+        },
+        PendingCostMoveResume::ManaAbilityPayment { pending, cursor } => {
+            visit_pending_mana_ability_events(pending, f);
+            visit_mana_cost_cursor_events(cursor, f);
+        }
+        PendingCostMoveResume::CounterAdditionUnlessPayment { trigger_event, .. } => {
+            if let Some(event) = trigger_event.as_mut() {
+                f(event);
+            }
+        }
+        PendingCostMoveResume::RandomDiscardUnlessPayment(resume) => {
+            if let Some(event) = resume.trigger_event.as_mut() {
+                f(event);
+            }
+        }
+        PendingCostMoveResume::Cast { .. }
+        | PendingCostMoveResume::WardSacrificePayment { .. }
+        | PendingCostMoveResume::ReplacementMayCost { .. }
+        | PendingCostMoveResume::Foretell { .. }
+        | PendingCostMoveResume::UnlessBouncePayment { .. }
+        | PendingCostMoveResume::ActivationMillPayment { .. }
+        | PendingCostMoveResume::LoyaltyActivation { .. } => {}
+    }
+}
+
+/// A parked mana-ability activation: its resume roots, and its cost cursor's
+/// parents (each a parked activation of its own).
+fn visit_pending_mana_ability_events(
+    pending: &mut PendingManaAbility,
+    f: &mut impl FnMut(&mut GameEvent),
+) {
+    visit_mana_ability_resume_events(&mut pending.resume, f);
+    if let Some(resume) = pending.cost_move_resume.as_mut() {
+        visit_mana_ability_resume_events(resume, f);
+    }
+}
+
+fn visit_mana_cost_cursor_events(
+    cursor: &mut ManaAbilityCostCursor,
+    f: &mut impl FnMut(&mut GameEvent),
+) {
+    cursor.deferred_cost_events.iter_mut().for_each(&mut *f);
+    if let Some(parent) = cursor.parent.as_deref_mut() {
+        visit_pending_mana_ability_events(&mut parent.pending, f);
+        visit_mana_cost_cursor_events(&mut parent.cursor, f);
+    }
+}
+
+fn visit_mana_ability_resume_events(
+    resume: &mut ManaAbilityResume,
+    f: &mut impl FnMut(&mut GameEvent),
+) {
+    match resume {
+        ManaAbilityResume::UnlessPayment { trigger_event, .. } => {
+            if let Some(event) = trigger_event.as_mut() {
+                f(event);
+            }
+        }
+        ManaAbilityResume::Priority
+        | ManaAbilityResume::CompanionToHand { .. }
+        | ManaAbilityResume::TurnFaceUp { .. }
+        | ManaAbilityResume::EndContinuousEffect { .. }
+        | ManaAbilityResume::ManaPayment { .. }
+        | ManaAbilityResume::ManaSourceSelection { .. }
+        | ManaAbilityResume::EffectPayCost { .. }
+        | ManaAbilityResume::PhyrexianCastPayment { .. }
+        | ManaAbilityResume::FinalizePendingManaPayment { .. } => {}
+    }
+}
+
 impl ManaAbilityResume {
     /// CR 601.2h + CR 602.2b + CR 116.2: Whether the outer payment root this
     /// resumes is a cast, activation or special action (no priority until it
@@ -29845,6 +29933,42 @@ impl GameState {
                 }
                 batch.delayed_events.iter_mut().for_each(&mut *f);
             }
+            match &mut resume.outer_resume {
+                ManaTriggerFixedPointResume::Parent => {}
+                ManaTriggerFixedPointResume::Root { resume, .. } => {
+                    visit_mana_ability_resume_events(resume, f);
+                }
+                ManaTriggerFixedPointResume::ColorChoice(choice) => match &mut choice.context {
+                    ManaChoiceContext::ManaAbility(pending) => {
+                        visit_pending_mana_ability_events(pending, f);
+                    }
+                    ManaChoiceContext::ResolvingEffect(..) => {}
+                },
+            }
+        }
+        // CR 608.2c + CR 608.2h: a staged resolution payment's captured trigger
+        // context.
+        if let Some(context) = self
+            .payment_transaction
+            .as_deref_mut()
+            .and_then(|transaction| transaction.resolving_trigger_context.as_mut())
+        {
+            if let Some(event) = context.event.as_mut() {
+                f(event);
+            }
+            context.events.iter_mut().for_each(&mut *f);
+        }
+        // CR 118.12 + CR 616.1: payment resumes paused on a replacement choice.
+        if let Some(resume) = self.pending_cost_move_resume.as_mut() {
+            visit_cost_move_resume_events(resume, f);
+        }
+        if let Some(resume) = self.pending_deferred_life_cost_resume.as_mut() {
+            match resume {
+                DeferredLifeCostResume::ManaRoot { resume, .. } => {
+                    visit_mana_ability_resume_events(resume, f);
+                }
+                DeferredLifeCostResume::Cast { .. } | DeferredLifeCostResume::PayAmount { .. } => {}
+            }
         }
     }
 
@@ -38708,8 +38832,9 @@ mod tests {
     /// Maintainer round 4, finding 1. CR 104.4b + CR 400.7: LKI retention and
     /// identity canonicalization share one carrier traversal that reaches every
     /// parked frame, not only the active one. A tapped incarnation named only in
-    /// a BURIED optional frame's PLURAL `trigger_events` keeps its snapshot, and
-    /// two positions minted at incarnation 3 vs 91 compare equal. Negative: the
+    /// a BURIED optional frame's PLURAL `trigger_events`, or only in a buried
+    /// copy-chosen walk's `trigger_event`, keeps its snapshot, and two positions
+    /// minted at incarnation 3 vs 91 compare equal. Negative: the
     /// retained snapshot names a different controller, so the positions differ.
     #[test]
     fn normalize_for_loop_reaches_a_buried_frames_plural_trigger_events() {
@@ -38756,16 +38881,38 @@ mod tests {
             })
         }
 
+        fn copy_chosen_frame(trigger_event: GameEvent) -> ResolutionFrame {
+            ResolutionFrame::EachPlayerCopyChosen(PendingEachPlayerCopyChosen {
+                stage: CopyChosenStage::AwaitingCopy,
+                player: PlayerId(0),
+                chosen: Vec::new(),
+                remaining_choices: Vec::new(),
+                choose_filter: TargetFilter::Controller,
+                min: 0,
+                max: 0,
+                copy_modifications: Vec::new(),
+                scale: None,
+                choose_scope: CopyChooseScope::Chooser,
+                source_id: ObjectId(5),
+                source_controller: PlayerId(0),
+                scoped_players: Vec::new(),
+                trigger_event: Some(trigger_event),
+            })
+        }
+
         let pyromancer = ObjectId(50);
-        let position = |incarnation: u64, controller: PlayerId| {
+        let position_in = |copy_chosen: bool, incarnation: u64, controller: PlayerId| {
             let mut state = GameState::new_two_player(7);
-            state
-                .resolution_stack
-                .push_inner(optional_frame(vec![GameEvent::PermanentTapped {
-                    object_id: pyromancer,
-                    caused_by: None,
-                    incarnation: Some(incarnation),
-                }]));
+            let tapped = GameEvent::PermanentTapped {
+                object_id: pyromancer,
+                caused_by: None,
+                incarnation: Some(incarnation),
+            };
+            state.resolution_stack.push_inner(if copy_chosen {
+                copy_chosen_frame(tapped)
+            } else {
+                optional_frame(vec![tapped])
+            });
             // The frame above buries the event-bearing one.
             state
                 .resolution_stack
@@ -38778,30 +38925,39 @@ mod tests {
             state
         };
 
-        let early = position(3, PlayerId(1));
-        let late = position(91, PlayerId(1));
-        assert_ne!(early, late, "reach guard: the raw positions differ");
-        let normalized_late = late.normalize_for_loop();
-        assert_eq!(
-            normalized_late
-                .lki_by_incarnation
-                .get(&pyromancer)
-                .map(|history| history.len()),
-            Some(1),
-            "the snapshot the buried plural event names is retained"
-        );
-        assert!(
-            loop_states_equal(&early.normalize_for_loop(), &normalized_late),
-            "consistently renumbered incarnations in a buried plural carrier are the same position"
-        );
-        let other_controller = position(91, PlayerId(0));
-        assert!(
-            !loop_states_equal(
-                &early.normalize_for_loop(),
-                &other_controller.normalize_for_loop()
-            ),
-            "a different referent controller is a different position"
-        );
+        // The buried optional frame's plural events, then a buried copy-chosen
+        // walk's singular trigger event.
+        for copy_chosen in [false, true] {
+            let position =
+                |incarnation, controller| position_in(copy_chosen, incarnation, controller);
+            let early = position(3, PlayerId(1));
+            let late = position(91, PlayerId(1));
+            assert_ne!(
+                early, late,
+                "[copy_chosen={copy_chosen}] reach guard: the raw positions differ"
+            );
+            let normalized_late = late.normalize_for_loop();
+            assert_eq!(
+                normalized_late
+                    .lki_by_incarnation
+                    .get(&pyromancer)
+                    .map(|history| history.len()),
+                Some(1),
+                "[copy_chosen={copy_chosen}] the snapshot the buried event names is retained"
+            );
+            assert!(
+                loop_states_equal(&early.normalize_for_loop(), &normalized_late),
+                "[copy_chosen={copy_chosen}] consistently renumbered incarnations are the same position"
+            );
+            let other_controller = position(91, PlayerId(0));
+            assert!(
+                !loop_states_equal(
+                    &early.normalize_for_loop(),
+                    &other_controller.normalize_for_loop()
+                ),
+                "[copy_chosen={copy_chosen}] a different referent controller is a different position"
+            );
+        }
     }
 
     /// CR 104.4b (issue #6877): two states differing only in the

@@ -7584,9 +7584,10 @@ fn check_trigger(
     }
 }
 
-/// Whether a trigger mode can fire: recognised, and either in the event-trigger
-/// registry or a CR 603.8 state trigger (handled by the priority pipeline's
-/// `check_state_triggers`). The single rule for printed and delayed triggers.
+/// Whether a printed (battlefield) trigger mode can fire: recognised, and either
+/// in the event-trigger registry or a CR 603.8 state trigger (handled by the
+/// priority pipeline's `check_state_triggers`). Delayed triggers use the
+/// stricter `delayed_trigger_mode_is_supported`.
 fn trigger_mode_is_supported(
     mode: &TriggerMode,
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
@@ -13680,13 +13681,6 @@ mod tests {
     /// mode stays supported.
     #[test]
     fn delayed_trigger_with_an_unregistered_mode_is_not_supported() {
-        use crate::types::ability::{
-            AbilityDefinition, AbilityKind, DelayedTriggerCondition, Effect, QuantityExpr,
-            TargetFilter, TriggerDefinition,
-        };
-        use crate::types::card::CardFace;
-        use crate::types::triggers::TriggerMode;
-
         fn generator(mode: TriggerMode) -> CardFace {
             CardFace {
                 abilities: vec![AbilityDefinition::new(
@@ -14593,10 +14587,11 @@ mod tests {
     use crate::database::synthesis::build_oracle_face;
     use crate::parser::oracle_ir::diagnostic::{CascadeSlot, OracleDiagnostic};
     use crate::types::ability::{
-        AbilityCondition, AbilityKind, Comparator, ContinuousModification, ControllerRef,
-        CounterTransferMode, DieResultBranch, Effect, PileSource, PlayerFilter, PlayerScope,
-        PreventionAmount, PreventionScope, ReplacementCondition, StaticDefinition, TargetFilter,
-        TriggerConstraint, VoteSubject, VoteTally, VoteVisibility, VoterScope,
+        AbilityCondition, AbilityDefinition, AbilityKind, Comparator, ContinuousModification,
+        ControllerRef, CounterTransferMode, DelayedTriggerCondition, DieResultBranch, Effect,
+        PileSource, PlayerFilter, PlayerScope, PreventionAmount, PreventionScope, QuantityExpr,
+        ReplacementCondition, StaticDefinition, TargetFilter, TriggerConstraint, TriggerDefinition,
+        VoteSubject, VoteTally, VoteVisibility, VoterScope,
     };
     use crate::types::card_type::CardType;
     use crate::types::identifiers::{CardId, ObjectId};

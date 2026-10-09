@@ -3307,7 +3307,7 @@ impl ResolutionStack {
 
     /// CR 104.4b: every trigger event a parked frame retains, in every frame
     /// rather than only the active one — an optional frame's singular and plural
-    /// events, and an ability continuation's zone-choice and pending trigger
+    /// events, a copy-chosen walk's trigger event, and an ability continuation's zone-choice and pending trigger
     /// contexts. Loop normalization's one carrier traversal reads and renumbers
     /// identities through this.
     pub(crate) fn for_each_retained_trigger_event_mut(
@@ -3321,6 +3321,11 @@ impl ResolutionStack {
                         f(event);
                     }
                     frame.trigger_events.iter_mut().for_each(&mut *f);
+                }
+                ResolutionFrame::EachPlayerCopyChosen(pending) => {
+                    if let Some(event) = pending.trigger_event.as_mut() {
+                        f(event);
+                    }
                 }
                 ResolutionFrame::AbilityContinuation(frame) => {
                     let contexts = frame
@@ -3346,7 +3351,6 @@ impl ResolutionStack {
                 | ResolutionFrame::CounterAdditions(_)
                 | ResolutionFrame::CopyToken(_)
                 | ResolutionFrame::DebugCardEntries(_)
-                | ResolutionFrame::EachPlayerCopyChosen(_)
                 | ResolutionFrame::ChooseOneOf(_)
                 | ResolutionFrame::VoteBallot(_)
                 | ResolutionFrame::PerPlayerZoneChoice(_)

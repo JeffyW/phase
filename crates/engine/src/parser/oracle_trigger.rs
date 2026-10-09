@@ -2690,9 +2690,11 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // controller") names the controller of the object that became the target,
     // not the targeter. The lowered `ParentTargetController` no longer carries
     // that noun, so rewriting it would name the wrong player; the body fails
-    // closed instead (no printed becomes-target line uses this wording).
+    // closed instead (no printed becomes-target line uses this wording). Only
+    // the references the rewrite below would transform count: the unless payer,
+    // and the body up to the same fresh-choice boundary the rebind stops at.
     if def.mode == TriggerMode::BecomesTarget {
-        if names_an_object_controller(&ir.source_text) {
+        if becomes_target_rewrite_reaches_an_object_controller(ir, def.unless_pay.is_some()) {
             if let Some(execute) = def.execute.as_deref_mut() {
                 *execute.effect = Effect::unimplemented(
                     "becomes_target_object_controller_antecedent",
@@ -2713,26 +2715,65 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     def
 }
 
+/// CR 608.2c: whether an object-controller antecedent sits where the
+/// becomes-target rewrite would reach it. The body's clauses are read in order
+/// and the walk stops after the first clause that introduces a freshly chosen
+/// object target (`introduces_chosen_object_target`, the rebind's own
+/// boundary): a later "that creature's controller" names that choice. The
+/// unless payer is always rewritten, so its "unless …" phrase always counts.
+/// A body that isn't a plain effect chain falls back to its whole text.
+fn becomes_target_rewrite_reaches_an_object_controller(ir: &TriggerIr, has_unless: bool) -> bool {
+    if has_unless
+        && super::oracle_nom::primitives::scan_at_word_boundaries(
+            &ir.source_text.to_lowercase(),
+            |i| preceded(tag("unless "), rest).parse(i),
+        )
+        .is_some_and(|tail: &str| names_an_object_controller(tail))
+    {
+        return true;
+    }
+    let Some(TriggerBody::EffectChain(chain)) = &ir.body else {
+        return names_an_object_controller(&ir.source_text);
+    };
+    for clause in &chain.clauses {
+        if clause
+            .source
+            .fragment()
+            .is_some_and(names_an_object_controller)
+        {
+            return true;
+        }
+        let mut link = Some((&clause.parsed.effect, clause.parsed.sub_ability.as_deref()));
+        while let Some((effect, sub)) = link {
+            if introduces_chosen_object_target(effect) {
+                return false;
+            }
+            link = sub.map(|sub| (sub.effect.as_ref(), sub.sub_ability.as_deref()));
+        }
+    }
+    false
+}
+
 /// CR 608.2c: whether `text` names an object's controller explicitly — "that
-/// creature's controller", "the permanent's controller" — rather than a spell
-/// or ability's ("that spell's controller") or the pronoun "its controller".
+/// creature's controller", "the artifact creature token's controller" — rather
+/// than a spell or ability's ("that spell's", "that spell or ability's") or the
+/// pronoun "its controller". Compositional: `that|the`, a noun phrase, then
+/// `'s controller`; only a spell or ability head noun is exempt.
 fn names_an_object_controller(text: &str) -> bool {
     let lower = text.to_lowercase();
     super::oracle_nom::primitives::scan_at_word_boundaries(&lower, |i| {
-        (
-            alt((tag("that "), tag("the "))),
-            alt((
-                tag("creature"),
-                tag("permanent"),
-                tag("land"),
-                tag("artifact"),
-                tag("enchantment"),
-                tag("planeswalker"),
-                tag("battle"),
-            )),
+        terminated(
+            preceded(
+                alt((tag("that "), tag("the "))),
+                nom::combinator::verify(separated_list1(space1, alpha1), |words: &Vec<&str>| {
+                    words
+                        .last()
+                        .is_some_and(|head| !matches!(*head, "spell" | "ability"))
+                }),
+            ),
             alt((tag("'s controller"), tag("\u{2019}s controller"))),
         )
-            .parse(i)
+        .parse(i)
     })
     .is_some()
 }
