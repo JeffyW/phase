@@ -2689,15 +2689,27 @@ fn validate_single_derived_role(
 }
 
 pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> ResolvedAbility {
+    validate_targets_in_chain_with_view(state, ability).0
+}
+
+/// CR 608.2b: [`validate_targets_in_chain`] together with the validated
+/// declared view it built: one position per declared slot, `None` (a hole)
+/// for every occurrence that may not supply information ? an illegal one and
+/// an unjudged `PassThrough` one alike.
+pub(crate) fn validate_targets_in_chain_with_view(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> (ResolvedAbility, Vec<Option<targeting::DeclaredSlotBinding>>) {
     let mut view = Vec::new();
-    validate_targets_in_chain_inner(
+    let validated = validate_targets_in_chain_inner(
         state,
         ability,
         TargetReadOrigin::OwnAnnouncement,
         &mut view,
         false,
         &[],
-    )
+    );
+    (validated, view)
 }
 
 /// CR 608.2b: one declared occurrence with the verdict resolution validation

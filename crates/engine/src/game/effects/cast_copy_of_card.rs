@@ -116,9 +116,17 @@ pub fn resolve(
         let copy_id =
             cast_one_copy(state, source_id, ability, events).map_err(EffectError::InvalidParam)?;
 
-        if open_copy_target_selection(state, copy_id, ability.controller, None)
+        if !open_copy_target_selection(state, copy_id, ability.controller, None)
             .map_err(EffectError::InvalidParam)?
         {
+            crate::game::casting_costs::commit_copy_cast(
+                state,
+                copy_id,
+                ability.controller,
+                events,
+            )
+            .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+        } else {
             let mut resume = ability.clone();
             resume.effect = Effect::CastCopyOfCard {
                 target: TargetFilter::None,
@@ -274,36 +282,9 @@ fn cast_one_copy(
         None,
         events,
     );
-    events.push(GameEvent::SpellCast {
-        card_id,
-        controller: ability.controller,
-        object_id: copy_id,
-        cast_mana_value: Some(
-            state
-                .objects
-                .get(&copy_id)
-                .expect("cast copy must remain available for SpellCast event")
-                .spell_mana_value(),
-        ),
-    });
-    if let Some(obj) = state.objects.get(&copy_id).cloned() {
-        // CR 707.12 + CR 601.2i: casting the object copy is a real cast, so the
-        // ledger mints a fresh occurrence and the finalized stack carriers are
-        // stamped exactly like an ordinary cast.
-        let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
-            state,
-            ability.controller,
-            &obj,
-            origin_zone,
-            CastingVariant::Normal,
-        )
-        .map_err(cast_copy_spell_cast_ledger_error)?;
-        crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(
-            state, copy_id, occurrence,
-        )
-        .map_err(|error| error.to_string())?;
-    }
-
+    // CR 707.12 + CR 601.2i: the copy becomes cast once its announcement is
+    // complete (`casting_costs::commit_copy_cast`): immediately when it has
+    // no target to announce, else at the end of its announcement walk.
     Ok(copy_id)
 }
 
@@ -370,6 +351,9 @@ mod tests {
         let mut events = Vec::new();
 
         let copy_id = cast_one_copy(&mut state, source_id, &ability, &mut events)
+            .expect("the card copy is put on the stack");
+        // CR 601.2i: the copy becomes cast when its announcement completes.
+        crate::game::casting_costs::commit_copy_cast(&mut state, copy_id, PlayerId(0), &mut events)
             .expect("the card copy is cast");
         let expected = crate::types::game_state::CastOccurrence {
             caster: PlayerId(0),

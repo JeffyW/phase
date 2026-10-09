@@ -5,7 +5,7 @@ use crate::types::ability::{
     TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{BatchCompletion, CastingVariant, GameState, WaitingFor};
+use crate::types::game_state::{BatchCompletion, GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
 use crate::types::statics::CastFrequency;
@@ -1816,24 +1816,6 @@ fn cast_stack_spell_copy_during_resolution(
         copy.cast_spell_keywords = cast_spell_keywords;
     }
 
-    let origin = obj.cast_from_zone.unwrap_or(Zone::Exile);
-    events.push(GameEvent::SpellCast {
-        card_id: obj.card_id,
-        controller: ability.controller,
-        object_id: copy_id,
-        cast_mana_value: Some(obj.spell_mana_value()),
-    });
-    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
-        state,
-        ability.controller,
-        &obj,
-        origin,
-        CastingVariant::Normal,
-    )
-    .map_err(stack_spell_copy_cast_ledger_error)?;
-    crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
-        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
-
     if crate::game::effects::prepare::open_copy_target_selection(
         state,
         copy_id,
@@ -1844,6 +1826,10 @@ fn cast_stack_spell_copy_during_resolution(
     {
         return Ok(());
     }
+    // CR 707.12 + CR 601.2i: with no target to announce, the copy is cast now;
+    // otherwise it becomes cast when its announcement walk completes.
+    crate::game::casting_costs::commit_copy_cast(state, copy_id, ability.controller, events)
+        .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
 
     state.waiting_for = WaitingFor::Priority {
         player: ability.controller,
@@ -3975,6 +3961,32 @@ mod tests {
             Some(Zone::Stack),
             "copy remains on the stack"
         );
+        // CR 601.2i: the copy is cast only once its targets are announced.
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy_id)
+            }),
+            "the copy is not cast before its announcement completes"
+        );
+        assert_eq!(state.objects[&copy_id].cast_occurrence, None);
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::CopyRetarget { copy_id: cid, .. } if cid == copy_id
+            ),
+            "targeted copy must open retarget selection, got {:?}",
+            state.waiting_for
+        );
+
+        // Choose a target and finalize the cast.
+        let events = apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target_creature)),
+            },
+        )
+        .expect("choose shock target")
+        .events;
         assert!(
             events.iter().any(|event| {
                 matches!(event, GameEvent::SpellCast { object_id, .. } if *object_id == copy_id)
@@ -3999,23 +4011,6 @@ mod tests {
             state.spells_cast_this_turn_by_player[&PlayerId(0)][0].spell_object_id,
             Some(copy_id)
         );
-        assert!(
-            matches!(
-                state.waiting_for,
-                WaitingFor::CopyRetarget { copy_id: cid, .. } if cid == copy_id
-            ),
-            "targeted copy must open retarget selection, got {:?}",
-            state.waiting_for
-        );
-
-        // Choose a target and finalize the cast.
-        let _ = apply_as_current(
-            &mut state,
-            GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(target_creature)),
-            },
-        )
-        .expect("choose shock target");
         assert!(
             state.stack.iter().any(|entry| {
                 matches!(
@@ -4053,7 +4048,7 @@ mod tests {
             kind: StackEntryKind::Spell {
                 card_id: CardId(68_655),
                 ability: None,
-                casting_variant: CastingVariant::Normal,
+                casting_variant: crate::types::game_state::CastingVariant::Normal,
                 actual_mana_spent: 0,
             },
         });

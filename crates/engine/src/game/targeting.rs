@@ -1354,7 +1354,8 @@ pub(crate) struct SlotReferent {
 /// - no stack entry carries `ability` — there is no chain to count from, and
 ///   the node's own slots must never stand in for the chain's;
 /// - the slot failed the CR 608.2b legality check made as the chain began to
-///   resolve (an illegal target supplies no information);
+///   resolve (an illegal target supplies no information), or that check did
+///   not judge it (an unjudged `PassThrough` occurrence supplies none either);
 /// - the slot holds a player, or is out of range;
 /// - the declaring node recorded no pin (a missing pin is never recovered from
 ///   the live row).
@@ -1376,7 +1377,10 @@ pub(crate) fn declared_slot_referent(
         .is_some_and(|root| {
             let base = parent_slot_base(state, ability);
             let ahead = super::ability_utils::declared_slots_ahead_of(root, base);
+            // CR 608.2b: an illegal slot, or one the check did not judge
+            // (`PassThrough`), supplies no information.
             root.illegal_target_slots.contains(&(ahead + slot))
+                || root.unjudged_target_slots.contains(&(ahead + slot))
         });
     if illegal_at_resolution {
         return None;

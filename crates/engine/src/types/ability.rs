@@ -33553,6 +33553,15 @@ pub struct ResolvedAbility {
     /// overwrites it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub illegal_target_slots: Vec<usize>,
+    /// CR 608.2b: Declared target slots (numbered like `illegal_target_slots`)
+    /// the legality check made as the chain began to resolve did not judge: a
+    /// `PassThrough` occurrence (an `Attach` node's unclaimed tail, carried for
+    /// a downstream sibling). Its storage and the fizzle verdict are unchanged,
+    /// but it supplies no information: `targeting::declared_slot_referent`
+    /// reads nothing from it. Stamped beside `illegal_target_slots` on the
+    /// resolution carrier's root by `stack::resolve_top`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unjudged_target_slots: Vec<usize>,
     /// CR 608.2b: This node's target-vector indices removed by the initial
     /// legality check for the current resolution. Unlike `illegal_target_slots`,
     /// these are local pre-compaction indices, not declared-chain identities.
@@ -33973,6 +33982,7 @@ impl PartialEq for ResolvedAbility {
             activation_cost_reduction: a_activation_cost_reduction,
             activation_record: a_activation_record,
             illegal_target_slots: a_illegal_target_slots,
+            unjudged_target_slots: a_unjudged_target_slots,
             illegal_local_target_slots: a_illegal_local_target_slots,
             controller: a_controller,
             original_controller: a_original_controller,
@@ -34045,6 +34055,7 @@ impl PartialEq for ResolvedAbility {
             activation_cost_reduction: b_activation_cost_reduction,
             activation_record: b_activation_record,
             illegal_target_slots: b_illegal_target_slots,
+            unjudged_target_slots: b_unjudged_target_slots,
             illegal_local_target_slots: b_illegal_local_target_slots,
             controller: b_controller,
             original_controller: b_original_controller,
@@ -34118,6 +34129,7 @@ impl PartialEq for ResolvedAbility {
             && a_activation_cost_reduction == b_activation_cost_reduction
             && a_activation_record == b_activation_record
             && a_illegal_target_slots == b_illegal_target_slots
+            && a_unjudged_target_slots == b_unjudged_target_slots
             && a_illegal_local_target_slots == b_illegal_local_target_slots
             && a_controller == b_controller
             && a_original_controller == b_original_controller
@@ -34525,6 +34537,7 @@ impl ResolvedAbility {
             activation_cost_reduction: None,
             activation_record: None,
             illegal_target_slots: Vec::new(),
+            unjudged_target_slots: Vec::new(),
             illegal_local_target_slots: Vec::new(),
             modal: None,
             mode_abilities: Vec::new(),

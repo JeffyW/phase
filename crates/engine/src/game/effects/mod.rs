@@ -5093,6 +5093,7 @@ fn instruction_outlives_declined_gate(
         target_pins: _,
         legacy_selected_target_incarnations: _,
         illegal_target_slots: _,
+        unjudged_target_slots: _,
         illegal_local_target_slots: _,
         controller: _,
         original_controller: _,

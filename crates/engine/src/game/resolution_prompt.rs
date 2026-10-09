@@ -598,6 +598,7 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         target_pins: _, // CR 400.7 selected-target pins, no choice
         legacy_selected_target_incarnations: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp, no choice
+        unjudged_target_slots: _, // CR 608.2b resolution legality stamp, no choice
         illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no choice
         controller: _,           // player id
         original_controller: _,  // player id

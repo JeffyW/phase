@@ -1088,7 +1088,13 @@ mod tests {
         state.objects.get_mut(&creature_id).unwrap().power = Some(1);
         state.objects.get_mut(&creature_id).unwrap().toughness = Some(1);
 
-        let copy_id = ObjectId(999);
+        let copy_id = create_object(
+            &mut state,
+            CardId(42),
+            PlayerId(0),
+            "Copy".to_string(),
+            Zone::Stack,
+        );
         // Copy's ability requires targeting a creature.
         let resolved = ResolvedAbility::new(
             Effect::DealDamage {

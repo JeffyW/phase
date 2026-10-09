@@ -253,6 +253,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         target_pins: _,            // CR 400.7 selected-target pins, no dynamic read
         legacy_selected_target_incarnations: _,
         illegal_target_slots: _, // CR 608.2b resolution legality stamp, no dynamic read
+        unjudged_target_slots: _, // CR 608.2b resolution legality stamp, no dynamic read
         illegal_local_target_slots: _, // CR 608.2b node-local legality stamp, no dynamic read
         controller: _,           // player id
         original_controller: _,  // player id

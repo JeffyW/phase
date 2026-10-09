@@ -498,6 +498,7 @@ fn rewrite_resolved_ability(
         legacy_selected_target_incarnations: _,
         activation_record: _,
         illegal_target_slots: _,
+        unjudged_target_slots: _,
         illegal_local_target_slots: _,
         target_reads: _,
         controller: _,

@@ -1185,29 +1185,32 @@ fn cast_history(r: &GameRunner) -> (u8, usize, u32) {
     )
 }
 
-/// Probe board (CR 601.2e + CR 707.12 + CR 733.1, three players): P0 controls
-/// Young Pyromancer. Mizzix's Mastery is cast (its Pyromancer trigger
-/// resolves: one Elemental), then the Volcanic Offering copy is cast; P2 owns
-/// the only nonbasic land A, which P0 announces first, and P2 concedes while
-/// answering. The copy can no longer be announced, so its cast is illegal
-/// (CR 601.2e): it ceases to exist (CR 704.5e) and no ability triggers from it
-/// (CR 733.1: no second Elemental), while Mastery's own trigger already made
-/// its Elemental. Control: A owned by the surviving P1, the announcement
-/// completes legally, and the Offering cast adds one Elemental and one cast
-/// record.
-///
-/// Known limitation (PR body, "Found, not fixed"): the aborted copy's cast
-/// stays in the turn and game cast history and counts, because the CR 733
-/// journal has no retraction edit. The cast-history assertion below records
-/// that current behaviour.
+const STORM_ENTITY: &str =
+    "Haste\nThis creature enters with a +1/+1 counter on it for each other spell cast this turn.";
+
+/// Probe board (CR 601.2e + CR 601.2i + CR 707.12 + CR 733.1, three players):
+/// P0 controls Young Pyromancer. Mizzix's Mastery is cast (its Pyromancer
+/// trigger resolves: one Elemental), then the Volcanic Offering copy is cast;
+/// P2 owns the only nonbasic land A, which P0 announces first, and P2 concedes
+/// while answering. The copy can no longer be announced, so it never becomes
+/// cast: it ceases to exist (CR 704.5e), no ability triggers from it (no second
+/// Elemental), and no cast is recorded: the cast history shows only Mastery,
+/// and a later Storm Entity (a cast-history consumer) enters with one counter.
+/// Control: A owned by the surviving P1, the announcement completes legally,
+/// and the Offering copy adds one Elemental, one cast record and one Storm
+/// Entity counter.
 #[test]
-fn an_aborted_copy_cast_retracts_its_cast_observers() {
+fn an_aborted_copy_is_never_cast() {
     let p2 = PlayerId(2);
     for a_owner in [p2, P1] {
         let label = format!("A owned by {a_owner:?}");
         let mut s = GameScenario::new_n_player(3, 7);
         s.at_phase(Phase::PreCombatMain);
         s.add_creature_from_oracle(P0, "Young Pyromancer", 2, 1, YOUNG_PYROMANCER);
+        let entity = s
+            .add_creature_to_hand_from_oracle(P0, "Storm Entity", 1, 1, STORM_ENTITY)
+            .with_mana_cost(ManaCost::zero())
+            .id();
         let a = s.add_land_from_oracle(a_owner, "Nonbasic A", "").id();
         let creatures = [
             s.add_creature(P1, "P1 Creature A", 3, 12).id(),
@@ -1279,19 +1282,40 @@ fn an_aborted_copy_cast_retracts_its_cast_observers() {
         }
         assert!(r.state().stack.is_empty(), "{label}: the stack drains");
         assert_eq!(r.state().objects[&mastery].zone, Zone::Exile, "{label}");
-        let extra_elementals = if a_owner == P1 { 1 } else { 0 };
-        // The cast is recorded either way: the aborted copy's record is the
-        // disclosed residue; the control's is a real cast.
-        let casts = 1;
+        let casts: u8 = if a_owner == P1 { 1 } else { 0 };
+        let extra_elementals = usize::from(casts);
         assert_eq!(elementals(&r), 1 + extra_elementals, "{label}: Elementals");
         assert_eq!(
             cast_history(&r),
             (
                 baseline.0 + casts,
-                baseline.1 + casts as usize,
-                baseline.2 + casts as u32
+                baseline.1 + usize::from(casts),
+                baseline.2 + u32::from(casts)
             ),
             "{label}: cast history"
+        );
+        // CR 601.2i: a later cast-history reader sees only completed casts.
+        r.cast(entity).commit();
+        resolve_entry(&mut r, entity);
+        for _ in 0..64 {
+            if r.state().stack.is_empty() && r.state().deferred_triggers.is_empty() {
+                break;
+            }
+            r.act(GameAction::PassPriority).expect("resolve");
+        }
+        assert_eq!(
+            r.state().objects[&entity].zone,
+            Zone::Battlefield,
+            "{label}: reach"
+        );
+        assert_eq!(
+            r.state().objects[&entity]
+                .counters
+                .get(&engine::types::counter::CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            1 + u32::from(casts),
+            "{label}: Storm Entity counts the other spells cast this turn"
         );
     }
 }
