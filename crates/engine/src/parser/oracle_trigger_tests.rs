@@ -37782,3 +37782,51 @@ fn chain_creates_reflexive_ability_descends_nested_definitions() {
         branch_without_reflexive
     )));
 }
+
+/// Maintainer round 4, finding 2. CR 608.2c: in a becomes-target body an
+/// explicit object-controller antecedent ("that creature's controller") names
+/// the targeted object's controller, which the lowered `ParentTargetController`
+/// can't keep apart from the targeter, so the body fails closed. A spell or
+/// ability controller ("that spell's controller", "that spell or ability's
+/// controller") keeps the targeter rewrite. The first line is the maintainer's
+/// synthetic grammar control; Forsaken Wastes is verbatim (Scryfall).
+#[test]
+fn becomes_target_object_controller_antecedent_fails_closed() {
+    let object = parse_trigger_line(
+        "Whenever a creature becomes the target of a spell or ability, that creature's controller draws a card.",
+        "Synthetic Watcher",
+    );
+    assert_eq!(object.mode, TriggerMode::BecomesTarget, "reach guard");
+    let json = serde_json::to_string(&object).expect("trigger serializes");
+    assert!(
+        json.contains("becomes_target_object_controller_antecedent"),
+        "the explicit creature-controller body fails closed: {json}"
+    );
+    assert!(
+        !json.contains("TriggeringSpellController"),
+        "no targeter rewrite for the creature's controller: {json}"
+    );
+
+    for (name, text) in [
+        (
+            "Synthetic Targeter Watcher",
+            "Whenever a creature becomes the target of a spell or ability, that spell or ability's controller draws a card.",
+        ),
+        (
+            "Forsaken Wastes",
+            "Whenever this enchantment becomes the target of a spell, that spell's controller loses 5 life.",
+        ),
+    ] {
+        let def = parse_trigger_line(text, name);
+        assert_eq!(def.mode, TriggerMode::BecomesTarget, "{name}: reach guard");
+        let json = serde_json::to_string(&def).expect("trigger serializes");
+        assert!(
+            json.contains("TriggeringSpellController"),
+            "{name}: the targeter controller keeps the rewrite: {json}"
+        );
+        assert!(
+            !json.contains("Unimplemented"),
+            "{name}: stays supported: {json}"
+        );
+    }
+}

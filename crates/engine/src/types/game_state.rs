@@ -29421,9 +29421,10 @@ impl GameState {
 
         // CR 104.4b + CR 732.2a: incarnation-versioned LKI is historical support
         // state, not independently loop-material state. Retain only snapshots
-        // reachable from trigger-event carriers that can still resume or resolve:
-        // stack/resolving entries, pending/deferred/ordering triggers, current and
-        // batched trigger contexts, and continuation/optional-choice sidecars.
+        // reachable from trigger-event carriers that can still resume or resolve
+        // (`for_each_trigger_event_carrier_mut`: stack/resolving entries,
+        // pending/deferred/ordering triggers, current and batched trigger events,
+        // every parked resolution frame, and a paused triggered mana ability).
         // WaitingFor copies are intentionally not a separate authority: every
         // trigger-event-bearing prompt has one of those pending/continuation
         // carriers, and loop samples are taken at the post-pipeline Priority frame.
@@ -29449,89 +29450,8 @@ impl GameState {
             }
         };
 
-        for entry in &clone.stack {
-            if let StackEntryKind::TriggeredAbility {
-                trigger_event: Some(event),
-                ..
-            } = &entry.kind
-            {
-                record_event(event);
-            }
-        }
-        if let Some(entry) = clone.resolving_stack_entry.as_ref() {
-            if let StackEntryKind::TriggeredAbility {
-                trigger_event: Some(event),
-                ..
-            } = &entry.kind
-            {
-                record_event(event);
-            }
-        }
-        if let Some(pending) = clone.pending_trigger.as_ref() {
-            if let Some(event) = pending.trigger_event.as_ref() {
-                record_event(event);
-            }
-        }
-        for event in &clone.pending_trigger_event_batch {
-            record_event(event);
-        }
-        for context in &clone.deferred_triggers {
-            if let Some(event) = context.pending.trigger_event.as_ref() {
-                record_event(event);
-            }
-            for event in &context.trigger_events {
-                record_event(event);
-            }
-        }
-        if let Some(order) = clone.pending_trigger_order.as_ref() {
-            for context in order.groups.iter().flat_map(|group| group.triggers.iter()) {
-                if let Some(event) = context.pending.trigger_event.as_ref() {
-                    record_event(event);
-                }
-                for event in &context.trigger_events {
-                    record_event(event);
-                }
-            }
-        }
-        if let Some(event) = clone.current_trigger_event.as_ref() {
-            record_event(event);
-        }
-        for event in &clone.current_trigger_events {
-            record_event(event);
-        }
-        for events in clone.stack_trigger_event_batches.values() {
-            for event in events {
-                record_event(event);
-            }
-        }
-        if let Some(event) = clone
-            .active_optional_effect_frame()
-            .and_then(|frame| frame.trigger_event.as_ref())
-        {
-            record_event(event);
-        }
-        if let Some(context) = clone
-            .active_ability_continuation_frame()
-            .and_then(|frame| frame.choose_zone_trigger_context.as_ref())
-        {
-            if let Some(event) = context.event.as_ref() {
-                record_event(event);
-            }
-            for event in &context.events {
-                record_event(event);
-            }
-        }
-        if let Some(context) = clone
-            .active_ability_continuation()
-            .and_then(|continuation| continuation.trigger_context.as_ref())
-        {
-            if let Some(event) = context.event.as_ref() {
-                record_event(event);
-            }
-            for event in &context.events {
-                record_event(event);
-            }
-        }
+        // The same traversal the canonicalization below uses (CR 104.4b).
+        clone.for_each_trigger_event_carrier_mut(&mut |event| record_event(event));
 
         clone.lki_by_incarnation = std::mem::take(&mut clone.lki_by_incarnation)
             .into_iter()
@@ -29853,8 +29773,11 @@ impl GameState {
         });
     }
 
-    /// Every trigger-event carrier that can still resume or resolve — the same
-    /// set `normalize_for_loop` reads for LKI retention.
+    /// Every trigger-event carrier that can still resume or resolve: the stack,
+    /// pending/deferred/ordering triggers, current and batched trigger events,
+    /// every parked resolution frame, and a paused triggered mana ability. The
+    /// one traversal `normalize_for_loop` uses for both LKI retention and
+    /// identity canonicalization.
     fn for_each_trigger_event_carrier_mut(&mut self, f: &mut impl FnMut(&mut GameEvent)) {
         for entry in self
             .stack
@@ -29897,24 +29820,30 @@ impl GameState {
         for events in self.stack_trigger_event_batches.values_mut() {
             events.iter_mut().for_each(&mut *f);
         }
-        if let Some(event) = self
-            .active_optional_effect_frame_mut()
-            .and_then(|frame| frame.trigger_event.as_mut())
-        {
-            f(event);
-        }
-        if let Some(frame) = self.active_ability_continuation_frame_mut() {
-            if let Some(context) = frame.choose_zone_trigger_context.as_mut() {
-                if let Some(event) = context.event.as_mut() {
+        // Every parked frame, not only the active one: an optional frame's
+        // singular and plural events, a continuation's trigger contexts.
+        self.resolution_stack.for_each_retained_trigger_event_mut(f);
+        // CR 605.4a: a triggered mana ability paused mid-occurrence retains its
+        // current work item, its accepted tail and its collected batches.
+        if let Some(resume) = self.pending_triggered_mana_resume.as_deref_mut() {
+            fn context_events(
+                context: &mut crate::game::triggers::PendingTriggerContext,
+                f: &mut impl FnMut(&mut GameEvent),
+            ) {
+                if let Some(event) = context.pending.trigger_event.as_mut() {
                     f(event);
                 }
-                context.events.iter_mut().for_each(&mut *f);
+                context.trigger_events.iter_mut().for_each(&mut *f);
             }
-            if let Some(context) = frame.pending.trigger_context.as_mut() {
-                if let Some(event) = context.event.as_mut() {
-                    f(event);
+            context_events(&mut resume.current, f);
+            for context in resume.accepted_tail.iter_mut() {
+                context_events(context, f);
+            }
+            for batch in resume.collected_batches.iter_mut() {
+                for context in batch.contexts.iter_mut() {
+                    context_events(context, f);
                 }
-                context.events.iter_mut().for_each(&mut *f);
+                batch.delayed_events.iter_mut().for_each(&mut *f);
             }
         }
     }
@@ -38773,6 +38702,105 @@ mod tests {
         assert!(
             !loop_states_equal(&early.normalize_for_loop(), &unmatched.normalize_for_loop()),
             "an event naming an incarnation with no retained snapshot is a different position"
+        );
+    }
+
+    /// Maintainer round 4, finding 1. CR 104.4b + CR 400.7: LKI retention and
+    /// identity canonicalization share one carrier traversal that reaches every
+    /// parked frame, not only the active one. A tapped incarnation named only in
+    /// a BURIED optional frame's PLURAL `trigger_events` keeps its snapshot, and
+    /// two positions minted at incarnation 3 vs 91 compare equal. Negative: the
+    /// retained snapshot names a different controller, so the positions differ.
+    #[test]
+    fn normalize_for_loop_reaches_a_buried_frames_plural_trigger_events() {
+        use crate::types::resolution::{OptionalEffectFrame, ResolutionFrame};
+
+        fn snapshot(controller: PlayerId) -> LKISnapshot {
+            LKISnapshot {
+                name: "Prodigal Pyromancer".to_string(),
+                token_image_ref: None,
+                power: Some(1),
+                toughness: Some(1),
+                base_power: Some(1),
+                base_toughness: Some(1),
+                mana_value: 3,
+                controller,
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: Vec::new(),
+                supertypes: Vec::new(),
+                keywords: Vec::new(),
+                colors: vec![ManaColor::Red],
+                chosen_attributes: Vec::new(),
+                counters: HashMap::new(),
+                tapped: true,
+                is_suspected: false,
+                attachments: Vec::new(),
+            }
+        }
+        fn optional_frame(trigger_events: Vec<GameEvent>) -> ResolutionFrame {
+            ResolutionFrame::OptionalEffect(OptionalEffectFrame {
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    vec![],
+                    ObjectId(5),
+                    PlayerId(0),
+                )),
+                trigger_event: None,
+                trigger_events,
+                trigger_match_count: None,
+                return_result_occurrence: None,
+            })
+        }
+
+        let pyromancer = ObjectId(50);
+        let position = |incarnation: u64, controller: PlayerId| {
+            let mut state = GameState::new_two_player(7);
+            state
+                .resolution_stack
+                .push_inner(optional_frame(vec![GameEvent::PermanentTapped {
+                    object_id: pyromancer,
+                    caused_by: None,
+                    incarnation: Some(incarnation),
+                }]));
+            // The frame above buries the event-bearing one.
+            state
+                .resolution_stack
+                .push_inner(optional_frame(Vec::new()));
+            state
+                .lki_by_incarnation
+                .entry(pyromancer)
+                .or_default()
+                .insert(incarnation, snapshot(controller));
+            state
+        };
+
+        let early = position(3, PlayerId(1));
+        let late = position(91, PlayerId(1));
+        assert_ne!(early, late, "reach guard: the raw positions differ");
+        let normalized_late = late.normalize_for_loop();
+        assert_eq!(
+            normalized_late
+                .lki_by_incarnation
+                .get(&pyromancer)
+                .map(|history| history.len()),
+            Some(1),
+            "the snapshot the buried plural event names is retained"
+        );
+        assert!(
+            loop_states_equal(&early.normalize_for_loop(), &normalized_late),
+            "consistently renumbered incarnations in a buried plural carrier are the same position"
+        );
+        let other_controller = position(91, PlayerId(0));
+        assert!(
+            !loop_states_equal(
+                &early.normalize_for_loop(),
+                &other_controller.normalize_for_loop()
+            ),
+            "a different referent controller is a different position"
         );
     }
 

@@ -2685,16 +2685,56 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // would let a declared parent target answer instead (Fractured Loyalty's
     // "that creature" is the enchanted creature), so the player reference is
     // re-pointed at `TriggeringSpellController`, the event-source referent.
+    //
+    // CR 608.2c: an explicit object-controller antecedent ("that creature's
+    // controller") names the controller of the object that became the target,
+    // not the targeter. The lowered `ParentTargetController` no longer carries
+    // that noun, so rewriting it would name the wrong player; the body fails
+    // closed instead (no printed becomes-target line uses this wording).
     if def.mode == TriggerMode::BecomesTarget {
-        if let Some(execute) = def.execute.as_deref_mut() {
-            rebind_parent_target_controller_to_targeter(execute);
-        }
-        if let Some(unless) = def.unless_pay.as_mut() {
-            rebind_parent_target_controller_filter_to_targeter(&mut unless.payer);
+        if names_an_object_controller(&ir.source_text) {
+            if let Some(execute) = def.execute.as_deref_mut() {
+                *execute.effect = Effect::unimplemented(
+                    "becomes_target_object_controller_antecedent",
+                    "an explicit object controller in a becomes-target body names the \
+                     targeted object's controller, not the targeter's",
+                );
+            }
+        } else {
+            if let Some(execute) = def.execute.as_deref_mut() {
+                rebind_parent_target_controller_to_targeter(execute);
+            }
+            if let Some(unless) = def.unless_pay.as_mut() {
+                rebind_parent_target_controller_filter_to_targeter(&mut unless.payer);
+            }
         }
     }
 
     def
+}
+
+/// CR 608.2c: whether `text` names an object's controller explicitly — "that
+/// creature's controller", "the permanent's controller" — rather than a spell
+/// or ability's ("that spell's controller") or the pronoun "its controller".
+fn names_an_object_controller(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    super::oracle_nom::primitives::scan_at_word_boundaries(&lower, |i| {
+        (
+            alt((tag("that "), tag("the "))),
+            alt((
+                tag("creature"),
+                tag("permanent"),
+                tag("land"),
+                tag("artifact"),
+                tag("enchantment"),
+                tag("planeswalker"),
+                tag("battle"),
+            )),
+            alt((tag("'s controller"), tag("\u{2019}s controller"))),
+        )
+            .parse(i)
+    })
+    .is_some()
 }
 
 /// See the becomes-target rebind above. Walks the trigger's effect chain (modes,

@@ -5767,12 +5767,14 @@ fn build_ability_item(
     // its own right; project it with the trigger-item builder, so a mode that
     // can't fire shows as an unsupported child, matching the aggregate gap.
     for trigger in delayed_trigger_definitions(&def.effect) {
-        children.push(build_trigger_item(
+        let mut child = build_trigger_item(
             trigger,
             trigger_registry,
             static_registry,
             token_static_traversal,
-        ));
+        );
+        child.supported &= delayed_trigger_mode_is_supported(&trigger.mode, trigger_registry);
+        children.push(child);
     }
 
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
@@ -7593,6 +7595,18 @@ fn trigger_mode_is_supported(
         && (trigger_registry.contains_key(mode) || matches!(mode, TriggerMode::StateCondition))
 }
 
+/// CR 603.7 + CR 603.8: a delayed trigger fires only through an event matcher
+/// (`trigger_matchers::trigger_matcher`); the state-trigger check walks
+/// battlefield definitions, never `state.delayed_triggers`. So a delayed
+/// definition (and its projected child) is supported only when its mode has a
+/// registered matcher — `StateCondition` is not.
+fn delayed_trigger_mode_is_supported(
+    mode: &TriggerMode,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+) -> bool {
+    !matches!(mode, TriggerMode::Unknown(_)) && trigger_registry.contains_key(mode)
+}
+
 /// CR 603.7: the trigger definitions a delayed trigger this effect creates is
 /// waiting for: a "whenever ? this turn" event, or a "when next" event and its
 /// alternative. Phase- and zone-change-bound conditions carry none.
@@ -8181,7 +8195,7 @@ fn collect_ability_missing_parts(
         }
     }
     for mode in delayed_trigger_modes(&def.effect) {
-        if !trigger_mode_is_supported(mode, trigger_registry) {
+        if !delayed_trigger_mode_is_supported(mode, trigger_registry) {
             let label = format!("Trigger:{mode}");
             if !missing.contains(&label) {
                 missing.push(label);
@@ -9028,7 +9042,7 @@ fn is_ability_supported(
     }
     if delayed_trigger_modes(&def.effect)
         .into_iter()
-        .any(|mode| !trigger_mode_is_supported(mode, trigger_registry))
+        .any(|mode| !delayed_trigger_mode_is_supported(mode, trigger_registry))
     {
         return false;
     }
@@ -13760,6 +13774,41 @@ mod tests {
             "the main and alternative events"
         );
         assert!(!super::card_face_gaps(&when_next).is_empty());
+
+        // Maintainer round 4, finding 3 (CR 603.7 + CR 603.8): a delayed
+        // StateCondition has no event matcher and the state-trigger check never
+        // reads delayed triggers, so it can't fire: unsupported, with an
+        // unsupported child. The ordinary battlefield state trigger stays
+        // supported, and so does the registered delayed event above.
+        let delayed_state = generator(TriggerMode::StateCondition);
+        assert!(
+            super::card_face_gaps(&delayed_state)
+                .iter()
+                .any(|gap| gap.starts_with("Trigger:")),
+            "a delayed state trigger is a gap"
+        );
+        assert!(!super::is_ability_supported(
+            &delayed_state.abilities[0],
+            &trigger_registry,
+            &static_registry,
+            super::TokenStaticTraversal::Include,
+        ));
+        assert_eq!(
+            trigger_children(&delayed_state),
+            [false],
+            "unsupported child"
+        );
+        let ordinary_state = TriggerDefinition::new(TriggerMode::StateCondition);
+        assert!(
+            super::build_trigger_item(
+                &ordinary_state,
+                &trigger_registry,
+                &static_registry,
+                super::TokenStaticTraversal::Include,
+            )
+            .supported,
+            "an ordinary battlefield state trigger stays supported"
+        );
     }
 
     /// An explicit Exile origin can retrieve the intended set when it is still
