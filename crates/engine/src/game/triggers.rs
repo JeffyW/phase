@@ -10465,6 +10465,28 @@ fn can_drain_deferred_triggers(state: &GameState, policy: DeferredTriggerDrainPo
     true
 }
 
+/// CR 603.3 + CR 601.2i: whether every parked trigger context was triggered
+/// by the casting of a spell that is still on the stack, and no resolution is
+/// in progress. Such observers (a cast copy's, latched when it became cast
+/// mid-resolution) go on the stack the next time a player would receive
+/// priority, above that spell: the post-announcement drain, not the
+/// resolution-safe one that holds observers until a resolving spell leaves the
+/// stack (issue #1793). A queue holding any other context keeps the
+/// resolution-safe policy unchanged.
+pub(super) fn deferred_triggers_await_announced_casts(state: &GameState) -> bool {
+    state.resolving_stack_entry.is_none()
+        && !state.deferred_triggers.is_empty()
+        && state.deferred_triggers.iter().all(|context| {
+            context.trigger_events.iter().any(|event| {
+                matches!(event, GameEvent::SpellCast { object_id, .. }
+                if state.stack.iter().any(|entry| {
+                    entry.id == *object_id
+                        && matches!(entry.kind, StackEntryKind::Spell { .. })
+                }))
+            })
+        })
+}
+
 pub(crate) fn should_drain_deferred_triggers_now(state: &GameState) -> bool {
     can_drain_deferred_triggers(state, DeferredTriggerDrainPolicy::ResolutionSafe)
 }

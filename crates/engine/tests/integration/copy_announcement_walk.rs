@@ -1336,6 +1336,7 @@ fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
         let label = format!("Grapeshot first: {grapeshot_first}");
         let mut s = GameScenario::new();
         s.at_phase(Phase::PreCombatMain);
+        s.add_creature_from_oracle(P0, "Young Pyromancer", 2, 1, YOUNG_PYROMANCER);
         let grapeshot = s
             .add_spell_to_graveyard(P0, "Grapeshot", false)
             .from_oracle_text_with_keywords(&["Storm"], GRAPESHOT)
@@ -1412,6 +1413,12 @@ fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
                     }
                     r.act(GameAction::PassPriority).expect("resolve");
                 }
+                WaitingFor::OrderTriggers { triggers, .. } => {
+                    r.act(GameAction::OrderTriggers {
+                        order: (0..triggers.len()).collect(),
+                    })
+                    .expect("order the cast triggers");
+                }
                 other => panic!("{label}: unexpected prompt {other:?}"),
             }
         }
@@ -1427,5 +1434,8 @@ fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
             expected,
             "{label}: Grapeshot damage"
         );
+        // CR 603.2 + CR 603.3b: Young Pyromancer triggers on Mastery and on
+        // both copies, wherever they fall in the resolution.
+        assert_eq!(elementals(&r), 3, "{label}: Elementals");
     }
 }

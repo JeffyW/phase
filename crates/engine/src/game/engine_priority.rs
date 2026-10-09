@@ -525,10 +525,21 @@ fn run_post_action_pipeline_from_with_policy(
                     state.waiting_for = wf;
                 }
             }
-        } else if let Some(wf) =
-            triggers::drain_deferred_trigger_queue_with_policy(state, events, drain_policy)
-        {
-            state.waiting_for = wf;
+        } else {
+            // CR 603.3: the observers of spells cast and announced during a
+            // finished resolution go on the stack above those spells.
+            let policy = if drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
+                && triggers::deferred_triggers_await_announced_casts(state)
+            {
+                DeferredTriggerDrainPolicy::SettledPriority
+            } else {
+                drain_policy
+            };
+            if let Some(wf) =
+                triggers::drain_deferred_trigger_queue_with_policy(state, events, policy)
+            {
+                state.waiting_for = wf;
+            }
         }
     }
 

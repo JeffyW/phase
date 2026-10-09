@@ -10034,28 +10034,16 @@ fn finalize_copy_walk(
     }
     // CR 601.2i + CR 707.12: a cast copy's announcement is complete, so the
     // copy becomes cast now. A copy of a spell (Retarget) is not cast.
-    let mut collected_cast_observers = false;
     if walk.mode == crate::types::game_state::CopyChoiceMode::Announce {
         let cast_start = events.len();
         super::casting_costs::commit_copy_cast(state, walk.copy_id, walk.player, events)?;
-        collected_cast_observers = collect_copy_cast_observers(state, events, cast_start);
+        collect_copy_cast_observers(state, events, cast_start);
     }
-    complete_copy_walk_effect(state, walk, events)?;
-    // CR 603.3b + CR 117.5: once the offering resolution has finished, the
-    // latched cast observers go on the stack at the post-announcement boundary
-    // (above the announced copies), where the post-action scan would have put
-    // them.
-    if collected_cast_observers
-        && matches!(state.waiting_for, WaitingFor::Priority { .. })
-        && state.resolving_stack_entry.is_none()
-    {
-        if let Some(wf) =
-            triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
-        {
-            state.waiting_for = wf;
-        }
-    }
-    Ok(())
+    // CR 603.3 + CR 603.3b: the latched observers wait in `deferred_triggers`;
+    // the post-action pipeline puts them on the stack, together with every
+    // observer of the rest of the resolution, once the offering resolution
+    // has finished (`triggers::deferred_triggers_await_announced_casts`).
+    complete_copy_walk_effect(state, walk, events)
 }
 
 /// CR 603.2 + CR 702.40a: a cast trigger triggers when the spell becomes
@@ -10065,14 +10053,10 @@ fn finalize_copy_walk(
 /// parked in `deferred_triggers` (put on the stack at the next priority, as
 /// before), and their occurrences are claimed so the post-action scan does
 /// not collect them a second time (CR 603.2c).
-fn collect_copy_cast_observers(
-    state: &mut GameState,
-    events: &[GameEvent],
-    cast_start: usize,
-) -> bool {
+fn collect_copy_cast_observers(state: &mut GameState, events: &[GameEvent], cast_start: usize) {
     let cast_events = &events[cast_start..];
     if cast_events.is_empty() {
-        return false;
+        return;
     }
     triggers::collect_triggers_into_deferred(state, cast_events);
     triggers::collect_delayed_triggers_into_deferred(state, cast_events);
@@ -10085,7 +10069,6 @@ fn collect_copy_cast_observers(
                 scope: triggers::ConsumedTriggerEventScope::AllCollectors,
             }),
         );
-    true
 }
 
 /// CR 601.2e + CR 707.12: a copy announcement that can no longer be completed
