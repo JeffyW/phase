@@ -21,6 +21,130 @@ use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
+const DEATH_FRENZY: &str = "All creatures get -2/-2 until end of turn. Whenever a creature dies this turn, you gain 1 life.";
+const KAMBAL: &str =
+    "Whenever an opponent casts a noncreature spell, that player loses 2 life and you gain 2 life.";
+const LAVA_SPIKE: &str = "Lava Spike deals 3 damage to target player or planeswalker.";
+const CHAINS_OF_CUSTODY: &str = "Enchant creature you control\nWhen this Aura enters, exile target nonland permanent an opponent controls until this Aura leaves the battlefield.\nEnchanted creature has ward {2}.";
+
+/// CR 603.2 + CR 603.2c + CR 603.7b + CR 610.3: one action's state-based
+/// death and exile return reach a persistent delayed observer exactly once.
+/// Chains of Custody (on Magnivore) exiled P1's Bear; Death Frenzy set up
+/// "whenever a creature dies this turn" and left Magnivore 1/1 (three
+/// sorceries in graveyards, -2/-2). Mizzix's Mastery exiles Lava Spike and the
+/// copy is announced at P1: Magnivore is 0/0 and dies, Chains of Custody goes
+/// to the graveyard, and the Bear returns, all in the action that finishes the
+/// resolution. P1's Kambal observes the copy's cast, so the batch is P0's
+/// Frenzy trigger and P1's Kambal trigger: put on the stack in APNAP order
+/// with no ordering choice, which lets the same pass reach its final delayed
+/// scan. The Frenzy triggers once, for Magnivore.
+#[test]
+fn a_persistent_delayed_observer_triggers_once_across_sbas_and_exile_returns() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let magnivore = s
+        .add_creature_from_oracle(P0, "Magnivore", 0, 0, MAGNIVORE)
+        .id();
+    let bear = s.add_creature(P1, "Bear", 2, 2).id();
+    let kambal = s
+        .add_creature_from_oracle(P1, "Kambal, Consul of Allocation", 2, 3, KAMBAL)
+        .id();
+    let mut chains = s.add_creature_to_hand(P0, "Chains of Custody", 0, 0);
+    chains
+        .as_enchantment()
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::zero())
+        .from_oracle_text_with_keywords(&["Enchant creature you control"], CHAINS_OF_CUSTODY);
+    let chains = chains.id();
+    let frenzy = s
+        .add_spell_to_hand_from_oracle(P0, "Death Frenzy", false, DEATH_FRENZY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    s.add_spell_to_graveyard(P1, "Divination", false);
+    let spike = s
+        .add_spell_to_graveyard(P0, "Lava Spike", false)
+        .from_oracle_text(LAVA_SPIKE)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(chains).target_object(magnivore).commit();
+    resolve_entry(&mut r, chains);
+    if matches!(
+        r.state().waiting_for,
+        WaitingFor::TriggerTargetSelection { .. }
+    ) {
+        r.act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(bear)),
+        })
+        .expect("exile the Bear");
+    }
+    r.advance_until_stack_empty();
+    assert_eq!(
+        r.state().objects[&bear].zone,
+        Zone::Exile,
+        "reach: Bear exiled"
+    );
+    r.cast(frenzy).commit();
+    resolve_entry(&mut r, frenzy);
+    assert_eq!(
+        r.state().objects[&magnivore].zone,
+        Zone::Battlefield,
+        "reach: Magnivore survives Death Frenzy"
+    );
+    r.cast(mastery).target_object(spike).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards { cards: vec![spike] })
+        .expect("cast the Lava Spike copy");
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::CopyRetarget { .. }),
+        "reach: the copy announcement, got {:?}",
+        r.state().waiting_for
+    );
+    r.act(GameAction::ChooseTarget {
+        target: Some(TargetRef::Player(P1)),
+    })
+    .expect("announce P1");
+    assert_ne!(
+        r.state().objects[&magnivore].zone,
+        Zone::Battlefield,
+        "reach: Magnivore died to the state-based check"
+    );
+    assert_ne!(
+        r.state().objects[&chains].zone,
+        Zone::Battlefield,
+        "reach: Chains of Custody left with its host"
+    );
+    assert!(
+        r.state()
+            .battlefield
+            .iter()
+            .any(|id| r.state().objects[id].name == "Bear"),
+        "reach: the Bear returned from exile"
+    );
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: the batch needs no ordering choice, got {:?}",
+        r.state().waiting_for
+    );
+    let frenzy_triggers = r
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id == frenzy)
+        .count();
+    assert_eq!(frenzy_triggers, 1, "Death Frenzy triggers once");
+    let kambal_triggers = r
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id == kambal)
+        .count();
+    assert_eq!(kambal_triggers, 1, "Kambal observed the copy's cast");
+}
 const MIZZIXS_MASTERY: &str = "Exile target card that's an instant or sorcery from your graveyard. For each card exiled this way, copy it, and you may cast the copy without paying its mana cost. Exile Mizzix's Mastery.\nOverload {5}{R}{R}{R} (You may cast this spell for its overload cost. If you do, change \"target\" in its text to \"each.\")";
 const FROST_BREATH: &str = "Tap up to two target creatures. Those creatures don't untap during their controller's next untap step.";
 const VOLCANIC_OFFERING: &str = "Destroy target nonbasic land you don't control and target nonbasic land of an opponent's choice you don't control.\nVolcanic Offering deals 7 damage to target creature you don't control and 7 damage to target creature of an opponent's choice you don't control.";
