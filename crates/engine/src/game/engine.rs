@@ -10039,10 +10039,11 @@ fn finalize_copy_walk(
         super::casting_costs::commit_copy_cast(state, walk.copy_id, walk.player, events)?;
         collect_copy_cast_observers(state, events, cast_start);
     }
-    // CR 603.3 + CR 603.3b: the latched observers wait in `deferred_triggers`;
-    // the post-action pipeline puts them on the stack, together with every
-    // observer of the rest of the resolution, once the offering resolution
-    // has finished (`triggers::deferred_triggers_await_announced_casts`).
+    // CR 603.3 + CR 603.3b: the latched observers wait in `deferred_triggers`.
+    // Once the offering resolution has finished, the post-action pipeline
+    // collects that action's fresh observers into the same queue and puts the
+    // whole queue on the stack as one batch above the cast spells
+    // (`triggers::deferred_triggers_hold_announced_casts`).
     complete_copy_walk_effect(state, walk, events)
 }
 

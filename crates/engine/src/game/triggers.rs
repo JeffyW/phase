@@ -10465,18 +10465,20 @@ fn can_drain_deferred_triggers(state: &GameState, policy: DeferredTriggerDrainPo
     true
 }
 
-/// CR 603.3 + CR 601.2i: whether every parked trigger context was triggered
-/// by the casting of a spell that is still on the stack, and no resolution is
-/// in progress. Such observers (a cast copy's, latched when it became cast
-/// mid-resolution) go on the stack the next time a player would receive
-/// priority, above that spell: the post-announcement drain, not the
-/// resolution-safe one that holds observers until a resolving spell leaves the
-/// stack (issue #1793). A queue holding any other context keeps the
-/// resolution-safe policy unchanged.
-pub(super) fn deferred_triggers_await_announced_casts(state: &GameState) -> bool {
+/// CR 603.3 + CR 603.3b + CR 601.2i: whether the queue holds the cast
+/// observers of a spell cast and announced during a resolution that has now
+/// finished (a parked context triggered by the casting of a spell still on the
+/// stack, such as a cast copy latched when its announcement completed), so the
+/// post-action boundary must put the whole queue, together with the action's
+/// fresh observers, on the stack as one batch above those spells: the
+/// post-announcement drain, not the resolution-safe one that holds observers
+/// until a resolving spell leaves the stack (issue #1793).
+pub(super) fn deferred_triggers_hold_announced_casts(state: &GameState) -> bool {
     state.resolving_stack_entry.is_none()
-        && !state.deferred_triggers.is_empty()
-        && state.deferred_triggers.iter().all(|context| {
+        && state.resolution_stack.is_empty()
+        && state.pending_resolution_completion.is_none()
+        && resolution_completion_can_settle(state)
+        && state.deferred_triggers.iter().any(|context| {
             context.trigger_events.iter().any(|event| {
                 matches!(event, GameEvent::SpellCast { object_id, .. }
                 if state.stack.iter().any(|entry| {

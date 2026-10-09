@@ -1385,6 +1385,7 @@ fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
         })
         .expect("overload");
         pass_to_choice(&mut r);
+        let mut groups: Vec<Vec<String>> = Vec::new();
         let order = if grapeshot_first {
             vec![grapeshot, ritual]
         } else {
@@ -1414,6 +1415,7 @@ fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
                     r.act(GameAction::PassPriority).expect("resolve");
                 }
                 WaitingFor::OrderTriggers { triggers, .. } => {
+                    groups.push(triggers.iter().map(|s| s.source_name.clone()).collect());
                     r.act(GameAction::OrderTriggers {
                         order: (0..triggers.len()).collect(),
                     })
@@ -1437,5 +1439,90 @@ fn storm_counts_only_spells_cast_before_the_copy_announced_it() {
         // CR 603.2 + CR 603.3b: Young Pyromancer triggers on Mastery and on
         // both copies, wherever they fall in the resolution.
         assert_eq!(elementals(&r), 3, "{label}: Elementals");
+        // CR 603.3b: both copies' observers (two Pyromancer triggers and
+        // Grapeshot's Storm) are put on the stack as one ordering group.
+        assert_eq!(
+            groups.len(),
+            1,
+            "{label}: one ordering group, got {groups:?}"
+        );
+        let mut group = groups[0].clone();
+        group.sort();
+        assert_eq!(
+            group,
+            vec![
+                "Grapeshot".to_string(),
+                "Young Pyromancer".to_string(),
+                "Young Pyromancer".to_string()
+            ],
+            "{label}: the group's members"
+        );
     }
+}
+
+const TEVAL: &str = "Flying\nWhenever Teval attacks, mill three cards. Then you may return a land card from your graveyard to the battlefield tapped.\nWhenever one or more cards leave your graveyard, create a 2/2 black Zombie Druid creature token.";
+
+/// CR 603.3 + CR 603.3b: Mizzix's Mastery exiles Grapeshot from P0's
+/// graveyard (Teval, the Balanced Scale triggers) and casts its copy, which P0
+/// announces at P1 (Storm triggers). Teval's triggers were parked during
+/// Mastery's resolution and Storm was latched when the copy became cast; once
+/// the resolution finishes they are put on the stack as one ordering group,
+/// above the Grapeshot copy, before anyone gets priority.
+#[test]
+fn a_resolution_s_parked_observers_join_the_copy_cast_batch() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    s.add_creature_from_oracle(P0, "Teval, the Balanced Scale", 4, 4, TEVAL);
+    let grapeshot = s
+        .add_spell_to_graveyard(P0, "Grapeshot", false)
+        .from_oracle_text_with_keywords(&["Storm"], GRAPESHOT)
+        .id();
+    let mastery = s
+        .add_spell_to_hand(P0, "Mizzix's Mastery", false)
+        .from_oracle_text_with_keywords(&["Overload"], MIZZIXS_MASTERY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut r = s.build();
+    r.cast(mastery).target_object(grapeshot).commit();
+    pass_to_choice(&mut r);
+    r.act(GameAction::SelectCards {
+        cards: vec![grapeshot],
+    })
+    .expect("cast the Grapeshot copy");
+    let WaitingFor::CopyRetarget { copy_id: copy, .. } = r.state().waiting_for else {
+        panic!(
+            "expected the copy announcement, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    let parked_teval = r.state().deferred_triggers.len();
+    assert!(
+        parked_teval >= 1,
+        "reach: Teval's trigger is parked during the resolution"
+    );
+    r.act(GameAction::ChooseTarget {
+        target: Some(TargetRef::Player(P1)),
+    })
+    .expect("announce P1");
+    let WaitingFor::OrderTriggers { triggers, .. } = &r.state().waiting_for else {
+        panic!(
+            "expected one ordering group before priority, got {:?}",
+            r.state().waiting_for
+        );
+    };
+    // Every observer of the finished resolution is in the group: Storm, and
+    // each Teval trigger parked while Mastery resolved.
+    let group: Vec<String> = triggers.iter().map(|s| s.source_name.clone()).collect();
+    let count = |name: &str| group.iter().filter(|member| *member == name).count();
+    assert_eq!(count("Grapeshot"), 1, "Storm is in the group: {group:?}");
+    assert_eq!(
+        count("Teval, the Balanced Scale"),
+        parked_teval,
+        "every parked Teval trigger is in the same group: {group:?}"
+    );
+    assert_eq!(group.len(), parked_teval + 1, "nothing else: {group:?}");
+    assert!(
+        r.state().stack.iter().any(|entry| entry.id == copy),
+        "the group is put on the stack while the copy is still on it"
+    );
 }

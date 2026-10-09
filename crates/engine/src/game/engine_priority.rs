@@ -144,6 +144,13 @@ fn run_post_action_pipeline_from_with_policy(
     let mut consumed_trigger_events =
         std::mem::take(&mut state.consumed_before_priority_trigger_events);
     let mut delayed_trigger_events = Vec::new();
+    // CR 603.3 + CR 603.3b: the cast observers latched during a finished
+    // resolution are put on the stack with this action's fresh observers as
+    // ONE batch, above the cast spells; the fresh observers join the queue
+    // instead of being dispatched ahead of it.
+    let announced_cast_batch = drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
+        && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && triggers::deferred_triggers_hold_announced_casts(state);
 
     // CR 603.2: Triggered abilities trigger at the moment the event occurs.
     // Scan for triggers BEFORE SBAs so that objects still on the battlefield
@@ -291,6 +298,9 @@ fn run_post_action_pipeline_from_with_policy(
             || deferred_trigger_batch_was_sba_choice_parked
         {
             triggers::collect_triggers_into_deferred(state, &filtered_events);
+        } else if announced_cast_batch && state.game_end.is_none() {
+            triggers::collect_triggers_into_deferred(state, &filtered_events);
+            triggers::collect_delayed_triggers_into_deferred(state, &delayed_trigger_events);
         } else if state.game_end.is_none() {
             // CR 104.1: only while the game is still going. Once this action
             // has recorded a result on `GameState::game_end` (e.g. a CR 104.4b
@@ -388,7 +398,7 @@ fn run_post_action_pipeline_from_with_policy(
             );
             // CR 603.3b: SBA-generated triggers join the terminal batch rather
             // than being ordered before its final cast trigger is collected.
-            if state.pending_resolution_completion.is_some() {
+            if state.pending_resolution_completion.is_some() || announced_cast_batch {
                 triggers::collect_triggers_into_deferred(state, &sba_events);
             } else {
                 triggers::process_triggers(state, &sba_events);
@@ -446,6 +456,7 @@ fn run_post_action_pipeline_from_with_policy(
         // cannot be ordered before the final cast trigger is collected.
         if !matches!(state.waiting_for, WaitingFor::Priority { .. })
             || state.pending_resolution_completion.is_some()
+            || announced_cast_batch
         {
             triggers::collect_triggers_into_deferred(state, &unconsumed_exile_return_events);
         } else {
@@ -528,9 +539,7 @@ fn run_post_action_pipeline_from_with_policy(
         } else {
             // CR 603.3: the observers of spells cast and announced during a
             // finished resolution go on the stack above those spells.
-            let policy = if drain_policy == DeferredTriggerDrainPolicy::ResolutionSafe
-                && triggers::deferred_triggers_await_announced_casts(state)
-            {
+            let policy = if announced_cast_batch {
                 DeferredTriggerDrainPolicy::SettledPriority
             } else {
                 drain_policy
