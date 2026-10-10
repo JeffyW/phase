@@ -308,6 +308,7 @@ fn filter_prop_deps(prop: &FilterProp) -> RetargetDeps {
         | FilterProp::MatchesLastChosenCardPredicate
         | FilterProp::HasSingleTarget
         | FilterProp::Modal
+        | FilterProp::PrepareSpell
         | FilterProp::Suspected
         | FilterProp::Renowned
         | FilterProp::Goaded

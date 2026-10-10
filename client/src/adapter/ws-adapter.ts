@@ -210,12 +210,12 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 121 — FilterProp's attachment-referent siblings (AttachedToSource,
+ * 127 — FilterProp's attachment-referent siblings (AttachedToSource,
  *      AttachedToRecipient, AttachedToPlayer) are one AttachedTo prop with a
  *      tagged `to` referent (Source, Recipient, Player, DeclaredTarget) — see
- *      PROTOCOL_VERSION's own `/// 121` entry in
+ *      PROTOCOL_VERSION's own `/// 127` entry in
  *      crates/lobby-broker/src/protocol.rs. This client hands server frames to
- *      JSON.parse, so a v120 client would take the new shape with no decode
+ *      JSON.parse, so a v126 client would take the new shape with no decode
  *      error; the exact-match version check at connect refuses the pairing
  *      instead. The same version makes retarget picks positional:
  *      RetargetSpell.new_targets is (TargetRef | null)[] (null keeps), and the
@@ -225,7 +225,37 @@ export class NativeEngineVersionMismatchError extends Error {
  *      controller when a slot's chooser answers, and
  *      CopyRetarget.announcer_election carries a copy announcement's
  *      announcing-opponent election.
- *      (Reserved as 119 while under review; it landed after 120, so 119 stays unused.)
+ *      (Reserved as 119 and then 121 while under review; it landed after 126, so 119 stays unused.)
+ * 126 — `ZoneChangeRecord` gains `arrival` (the owner and controller the
+ *      destination object holds) inside `GameState` and the resolved-rules
+ *      journal's zone-change commands; a v125 peer rejects the journal when the
+ *      departure owner differs from the command owner. Wire 108 moves with it;
+ *      no lobby frame names it.
+ * 125 — `MulliganDecisionEntry` and `MulliganDeclaration` (inside
+ *      `WaitingFor::MulliganDecision`) gain `free_reveals_taken`. Wire 107
+ *      moves with it; no lobby frame names it.
+ * 124 — the resolved-rules journal admits a land-play `rebound_from`
+ *      (Library/Graveyard/Exile -> Battlefield) inside
+ *      GameState.resolved_rules_journal; a v123 peer rejects the state. Wire
+ *      106 moves with it; no lobby frame names it.
+ * 123 — FilterProp PrepareSpell ("a prepared spell" cast-trigger qualifier,
+ *      CR 722.3d), scope on Effect BecomePrepared / BecomeUnprepared (mass
+ *      "each creature you control becomes prepared", CR 722.3a + CR 115.10a),
+ *      prepared_copy_source on SpellCastRecord, and prepare_face on
+ *      CopiableValues and GameObject.copied_prepare_face (a copy of a
+ *      preparation creature keeps its prepare spell, CR 722.2b). A v122 peer
+ *      cannot parse the new FilterProp tag and would read a mass scope as a
+ *      single-target prepare; the exact-match handshake refuses the pairing.
+ *      P2P moves in lockstep (wire 105); lobby messages are unchanged.
+ * 122 — PermissionGrantee gains TriggeringSourceController (a cast grant bound to the
+ *      controller of the object that caused the trigger, CR 603.2 + CR 109.4),
+ *      serialized in the ability definitions of GameState; damage events carry
+ *      the source incarnation. A v121 peer cannot deserialize the tag. Wire 104
+ *      moves with it; no lobby frame names it.
+ * 121 — GameState's triggered-ability mana ledger records the actual
+ *       receiving player alongside the exact trigger definition. A v120 peer
+ *       cannot decode a nonempty pair ledger; the exact-match handshake
+ *       refuses it. P2P moves in lockstep (wire 103).
  * 120 — CR 601.2a spell announcement: GameObject gains spell_announcement,
  *      GameState gains next_spell_announcement, and GameEvent BecomesTarget
  *      gains the targeter that announced the target. A v119 peer cannot
@@ -767,7 +797,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 121;
+export const PROTOCOL_VERSION = 127;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

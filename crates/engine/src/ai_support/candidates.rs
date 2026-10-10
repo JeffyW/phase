@@ -9756,11 +9756,13 @@ mod tests {
         state.waiting_for = WaitingFor::MulliganDecision {
             pending: vec![
                 MulliganDecisionEntry {
+                    free_reveals_taken: 0,
                     player: PlayerId(0),
                     mulligan_count: p0_count,
                     phase: p0_phase,
                 },
                 MulliganDecisionEntry {
+                    free_reveals_taken: 0,
                     player: PlayerId(1),
                     mulligan_count: 0,
                     phase: MulliganDecisionPhase::Declare,
