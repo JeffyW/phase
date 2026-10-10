@@ -138,6 +138,7 @@ mod carmen_cruel_skymarcher_counter_lookback_8160;
 mod carrot_cake_self_sacrifice_trigger;
 mod cartographers_hawk_relative_damage_recipient;
 mod cascade_intervening_if_pipeline;
+mod cascade_spell_ability_spells;
 mod case_solve_condition;
 mod cast_during_resolution_pipeline;
 mod cast_grant_mana_rider_conjunct;
