@@ -123,17 +123,43 @@ fn oft_nabbed_goat_is_not_offered_again_after_its_activator_gains_control() {
 }
 
 /// The controller is never offered its own Goat (CR 602.2 "only your opponents").
+/// One fixture: while P1 controls the Goat it IS offered to P0 (reach guard:
+/// parse, timing and mana all admit P0), then control moves to P0 with timing and
+/// resources unchanged and the offer disappears.
 #[test]
 fn oft_nabbed_goat_is_not_offered_to_its_controller() {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
     let goat = s
         .add_creature_from_oracle(P0, "Oft-Nabbed Goat", 0, 5, GOAT)
+        .controlled_by(P1)
         .id();
     s.with_mana_pool(P0, colorless(1));
-    let r = s.build();
+    let mut r = s.build();
     assert_eq!(priority_holder(&r), P0, "reach guard: P0 holds priority");
-    assert!(!legal_actions(r.state()).contains(&activate(goat)));
+    assert!(
+        legal_actions(r.state()).contains(&activate(goat)),
+        "reach guard: offered to P0 while P1 controls the Goat"
+    );
+
+    // Same layer-safe control assignment `CardBuilder::controlled_by` uses.
+    let obj = r.state_mut().objects.get_mut(&goat).unwrap();
+    obj.base_controller = Some(P0);
+    obj.controller = P0;
+    assert_eq!(
+        priority_holder(&r),
+        P0,
+        "reach guard: P0 still holds priority"
+    );
+    assert_eq!(
+        r.state().players[0].mana_pool.total(),
+        1,
+        "reach guard: P0 still has {{1}} floating"
+    );
+    assert!(
+        !legal_actions(r.state()).contains(&activate(goat)),
+        "CR 602.2: the Goat's controller may not activate its opponents-only ability"
+    );
 }
 
 /// CR 602.5d: the opponent may activate it only as a sorcery. On the
