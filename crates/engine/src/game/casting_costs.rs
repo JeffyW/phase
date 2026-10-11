@@ -2574,6 +2574,14 @@ fn park_cost_payment_triggers_if_paused(
     } else {
         crate::game::triggers::collect_triggers_into_deferred(state, &cost_events);
     }
+    // CR 603.2c: the span is collected; the end-of-action announcement staging
+    // must not collect it again.
+    super::announcement_triggers::claim_ordinary_collected_span(
+        state,
+        events,
+        cost_event_start,
+        cost_event_end,
+    );
 }
 
 /// CR 601.2h + CR 616.1: Move `chosen[start_at_index..]` through the zone pipeline as
@@ -3485,6 +3493,8 @@ fn park_deferred_cost_triggers_if_paused(
         .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
         .collect();
     crate::game::triggers::collect_triggers_into_deferred(state, &cost_events);
+    // CR 603.2c: see `park_cost_payment_triggers_if_paused`.
+    super::announcement_triggers::claim_ordinary_collected_span(state, events, start, end);
 }
 
 /// CR 603.10a: Retain the state-ledger identities for every selected permanent
@@ -6898,6 +6908,7 @@ pub(super) fn push_activated_ability_to_stack(
                 ability_index,
                 target_selection,
                 carrier(),
+                activation_trigger_collection.clone(),
             ));
         }
         // CR 606.3: A `[−X]` loyalty ability is modeled as a chosen-X removal of
@@ -12783,6 +12794,11 @@ fn finalize_cast_with_phyrexian_choices_inner(
             new_cumulative,
         });
     }
+
+    // CR 601.2i + CR 603.3b: the spell became cast. A paused announcement's
+    // staged triggers and this cast's own triggers (read against the cast
+    // ledger recorded above) are committed as one batch.
+    super::announcement_triggers::commit_spell_announcement(state, object_id, events);
 
     Ok(resolution_success_waiting_for.unwrap_or(WaitingFor::Priority { player }))
 }
