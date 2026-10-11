@@ -4486,7 +4486,13 @@ pub(crate) fn priority_actions_with_probe(
         let mut prepare_castability_sim: Option<GameState> = None;
         for &obj_id in &state.battlefield {
             if let Some(obj) = state.objects.get(&obj_id) {
-                if obj.controller == player {
+                let controls = obj.controller == player;
+                // CR 602.2: a permanent's activated abilities are its controller's
+                // to activate "unless the object specifically says otherwise"
+                // (Oft-Nabbed Goat, Mercenaries) — those are offered to the other
+                // players it names. The legality authority below decides each one.
+                if controls || casting::object_permits_non_controller_activation(state, player, obj)
+                {
                     for (i, ability_def) in casting::activated_ability_definitions(state, obj_id) {
                         if ability_def.kind == crate::types::ability::AbilityKind::Activated
                             && !crate::game::mana_abilities::is_mana_ability(&ability_def)
@@ -4508,6 +4514,8 @@ pub(crate) fn priority_actions_with_probe(
                             ));
                         }
                     }
+                }
+                if controls {
                     // CR 702.xxx: Prepare (Strixhaven) — priority-time offer to
                     // cast a copy of the prepare-spell face. Gated on
                     // `prepared.is_some()` (single-authority state flag managed
