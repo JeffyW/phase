@@ -792,7 +792,7 @@ fn live_base_mana_output(
         return Vec::new();
     };
     let production_override =
-        super::casting_costs::production_override_for_option(ability_def, option);
+        super::casting_costs::production_override_for_option(state, ability_def, option);
     live_mana_output_units(
         state,
         &ability,
@@ -1006,7 +1006,7 @@ pub(crate) fn activate_mana_source_option_with_output(
             })?;
         let production_override = match output {
             ManaSourceOutput::Concrete(_) => {
-                super::casting_costs::production_override_for_option(&ability, option)
+                super::casting_costs::production_override_for_option(state, &ability, option)
             }
             ManaSourceOutput::DeferredColorChoice { .. } => None,
         };
@@ -2115,10 +2115,7 @@ pub fn max_mana_yield(state: &GameState, object_id: ObjectId, controller: Player
             Effect::Mana { produced, .. } => {
                 let resolved =
                     super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-                let gross = super::effects::mana::resolve_mana_types_for_ability(
-                    produced, state, &resolved,
-                )
-                .len() as u32;
+                let gross = planned_gross_mana(produced, state, &resolved);
                 // CR 605.3b: Net the mana paid to activate this ability —
                 // gross output overstates what a filter land actually adds.
                 let activation_cost = mana_abilities::mana_sub_cost_of(&ability.cost)
@@ -2249,10 +2246,7 @@ pub(crate) fn feasible_mana_capacity(
             Effect::Mana { produced, .. } => {
                 let resolved =
                     super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-                let gross = super::effects::mana::resolve_mana_types_for_ability(
-                    produced, state, &resolved,
-                )
-                .len() as u32;
+                let gross = planned_gross_mana(produced, state, &resolved);
                 // CR 605.3b: Net the mana paid to activate. Non-mana cost
                 // components (Sacrifice / Discard / PayLife / Exile) have no
                 // mana sub-cost, so `mana_sub_cost_of` returns `None` and the
@@ -2362,6 +2356,24 @@ fn resolved_production_count(
     super::effects::mana::resolve_mana_types_for_ability(produced, state, resolved).len() as u32
 }
 
+/// CR 106.1 + CR 605.3b + CR 607.2d: Gross mana one activation could add, for
+/// capacity planning. A pure chosen-color ability that chooses on activation
+/// resolves to no mana until the choice is made, so its best per-color amount
+/// is used instead.
+fn planned_gross_mana(
+    produced: &ManaProduction,
+    state: &GameState,
+    resolved: &crate::types::ability::ResolvedAbility,
+) -> u32 {
+    let on_activation =
+        super::effects::mana::activation_chosen_color_outputs(state, produced, resolved)
+            .into_iter()
+            .map(|(_, count)| count as u32)
+            .max()
+            .unwrap_or(0);
+    resolved_production_count(produced, state, resolved).max(on_activation)
+}
+
 fn profile_kind_from_production(
     state: &GameState,
     object_id: ObjectId,
@@ -2393,6 +2405,28 @@ fn profile_kind_from_production(
         ManaProduction::ChosenColor {
             fixed_alternative, ..
         } => {
+            // CR 106.1 + CR 607.2d: a color chosen on activation may give a
+            // different amount per color (Nykthos's devotion to that color).
+            if fixed_alternative.is_none()
+                && super::effects::mana::chooses_color_on_activation(state, object_id)
+            {
+                let outputs = super::effects::mana::activation_chosen_color_outputs(
+                    state, produced, resolved,
+                );
+                let first_count = outputs.first()?.1;
+                if outputs.iter().all(|(_, count)| *count == first_count) {
+                    return Some(ActivatableManaProfileKind::AnyOneColor {
+                        count: first_count as u32,
+                        options: outputs.iter().map(|(mana_type, _)| *mana_type).collect(),
+                    });
+                }
+                return Some(ActivatableManaProfileKind::CombinationChoices(
+                    outputs
+                        .into_iter()
+                        .map(|(mana_type, count)| vec![mana_type; count])
+                        .collect(),
+                ));
+            }
             let count = resolved_production_count(produced, state, resolved);
             let options = chosen_color_mana_type_options(state, object_id, *fixed_alternative);
             if options.is_empty() {
@@ -3080,9 +3114,29 @@ fn emit_source_rows(
                 restrictions: concrete_restrictions.clone(),
             }]
         }
-        // CR 106.5: a pure chosen-color source with no color chosen cannot
-        // produce mana. Display/preview paths may show all five colors, but
-        // auto-tap must not plan a payment around an undefined mana type.
+        // CR 106.1 + CR 607.2d: a pure chosen-color ability that makes its
+        // color choice during activation (Astral Cornucopia, Nykthos) can add
+        // any color whose choice would produce mana. Emit one row per such
+        // color; the auto-tap replay passes the row's color as the choice.
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        } if super::effects::mana::chooses_color_on_activation(state, object_id) => {
+            let resolved =
+                super::ability_utils::build_resolved_from_def(ability, object_id, controller);
+            super::effects::mana::activation_chosen_color_outputs(state, produced, &resolved)
+                .into_iter()
+                .map(|(mana_type, _)| SourceRow {
+                    mana_type,
+                    atomic_combination: None,
+                    restrictions: concrete_restrictions.clone(),
+                })
+                .collect()
+        }
+        // CR 106.5 + CR 607.2d: a pure chosen-color source whose linked choice
+        // was never made cannot produce mana. Display/preview paths may show
+        // all five colors, but auto-tap must not plan a payment around an
+        // undefined mana type.
         ManaProduction::ChosenColor {
             fixed_alternative: None,
             ..

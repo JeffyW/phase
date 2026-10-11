@@ -1671,6 +1671,7 @@ mod issue_7816_call_of_the_ring;
 mod issue_7821_bare_plural_enters_with_counters;
 mod issue_7822_manifested_planeswalker_loyalty;
 mod issue_7882_reflections_of_littjara;
+mod issue_8443_chosen_on_activation_mana;
 mod kang_dynasty_until_next_turn_rider;
 mod karona_false_god;
 mod karplusan_yeti_fight_back;

@@ -1104,6 +1104,135 @@ pub(crate) fn chosen_color_for_mana(
         })
 }
 
+/// CR 607.2d: Whether a pure chosen-color mana ability on `source_id` makes
+/// its color choice as part of its own activation.
+///
+/// "Add one mana of the chosen color" is linked to an ability printed on the
+/// same object that makes the choice (Sunken Citadel's "As it enters, choose a
+/// color"); when that linked choice was never made, the color is undefined and
+/// the ability adds no mana (CR 106.5). An ability such as Astral Cornucopia's
+/// "Choose a color. Add one mana of that color for each charge counter" has no
+/// linked chooser: the choice is made while the ability resolves, so any of
+/// the five colors is available. Any persisted chooser that could name a color
+/// counts as linked, so an unrecognized chooser fails closed.
+pub(crate) fn chooses_color_on_activation(
+    state: &GameState,
+    source_id: crate::types::identifiers::ObjectId,
+) -> bool {
+    let Some(obj) = state.objects.get(&source_id) else {
+        return false;
+    };
+    if obj.chosen_color().is_some() {
+        return false;
+    }
+    let linked = obj
+        .abilities
+        .iter()
+        .any(definition_makes_linked_color_choice)
+        || obj
+            .trigger_definitions
+            .iter_all()
+            .filter_map(|entry| entry.definition.execute.as_deref())
+            .any(definition_makes_linked_color_choice)
+        || obj
+            .replacement_definitions
+            .iter_all()
+            .filter_map(|replacement| replacement.execute.as_deref())
+            .any(definition_makes_linked_color_choice);
+    !linked
+}
+
+/// CR 607.2d: True when any link of `def` (its chain, else branch, or modal
+/// modes) is a persisted choice whose answer could be a color, i.e. a choice
+/// "the chosen color" can refer back to.
+fn definition_makes_linked_color_choice(def: &crate::types::ability::AbilityDefinition) -> bool {
+    let here = match &*def.effect {
+        Effect::Choose {
+            choice_type,
+            persist: true,
+            ..
+        } => choice_type_can_name_a_color(choice_type),
+        _ => false,
+    };
+    here || def
+        .sub_ability
+        .as_deref()
+        .is_some_and(definition_makes_linked_color_choice)
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(definition_makes_linked_color_choice)
+        || def
+            .mode_abilities
+            .iter()
+            .any(definition_makes_linked_color_choice)
+}
+
+/// CR 105.1: Whether a choice of this type can answer with a color. Labeled
+/// options count when any label is a color word (Unknown Event Shores' "choose
+/// white, blue, black, red, or green").
+fn choice_type_can_name_a_color(choice_type: &crate::types::ability::ChoiceType) -> bool {
+    use crate::types::ability::ChoiceType;
+    match choice_type {
+        ChoiceType::Color { .. } | ChoiceType::TwoColors => true,
+        ChoiceType::Labeled { options } => options
+            .iter()
+            .any(|option| option.parse::<ManaColor>().is_ok()),
+        ChoiceType::CreatureType { .. }
+        | ChoiceType::OddOrEven
+        | ChoiceType::BasicLandType
+        | ChoiceType::CardType { .. }
+        | ChoiceType::CardName
+        | ChoiceType::NumberRange { .. }
+        | ChoiceType::LandType
+        | ChoiceType::CardPredicate { .. }
+        | ChoiceType::CardPredicateGuess { .. }
+        | ChoiceType::Opponent { .. }
+        | ChoiceType::Player { .. }
+        | ChoiceType::Word
+        | ChoiceType::Artist
+        | ChoiceType::Keyword { .. }
+        | ChoiceType::CounterKind { .. } => false,
+    }
+}
+
+/// CR 106.1 + CR 605.3b + CR 607.2d: The mana a pure chosen-color ability that
+/// chooses on activation (see [`chooses_color_on_activation`]) could add, one
+/// entry per color choice, for planning a payment before activating it.
+///
+/// Mirrors the activation path, which prompts for any of the five colors and
+/// evaluates the amount under that choice (`resolve_single_color_override`),
+/// so a count that depends on the color (Nykthos's devotion to that color) is
+/// right per color. Colors that would add no mana are omitted. Every other
+/// production shape returns empty: a linked chooser left unset produces no mana
+/// (CR 106.5), and a set color is already resolvable directly.
+pub(crate) fn activation_chosen_color_outputs(
+    state: &GameState,
+    produced: &ManaProduction,
+    ability: &ResolvedAbility,
+) -> Vec<(ManaType, usize)> {
+    let ManaProduction::ChosenColor {
+        fixed_alternative: None,
+        ..
+    } = produced
+    else {
+        return Vec::new();
+    };
+    if !chooses_color_on_activation(state, ability.source_id) {
+        return Vec::new();
+    }
+    let mut probe = state.clone();
+    let mut outputs = Vec::new();
+    for color in ManaColor::ALL.iter().copied() {
+        probe.last_named_choice = Some(ChoiceValue::Color(color));
+        let count = resolve_mana_types_for_ability(produced, &probe, ability).len();
+        if count > 0 {
+            outputs.push((mana_color_to_type(&color), count));
+        }
+    }
+    outputs
+}
+
 /// CR 106.1b: The first mana type noted by a past `Effect::NoteManaSpent`
 /// resolution on `source_id` ("this artifact's last noted type" — Jeweled
 /// Amulet). Unlike `chosen_color_for_mana`, this is never player-prompted —
