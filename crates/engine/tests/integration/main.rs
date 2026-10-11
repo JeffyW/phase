@@ -1821,6 +1821,7 @@ mod sheoldred_edict_multi_opponent_sac;
 mod sheriff_base_plus_additional_counters_runtime;
 mod shiko_reflexive_copy_draw_1370;
 mod shilgengar_return_each_to_battlefield;
+mod shinryu_chosen_player_loses_game_9768;
 mod shuffle_that_pile_manifest;
 mod silumgar_scavenger_exploit_haste;
 mod skullspore_nexus_dynamic_pt;

@@ -16262,6 +16262,14 @@ fn parse_loses_game_actor(input: &str) -> OracleResult<'_, Option<TargetFilter>>
             (Some(TargetFilter::AttachedTo), true),
             tag("enchanted player "),
         ),
+        // CR 607.2d: "the chosen player" is linked to the source's own
+        // "choose a player/opponent" ability, whose answer is persisted on the
+        // source and read here as `SourceChosenPlayer` (Shinryu, Transcendent
+        // Rival). The reader also makes the linked chooser persist its pick.
+        value(
+            (Some(TargetFilter::SourceChosenPlayer), true),
+            tag("the chosen player "),
+        ),
     ))
     .parse(input)?;
     let verb = if third_person { "loses" } else { "lose" };
