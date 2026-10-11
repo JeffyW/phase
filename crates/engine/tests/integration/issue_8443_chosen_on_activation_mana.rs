@@ -780,7 +780,7 @@ fn nyx_lotus_default_resolution_counts_its_first_color_option() {
                 "white and blue devotion differ; blue devotion is one"
             );
             let mut ability = runner.state().objects[&lotus].abilities[0].clone();
-            let Effect::Mana { produced, .. } = Arc::make_mut(&mut ability.effect) else {
+            let Effect::Mana { produced, .. } = ability.effect.as_mut() else {
                 panic!("Nyx Lotus must have a mana production");
             };
             let ManaProduction::AnyOneColor { color_options, .. } = produced else {
