@@ -392,6 +392,194 @@ fn nyx_lotus_plans_each_color_with_its_own_devotion() {
     );
 }
 
+/// CR 106.5 + CR 607.2d fail-closed control for the chooser traversal: a
+/// persisted color chooser nested inside an inline branch carrier
+/// (`ChooseOneOf`) is still a linked chooser, so the unset source adds no mana.
+#[test]
+fn linked_color_chooser_inside_a_branch_carrier_counts_as_linked() {
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, PlayerFilter, ReplacementDefinition, TargetSelectionMode,
+    };
+    use engine::types::replacements::ReplacementEvent;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let astral = scenario
+        .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
+        .id();
+    scenario.with_counter(astral, charge(), 3);
+    let spell = add_instant(&mut scenario, cost(vec![ManaCostShard::Red], 0));
+    let mut runner = scenario.build();
+    assert!(
+        priority_facts(&runner, spell).0,
+        "reach: without a linked chooser the source pays {{R}}"
+    );
+
+    let nested_chooser = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Choose {
+                    choice_type: ChoiceType::color(),
+                    persist: true,
+                    selection: TargetSelectionMode::Chosen,
+                },
+            )],
+        },
+    );
+    let replacement = ReplacementDefinition::new(ReplacementEvent::Moved).execute(nested_chooser);
+    {
+        let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+        // Both the live list and its layer base, so a layer pass keeps it.
+        std::sync::Arc::make_mut(&mut obj.base_replacement_definitions).push(replacement.clone());
+        obj.replacement_definitions.push(replacement);
+    }
+    assert_eq!(
+        priority_facts(&runner, spell),
+        (false, true),
+        "a nested linked chooser left unset produces no mana (CR 106.5)"
+    );
+}
+
+/// Reviewer probe board (#8443 r1, R1): Nyx Lotus's per-color amounts must
+/// still let surplus mana of the chosen color pay generic. Devotion G3 / U1;
+/// Krark-Clan Ironworks makes the payment a manual mana choice, so the
+/// activatable-profile path decides. 3G + CC pays {2}{G}{G} with one left
+/// over (CR 700.5, CR 106.4, CR 601.2g).
+#[test]
+fn nyx_lotus_surplus_color_pays_generic_alongside_ironworks() {
+    const HARMONIZE: &str = "Draw three cards.";
+    let build = |with_ironworks: bool| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
+        let lotus = scenario
+            .add_artifact_from_oracle(
+                P0,
+                "Nyx Lotus",
+                "Nyx Lotus enters tapped.\n{T}: Choose a color. Add an amount of mana of that color equal to your devotion to that color.",
+            )
+            .id();
+        scenario
+            .add_creature(P0, "Leatherback Baloth", 4, 5)
+            .with_mana_cost(cost(
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                ],
+                0,
+            ));
+        scenario
+            .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+        let mut ironworks = None;
+        let mut ornithopter = None;
+        if with_ironworks {
+            ironworks = Some(
+                scenario
+                    .add_artifact_from_oracle(P0, "Krark-Clan Ironworks", KCI)
+                    .id(),
+            );
+            ornithopter = Some(
+                scenario
+                    .add_creature(P0, "Ornithopter", 0, 2)
+                    .as_artifact_creature()
+                    .from_oracle_text("Flying")
+                    .with_mana_cost(cost(vec![], 0))
+                    .id(),
+            );
+        }
+        let harmonize = scenario
+            .add_spell_to_hand_from_oracle(P0, "Harmonize", false, HARMONIZE)
+            .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
+            .id();
+        (scenario.build(), lotus, ironworks, ornithopter, harmonize)
+    };
+
+    // Reach: the Lotus ability is a pure chosen-color production with no
+    // recorded color.
+    let (runner, lotus, _, _, harmonize) = build(true);
+    assert!(matches!(
+        produced_of(&runner, lotus, 0),
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        }
+    ));
+    assert_eq!(runner.state().objects[&lotus].chosen_color(), None);
+
+    assert_eq!(
+        priority_facts(&runner, harmonize),
+        (true, false),
+        "GGG from Nyx Lotus plus CC from Ironworks pays {{2}}{{G}}{{G}}"
+    );
+
+    // Control: without Ironworks, three mana cannot pay four.
+    let (runner, _, _, _, harmonize) = build(false);
+    assert!(!priority_facts(&runner, harmonize).0);
+
+    // Control: tap the Lotus for green, sacrifice Ornithopter to Ironworks,
+    // and the cast resolves with one green left over.
+    let (mut runner, lotus, ironworks, ornithopter, harmonize) = build(true);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: lotus,
+            ability_index: 0,
+        })
+        .expect("Nyx Lotus activates");
+    runner
+        .act(GameAction::ChooseManaColor {
+            choice: engine::types::game_state::ManaChoice::SingleColor(ManaType::Green),
+            count: 1,
+        })
+        .expect("choose green");
+    assert_eq!(
+        runner.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Green),
+        3,
+        "devotion to green is 3"
+    );
+    let _ = ironworks;
+    let card_id = runner.state().objects[&harmonize].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: harmonize,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .expect("Harmonize is cast with manual payment");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ManaPayment { .. }
+    ));
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: ironworks.unwrap(),
+            ability_index: 0,
+        })
+        .expect("Ironworks activates during payment");
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![ornithopter.unwrap()],
+        })
+        .expect("sacrifice Ornithopter");
+    runner
+        .act(GameAction::PassPriority)
+        .expect("finalize the payment");
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        1,
+        "GGG + CC paid {{2}}{{G}}{{G}} with one mana unspent"
+    );
+    runner.resolve_top();
+    assert_eq!(spell_zone(&runner, harmonize), Zone::Graveyard);
+}
+
 /// CR 106.5 + CR 607.2d control: Sunken Citadel's "the chosen color" is linked
 /// to its as-enters choice. Unset, it adds no mana; once a color is chosen it
 /// pays that color.

@@ -1115,57 +1115,51 @@ pub(crate) fn chosen_color_for_mana(
 /// linked chooser: the choice is made while the ability resolves, so any of
 /// the five colors is available. Any persisted chooser that could name a color
 /// counts as linked, so an unrecognized chooser fails closed.
+///
+/// Boundary: the object's own activated abilities, triggers and replacements,
+/// each walked with the shared `ability_visit` traversal (every nested carrier,
+/// including inline branches such as `ChooseOneOf`). Static abilities are not
+/// walked: what they grant belongs to the affected objects (CR 611.2), and an
+/// ability granted to this object is already among its live `abilities`.
 pub(crate) fn chooses_color_on_activation(
     state: &GameState,
     source_id: crate::types::identifiers::ObjectId,
 ) -> bool {
+    use crate::types::ability_visit::{visit_ability_def, visit_replacement, visit_trigger};
+
     let Some(obj) = state.objects.get(&source_id) else {
         return false;
     };
     if obj.chosen_color().is_some() {
         return false;
     }
+    let mut stop_at_chooser = break_on_linked_color_chooser;
     let linked = obj
         .abilities
         .iter()
-        .any(definition_makes_linked_color_choice)
+        .any(|def| visit_ability_def(def, &mut stop_at_chooser).is_break())
         || obj
             .trigger_definitions
             .iter_all()
-            .filter_map(|entry| entry.definition.execute.as_deref())
-            .any(definition_makes_linked_color_choice)
+            .any(|entry| visit_trigger(&entry.definition, &mut stop_at_chooser).is_break())
         || obj
             .replacement_definitions
             .iter_all()
-            .filter_map(|replacement| replacement.execute.as_deref())
-            .any(definition_makes_linked_color_choice);
+            .any(|replacement| visit_replacement(replacement, &mut stop_at_chooser).is_break());
     !linked
 }
 
-/// CR 607.2d: True when any link of `def` (its chain, else branch, or modal
-/// modes) is a persisted choice whose answer could be a color, i.e. a choice
-/// "the chosen color" can refer back to.
-fn definition_makes_linked_color_choice(def: &crate::types::ability::AbilityDefinition) -> bool {
-    let here = match &*def.effect {
+/// CR 607.2d: Stop the traversal at a persisted choice whose answer could be a
+/// color, i.e. a choice "the chosen color" can refer back to.
+fn break_on_linked_color_chooser(effect: &Effect) -> std::ops::ControlFlow<()> {
+    match effect {
         Effect::Choose {
             choice_type,
             persist: true,
             ..
-        } => choice_type_can_name_a_color(choice_type),
-        _ => false,
-    };
-    here || def
-        .sub_ability
-        .as_deref()
-        .is_some_and(definition_makes_linked_color_choice)
-        || def
-            .else_ability
-            .as_deref()
-            .is_some_and(definition_makes_linked_color_choice)
-        || def
-            .mode_abilities
-            .iter()
-            .any(definition_makes_linked_color_choice)
+        } if choice_type_can_name_a_color(choice_type) => std::ops::ControlFlow::Break(()),
+        _ => std::ops::ControlFlow::Continue(()),
+    }
 }
 
 /// CR 105.1: Whether a choice of this type can answer with a color. Labeled
@@ -1212,6 +1206,7 @@ pub(crate) fn activation_chosen_color_outputs(
     ability: &ResolvedAbility,
 ) -> Vec<(ManaType, usize)> {
     let ManaProduction::ChosenColor {
+        count,
         fixed_alternative: None,
         ..
     } = produced
@@ -1221,13 +1216,22 @@ pub(crate) fn activation_chosen_color_outputs(
     if !chooses_color_on_activation(state, ability.source_id) {
         return Vec::new();
     }
+    // The amount can read the choice (devotion to that color) from
+    // `last_named_choice`, so it is evaluated on one copy with each color
+    // written in turn; only the scalar count is resolved.
     let mut probe = state.clone();
     let mut outputs = Vec::new();
     for color in ManaColor::ALL.iter().copied() {
         probe.last_named_choice = Some(ChoiceValue::Color(color));
-        let count = resolve_mana_types_for_ability(produced, &probe, ability).len();
-        if count > 0 {
-            outputs.push((mana_color_to_type(&color), count));
+        let amount = resolve_count(
+            count,
+            &probe,
+            Some(ability),
+            ability.controller,
+            ability.source_id,
+        );
+        if amount > 0 {
+            outputs.push((mana_color_to_type(&color), amount));
         }
     }
     outputs

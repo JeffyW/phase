@@ -2337,9 +2337,29 @@ pub(crate) fn has_activatable_non_tap_mana_ability_for_payment(
 #[derive(Debug, Clone)]
 enum ActivatableManaProfileKind {
     Exact(Vec<ManaType>),
-    AnyOneColor { count: u32, options: Vec<ManaType> },
-    AnyCombination { count: u32, options: Vec<ManaType> },
+    /// CR 106.1: one color is chosen per activation; each option carries the
+    /// amount that choice adds (equal for "three mana of any one color",
+    /// per color for "equal to your devotion to that color").
+    AnyOneColor {
+        options: Vec<(ManaType, u32)>,
+    },
+    AnyCombination {
+        count: u32,
+        options: Vec<ManaType>,
+    },
     CombinationChoices(Vec<Vec<ManaType>>),
+}
+
+impl ActivatableManaProfileKind {
+    /// `count` mana of any one of `options`.
+    fn any_one_color(count: u32, options: Vec<ManaType>) -> Self {
+        Self::AnyOneColor {
+            options: options
+                .into_iter()
+                .map(|mana_type| (mana_type, count))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2391,10 +2411,10 @@ fn profile_kind_from_production(
             ))
         }
         ManaProduction::AnyOneColor { color_options, .. } => {
-            Some(ActivatableManaProfileKind::AnyOneColor {
-                count: resolved_production_count(produced, state, resolved),
-                options: color_options.iter().map(mana_color_to_type).collect(),
-            })
+            Some(ActivatableManaProfileKind::any_one_color(
+                resolved_production_count(produced, state, resolved),
+                color_options.iter().map(mana_color_to_type).collect(),
+            ))
         }
         ManaProduction::AnyCombination { color_options, .. } => {
             Some(ActivatableManaProfileKind::AnyCombination {
@@ -2413,19 +2433,15 @@ fn profile_kind_from_production(
                 let outputs = super::effects::mana::activation_chosen_color_outputs(
                     state, produced, resolved,
                 );
-                let first_count = outputs.first()?.1;
-                if outputs.iter().all(|(_, count)| *count == first_count) {
-                    return Some(ActivatableManaProfileKind::AnyOneColor {
-                        count: first_count as u32,
-                        options: outputs.iter().map(|(mana_type, _)| *mana_type).collect(),
-                    });
+                if outputs.is_empty() {
+                    return None;
                 }
-                return Some(ActivatableManaProfileKind::CombinationChoices(
-                    outputs
+                return Some(ActivatableManaProfileKind::AnyOneColor {
+                    options: outputs
                         .into_iter()
-                        .map(|(mana_type, count)| vec![mana_type; count])
+                        .map(|(mana_type, count)| (mana_type, count as u32))
                         .collect(),
-                ));
+                });
             }
             let count = resolved_production_count(produced, state, resolved);
             let options = chosen_color_mana_type_options(state, object_id, *fixed_alternative);
@@ -2435,7 +2451,7 @@ fn profile_kind_from_production(
             if count <= 1 && options.len() == 1 {
                 Some(ActivatableManaProfileKind::Exact(options))
             } else {
-                Some(ActivatableManaProfileKind::AnyOneColor { count, options })
+                Some(ActivatableManaProfileKind::any_one_color(count, options))
             }
         }
         ManaProduction::OpponentLandColors { .. }
@@ -2447,10 +2463,10 @@ fn profile_kind_from_production(
             if options.is_empty() {
                 return None;
             }
-            Some(ActivatableManaProfileKind::AnyOneColor {
-                count: resolved_production_count(produced, state, resolved),
+            Some(ActivatableManaProfileKind::any_one_color(
+                resolved_production_count(produced, state, resolved),
                 options,
-            })
+            ))
         }
         ManaProduction::DistinctColorsAmongPermanents { .. } => {
             let types =
@@ -2562,13 +2578,12 @@ fn profile_kind_allowed_for_context(
                 .collect();
             (!types.is_empty()).then_some(ActivatableManaProfileKind::Exact(types))
         }
-        ActivatableManaProfileKind::AnyOneColor { count, options } => {
+        ActivatableManaProfileKind::AnyOneColor { options } => {
             let options: Vec<_> = options
                 .into_iter()
-                .filter(|mana_type| ctx.permits_actual_mana_type(*mana_type))
+                .filter(|(mana_type, _)| ctx.permits_actual_mana_type(*mana_type))
                 .collect();
-            (!options.is_empty())
-                .then_some(ActivatableManaProfileKind::AnyOneColor { count, options })
+            (!options.is_empty()).then_some(ActivatableManaProfileKind::AnyOneColor { options })
         }
         ActivatableManaProfileKind::AnyCombination { count, options } => {
             let options: Vec<_> = options
@@ -2659,10 +2674,10 @@ fn profile_applications(
             }
             vec![(remaining, types.len() as u32)]
         }
-        ActivatableManaProfileKind::AnyOneColor { count, options } => options
+        ActivatableManaProfileKind::AnyOneColor { options } => options
             .iter()
-            .flat_map(|&color| {
-                combination_assignments(*count, std::slice::from_ref(&color), requirements)
+            .flat_map(|(color, count)| {
+                combination_assignments(*count, std::slice::from_ref(color), requirements)
             })
             .collect(),
         ActivatableManaProfileKind::AnyCombination { count, options } => {
