@@ -6881,6 +6881,10 @@ mod paid_object_label_tests {
     /// `others` placed on the battlefield before it.
     fn labels(member: &str, others: &[&str]) -> Vec<Vec<ManaType>> {
         let (runner, id) = board(member, others);
+        option_labels(&runner, id)
+    }
+
+    fn option_labels(runner: &GameRunner, id: ObjectId) -> Vec<Vec<ManaType>> {
         let state = runner.state();
         let gates = mana_abilities::ManaActivationGates::compute(state);
         let auras = taps_for_mana_trigger_sources(state);
@@ -6893,6 +6897,62 @@ mod paid_object_label_tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Reviewer probe B, selected output (#8443 m1, M1-02): Nyx Lotus beside
+    /// devotion G3 / U1 offers a green row labelled GGG and a blue row labelled
+    /// U. Each label reads devotion to its own row's color (CR 700.5 +
+    /// CR 608.2d), not an unrelated blue stored on the Lotus, which is left
+    /// unchanged.
+    #[test]
+    fn color_dependent_amount_labels_each_row_with_its_own_color() {
+        use crate::types::ability::ChosenAttribute;
+        use crate::types::mana::ManaCost;
+        for stored in [None, Some(ManaColor::Blue)] {
+            let mut scenario = GameScenario::new();
+            let lotus = scenario
+                .add_artifact_from_oracle(
+                    P0,
+                    "Nyx Lotus",
+                    "{T}: Choose a color. Add an amount of mana of that color equal to your devotion to that color.",
+                )
+                .id();
+            scenario
+                .add_creature(P0, "Leatherback Baloth", 4, 5)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green; 3],
+                    generic: 0,
+                });
+            scenario
+                .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 0,
+                });
+            let mut runner = scenario.build();
+            if let Some(color) = stored {
+                runner
+                    .state_mut()
+                    .objects
+                    .get_mut(&lotus)
+                    .unwrap()
+                    .chosen_attributes
+                    .push(ChosenAttribute::Color(color));
+            }
+            assert!(matches!(
+                &*runner.state().objects[&lotus].abilities[0].effect,
+                Effect::Mana {
+                    produced: ManaProduction::AnyOneColor { .. },
+                    ..
+                }
+            ));
+            assert_eq!(
+                option_labels(&runner, lotus),
+                vec![vec![ManaType::Green; 3], vec![ManaType::Blue]],
+                "{stored:?}"
+            );
+            assert_eq!(runner.state().objects[&lotus].chosen_color(), stored);
+        }
     }
 
     /// CR 608.2h: Priest of Yawgmoth ("{T}, Sacrifice an artifact: Add an
