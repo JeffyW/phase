@@ -147,6 +147,10 @@ fn oft_nabbed_goat_is_not_offered_outside_the_opponents_sorcery_timing() {
         .id();
     s.with_mana_pool(P0, colorless(1));
     let mut r = s.build();
+    assert!(
+        legal_actions(r.state()).contains(&activate(goat)),
+        "reach guard: offered to P0 in its own main phase with an empty stack"
+    );
     // P1's turn; P0 holds priority (not the active player).
     r.state_mut().active_player = P1;
     r.state_mut().priority_player = P0;
