@@ -7616,6 +7616,21 @@ pub(super) fn handle_resolution_choice(
                 ));
             }
 
+            // CR 614.12a: a pre-entry as-enters choice answers the parked
+            // battlefield entry, not a resolving ability — no object binding and
+            // no continuation.
+            if source.as_ref().is_some_and(|source| {
+                source.binding == crate::types::game_state::NamedChoiceSourceBinding::PendingEntry
+            }) {
+                let waiting_for = crate::game::engine_replacement::handle_entry_named_choice(
+                    state,
+                    &choice_type,
+                    &choice,
+                    events,
+                )?;
+                return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
+            }
+
             // CR 607.2d + CR 613.1: Persist the chosen attribute on the source
             // (Morophon buffs, Pithing Needle prohibitions, Serra's Emissary
             // protection, Sewer Nemesis CDA, …), recompute layers for the

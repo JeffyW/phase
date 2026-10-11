@@ -15,9 +15,9 @@ use crate::game::targeting::{DeclaredSlotBinding, SlotReferent};
 use crate::types::ability::{
     AbilityCondition, AttachmentReferent, AttackerBlockStatus, CardTypeSetSource,
     CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatRelation, CombatRelationSubject,
-    ControllerRef, CountScope, FilterProp, Parity, ParitySource, PlayerFilter, PtStat,
-    PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility, SharedQuality, SharedQualityRelation,
-    TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    ContinuousModification, ControllerRef, CountScope, FilterProp, Parity, ParitySource,
+    PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef, ResolvedAbility, SharedQuality,
+    SharedQualityRelation, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::{CoreType, Supertype};
@@ -4621,6 +4621,293 @@ fn entering_object_projection(
     state.entering_or_live_object(*object_id).cloned()
 }
 
+/// CR 614.12: the entering permanent "as it would exist on the battlefield"
+/// for an entrant whose as-enters choices are made before it enters
+/// (`replacement::object_has_pre_entry_choice`). Two typed boundaries:
+///
+/// * [`EntryProjection::proposed`] — while the entry is still a proposal. The
+///   object is prepared as the NEW object (CR 400.7): its chosen attributes are
+///   exactly the choices this entry already carries (a returning permanent's old
+///   choice is not its own), its zone is the battlefield and its controller is
+///   the one it will enter under (CR 110.2 + CR 110.2a).
+/// * [`EntryProjection::delivered`] — the object that has just entered (already
+///   reset, its choices installed), for the static "enters with an additional
+///   counter" path that reads it before the layer pass runs.
+///
+/// Both then apply the object's own static abilities that would apply to it on
+/// the battlefield (types and colours, CR 613.1d / CR 613.1e) through the layer
+/// pass's own per-object applier. Other entrants are not projected.
+pub(crate) enum EntryProjection {}
+
+impl EntryProjection {
+    /// CR 614.12 + CR 614.12a: `staged` (the entrant as currently staged) as it
+    /// would exist on the battlefield with `entry_choices` made. `None` when the
+    /// entrant has no pre-entry choice.
+    fn proposed(
+        state: &GameState,
+        mut staged: crate::game::game_object::GameObject,
+        entry_choices: &[ChosenAttribute],
+        controller_override: Option<PlayerId>,
+    ) -> Option<crate::game::game_object::GameObject> {
+        if !crate::game::replacement::object_has_pre_entry_choice(&staged) {
+            return None;
+        }
+        staged.chosen_attributes = entry_choices.to_vec();
+        // allow-raw-zone: sets the zone of a detached projection clone used only to evaluate a filter; no zone change occurs (CR 614.12).
+        staged.zone = Zone::Battlefield;
+        staged.controller = controller_override.unwrap_or(staged.owner);
+        apply_entrant_own_statics(state, &mut staged);
+        Some(staged)
+    }
+
+    /// CR 614.12: the just-delivered entrant with its own statics applied.
+    /// `None` when it has no pre-entry choice.
+    pub(crate) fn delivered(
+        state: &GameState,
+        object_id: ObjectId,
+    ) -> Option<crate::game::game_object::GameObject> {
+        let mut entered = state.objects.get(&object_id)?.clone();
+        if !crate::game::replacement::object_has_pre_entry_choice(&entered) {
+            return None;
+        }
+        apply_entrant_own_statics(state, &mut entered);
+        Some(entered)
+    }
+}
+
+/// CR 614.12: whether a static of the entrant can be evaluated by the entry
+/// projection. `false` for a type/colour static whose condition the projection
+/// cannot read on the entrant (anything but its own chosen label) or that sets a
+/// land subtype (CR 305.7's ability removal belongs to the layer pass).
+/// Statics that only affect the object an Aura or Equipment is attached to
+/// can't apply to the entrant itself and are always supportable.
+pub(crate) fn entry_projection_supports_static(
+    def: &crate::types::ability::StaticDefinition,
+) -> bool {
+    if def.mode != StaticMode::Continuous
+        || !def.modifications.iter().any(is_type_or_color_modification)
+        || static_affects_only_attachment_host(def)
+    {
+        return true;
+    }
+    let condition_supported = match &def.condition {
+        None | Some(crate::types::ability::StaticCondition::ChosenLabelIs { .. }) => true,
+        Some(_) => false,
+    };
+    condition_supported
+        && !def.modifications.iter().any(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::SetBasicLandType { .. }
+                    | ContinuousModification::SetChosenBasicLandType
+            )
+        })
+}
+
+/// CR 614.12 + CR 616.1e: whether the entrant's projection depends on its
+/// as-enters choices — an own static that applies the chosen subtype or colour,
+/// or a type/colour static gated on the chosen label.
+pub(crate) fn entry_projection_reads_choices(
+    entrant: &crate::game::game_object::GameObject,
+) -> bool {
+    entrant.static_definitions.iter_all().any(|def| {
+        def.mode == StaticMode::Continuous
+            && (def.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::AddChosenSubtype { .. }
+                        | ContinuousModification::AddChosenColor { .. }
+                )
+            }) || (matches!(
+                def.condition,
+                Some(crate::types::ability::StaticCondition::ChosenLabelIs { .. })
+            ) && def.modifications.iter().any(is_type_or_color_modification)))
+    })
+}
+
+/// CR 613.1d + CR 613.1e: a type- or colour-changing modification.
+fn is_type_or_color_modification(modification: &ContinuousModification) -> bool {
+    is_color_modification(modification)
+        || matches!(
+            modification,
+            ContinuousModification::AddType { .. }
+                | ContinuousModification::RemoveType { .. }
+                | ContinuousModification::AddSubtype { .. }
+                | ContinuousModification::RemoveSubtype { .. }
+                | ContinuousModification::SetCardTypes { .. }
+                | ContinuousModification::RemoveAllSubtypes { .. }
+                | ContinuousModification::AddSupertype { .. }
+                | ContinuousModification::RemoveSupertype { .. }
+                | ContinuousModification::AddAllCreatureTypes
+                | ContinuousModification::AddAllBasicLandTypes
+                | ContinuousModification::AddAllLandTypes
+                | ContinuousModification::AddChosenSubtype { .. }
+                | ContinuousModification::SetBasicLandType { .. }
+                | ContinuousModification::SetChosenBasicLandType
+        )
+}
+
+/// CR 613.1e: a colour-changing (layer 5) modification.
+fn is_color_modification(modification: &ContinuousModification) -> bool {
+    matches!(
+        modification,
+        ContinuousModification::SetColor { .. }
+            | ContinuousModification::AddColor { .. }
+            | ContinuousModification::AddChosenColor { .. }
+    )
+}
+
+/// CR 303.4 + CR 301.5: "enchanted/equipped [object]" names the object this
+/// Aura or Equipment is attached to — never the attachment itself.
+fn static_affects_only_attachment_host(def: &crate::types::ability::StaticDefinition) -> bool {
+    matches!(
+        &def.affected,
+        Some(TargetFilter::Typed(typed)) if typed.properties.iter().any(|prop| {
+            matches!(prop, FilterProp::EnchantedBy | FilterProp::EquippedBy)
+        })
+    )
+}
+
+/// CR 614.12: apply the entrant's own static abilities that would apply to it
+/// once it's on the battlefield — every functioning `Continuous` static whose
+/// affected set includes the entrant (its own `SelfRef` statics and global ones
+/// such as Painter's Servant's) — in layer order: types (CR 613.1d) before
+/// colours (CR 613.1e); within a layer the statics share the entrant's
+/// timestamp and apply in written order (CR 613.7a). A static the projection
+/// can't evaluate (`entry_projection_supports_static`) is skipped; such faces
+/// are marked unsupported by coverage (`ENTRY_PROJECTION_GAP`).
+fn apply_entrant_own_statics(
+    state: &GameState,
+    entrant: &mut crate::game::game_object::GameObject,
+) {
+    let statics: Vec<crate::types::ability::StaticDefinition> =
+        entrant.static_definitions.iter_all().cloned().collect();
+    let mut applicable = Vec::new();
+    for def in statics {
+        if def.mode != StaticMode::Continuous
+            || !def.modifications.iter().any(is_type_or_color_modification)
+            || !crate::game::functioning_abilities::static_functions_in_zone(entrant, &def)
+        {
+            continue;
+        }
+        if !entry_projection_supports_static(&def) {
+            continue;
+        }
+        if let Some(crate::types::ability::StaticCondition::ChosenLabelIs { label }) =
+            &def.condition
+        {
+            if !crate::game::conditions::object_chosen_label_is(entrant, label) {
+                continue;
+            }
+        }
+        let applies = match def.affected.as_ref() {
+            None => false,
+            Some(TargetFilter::SelfRef) => true,
+            Some(filter) => filter_inner_for_object(
+                state,
+                entrant,
+                entrant.id,
+                filter,
+                entrant.id,
+                Some(entrant.controller),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ControllerLookup::LiveOrLki,
+            ),
+        };
+        if applies {
+            applicable.push(def);
+        }
+    }
+    let all_creature_types = state.all_creature_types.clone();
+    for color_layer in [false, true] {
+        for def in &applicable {
+            for modification in &def.modifications {
+                if is_color_modification(modification) != color_layer {
+                    continue;
+                }
+                let chosen_subtype = match modification {
+                    ContinuousModification::AddChosenSubtype { kind } => {
+                        entrant.chosen_subtype_str(kind)
+                    }
+                    _ => None,
+                };
+                let chosen_color = entrant.chosen_color();
+                let _ = crate::game::layers::apply_type_or_color_modification(
+                    entrant,
+                    modification,
+                    chosen_subtype.as_deref(),
+                    chosen_color,
+                    &all_creature_types,
+                );
+            }
+        }
+    }
+}
+
+/// CR 614.12: match `filter` against a projected entrant (an
+/// [`EntryProjection`]) under `ctx`.
+pub(crate) fn matches_target_filter_on_object(
+    state: &GameState,
+    obj: &crate::game::game_object::GameObject,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> bool {
+    filter_inner_for_object(
+        state,
+        obj,
+        obj.id,
+        filter,
+        ctx.source_id,
+        ctx.source_controller,
+        ctx.ability,
+        ctx.trigger_source,
+        ctx.recipient_id,
+        ctx.scoped_iteration_player,
+        ctx.triggering_object,
+        ctx.declared_slot_view,
+        ctx.granting_object,
+        ControllerLookup::LiveOrLki,
+    )
+}
+
+/// CR 614.12: match a battlefield-entry filter against `staged`, projected as it
+/// would exist on the battlefield when it has a pre-entry choice.
+#[allow(clippy::too_many_arguments)]
+fn entry_filter_matches_staged(
+    state: &GameState,
+    staged: &crate::game::game_object::GameObject,
+    object_id: ObjectId,
+    entry_choices: &[ChosenAttribute],
+    controller_override: Option<PlayerId>,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> bool {
+    let projected =
+        EntryProjection::proposed(state, staged.clone(), entry_choices, controller_override);
+    filter_inner_for_object(
+        state,
+        projected.as_ref().unwrap_or(staged),
+        object_id,
+        filter,
+        ctx.source_id,
+        ctx.source_controller,
+        ctx.ability,
+        ctx.trigger_source,
+        ctx.recipient_id,
+        ctx.scoped_iteration_player,
+        ctx.triggering_object,
+        ctx.declared_slot_view,
+        ctx.granting_object,
+        ControllerLookup::LiveOrLki,
+    )
+}
+
 pub fn matches_target_filter_on_battlefield_entry(
     state: &GameState,
     event: &ProposedEvent,
@@ -4633,6 +4920,8 @@ pub fn matches_target_filter_on_battlefield_entry(
             to,
             enter_as_copy,
             face_down_profile,
+            enter_with_choices,
+            controller_override,
             ..
         } if *to == Zone::Battlefield => {
             if let Some(profile) = face_down_profile {
@@ -4675,38 +4964,40 @@ pub fn matches_target_filter_on_battlefield_entry(
                     copy.printed_ref.clone(),
                     copy.token_image_ref.clone(),
                 );
-                filter_inner_for_object(
+                entry_filter_matches_staged(
                     state,
                     &obj,
                     *object_id,
+                    crate::types::proposed_event::EntryChoices::of(enter_with_choices),
+                    *controller_override,
                     filter,
-                    ctx.source_id,
-                    ctx.source_controller,
-                    ctx.ability,
-                    ctx.trigger_source,
-                    ctx.recipient_id,
-                    ctx.scoped_iteration_player,
-                    ctx.triggering_object,
-                    ctx.declared_slot_view,
-                    ctx.granting_object,
-                    ControllerLookup::LiveOrLki,
+                    ctx,
                 )
             } else if let Some(entry) = state.liminal_entries.get(object_id) {
-                filter_inner_for_object(
+                entry_filter_matches_staged(
                     state,
                     entry.object.projected(),
                     *object_id,
+                    crate::types::proposed_event::EntryChoices::of(enter_with_choices),
+                    *controller_override,
                     filter,
-                    ctx.source_id,
-                    ctx.source_controller,
-                    ctx.ability,
-                    ctx.trigger_source,
-                    ctx.recipient_id,
-                    ctx.scoped_iteration_player,
-                    ctx.triggering_object,
-                    ctx.declared_slot_view,
-                    ctx.granting_object,
-                    ControllerLookup::LiveOrLki,
+                    ctx,
+                )
+            } else if let Some(live) = state
+                .objects
+                .get(object_id)
+                .filter(|live| crate::game::replacement::object_has_pre_entry_choice(live))
+            {
+                // CR 614.12: an entrant with a pre-entry choice is matched as it
+                // would exist on the battlefield.
+                entry_filter_matches_staged(
+                    state,
+                    live,
+                    *object_id,
+                    crate::types::proposed_event::EntryChoices::of(enter_with_choices),
+                    *controller_override,
+                    filter,
+                    ctx,
                 )
             } else {
                 matches_target_filter(state, *object_id, filter, ctx)
@@ -21760,5 +22051,218 @@ mod dandan_axis_collapse_tests {
             assert!(observes(&own), "reach: P0's own pile creature matches");
             assert!(!observes(&theirs), "P1's pile creature is not P0's");
         }
+    }
+}
+
+#[cfg(test)]
+mod entry_projection_tests {
+    //! CR 614.12 + CR 614.12a building blocks: the pre-entry as-enters choice
+    //! shape, the projection's static-support contract, the shared type/colour
+    //! applier, and the coverage label that fails unsupported faces closed.
+    use super::*;
+    use crate::game::coverage::{card_face_gaps, ENTRY_PROJECTION_GAP};
+    use crate::game::layers::{apply_type_or_color_modification, TypeColorModification};
+    use crate::game::replacement::as_enters_choice_type;
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, ChoiceType, ChosenSubtypeKind, ColorChangeMode, Effect,
+        ReplacementDefinition, ReplacementMode, StaticCondition, StaticDefinition,
+        TargetSelectionMode,
+    };
+    use crate::types::card::CardFace;
+    use crate::types::replacements::ReplacementEvent;
+
+    fn choose(persist: bool, selection: TargetSelectionMode) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Choose {
+                choice_type: ChoiceType::CreatureType { options: vec![] },
+                persist,
+                selection,
+            },
+        )
+    }
+
+    fn as_enters(execute: AbilityDefinition) -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .execute(execute)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+    }
+
+    /// CR 614.12a: only the single persisting, player-chosen as-enters choice
+    /// is made before entry; chained, random, optional-cost and non-self shapes
+    /// keep their post-entry continuation.
+    #[test]
+    fn as_enters_choice_shape_is_exact() {
+        assert!(
+            as_enters_choice_type(&as_enters(choose(true, TargetSelectionMode::Chosen))).is_some()
+        );
+        assert!(
+            as_enters_choice_type(&as_enters(choose(false, TargetSelectionMode::Chosen))).is_none(),
+            "a non-persisting choice"
+        );
+        assert!(
+            as_enters_choice_type(&as_enters(choose(true, TargetSelectionMode::Random))).is_none(),
+            "a random choice"
+        );
+        let chained =
+            choose(true, TargetSelectionMode::Chosen).sub_ability(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Choose {
+                    choice_type: ChoiceType::CardName,
+                    persist: true,
+                    selection: TargetSelectionMode::Chosen,
+                },
+            ));
+        assert!(
+            as_enters_choice_type(&as_enters(chained)).is_none(),
+            "a chained follow-up"
+        );
+        let may_cost = as_enters(choose(true, TargetSelectionMode::Chosen))
+            .mode(ReplacementMode::Optional { decline: None });
+        assert!(
+            as_enters_choice_type(&may_cost).is_none(),
+            "an optional replacement"
+        );
+        let other = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .execute(choose(true, TargetSelectionMode::Chosen))
+            .valid_card(TargetFilter::Any);
+        assert!(
+            as_enters_choice_type(&other).is_none(),
+            "not the entrant's own"
+        );
+    }
+
+    fn self_static(modification: ContinuousModification) -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![modification])
+    }
+
+    /// CR 614.12 completeness contract: unconditional and chosen-label-gated
+    /// type/colour statics are projected; any other condition and the
+    /// ability-removing land-subtype sets are not, unless the static can only
+    /// affect an attachment host.
+    #[test]
+    fn projection_static_support_contract() {
+        let chosen = ContinuousModification::AddChosenSubtype {
+            kind: ChosenSubtypeKind::CreatureType,
+        };
+        assert!(entry_projection_supports_static(&self_static(
+            chosen.clone()
+        )));
+        assert!(entry_projection_supports_static(
+            &self_static(ContinuousModification::AddType {
+                core_type: CoreType::Artifact
+            })
+            .condition(StaticCondition::ChosenLabelIs {
+                label: "1/6".to_string()
+            })
+        ));
+        assert!(!entry_projection_supports_static(
+            &self_static(chosen).condition(StaticCondition::SourceIsAttacking)
+        ));
+        assert!(!entry_projection_supports_static(&self_static(
+            ContinuousModification::SetChosenBasicLandType
+        )));
+        let enchanted_land = StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::land().properties(vec![FilterProp::EnchantedBy]),
+            ))
+            .modifications(vec![ContinuousModification::SetChosenBasicLandType]);
+        assert!(entry_projection_supports_static(&enchanted_land));
+        // A static that changes no type or colour is outside the contract.
+        assert!(entry_projection_supports_static(
+            &self_static(ContinuousModification::AddPower { value: 1 })
+                .condition(StaticCondition::SourceIsAttacking)
+        ));
+    }
+
+    /// CR 613.1d + CR 613.1e: the shared applier performs exactly the type and
+    /// colour modifications and declines the rest.
+    #[test]
+    fn type_or_color_applier_partitions_modifications() {
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Probe".to_string(),
+            Zone::Battlefield,
+        );
+        let types = vec!["Angel".to_string()];
+        assert_eq!(
+            apply_type_or_color_modification(
+                &mut obj,
+                &ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType
+                },
+                Some("Angel"),
+                None,
+                &types,
+            ),
+            TypeColorModification::Applied
+        );
+        assert!(obj.card_types.subtypes.iter().any(|s| s == "Angel"));
+        assert_eq!(
+            apply_type_or_color_modification(
+                &mut obj,
+                &ContinuousModification::AddChosenColor {
+                    mode: ColorChangeMode::Add
+                },
+                None,
+                Some(ManaColor::Blue),
+                &types,
+            ),
+            TypeColorModification::Applied
+        );
+        assert_eq!(obj.color, vec![ManaColor::Blue]);
+        assert_eq!(
+            apply_type_or_color_modification(
+                &mut obj,
+                &ContinuousModification::SetChosenBasicLandType,
+                Some("Island"),
+                None,
+                &types,
+            ),
+            TypeColorModification::Unsupported
+        );
+        assert_eq!(
+            apply_type_or_color_modification(
+                &mut obj,
+                &ContinuousModification::AddPower { value: 1 },
+                None,
+                None,
+                &types,
+            ),
+            TypeColorModification::OtherLayer
+        );
+    }
+
+    /// Fail closed: a face whose as-enters choice is made before entry but
+    /// whose own type static the projection can't evaluate is unsupported.
+    #[test]
+    fn unsupported_projection_face_carries_the_coverage_gap() {
+        let mut face = CardFace::default();
+        face.replacements
+            .push(as_enters(choose(true, TargetSelectionMode::Chosen)));
+        face.static_abilities
+            .push(self_static(ContinuousModification::AddChosenSubtype {
+                kind: ChosenSubtypeKind::CreatureType,
+            }));
+        assert!(
+            !card_face_gaps(&face)
+                .iter()
+                .any(|gap| gap == ENTRY_PROJECTION_GAP),
+            "the Metallic Mimic shape is supported"
+        );
+        face.static_abilities.push(
+            self_static(ContinuousModification::AddType {
+                core_type: CoreType::Artifact,
+            })
+            .condition(StaticCondition::SourceIsAttacking),
+        );
+        assert!(card_face_gaps(&face)
+            .iter()
+            .any(|gap| gap == ENTRY_PROJECTION_GAP));
     }
 }

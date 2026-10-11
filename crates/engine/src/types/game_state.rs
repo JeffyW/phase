@@ -851,6 +851,12 @@ impl PromptSourceBinding {
 pub enum NamedChoiceSourceBinding {
     ResolutionContext,
     ExactObjectAndResolution,
+    /// CR 614.12a: the answer belongs to the battlefield entry parked in
+    /// `GameState::pending_replacement` — an "As ~ enters, choose …"
+    /// replacement whose choice is made before the permanent enters. The answer
+    /// rides the entry event (`ProposedEvent::ZoneChange::enter_with_choices`)
+    /// and is never written onto a live object or resolution projection.
+    PendingEntry,
 }
 
 /// Exact source authority carried by a source-bound `NamedChoice` prompt.
@@ -25294,6 +25300,14 @@ pub struct PendingReplacement {
     /// before the replacement is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may_cost_remaining: Option<AbilityCost>,
+    /// The event the logical zone-change owner parked on, when it differs from
+    /// `proposed`. An answered pre-entry choice (CR 614.12a) writes into
+    /// `proposed`, and a CR 616.1f re-park replaces it, but the owner's paused
+    /// delivery is keyed on the exact event it first parked on
+    /// (`PendingZoneChangeDelivery::captures`). `None` means `proposed` is that
+    /// boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_boundary: Option<Box<ProposedEvent>>,
 }
 
 /// CR 701.21a: The subject and controller of a sacrifice whose inner zone
@@ -27761,7 +27775,14 @@ impl GameState {
     pub fn pending_zone_change_delivery_from_replacement(
         &self,
     ) -> Option<PendingZoneChangeDelivery> {
-        let expected_event = self.pending_replacement.as_ref()?.proposed.clone();
+        let pending = self.pending_replacement.as_ref()?;
+        // The owner parked on `delivery_boundary` when an answered pre-entry
+        // choice or a CR 616.1f re-park has since changed `proposed`.
+        let expected_event = pending
+            .delivery_boundary
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| pending.proposed.clone());
         let object_id = match &expected_event {
             ProposedEvent::ZoneChange { object_id, .. } => *object_id,
             _ => return None,

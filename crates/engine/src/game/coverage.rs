@@ -7322,7 +7322,31 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
         &mut missing,
     );
     check_shared_source_graveyard_slot(face, &mut missing);
+    check_entry_projection(face, &mut missing);
     missing
+}
+
+/// The coverage label for a face whose as-enters choice is made before it
+/// enters (CR 614.12a) but which has a type/colour static the CR 614.12 entry
+/// projection can't evaluate on the entrant (`filter::entry_projection_supports_static`).
+/// Entry replacements would see the permanent without that static, so the face
+/// is unsupported and fails closed.
+pub const ENTRY_PROJECTION_GAP: &str = "Replacement:as_enters_projection";
+
+fn check_entry_projection(face: &CardFace, missing: &mut Vec<String>) {
+    let has_pre_entry_choice = face
+        .replacements
+        .iter()
+        .any(|def| crate::game::replacement::as_enters_choice_type(def).is_some());
+    if has_pre_entry_choice
+        && face
+            .static_abilities
+            .iter()
+            .any(|def| !crate::game::filter::entry_projection_supports_static(def))
+        && !missing.iter().any(|label| label == ENTRY_PROJECTION_GAP)
+    {
+        missing.push(ENTRY_PROJECTION_GAP.to_string());
+    }
 }
 
 /// The coverage label for a graveyard-cast permission whose extra cost
