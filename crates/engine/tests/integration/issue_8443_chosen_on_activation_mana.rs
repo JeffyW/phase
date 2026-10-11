@@ -16,9 +16,9 @@ use engine::game::planechase::PlanarDieFace;
 use engine::game::printed_cards::apply_card_face_to_object;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ChosenAttribute,
-    ContinuousModification, Duration, Effect, ManaProduction, PlayerFilter, QuantityExpr,
-    ReplacementDefinition, StaticDefinition, TargetFilter, TargetSelectionMode,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ChoiceValue,
+    ChosenAttribute, ContinuousModification, Duration, Effect, ManaProduction, PlayerFilter,
+    QuantityExpr, ReplacementDefinition, StaticDefinition, TargetFilter, TargetSelectionMode,
 };
 use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
@@ -760,6 +760,60 @@ fn nyx_lotus_manual_activation_counts_the_color_chosen_for_it() {
         1
     );
     assert_eq!(runner.state().players[0].mana_pool.total(), 1);
+}
+
+/// CR 608.2d + CR 700.5: The no-override resolver counts the color it produces,
+/// regardless of an unrelated stored or global color choice.
+#[test]
+fn nyx_lotus_default_resolution_counts_its_first_color_option() {
+    for stored in [None, Some(ManaColor::Blue)] {
+        for (options, expected_color, expected_amount) in [
+            (ManaColor::ALL.to_vec(), ManaType::White, 0),
+            (vec![ManaColor::Green, ManaColor::Blue], ManaType::Green, 3),
+            (vec![], ManaType::White, 0),
+        ] {
+            let (mut runner, lotus) = nyx_lotus_devotion_board(stored);
+            runner.state_mut().last_named_choice = Some(ChoiceValue::Color(ManaColor::Blue));
+            assert_eq!(
+                engine::game::devotion::count_devotion(runner.state(), P0, &[ManaColor::White]),
+                0,
+                "white and blue devotion differ; blue devotion is one"
+            );
+            let mut ability = runner.state().objects[&lotus].abilities[0].clone();
+            let Effect::Mana { produced, .. } = Arc::make_mut(&mut ability.effect) else {
+                panic!("Nyx Lotus must have a mana production");
+            };
+            let ManaProduction::AnyOneColor { color_options, .. } = produced else {
+                panic!("Nyx Lotus must choose its color during resolution");
+            };
+            *color_options = options;
+            let mut events = Vec::new();
+            engine::game::mana_abilities::resolve_mana_ability(
+                runner.state_mut(),
+                lotus,
+                P0,
+                &ability,
+                &mut events,
+                None,
+            )
+            .expect("the direct no-override mana resolver completes");
+            let state = runner.state();
+            assert!(
+                state.objects[&lotus].tapped,
+                "the real activation cost was paid"
+            );
+            assert_eq!(
+                state.players[0].mana_pool.count_color(expected_color),
+                expected_amount
+            );
+            assert_eq!(state.players[0].mana_pool.total(), expected_amount);
+            assert_eq!(state.objects[&lotus].chosen_color(), stored);
+            assert_eq!(
+                state.last_named_choice,
+                Some(ChoiceValue::Color(ManaColor::Blue))
+            );
+        }
+    }
 }
 
 const NYX_PLANE: &str = "Nontoken creatures are enchantments in addition to their other types.\nConstellation — Whenever an enchantment you control enters, you gain 1 life.\nWhenever chaos ensues, choose a color. Add an amount of mana of that color equal to your devotion to that color.";

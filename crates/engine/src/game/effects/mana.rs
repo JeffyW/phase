@@ -732,16 +732,18 @@ fn resolve_mana_types_impl(
         }
         // CR 106.5: If an ability would produce one or more mana of an undefined type,
         // it produces no mana instead.
-        ManaProduction::AnyOneColor {
-            count,
-            color_options,
-            ..
-        } => {
-            let amount = resolve_count(count, state, ability, controller, source_id);
-            let Some(mana_type) = color_options.first().map(mana_color_to_type) else {
+        ManaProduction::AnyOneColor { color_options, .. } => {
+            let Some(&color) = color_options.first() else {
                 return Vec::new();
             };
-            vec![mana_type; amount]
+            // CR 608.2d + CR 700.5: The count reads this production's selected
+            // color, including when the default path makes that choice.
+            let bound = bind_any_one_color_choice(produced, color);
+            let ManaProduction::AnyOneColor { count, .. } = &*bound else {
+                unreachable!("binding preserves the production variant");
+            };
+            let amount = resolve_count(count, state, ability, controller, source_id);
+            vec![mana_color_to_type(&color); amount]
         }
         ManaProduction::AnyCombination {
             count,
