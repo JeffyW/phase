@@ -39,7 +39,8 @@ const SKULKING_GHOST: &str =
     "Flying\nWhen this creature becomes the target of a spell or ability, sacrifice it.";
 const DISENCHANT: &str = "Destroy target artifact or enchantment.";
 const SHOCK: &str = "Shock deals 2 damage to any target.";
-const FIREBALL: &str = "This spell costs {1} more to cast for each target beyond the first.\nFireball deals X damage divided evenly, rounded down, among any number of targets.";
+const PYROTECHNICS: &str =
+    "Pyrotechnics deals 4 damage divided as you choose among any number of targets.";
 const BONE_SPLINTERS: &str =
     "As an additional cost to cast this spell, sacrifice a creature.\nDestroy target creature.";
 const PACIFISM: &str = "Enchant creature\nEnchanted creature can't attack or block.";
@@ -112,9 +113,9 @@ fn bone_splinters(sc: &mut GameScenario, player: PlayerId) -> ObjectId {
         .id()
 }
 
-fn fireball(sc: &mut GameScenario, player: PlayerId) -> ObjectId {
-    sc.add_spell_to_hand_from_oracle(player, "Fireball", false, FIREBALL)
-        .with_mana_cost(mana(&[ManaCostShard::X, ManaCostShard::Red], 0))
+fn pyrotechnics(sc: &mut GameScenario, player: PlayerId) -> ObjectId {
+    sc.add_spell_to_hand_from_oracle(player, "Pyrotechnics", false, PYROTECHNICS)
+        .with_mana_cost(mana(&[ManaCostShard::Red], 4))
         .id()
 }
 
@@ -439,8 +440,17 @@ fn ward_triggers_across_a_damage_division() {
     for mode in [CastPaymentMode::Auto, CastPaymentMode::Manual] {
         let mut sc = board();
         let ward = ward_creature(&mut sc, P1);
-        let spell = fireball(&mut sc, P0);
-        sc.with_mana_pool(P0, pool(&[ManaType::Red, ManaType::Colorless]));
+        let spell = pyrotechnics(&mut sc, P0);
+        sc.with_mana_pool(
+            P0,
+            pool(&[
+                ManaType::Red,
+                ManaType::Colorless,
+                ManaType::Colorless,
+                ManaType::Colorless,
+                ManaType::Colorless,
+            ]),
+        );
         let mut runner = sc.build();
 
         cast(&mut runner, spell, mode);
@@ -448,7 +458,6 @@ fn ward_triggers_across_a_damage_division() {
             &mut runner,
             &Answers {
                 target: Some(ward),
-                x: Some(1),
                 ..Default::default()
             },
         );
