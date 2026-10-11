@@ -25219,6 +25219,36 @@ pub(crate) fn can_pay_ability_cost_now(
     )
 }
 
+/// CR 602.2: True when `obj` has an activated ability that `player` may begin to
+/// activate although `player` does not control `obj` — the "unless the object
+/// specifically says otherwise" exception ("Any player may activate this
+/// ability", "Only your opponents may activate this ability").
+///
+/// A cheap pre-filter for enumerators that otherwise scope a zone scan to the
+/// acting player's own objects. It reads the same permission authority as
+/// activation itself ([`player_may_begin_activating`]) but nothing else:
+/// timing, restrictions, targets and costs are still decided per ability by
+/// [`can_activate_ability_now`]. Runtime-granted activations (cycling, equip,
+/// plot, graveyard grants) are never non-controller permissions, so the
+/// object's own ability list is the complete domain.
+pub fn object_permits_non_controller_activation(
+    state: &GameState,
+    player: PlayerId,
+    obj: &GameObject,
+) -> bool {
+    let reference = obj.controller_or_owner();
+    reference != player
+        && obj.abilities.iter().any(|ability| {
+            ability.kind == AbilityKind::Activated
+                && player_may_begin_activating(
+                    state,
+                    player,
+                    reference,
+                    ability.activator_filter.as_ref(),
+                )
+        })
+}
+
 /// CR 602.2: Whether `player` may begin to activate an activated ability whose
 /// permission reference point is `source_controller`.
 ///

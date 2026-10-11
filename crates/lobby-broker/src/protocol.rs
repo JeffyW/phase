@@ -60,6 +60,11 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 130 — `GameState::linked_exile_lki` holds one incarnation-bounded
+///      `LinkedExileLki` per departure (CR 400.7). A v129 peer cannot decode a
+///      non-empty map. Full-game peers and P2P move in lockstep (wire 112); no
+///      lobby carrier names it.
+///
 /// 129 — Loop-shortcut and period-confirmation shapes, one bump over 128. P2P
 ///      moves in lockstep (wire 111); lobby messages are unchanged.
 ///      - `ShortcutDecisionSchema` replaced `max_iterations: u32` with the pair
@@ -999,7 +1004,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 129;
+pub const PROTOCOL_VERSION: u32 = 130;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2256,12 +2261,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 129);
+        assert_eq!(PROTOCOL_VERSION, 130);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 128);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 129);
     }
 
     #[test]
