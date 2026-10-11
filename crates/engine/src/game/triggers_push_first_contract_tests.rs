@@ -3,7 +3,8 @@ use crate::game::effects::resolve_ability_chain;
 use crate::game::zones::create_object;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect,
-    QuantityExpr, ResolvedAbility, TargetFilter, TargetRef, TriggerDefinition, TypedFilter,
+    ModalChoice, PlayerFilter, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+    TargetSelectionMode, TriggerDefinition, TypedFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
@@ -585,8 +586,6 @@ fn random_modal_trigger_resolves_without_prompting() {
 /// `max_choices` 0 the draw can only choose zero modes, so the outcome is fixed.
 #[test]
 fn random_up_to_modal_trigger_choosing_no_mode_is_removed() {
-    use crate::types::ability::{ModalChoice, PlayerFilter, QuantityExpr, TargetSelectionMode};
-
     let mut state = setup();
     state.active_player = PlayerId(0);
     state.priority_player = PlayerId(0);
