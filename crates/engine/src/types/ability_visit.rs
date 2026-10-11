@@ -1085,6 +1085,15 @@ macro_rules! exclusive_iter {
 
 define_walk!([]; [FnMut(&Effect) -> ControlFlow<()>]; visit_each_effect; skip_nodes; shared_iter);
 
+/// The exclusive effect walk: visits every `Effect` the shared walk descends,
+/// pre-order, so a visitor can rewrite a node before its children are
+/// reached (e.g. pruning a payload on a throwaway copy).
+pub mod effects_mut {
+    use super::*;
+
+    define_walk!([mut]; [FnMut(&mut Effect) -> ControlFlow<()>]; visit_each_effect; skip_nodes; exclusive_iter);
+}
+
 /// A definition node surfaced by the exclusive walk.
 pub enum DefinitionNodeMut<'a> {
     Ability(&'a mut AbilityDefinition),

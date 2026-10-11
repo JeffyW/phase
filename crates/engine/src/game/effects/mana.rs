@@ -6,7 +6,7 @@ use crate::types::ability::{
     ChoiceValue, Effect, EffectError, EffectKind, LinkedExileScope, ManaProduction,
     ManaSpendRestriction, ManaTargetRole, ManaTargetSlot, ObjectScope, ResolvedAbility, TargetRef,
 };
-use crate::types::ability_visit::{nodes_mut, visit_ability_def, DefinitionNodeMut};
+use crate::types::ability_visit::{effects_mut, visit_ability_def};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, ManaChoice, ManaChoiceContext, ManaChoicePrompt, MayTriggerOrigin, WaitingFor,
@@ -1160,8 +1160,10 @@ pub(crate) fn chooses_color_on_activation(
 
 /// CR 607.2d: Whether `def` carries a linked color chooser outside every
 /// payload it installs on another object. Without such a payload the shared
-/// walk answers directly; otherwise a copy with each payload pruned where it
-/// occurs (pre-order, by the shared mutable walk) is searched.
+/// walk answers directly; otherwise a copy is searched after the shared
+/// mutable effect walk (`effects_mut`, pre-order) prunes each payload at every
+/// effect node where it occurs, including effects nested directly in other
+/// effects or in costs.
 fn has_own_linked_color_chooser(def: &crate::types::ability::AbilityDefinition) -> bool {
     let has_foreign_payload = visit_ability_def(def, &mut |effect: &Effect| {
         if registers_for_another_object(effect) {
@@ -1182,10 +1184,8 @@ fn has_own_linked_color_chooser(def: &crate::types::ability::AbilityDefinition) 
         return visit_ability_def(def, find_chooser).is_break();
     }
     let mut own = def.clone();
-    let _ = nodes_mut::visit_ability_def(&mut own, &mut |node| {
-        if let DefinitionNodeMut::Ability(def) = node {
-            prune_payload_for_another_object(&mut def.effect);
-        }
+    let _ = effects_mut::visit_ability_def(&mut own, &mut |effect: &mut Effect| {
+        prune_payload_for_another_object(effect);
         ControlFlow::Continue(())
     });
     visit_ability_def(&own, find_chooser).is_break()

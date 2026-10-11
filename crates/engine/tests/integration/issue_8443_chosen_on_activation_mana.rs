@@ -1268,6 +1268,21 @@ fn own_chooser_shared_with_a_copy_payload_stays_linked() {
         !priority_facts(&runner, harmonize).0,
         "the own chooser left unset keeps Cornucopia linked (CR 106.5)"
     );
+    // The check prunes a throwaway copy: the payload and the shared arrays
+    // are unchanged after the legal-action query.
+    let obj = &runner.state().objects[&astral];
+    assert!(std::sync::Arc::ptr_eq(&payload_abilities, &obj.abilities));
+    assert!(matches!(
+        &*payload_abilities[1].effect,
+        Effect::Choose { persist: true, .. }
+    ));
+    assert!(obj
+        .replacement_definitions
+        .iter_unchecked()
+        .any(|replacement| matches!(
+            replacement.execute.as_deref().map(|d| &*d.effect),
+            Some(Effect::GenericEffect { static_abilities, .. }) if !static_abilities.is_empty()
+        )));
 
     // Control: without the copy payload, still linked.
     let (runner, _, harmonize) = build(false);
@@ -1281,6 +1296,108 @@ fn own_chooser_shared_with_a_copy_payload_stays_linked() {
         Some(ManaColor::Green)
     );
     assert!(priority_facts(&runner, harmonize).0);
+}
+
+/// Reviewer probe board (#8443 r5, R5-01, engine-shape fixture): a grant to
+/// another object nested directly inside another effect (here a draw
+/// replacement's substitute effect) is pruned like one at an ability root, so
+/// a chooser granted to the Baloth never makes Cornucopia's color linked
+/// (CR 607.2d, CR 611.2).
+#[test]
+fn chooser_granted_inside_a_nested_effect_is_not_linked() {
+    let build = |nested: bool| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
+        let astral = scenario
+            .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
+            .id();
+        scenario.with_counter(astral, charge(), 4);
+        let baloth = scenario
+            .add_creature(P0, "Leatherback Baloth", 4, 5)
+            .with_mana_cost(cost(
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                ],
+                0,
+            ))
+            .id();
+        let harmonize = scenario
+            .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
+            .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
+            .id();
+        let mut runner = scenario.build();
+        assert!(
+            priority_facts(&runner, harmonize).0,
+            "reach: plain Cornucopia pays Harmonize"
+        );
+
+        let grant_to_baloth = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::SpecificObject { id: baloth })
+                .modifications(vec![ContinuousModification::GrantAbility {
+                    definition: Box::new(
+                        AbilityDefinition::new(
+                            AbilityKind::Activated,
+                            Effect::Choose {
+                                choice_type: ChoiceType::color(),
+                                persist: true,
+                                selection: TargetSelectionMode::Chosen,
+                            },
+                        )
+                        .cost(AbilityCost::Mana {
+                            cost: ManaCost::generic(0),
+                        }),
+                    ),
+                }])],
+            duration: Some(Duration::UntilEndOfTurn),
+            target: None,
+            end_cost: None,
+        };
+        let root = if nested {
+            Effect::CreateDrawReplacement {
+                replacement_effect: Box::new(grant_to_baloth),
+            }
+        } else {
+            grant_to_baloth
+        };
+        let carrier =
+            AbilityDefinition::new(AbilityKind::Activated, root).cost(AbilityCost::Mana {
+                cost: cost(vec![], 9),
+            });
+        {
+            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+            std::sync::Arc::make_mut(&mut obj.base_abilities).push(carrier.clone());
+            std::sync::Arc::make_mut(&mut obj.abilities).push(carrier);
+        }
+        (runner, astral, harmonize)
+    };
+
+    let (runner, astral, harmonize) = build(true);
+    assert!(
+        matches!(
+            &*runner.state().objects[&astral].abilities[1].effect,
+            Effect::CreateDrawReplacement { replacement_effect }
+                if matches!(&**replacement_effect, Effect::GenericEffect { .. })
+        ),
+        "reach: the grant sits inside a draw replacement's substitute effect"
+    );
+    assert!(
+        priority_facts(&runner, harmonize).0,
+        "a chooser granted to the Baloth does not make Cornucopia's color linked"
+    );
+
+    // Control: the same grant at the ability root.
+    let (runner, _, harmonize) = build(false);
+    assert!(priority_facts(&runner, harmonize).0);
+
+    // Cast and resolve with the nested grant present.
+    let (mut runner, _, harmonize) = build(true);
+    runner.cast(harmonize).resolve();
+    assert_eq!(spell_zone(&runner, harmonize), Zone::Graveyard);
+    assert_eq!(runner.state().players[0].hand.len(), 3);
 }
 
 /// CR 106.5 + CR 607.2d control: Sunken Citadel's "the chosen color" is linked
