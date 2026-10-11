@@ -344,13 +344,12 @@ pub(crate) fn discard_legs_jointly_payable(
     let ctx = FilterContext::from_source(state, source).with_granting_object(granting_object);
     let legs: Vec<(usize, Vec<ObjectId>)> = costs
         .iter()
-        .filter_map(|cost| match cost {
-            AbilityCost::Discard {
-                count: QuantityExpr::Fixed { value },
-                filter,
-                selection: CardSelectionMode::Chosen,
-                self_scope: DiscardSelfScope::FromHand,
-            } if *value > 0 => {
+        .filter_map(|cost| {
+            let count = printed_order_discard_count(cost)?;
+            let AbilityCost::Discard { filter, .. } = cost else {
+                return None;
+            };
+            {
                 let effective_filter = cost_filter_before_x_announcement(filter.as_ref());
                 let eligible = player_state
                     .hand
@@ -363,12 +362,26 @@ pub(crate) fn discard_legs_jointly_payable(
                                 .is_none_or(|f| matches_target_filter(state, id, f, &ctx))
                     })
                     .collect();
-                Some((*value as usize, eligible))
+                Some((count, eligible))
             }
-            _ => None,
         })
         .collect();
     discard_legs_payable_for_every_choice(&legs, &[])
+}
+
+/// The legs [`discard_legs_jointly_payable`] models: a `Fixed` positive-count
+/// `Chosen` `FromHand` discard, given as a direct child of the composite being
+/// checked. Returns its count.
+fn printed_order_discard_count(cost: &AbilityCost) -> Option<usize> {
+    match cost {
+        AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value },
+            selection: CardSelectionMode::Chosen,
+            self_scope: DiscardSelfScope::FromHand,
+            ..
+        } if *value > 0 => Some(*value as usize),
+        _ => None,
+    }
 }
 
 /// Every choice of `count` cards for the first leg (from those not already
@@ -465,6 +478,20 @@ struct ObjectCostLeg<'a> {
     leaf: &'a AbilityCost,
     demand: ObjectLegDemand,
     candidates: Vec<ObjectId>,
+    coverage: ObjectLegCoverage,
+}
+
+/// Which check vouches for a leg that shares candidates with another leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectLegCoverage {
+    /// A direct child of the composite being checked that
+    /// [`discard_legs_jointly_payable`] models
+    /// ([`printed_order_discard_count`]). That check, run by the same authority
+    /// over the same children, accepts only when every printed-order selection
+    /// set leaves every later modeled discard leg payable.
+    PrintedOrderDiscardSequence,
+    /// Only the overlap policy and the assignment model cover this leg.
+    AssignmentOnly,
 }
 
 /// The object-using leaf kinds, carrying exactly what their projection reads.
@@ -778,6 +805,7 @@ fn collect_object_cost_legs<'a>(
                 leaf: cost,
                 demand: ObjectLegDemand::Unmodeled,
                 candidates,
+                coverage: ObjectLegCoverage::AssignmentOnly,
             });
         }
         ObjectCostNode::ObjectLeg(kind) => {
@@ -787,21 +815,11 @@ fn collect_object_cost_legs<'a>(
                 leaf: cost,
                 demand,
                 candidates,
+                coverage: ObjectLegCoverage::AssignmentOnly,
             });
         }
         ObjectCostNode::NoObjectLeg => {}
     }
-}
-
-fn is_chosen_hand_discard(cost: &AbilityCost) -> bool {
-    matches!(
-        cost,
-        AbilityCost::Discard {
-            selection: CardSelectionMode::Chosen,
-            self_scope: DiscardSelfScope::FromHand,
-            ..
-        }
-    )
 }
 
 /// CR 118.3 + CR 601.2h: Can every modeled leg be paid with its own distinct
@@ -856,9 +874,12 @@ fn augment_object_slot(
 /// legs under guided activation payment (the dispatcher narrows each one-object
 /// prompt to a joint completion, which is exact per pick). A multi-object leg
 /// that overlaps another leg fails closed even when guided: per-candidate
-/// narrowing can't stop a selected *set* from stranding a later leg. A pair of
-/// chosen hand-discards is exempt; [`discard_legs_jointly_payable`] checks
-/// every printed-order selection set for those.
+/// narrowing can't stop a selected *set* from stranding a later leg. The only
+/// exemption is a pair of legs that both carry
+/// [`ObjectLegCoverage::PrintedOrderDiscardSequence`]: the same authority runs
+/// [`discard_legs_jointly_payable`] over exactly those legs, which checks every
+/// printed-order selection set. Any other discard leg (a nested one, a dynamic
+/// count, a random selection) gets no exemption.
 fn object_legs_jointly_payable(legs: &[ObjectCostLeg<'_>], payment: ObjectLegPayment) -> bool {
     for (index, leg) in legs.iter().enumerate() {
         for other in &legs[index + 1..] {
@@ -869,7 +890,9 @@ fn object_legs_jointly_payable(legs: &[ObjectCostLeg<'_>], payment: ObjectLegPay
             {
                 continue;
             }
-            if is_chosen_hand_discard(leg.leaf) && is_chosen_hand_discard(other.leaf) {
+            if leg.coverage == ObjectLegCoverage::PrintedOrderDiscardSequence
+                && other.coverage == ObjectLegCoverage::PrintedOrderDiscardSequence
+            {
                 continue;
             }
             // A zero-count leg takes no object, so it competes with nothing.
@@ -895,6 +918,10 @@ fn object_legs_jointly_payable(legs: &[ObjectCostLeg<'_>], payment: ObjectLegPay
 /// satisfies both legs; but one object can pay only one leg, because paying
 /// uses it up. The cost is payable only if every leg can be given its own
 /// distinct objects at once, under the overlap policy for `payment`.
+///
+/// This is the single joint authority for a composite's direct children: it
+/// also runs [`discard_legs_jointly_payable`] over the same children, which is
+/// the evidence behind [`ObjectLegCoverage::PrintedOrderDiscardSequence`].
 pub(crate) fn object_cost_legs_jointly_payable(
     state: &GameState,
     player: PlayerId,
@@ -908,9 +935,16 @@ pub(crate) fn object_cost_legs_jointly_payable(
     }
     let mut legs = Vec::new();
     for cost in costs {
+        let first = legs.len();
         collect_object_cost_legs(state, player, source, granting_object, cost, &mut legs);
+        if printed_order_discard_count(cost).is_some() {
+            for leg in &mut legs[first..] {
+                leg.coverage = ObjectLegCoverage::PrintedOrderDiscardSequence;
+            }
+        }
     }
-    object_legs_jointly_payable(&legs, payment)
+    discard_legs_jointly_payable(state, player, source, granting_object, costs)
+        && object_legs_jointly_payable(&legs, payment)
 }
 
 /// CR 118.3 + CR 601.2h + CR 602.2b: Whether an activation's unpaid residual
@@ -924,12 +958,18 @@ pub(crate) fn activation_residual_jointly_payable(
     granting_object: Option<ObjectIncarnationRef>,
     residual: &AbilityCost,
 ) -> bool {
+    // The residual's top level plays the role of the gate's composite, so its
+    // direct children carry the same coverage they had at the gate.
+    let children = match residual {
+        AbilityCost::Composite { costs } => costs.as_slice(),
+        leaf => std::slice::from_ref(leaf),
+    };
     object_cost_legs_jointly_payable(
         state,
         player,
         source,
         granting_object,
-        std::slice::from_ref(residual),
+        children,
         ObjectLegPayment::GuidedActivation,
     )
 }
@@ -1626,15 +1666,14 @@ impl AbilityCost {
                         true,
                     ),
                     other => other.is_payable_in(state, player, source, ability_index, payment),
-                }) && discard_legs_jointly_payable(state, player, source, granting_object, costs)
-                    && object_cost_legs_jointly_payable(
-                        state,
-                        player,
-                        source,
-                        granting_object,
-                        costs,
-                        payment,
-                    )
+                }) && object_cost_legs_jointly_payable(
+                    state,
+                    player,
+                    source,
+                    granting_object,
+                    costs,
+                    payment,
+                )
             }
             // CR 118.12a: Disjunctive — payable if **any** sub-cost is
             // payable. The interactive choice is surfaced at resolution via
@@ -2479,6 +2518,18 @@ mod tests {
             leaf,
             demand,
             candidates: candidates.iter().copied().map(ObjectId).collect(),
+            coverage: ObjectLegCoverage::AssignmentOnly,
+        }
+    }
+
+    fn sequenced_discard_leg<'a>(
+        leaf: &'a AbilityCost,
+        demand: ObjectLegDemand,
+        candidates: &[u64],
+    ) -> ObjectCostLeg<'a> {
+        ObjectCostLeg {
+            coverage: ObjectLegCoverage::PrintedOrderDiscardSequence,
+            ..object_leg(leaf, demand, candidates)
         }
     }
 
@@ -2585,12 +2636,22 @@ mod tests {
             ObjectLegPayment::Unguided
         ));
         let discards = [
-            object_leg(&discard, ObjectLegDemand::Exactly(1), &[1, 2]),
-            object_leg(&discard, ObjectLegDemand::Exactly(1), &[1]),
+            sequenced_discard_leg(&discard, ObjectLegDemand::Exactly(2), &[1, 2, 3]),
+            sequenced_discard_leg(&discard, ObjectLegDemand::Exactly(1), &[1]),
         ];
         assert!(object_legs_jointly_payable(
             &discards,
             ObjectLegPayment::Unguided
+        ));
+        // Without the printed-order evidence (a nested or dynamic-count
+        // discard), a discard pair gets no exemption.
+        let unsequenced_discards = [
+            sequenced_discard_leg(&discard, ObjectLegDemand::Exactly(2), &[1, 2, 3]),
+            object_leg(&discard, ObjectLegDemand::Exactly(1), &[1]),
+        ];
+        assert!(!object_legs_jointly_payable(
+            &unsequenced_discards,
+            ObjectLegPayment::GuidedActivation
         ));
         let unmodeled_overlap = [
             object_leg(&sacrifice, ObjectLegDemand::Unmodeled, &[1, 2]),

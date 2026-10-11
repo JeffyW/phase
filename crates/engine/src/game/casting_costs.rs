@@ -1100,9 +1100,7 @@ fn spell_alternative_cost_is_payable(
         AbilityCost::Composite { costs } => {
             costs.iter().all(|sub_cost| {
                 spell_alternative_cost_is_payable(state, player, object_id, sub_cost)
-            }) && super::cost_payability::discard_legs_jointly_payable(
-                state, player, object_id, None, costs,
-            ) && super::cost_payability::object_cost_legs_jointly_payable(
+            }) && super::cost_payability::object_cost_legs_jointly_payable(
                 state,
                 player,
                 object_id,

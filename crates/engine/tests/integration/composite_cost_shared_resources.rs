@@ -14,10 +14,12 @@
 
 use engine::game::casting::can_activate_ability_now;
 use engine::game::game_object::AttachTarget;
+use engine::game::quantity::resolve_quantity;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr,
-    SacrificeCost, TargetFilter, TargetRef, TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, CardSelectionMode, ControllerRef,
+    DiscardSelfScope, Effect, QuantityExpr, QuantityRef, SacrificeCost, TargetFilter, TargetRef,
+    TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
@@ -594,6 +596,280 @@ fn probe_control_disjoint_lands_pay_through_the_replacements() {
         assert_eq!(state.stack.len(), 1, "the ability is on the stack");
         for land in lands {
             assert_ne!(state.objects[&land].zone, Zone::Battlefield);
+        }
+    }
+}
+
+// --- Review probe board (r2, F1): discard legs outside the printed-order sequence. ---
+//
+// Synthetic typed costs, not printed cards. Only direct `Fixed` chosen hand-discard
+// siblings are covered by the printed-order discard check; a dynamic count or a
+// nested leg that shares cards with another leg must fail closed, or a pick of both
+// Islands for the first leg strands the Island leg after a replacement pause.
+
+fn hand_discard(count: QuantityExpr, filter: Option<TargetFilter>) -> AbilityCost {
+    AbilityCost::Discard {
+        count,
+        filter,
+        selection: CardSelectionMode::Chosen,
+        self_scope: DiscardSelfScope::FromHand,
+    }
+}
+
+fn card_with_subtype(subtype: &str) -> Option<TargetFilter> {
+    Some(TypedFilter::default().subtype(subtype.to_string()).into())
+}
+
+fn lands_you_control() -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TypedFilter::land().controller(ControllerRef::You).into(),
+        },
+    }
+}
+
+fn fixed(value: i32) -> QuantityExpr {
+    QuantityExpr::Fixed { value }
+}
+
+/// The synthetic discard costs on the probe board.
+#[derive(Clone, Copy, Debug)]
+enum DiscardProbeCost {
+    /// The board: `[Discard (lands you control) cards, Discard an Island card]`.
+    DynamicAnyThenIsland,
+    /// Control: `[Discard two cards, Discard an Island card]` (flat, Fixed).
+    FixedTwoAnyThenIsland,
+    /// Hole (b): `[Discard two cards, Composite[Discard an Island card]]`.
+    NestedIsland,
+    /// Control: `[Discard two Forest cards, Discard an Island card]` (disjoint).
+    DisjointForestsThenIsland,
+    /// Control: `[Discard an Island card, Discard a card]` (flat, Fixed,
+    /// printed-order safe; the exemption still admits it).
+    IslandThenAny,
+}
+
+impl DiscardProbeCost {
+    fn cost(self) -> AbilityCost {
+        let island = || hand_discard(fixed(1), card_with_subtype("Island"));
+        let costs = match self {
+            Self::DynamicAnyThenIsland => vec![hand_discard(lands_you_control(), None), island()],
+            Self::FixedTwoAnyThenIsland => vec![hand_discard(fixed(2), None), island()],
+            Self::NestedIsland => vec![
+                hand_discard(fixed(2), None),
+                AbilityCost::Composite {
+                    costs: vec![island()],
+                },
+            ],
+            Self::DisjointForestsThenIsland => {
+                vec![
+                    hand_discard(fixed(2), card_with_subtype("Forest")),
+                    island(),
+                ]
+            }
+            Self::IslandThenAny => vec![island(), hand_discard(fixed(1), None)],
+        };
+        AbilityCost::Composite { costs }
+    }
+
+    /// Subtypes of the three hand cards.
+    fn hand(self) -> [&'static str; 3] {
+        match self {
+            Self::DisjointForestsThenIsland => ["Forest", "Forest", "Island"],
+            Self::DynamicAnyThenIsland
+            | Self::FixedTwoAnyThenIsland
+            | Self::NestedIsland
+            | Self::IslandThenAny => ["Island", "Island", "Forest"],
+        }
+    }
+}
+
+struct DiscardProbe {
+    runner: GameRunner,
+    source: ObjectId,
+    hand: Vec<ObjectId>,
+}
+
+fn discard_probe(cost: DiscardProbeCost, rest_in_peace: usize) -> DiscardProbe {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_enchantment_from_oracle(P0, "Synthetic Discard Altar", "")
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::GainLife {
+                    amount: fixed(1),
+                    player: TargetFilter::Controller,
+                },
+            )
+            .cost(cost.cost()),
+        )
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Green);
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let hand: Vec<ObjectId> = cost
+        .hand()
+        .iter()
+        .enumerate()
+        .map(|(i, subtype)| scenario.add_card_to_hand(P0, &format!("{subtype} card {i}")))
+        .collect();
+    for _ in 0..rest_in_peace {
+        scenario.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+    }
+    let mut runner = scenario.build();
+    for (id, subtype) in hand.iter().zip(cost.hand()) {
+        let obj = runner.state_mut().objects.get_mut(id).unwrap();
+        for types in [&mut obj.card_types, &mut obj.base_card_types] {
+            types.core_types = vec![CoreType::Land];
+            types.subtypes = vec![subtype.to_string()];
+        }
+    }
+    let state = runner.state();
+    let live = state
+        .battlefield
+        .iter()
+        .map(|id| &state.objects[id])
+        .filter(|obj| obj.name == "Rest in Peace" && !obj.replacement_definitions.is_empty())
+        .count();
+    assert_eq!(
+        live, rest_in_peace,
+        "reach: every Rest in Peace replacement is live"
+    );
+    assert_eq!(
+        resolve_quantity(state, &lands_you_control(), P0, source),
+        2,
+        "reach: the dynamic count resolves to 2"
+    );
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+            && state.stack.is_empty(),
+        "reach: P0 has priority with an empty stack"
+    );
+    DiscardProbe {
+        runner,
+        source,
+        hand,
+    }
+}
+
+fn discard_choices(runner: &GameRunner) -> Vec<ObjectId> {
+    match &runner.state().waiting_for {
+        WaitingFor::PayCost {
+            kind: PayCostKind::Discard,
+            choices,
+            ..
+        } => choices.clone(),
+        other => panic!("expected a discard cost prompt, got {other:?}"),
+    }
+}
+
+#[test]
+fn probe_overlapping_discard_outside_the_printed_order_sequence_is_refused_without_payment() {
+    for cost in [
+        DiscardProbeCost::DynamicAnyThenIsland,
+        DiscardProbeCost::FixedTwoAnyThenIsland,
+        DiscardProbeCost::NestedIsland,
+    ] {
+        for rest_in_peace in [2, 0] {
+            let DiscardProbe {
+                mut runner,
+                source,
+                hand,
+            } = discard_probe(cost, rest_in_peace);
+            let (island_a, island_b) = (hand[0], hand[1]);
+            let activated = runner.act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            });
+            if activated.is_ok() {
+                // The board's actions, so a regression shows what it pays.
+                let first = discard_choices(&runner);
+                assert!(
+                    first.contains(&island_a) && first.contains(&island_b),
+                    "reach: the first prompt offers both Islands ({cost:?})"
+                );
+                let _ = runner.act(GameAction::SelectCards {
+                    cards: vec![island_a, island_b],
+                });
+                for _ in 0..6 {
+                    if matches!(
+                        runner.state().waiting_for,
+                        WaitingFor::ReplacementChoice { .. }
+                    ) {
+                        let _ = runner.act(GameAction::ChooseReplacement { index: 0 });
+                    }
+                }
+            }
+            let state = runner.state();
+            for card in &hand {
+                assert_eq!(
+                    state.objects[card].zone,
+                    Zone::Hand,
+                    "no partial payment (CR 601.2h): {cost:?} with {rest_in_peace} Rest in Peace, \
+                     activate {activated:?}, now {:?}",
+                    state.waiting_for
+                );
+            }
+            assert!(
+                activated.is_err(),
+                "{cost:?} is refused at activation, before any prompt"
+            );
+            assert!(state.stack.is_empty() && state.pending_cast.is_none());
+        }
+    }
+}
+
+/// Controls: a disjoint pair and a printed-order-safe pair are admitted and pay
+/// in full through the Rest in Peace replacement pauses.
+#[test]
+fn probe_control_sequenced_and_disjoint_discards_pay_through_the_replacements() {
+    for cost in [
+        DiscardProbeCost::DisjointForestsThenIsland,
+        DiscardProbeCost::IslandThenAny,
+    ] {
+        let DiscardProbe {
+            mut runner,
+            source,
+            hand,
+        } = discard_probe(cost, 2);
+        assert!(can_activate_ability_now(runner.state(), P0, source, 0));
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("activation starts");
+        let picks: Vec<Vec<ObjectId>> = match cost {
+            DiscardProbeCost::DisjointForestsThenIsland => {
+                vec![vec![hand[0], hand[1]], vec![hand[2]]]
+            }
+            DiscardProbeCost::IslandThenAny => vec![vec![hand[0]], vec![hand[2]]],
+            DiscardProbeCost::DynamicAnyThenIsland
+            | DiscardProbeCost::FixedTwoAnyThenIsland
+            | DiscardProbeCost::NestedIsland => unreachable!("refused shapes"),
+        };
+        let mut paused = 0;
+        for pick in picks {
+            for card in &pick {
+                assert!(discard_choices(&runner).contains(card), "{cost:?}");
+            }
+            runner
+                .act(GameAction::SelectCards { cards: pick })
+                .expect("the pick pays its leg");
+            paused += settle_replacement_choices(&mut runner);
+        }
+        assert!(
+            paused > 0,
+            "reach: two Rest in Peace pause the discards ({cost:?})"
+        );
+        let state = runner.state();
+        assert_eq!(state.stack.len(), 1, "the ability is on the stack");
+        let discarded = match cost {
+            DiscardProbeCost::DisjointForestsThenIsland => vec![hand[0], hand[1], hand[2]],
+            _ => vec![hand[0], hand[2]],
+        };
+        for card in discarded {
+            assert_eq!(state.objects[&card].zone, Zone::Exile, "{cost:?}");
         }
     }
 }
