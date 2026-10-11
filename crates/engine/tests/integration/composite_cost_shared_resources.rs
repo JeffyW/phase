@@ -646,6 +646,10 @@ enum DiscardProbeCost {
     /// Control: `[Discard an Island card, Discard a card]` (flat, Fixed,
     /// printed-order safe; the exemption still admits it).
     IslandThenAny,
+    /// Review r3 (F2): `[Composite[Discard an Island card], Discard a card]`.
+    NestedIslandThenAny,
+    /// Review r3 (F2) control: `[Discard a card, Composite[Discard an Island card]]`.
+    AnyThenNestedIsland,
 }
 
 impl DiscardProbeCost {
@@ -667,18 +671,31 @@ impl DiscardProbeCost {
                 ]
             }
             Self::IslandThenAny => vec![island(), hand_discard(fixed(1), None)],
+            Self::NestedIslandThenAny => vec![
+                AbilityCost::Composite {
+                    costs: vec![island()],
+                },
+                hand_discard(fixed(1), None),
+            ],
+            Self::AnyThenNestedIsland => vec![
+                hand_discard(fixed(1), None),
+                AbilityCost::Composite {
+                    costs: vec![island()],
+                },
+            ],
         };
         AbilityCost::Composite { costs }
     }
 
-    /// Subtypes of the three hand cards.
-    fn hand(self) -> [&'static str; 3] {
+    /// Subtypes of the hand cards.
+    fn hand(self) -> &'static [&'static str] {
         match self {
-            Self::DisjointForestsThenIsland => ["Forest", "Forest", "Island"],
+            Self::DisjointForestsThenIsland => &["Forest", "Forest", "Island"],
             Self::DynamicAnyThenIsland
             | Self::FixedTwoAnyThenIsland
             | Self::NestedIsland
-            | Self::IslandThenAny => ["Island", "Island", "Forest"],
+            | Self::IslandThenAny => &["Island", "Island", "Forest"],
+            Self::NestedIslandThenAny | Self::AnyThenNestedIsland => &["Island", "Forest"],
         }
     }
 }
@@ -717,7 +734,7 @@ fn discard_probe(cost: DiscardProbeCost, rest_in_peace: usize) -> DiscardProbe {
         scenario.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
     }
     let mut runner = scenario.build();
-    for (id, subtype) in hand.iter().zip(cost.hand()) {
+    for (id, subtype) in hand.iter().zip(cost.hand().iter()) {
         let obj = runner.state_mut().objects.get_mut(id).unwrap();
         for types in [&mut obj.card_types, &mut obj.base_card_types] {
             types.core_types = vec![CoreType::Land];
@@ -846,7 +863,9 @@ fn probe_control_sequenced_and_disjoint_discards_pay_through_the_replacements() 
             DiscardProbeCost::IslandThenAny => vec![vec![hand[0]], vec![hand[2]]],
             DiscardProbeCost::DynamicAnyThenIsland
             | DiscardProbeCost::FixedTwoAnyThenIsland
-            | DiscardProbeCost::NestedIsland => unreachable!("refused shapes"),
+            | DiscardProbeCost::NestedIsland
+            | DiscardProbeCost::NestedIslandThenAny
+            | DiscardProbeCost::AnyThenNestedIsland => unreachable!("not in this control"),
         };
         let mut paused = 0;
         for pick in picks {
@@ -871,5 +890,55 @@ fn probe_control_sequenced_and_disjoint_discards_pay_through_the_replacements() 
         for card in discarded {
             assert_eq!(state.objects[&card].zone, Zone::Exile, "{cost:?}");
         }
+    }
+}
+
+/// Review r3 probe board (F2): a nested one-card Island leg beside a flat one-card
+/// leg. The discard payment path removes the first *direct* discard leg, not the
+/// nested leg its prompt found, so a nested discard leg that competes with another
+/// discard leg for a card is refused before anything is paid (fail closed). The flat
+/// pair stays payable.
+#[test]
+fn probe_nested_discard_leg_overlapping_another_discard_is_refused_without_payment() {
+    for cost in [
+        DiscardProbeCost::NestedIslandThenAny,
+        DiscardProbeCost::AnyThenNestedIsland,
+    ] {
+        let DiscardProbe {
+            mut runner,
+            source,
+            hand,
+        } = discard_probe(cost, 2);
+        let (island, forest) = (hand[0], hand[1]);
+        assert!(
+            !can_activate_ability_now(runner.state(), P0, source, 0),
+            "{cost:?} is not offered"
+        );
+        let activated = runner.act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        });
+        assert!(activated.is_err(), "{cost:?} is refused at activation");
+        let state = runner.state();
+        assert_eq!(state.objects[&island].zone, Zone::Hand, "{cost:?}");
+        assert_eq!(state.objects[&forest].zone, Zone::Hand, "{cost:?}");
+        assert!(state.stack.is_empty() && state.pending_cast.is_none());
+    }
+}
+
+/// Reach guard for the board: each leaf alone is payable, so the refusal comes
+/// from the joint check, not from a leaf.
+#[test]
+fn probe_nested_discard_board_leaves_are_each_payable() {
+    let DiscardProbe { runner, source, .. } =
+        discard_probe(DiscardProbeCost::NestedIslandThenAny, 2);
+    for leaf in [
+        hand_discard(fixed(1), card_with_subtype("Island")),
+        hand_discard(fixed(1), None),
+    ] {
+        assert!(
+            leaf.is_payable_for_activation(runner.state(), P0, source, Some(0)),
+            "reach: {leaf:?} alone is payable"
+        );
     }
 }

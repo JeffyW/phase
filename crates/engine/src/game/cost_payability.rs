@@ -901,6 +901,15 @@ fn object_legs_jointly_payable(legs: &[ObjectCostLeg<'_>], payment: ObjectLegPay
             {
                 continue;
             }
+            // Two discard legs that compete for a card are admitted only with
+            // the printed-order evidence above; a nested or dynamic discard
+            // leg gets no guided fallback, because the discard payment path
+            // removes its paid leg by its own (direct-child) traversal.
+            if matches!(leg.leaf, AbilityCost::Discard { .. })
+                && matches!(other.leaf, AbilityCost::Discard { .. })
+            {
+                return false;
+            }
             let guided_single_objects = payment == ObjectLegPayment::GuidedActivation
                 && leg.demand == ObjectLegDemand::Exactly(1)
                 && other.demand == ObjectLegDemand::Exactly(1);
@@ -2651,6 +2660,16 @@ mod tests {
         ];
         assert!(!object_legs_jointly_payable(
             &unsequenced_discards,
+            ObjectLegPayment::GuidedActivation
+        ));
+        // Two single-card discard legs without that evidence (a nested leg)
+        // get no guided fallback either.
+        let nested_single_discards = [
+            object_leg(&discard, ObjectLegDemand::Exactly(1), &[1]),
+            sequenced_discard_leg(&discard, ObjectLegDemand::Exactly(1), &[1, 2]),
+        ];
+        assert!(!object_legs_jointly_payable(
+            &nested_single_discards,
             ObjectLegPayment::GuidedActivation
         ));
         let unmodeled_overlap = [
