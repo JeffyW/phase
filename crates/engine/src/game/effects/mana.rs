@@ -6,12 +6,14 @@ use crate::types::ability::{
     ChoiceValue, Effect, EffectError, EffectKind, LinkedExileScope, ManaProduction,
     ManaSpendRestriction, ManaTargetRole, ManaTargetSlot, ObjectScope, ResolvedAbility, TargetRef,
 };
+use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, ManaChoice, ManaChoiceContext, ManaChoicePrompt, MayTriggerOrigin, WaitingFor,
 };
 use crate::types::mana::{ManaColor, ManaRestriction, ManaType};
 use crate::types::player::PlayerId;
+use std::ops::ControlFlow;
 
 /// CR 601.2c + CR 608.2b: A view of `ability` whose `targets` contain only the
 /// target chosen for `slot`, re-validated against that slot's own filter.
@@ -1117,48 +1119,60 @@ pub(crate) fn chosen_color_for_mana(
 /// counts as linked, so an unrecognized chooser fails closed.
 ///
 /// Boundary: the object's own activated abilities, triggers and replacements,
-/// each walked with the shared `ability_visit` traversal (every nested carrier,
-/// including inline branches such as `ChooseOneOf`). Static abilities are not
-/// walked: what they grant belongs to the affected objects (CR 611.2), and an
-/// ability granted to this object is already among its live `abilities`.
+/// each walked over its own resolution with the shared `ability_visit`
+/// traversal at `ResolutionScope::OwnResolutionOnly`. That descends every
+/// inline carrier (sub, else and modal links, `ChooseOneOf` branches) but
+/// stops where an effect registers an ability for another object (a
+/// `GenericEffect` grant, a token or emblem payload): a chooser granted to
+/// another object is that object's, not this one's (CR 611.2). The same scope
+/// also stops at a reflexive "when you do" ability (CR 603.12); no printed
+/// linked color chooser sits there. Static abilities are not walked: their
+/// effects apply to what their text names (CR 611.3), and an ability granted
+/// to this object is already among its live `abilities`.
 pub(crate) fn chooses_color_on_activation(
     state: &GameState,
     source_id: crate::types::identifiers::ObjectId,
 ) -> bool {
-    use crate::types::ability_visit::{visit_ability_def, visit_replacement, visit_trigger};
-
     let Some(obj) = state.objects.get(&source_id) else {
         return false;
     };
     if obj.chosen_color().is_some() {
         return false;
     }
-    let mut stop_at_chooser = break_on_linked_color_chooser;
+    let trigger_executes = obj
+        .trigger_definitions
+        .iter_all()
+        .filter_map(|entry| entry.definition.execute.as_deref());
+    let replacement_executes = obj
+        .replacement_definitions
+        .iter_all()
+        .filter_map(|replacement| replacement.execute.as_deref());
     let linked = obj
         .abilities
         .iter()
-        .any(|def| visit_ability_def(def, &mut stop_at_chooser).is_break())
-        || obj
-            .trigger_definitions
-            .iter_all()
-            .any(|entry| visit_trigger(&entry.definition, &mut stop_at_chooser).is_break())
-        || obj
-            .replacement_definitions
-            .iter_all()
-            .any(|replacement| visit_replacement(replacement, &mut stop_at_chooser).is_break());
+        .chain(trigger_executes)
+        .chain(replacement_executes)
+        .any(|def| {
+            visit_ability_def_scoped(
+                def,
+                ResolutionScope::OwnResolutionOnly,
+                &mut break_on_linked_color_chooser,
+            )
+            .is_break()
+        });
     !linked
 }
 
 /// CR 607.2d: Stop the traversal at a persisted choice whose answer could be a
 /// color, i.e. a choice "the chosen color" can refer back to.
-fn break_on_linked_color_chooser(effect: &Effect) -> std::ops::ControlFlow<()> {
+fn break_on_linked_color_chooser(effect: &Effect) -> ControlFlow<()> {
     match effect {
         Effect::Choose {
             choice_type,
             persist: true,
             ..
-        } if choice_type_can_name_a_color(choice_type) => std::ops::ControlFlow::Break(()),
-        _ => std::ops::ControlFlow::Continue(()),
+        } if choice_type_can_name_a_color(choice_type) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
     }
 }
 
@@ -1234,6 +1248,9 @@ pub(crate) fn activation_chosen_color_outputs(
             outputs.push((mana_color_to_type(&color), amount));
         }
     }
+    // Best first (ties keep W, U, B, R, G order): a planner that takes one
+    // row of the source for generic mana takes the color that adds the most.
+    outputs.sort_by_key(|(_, amount)| std::cmp::Reverse(*amount));
     outputs
 }
 

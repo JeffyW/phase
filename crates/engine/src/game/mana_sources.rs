@@ -2365,7 +2365,21 @@ impl ActivatableManaProfileKind {
 #[derive(Debug, Clone)]
 struct ActivatableManaProfile {
     object_id: ObjectId,
+    /// The object's planned mana capacity (`feasible_mana_capacity`), which
+    /// the generic-mana sum counts for it. A shard assignment that uses an
+    /// activation producing less than this is charged the difference.
+    capacity: u32,
     kind: ActivatableManaProfileKind,
+}
+
+/// One way to spend an activation on colored shards.
+struct ProfileApplication {
+    /// The shards it leaves for other sources.
+    remaining: Vec<Vec<ManaType>>,
+    /// Units of its output assigned to shards.
+    assigned: u32,
+    /// Its total output; units not assigned to shards stay available for generic.
+    output: u32,
 }
 
 fn resolved_production_count(
@@ -2508,7 +2522,8 @@ fn activatable_mana_profiles_for_object(
         return Vec::new();
     }
 
-    obj.abilities
+    let kinds: Vec<ActivatableManaProfileKind> = obj
+        .abilities
         .iter()
         .enumerate()
         .filter_map(|(idx, ability)| {
@@ -2555,7 +2570,18 @@ fn activatable_mana_profiles_for_object(
                 super::ability_utils::build_resolved_from_def(ability, object_id, controller);
             profile_kind_from_production(state, object_id, controller, produced, &resolved)
                 .and_then(|kind| profile_kind_allowed_for_context(kind, payment_context))
-                .map(|kind| ActivatableManaProfile { object_id, kind })
+        })
+        .collect();
+    if kinds.is_empty() {
+        return Vec::new();
+    }
+    let capacity = feasible_mana_capacity(state, object_id, controller, payment_context);
+    kinds
+        .into_iter()
+        .map(|kind| ActivatableManaProfile {
+            object_id,
+            capacity,
+            kind,
         })
         .collect()
 }
@@ -2644,25 +2670,39 @@ fn shard_payment_options(shard: ManaCostShard) -> Option<Vec<ManaType>> {
 
 fn group_profiles_by_object(
     profiles: Vec<ActivatableManaProfile>,
-) -> Vec<(ObjectId, Vec<ActivatableManaProfileKind>)> {
+) -> Vec<(ObjectId, u32, Vec<ActivatableManaProfileKind>)> {
     // Issue #4878: BTreeMap (not HashMap) so the grouped Vec below is
     // ObjectId-sorted and deterministic across processes, rather than
     // following per-process HashMap iteration order.
     use std::collections::BTreeMap;
-    let mut grouped: BTreeMap<ObjectId, Vec<ActivatableManaProfileKind>> = BTreeMap::new();
+    let mut grouped: BTreeMap<ObjectId, (u32, Vec<ActivatableManaProfileKind>)> = BTreeMap::new();
     for profile in profiles {
-        grouped
+        let entry = grouped
             .entry(profile.object_id)
-            .or_default()
-            .push(profile.kind);
+            .or_insert_with(|| (profile.capacity, Vec::new()));
+        entry.1.push(profile.kind);
     }
-    grouped.into_iter().collect()
+    grouped
+        .into_iter()
+        .map(|(object_id, (capacity, kinds))| (object_id, capacity, kinds))
+        .collect()
 }
 
 fn profile_applications(
     profile: &ActivatableManaProfileKind,
     requirements: &[Vec<ManaType>],
-) -> Vec<(Vec<Vec<ManaType>>, u32)> {
+) -> Vec<ProfileApplication> {
+    let partial = |count: u32, options: &[ManaType]| {
+        combination_assignments(count, options, requirements)
+            .into_iter()
+            .filter(|(_, assigned)| *assigned > 0)
+            .map(move |(remaining, assigned)| ProfileApplication {
+                remaining,
+                assigned,
+                output: count,
+            })
+            .collect::<Vec<_>>()
+    };
     match profile {
         ActivatableManaProfileKind::Exact(types) => {
             let mut remaining = requirements.to_vec();
@@ -2672,17 +2712,17 @@ fn profile_applications(
                 };
                 remaining.remove(pos);
             }
-            vec![(remaining, types.len() as u32)]
+            vec![ProfileApplication {
+                remaining,
+                assigned: types.len() as u32,
+                output: types.len() as u32,
+            }]
         }
         ActivatableManaProfileKind::AnyOneColor { options } => options
             .iter()
-            .flat_map(|(color, count)| {
-                combination_assignments(*count, std::slice::from_ref(color), requirements)
-            })
+            .flat_map(|(color, count)| partial(*count, std::slice::from_ref(color)))
             .collect(),
-        ActivatableManaProfileKind::AnyCombination { count, options } => {
-            combination_assignments(*count, options, requirements)
-        }
+        ActivatableManaProfileKind::AnyCombination { count, options } => partial(*count, options),
         ActivatableManaProfileKind::CombinationChoices(choices) => choices
             .iter()
             .flat_map(|choice| {
@@ -2695,8 +2735,14 @@ fn profile_applications(
     }
 }
 
+/// CR 117.1d + CR 601.2g + CR 106.4: The cheapest way for the remaining
+/// objects to cover `requirements`, measured as the generic capacity it uses
+/// up. Each covered shard costs one unit; an activation whose output is below
+/// the object's planned capacity (blue from Nyx Lotus when green would add
+/// more) also forgoes the difference, and its unassigned units stay
+/// available for generic.
 fn assign_profiles_to_requirements(
-    objects: &[(ObjectId, Vec<ActivatableManaProfileKind>)],
+    objects: &[(ObjectId, u32, Vec<ActivatableManaProfileKind>)],
     object_index: usize,
     requirements: Vec<Vec<ManaType>>,
 ) -> Option<u32> {
@@ -2706,43 +2752,52 @@ fn assign_profiles_to_requirements(
     if object_index >= objects.len() {
         return None;
     }
-    if let Some(consumed) =
-        assign_profiles_to_requirements(objects, object_index + 1, requirements.clone())
-    {
-        return Some(consumed);
+    // Every shard costs at least the unit that pays it.
+    let floor = requirements.len() as u32;
+    let mut best = assign_profiles_to_requirements(objects, object_index + 1, requirements.clone());
+    if best == Some(floor) {
+        return best;
     }
-    for profile in &objects[object_index].1 {
-        for (remaining, consumed) in profile_applications(profile, &requirements) {
+    let (_, capacity, profiles) = &objects[object_index];
+    for profile in profiles {
+        for application in profile_applications(profile, &requirements) {
+            let charge = application.assigned + capacity.saturating_sub(application.output);
+            let lower_bound = charge + application.remaining.len() as u32;
+            if best.is_some_and(|best| lower_bound >= best) {
+                continue;
+            }
             if let Some(rest) =
-                assign_profiles_to_requirements(objects, object_index + 1, remaining)
+                assign_profiles_to_requirements(objects, object_index + 1, application.remaining)
             {
-                return Some(consumed + rest);
+                let total = charge + rest;
+                if best.is_none_or(|best| total < best) {
+                    best = Some(total);
+                    if total == floor {
+                        return best;
+                    }
+                }
             }
         }
     }
-    None
+    best
 }
 
-/// CR 106.1 + CR 601.2g: Enumerate the colored shards one flexible source can
-/// cover, allowing later sources to cover the remainder. A one-mana
-/// `AnyOneColor` source must not be rejected simply because the spell has two
-/// colored shards; Relic of Legends plus a dual land is the common case.
+/// CR 106.1 + CR 601.2g + CR 106.4: Enumerate the colored shards one flexible
+/// source can cover, allowing later sources to cover the remainder. The source
+/// may stop at any point: units it does not assign stay in the pool for
+/// generic or go unspent. A one-mana `AnyOneColor` source must not be rejected
+/// simply because the spell has two colored shards (Relic of Legends plus a
+/// dual land), and three green must still pay {G} when the spell's {U} comes
+/// from another source.
 fn combination_assignments(
     count: u32,
     options: &[ManaType],
     requirements: &[Vec<ManaType>],
 ) -> Vec<(Vec<Vec<ManaType>>, u32)> {
-    if requirements.is_empty() {
-        // All shards are covered; any leftover `count` is simply surplus mana
-        // the player never produces (or lets drain). Rejecting over-production
-        // here would falsely mark e.g. a power-3 combination source as unable
-        // to pay a two-shard cost.
-        return vec![(Vec::new(), 0)];
+    let mut applications = vec![(requirements.to_vec(), 0)];
+    if requirements.is_empty() || count == 0 {
+        return applications;
     }
-    if count == 0 {
-        return vec![(requirements.to_vec(), 0)];
-    }
-    let mut applications = Vec::new();
     for (index, payment_options) in requirements.iter().enumerate() {
         for &color in payment_options {
             if !options.contains(&color) {
@@ -2779,9 +2834,11 @@ fn assign_profiles_to_shards(
 /// activating currently legal mana abilities (non-tap sources like Vivi
 /// Ornitier's {0} combination mana, unrestricted discard mana, etc.).
 ///
-/// Returns `(covered, consumed_pips)` where `consumed_pips` is the total mana
-/// produced by activations used for shard coverage — callers must subtract
-/// this from generic capacity to avoid double-counting one activation.
+/// Returns `(covered, capacity_charge)`: the generic capacity the cheapest
+/// covering assignment uses up (each covered shard, plus any output an
+/// activation forgoes against its object's planned capacity). Callers must
+/// subtract it from the summed `feasible_mana_capacity` to avoid counting one
+/// activation twice or crediting a color that was not chosen.
 pub(crate) fn can_cover_shards_with_activatable_mana(
     state: &GameState,
     player: PlayerId,

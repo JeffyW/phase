@@ -10,13 +10,18 @@
 
 use engine::ai_support::{auto_pass_recommended, flat_priority_actions, legal_actions};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{ChoiceType, ChosenAttribute, Effect, ManaProduction};
+use engine::types::ability::{
+    AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ChosenAttribute,
+    ContinuousModification, Duration, Effect, ManaProduction, PlayerFilter, ReplacementDefinition,
+    StaticDefinition, TargetFilter, TargetSelectionMode,
+};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, ManaChoice, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
 const ASTRAL: &str = "This artifact enters with X charge counters on it.\n{T}: Choose a color. Add one mana of that color for each charge counter on this artifact.";
@@ -397,11 +402,6 @@ fn nyx_lotus_plans_each_color_with_its_own_devotion() {
 /// (`ChooseOneOf`) is still a linked chooser, so the unset source adds no mana.
 #[test]
 fn linked_color_chooser_inside_a_branch_carrier_counts_as_linked() {
-    use engine::types::ability::{
-        AbilityDefinition, AbilityKind, PlayerFilter, ReplacementDefinition, TargetSelectionMode,
-    };
-    use engine::types::replacements::ReplacementEvent;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let astral = scenario
@@ -532,7 +532,7 @@ fn nyx_lotus_surplus_color_pays_generic_alongside_ironworks() {
         .expect("Nyx Lotus activates");
     runner
         .act(GameAction::ChooseManaColor {
-            choice: engine::types::game_state::ManaChoice::SingleColor(ManaType::Green),
+            choice: ManaChoice::SingleColor(ManaType::Green),
             count: 1,
         })
         .expect("choose green");
@@ -578,6 +578,376 @@ fn nyx_lotus_surplus_color_pays_generic_alongside_ironworks() {
     );
     runner.resolve_top();
     assert_eq!(spell_zone(&runner, harmonize), Zone::Graveyard);
+    assert_eq!(
+        runner.state().players[0].hand.len(),
+        3,
+        "Harmonize drew three cards"
+    );
+}
+
+/// Shared Nyx Lotus board (devotion G3 / U1) for the per-color accounting
+/// boards. `island_first` creates the Island before the Lotus; profile
+/// grouping is ObjectId-sorted, so this controls which source is tried first.
+struct LotusBoard {
+    runner: GameRunner,
+    lotus: ObjectId,
+    island: Option<ObjectId>,
+    spell: ObjectId,
+}
+
+fn lotus_board(
+    with_island: Option<bool>,
+    with_ironworks: bool,
+    spell_name: &str,
+    spell_oracle: &str,
+    spell_cost: ManaCost,
+    instant: bool,
+) -> LotusBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
+    let mut island = None;
+    if with_island == Some(true) {
+        island = Some(scenario.add_basic_land(P0, ManaColor::Blue));
+    }
+    let lotus = scenario
+        .add_artifact_from_oracle(P0, "Nyx Lotus", NYX_LOTUS)
+        .id();
+    if with_island == Some(false) {
+        island = Some(scenario.add_basic_land(P0, ManaColor::Blue));
+    }
+    scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ));
+    scenario
+        .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+    if with_ironworks {
+        scenario.add_artifact_from_oracle(P0, "Krark-Clan Ironworks", KCI);
+        scenario
+            .add_creature(P0, "Ornithopter", 0, 2)
+            .as_artifact_creature()
+            .from_oracle_text("Flying");
+    }
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, spell_name, instant, spell_oracle)
+        .with_mana_cost(spell_cost)
+        .id();
+    LotusBoard {
+        runner: scenario.build(),
+        lotus,
+        island,
+        spell,
+    }
+}
+
+/// Reviewer probe board (#8443 r2, R1a): green from Nyx Lotus covers {G} and
+/// its two other green pay generic, while the {U} comes from an Island tried
+/// after it. GGG + U + CC pays {3}{G}{U} with one to spare (CR 106.4,
+/// CR 601.2g, CR 700.5).
+#[test]
+fn nyx_lotus_covers_part_of_the_colored_shards_and_leaves_the_rest() {
+    const URBAN_EVOLUTION: &str = "Draw three cards. You may play an additional land this turn.";
+    let urban_evolution = || cost(vec![ManaCostShard::Green, ManaCostShard::Blue], 3);
+
+    let board = lotus_board(
+        Some(false),
+        true,
+        "Urban Evolution",
+        URBAN_EVOLUTION,
+        urban_evolution(),
+        false,
+    );
+    let island = board.island.unwrap();
+    assert!(
+        board.lotus < island,
+        "reach: the Lotus is grouped before the Island"
+    );
+    assert!(matches!(
+        produced_of(&board.runner, board.lotus, 0),
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        }
+    ));
+    assert_eq!(
+        board.runner.state().objects[&board.lotus].chosen_color(),
+        None
+    );
+    assert_eq!(
+        priority_facts(&board.runner, board.spell),
+        (true, false),
+        "GGG + U + CC pays {{3}}{{G}}{{U}}"
+    );
+
+    // Control: without Ironworks, four mana cannot pay five.
+    let board = lotus_board(
+        Some(false),
+        false,
+        "Urban Evolution",
+        URBAN_EVOLUTION,
+        urban_evolution(),
+        false,
+    );
+    assert!(!priority_facts(&board.runner, board.spell).0);
+
+    // Control: Island created first.
+    let board = lotus_board(
+        Some(true),
+        true,
+        "Urban Evolution",
+        URBAN_EVOLUTION,
+        urban_evolution(),
+        false,
+    );
+    assert!(board.island.unwrap() < board.lotus);
+    assert!(priority_facts(&board.runner, board.spell).0);
+}
+
+/// Reviewer probe board (#8443 r2, R1b): choosing blue from Nyx Lotus for a
+/// {U} adds one mana, not green's three. Blue gives U + R (Ogre); green gives
+/// GGG + R with no U. Treasonous Ogre's "Pay 3 life" works once at 4 life
+/// (CR 119.4). Planning must credit the chosen color's amount (CR 700.5,
+/// CR 601.2g).
+#[test]
+fn nyx_lotus_generic_capacity_follows_the_chosen_color() {
+    const OGRE: &str = "Dethrone\nPay 3 life: Add {R}.";
+    const INSPIRATION: &str = "Target player draws two cards.";
+    struct Board {
+        runner: GameRunner,
+        lotus: ObjectId,
+        ogre: ObjectId,
+        inspiration: ObjectId,
+        divination: ObjectId,
+        blue_two: ObjectId,
+    }
+    let build = |floating_blue: bool| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_life(P0, 4);
+        let lotus = scenario
+            .add_artifact_from_oracle(P0, "Nyx Lotus", NYX_LOTUS)
+            .id();
+        scenario
+            .add_creature(P0, "Leatherback Baloth", 4, 5)
+            .with_mana_cost(cost(
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                ],
+                0,
+            ));
+        scenario
+            .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+        let ogre = scenario
+            .add_creature(P0, "Treasonous Ogre", 2, 3)
+            .from_oracle_text(OGRE)
+            .id();
+        if floating_blue {
+            scenario.with_mana_pool(
+                P0,
+                vec![ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![])],
+            );
+        }
+        let inspiration = scenario
+            .add_spell_to_hand_from_oracle(P0, "Inspiration", true, INSPIRATION)
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 3))
+            .id();
+        let divination = scenario
+            .add_spell_to_hand_from_oracle(P0, "Divination", false, "Draw two cards.")
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 2))
+            .id();
+        let blue_two = scenario
+            .add_spell_to_hand_from_oracle(P0, "Blue Two", true, "Draw a card.")
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+            .id();
+        Board {
+            runner: scenario.build(),
+            lotus,
+            ogre,
+            inspiration,
+            divination,
+            blue_two,
+        }
+    };
+    let offered = |board: &Board, spell: ObjectId| priority_facts(&board.runner, spell).0;
+
+    let board = build(false);
+    assert!(matches!(
+        produced_of(&board.runner, board.lotus, 0),
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        }
+    ));
+    // Reach: an untargeted {1}{U} is payable only by Lotus blue plus the
+    // Ogre's manual pay-life mana, so the activatable-profile path decides.
+    assert!(
+        offered(&board, board.blue_two),
+        "Lotus U + Ogre R pays {{1}}{{U}}"
+    );
+    // The board verbatim: {3}{U} is out of reach.
+    assert!(!offered(&board, board.inspiration));
+    // Discriminating twin: an untargeted {2}{U}. Blue from the Lotus credits
+    // one mana, so U + R is two of three; crediting green's three would offer it.
+    assert!(
+        !offered(&board, board.divination),
+        "blue from the Lotus plus the Ogre's R is two mana, not four"
+    );
+
+    // Control: the Ogre activates once at 4 life and not again at 1.
+    let mut board = build(false);
+    board
+        .runner
+        .act(GameAction::ActivateAbility {
+            source_id: board.ogre,
+            ability_index: 0,
+        })
+        .expect("the Ogre activates at 4 life");
+    assert_eq!(board.runner.state().players[0].life, 1);
+    assert!(
+        board
+            .runner
+            .act(GameAction::ActivateAbility {
+                source_id: board.ogre,
+                ability_index: 0,
+            })
+            .is_err(),
+        "CR 119.4: 3 life cannot be paid at 1"
+    );
+
+    // Positive witness: one floating blue pays {U}; GGG + R covers {3}.
+    let board = build(true);
+    assert!(offered(&board, board.inspiration));
+}
+
+/// CR 106.1 + CR 700.5 + CR 601.2g: generic mana from Nyx Lotus uses the
+/// color that adds the most (green, devotion 3), so {3} is payable by the
+/// Lotus alone and the cast resolves.
+#[test]
+fn nyx_lotus_pays_generic_with_its_best_color() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let lotus = scenario
+        .add_artifact_from_oracle(P0, "Nyx Lotus", NYX_LOTUS)
+        .id();
+    scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ));
+    scenario
+        .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+    let spell = add_instant(&mut scenario, cost(vec![], 3));
+    let mut runner = scenario.build();
+    assert!(matches!(
+        produced_of(&runner, lotus, 0),
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        }
+    ));
+    assert_eq!(priority_facts(&runner, spell), (true, false));
+    assert_eq!(
+        opponent_turn_priority_facts(&mut runner, spell),
+        (true, false)
+    );
+    runner.cast(spell).resolve();
+    assert_eq!(spell_zone(&runner, spell), Zone::Graveyard);
+    assert!(runner.state().objects[&lotus].tapped);
+}
+
+/// Reviewer probe board (#8443 r2, R2a, engine-shape fixture): an ability on
+/// Astral Cornucopia that grants a color chooser to another object (CR 611.2)
+/// is that object's chooser, not a linked chooser for Cornucopia.
+#[test]
+fn chooser_granted_to_another_object_is_not_linked() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Library A", "Library B", "Library C"]);
+    let astral = scenario
+        .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
+        .id();
+    scenario.with_counter(astral, charge(), 4);
+    let baloth = scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ))
+        .id();
+    let harmonize = scenario
+        .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
+        .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
+        .id();
+    let mut runner = scenario.build();
+    assert!(
+        priority_facts(&runner, harmonize).0,
+        "reach: plain Cornucopia pays Harmonize"
+    );
+
+    let grant = AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::SpecificObject { id: baloth })
+                .modifications(vec![ContinuousModification::GrantAbility {
+                    definition: Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::Choose {
+                            choice_type: ChoiceType::color(),
+                            persist: true,
+                            selection: TargetSelectionMode::Chosen,
+                        },
+                    )),
+                }])],
+            duration: Some(Duration::UntilEndOfTurn),
+            target: None,
+            end_cost: None,
+        },
+    )
+    .cost(AbilityCost::Mana {
+        cost: cost(vec![], 9),
+    });
+    {
+        let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+        std::sync::Arc::make_mut(&mut obj.base_abilities).push(grant.clone());
+        std::sync::Arc::make_mut(&mut obj.abilities).push(grant);
+    }
+    assert!(
+        matches!(
+            &*runner.state().objects[&astral].abilities[1].effect,
+            Effect::GenericEffect { static_abilities, .. }
+                if matches!(
+                    &static_abilities[0].affected,
+                    Some(TargetFilter::SpecificObject { id }) if *id == baloth
+                )
+        ),
+        "reach: the grant targets the Baloth"
+    );
+    assert!(
+        priority_facts(&runner, harmonize).0,
+        "a chooser granted to the Baloth does not make Cornucopia's color linked"
+    );
 }
 
 /// CR 106.5 + CR 607.2d control: Sunken Citadel's "the chosen color" is linked
