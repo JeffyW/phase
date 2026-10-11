@@ -4756,6 +4756,19 @@ pub(super) fn parse_choose_ast(
     lower: &str,
     ctx: &mut ParseContext,
 ) -> Option<ChooseImperativeAst> {
+    // CR 105.1 + CR 106.5: "choose a color of a permanent you control" / "of a
+    // card in your graveyard" (Meteor Crater, Corrupted Grafstone) restricts the
+    // color domain to game state that no `ChoiceType` expresses. It is neither a
+    // zone choice nor targeting; decline before those parsers so the clause
+    // stays unsupported instead of lowering to a five-color choice, a card pick,
+    // or `TargetOnly { Any }`.
+    if preceded(tag::<_, _, OracleError<'_>>("choose a color"), tag(" of "))
+        .parse(lower)
+        .is_ok()
+    {
+        return None;
+    }
+
     if let Some(ast) = try_parse_choose_from_zone(lower, ctx) {
         return Some(ast);
     }
