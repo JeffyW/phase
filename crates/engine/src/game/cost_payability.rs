@@ -25,6 +25,7 @@ use crate::types::ability::{
     TapCreaturesAggregateStat, TapCreaturesRequirement, TargetFilter, TypedFilter, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
+use crate::types::game_state::{CostResume, PayCostKind, WaitingFor};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
@@ -421,6 +422,519 @@ fn every_combination_leaves_later_payable(
     true
 }
 
+/// How the payment step surfaces a composite cost's object-using legs, which
+/// decides how much overlap between legs the pre-gate may accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectLegPayment {
+    /// The activation-cost dispatcher
+    /// (`casting_costs::surface_next_unpaid_interactive_activation_cost`)
+    /// offers each leg only the objects that still let every other unpaid leg
+    /// be paid ([`restrict_activation_prompt_to_joint_payment`]), so any joint
+    /// assignment the gate finds can be reached whatever the player picks.
+    GuidedActivation,
+    /// Legs are prompted one at a time with no such look-ahead (spell,
+    /// mana-ability and resolution-time payment). Two legs that could compete
+    /// for one object fail closed here, except a pair of chosen hand-discard
+    /// legs, which [`discard_legs_jointly_payable`] already checks against
+    /// every printed-order choice.
+    Unguided,
+}
+
+impl ObjectLegPayment {
+    /// Only the activation pipeline knows its ability index, and it is the only
+    /// route that pays object legs through the guided dispatcher.
+    pub(crate) fn for_ability_index(ability_index: Option<usize>) -> Self {
+        match ability_index {
+            Some(_) => Self::GuidedActivation,
+            None => Self::Unguided,
+        }
+    }
+}
+
+/// How many objects one object-using leg needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectLegDemand {
+    /// Exactly this many distinct objects.
+    Exactly(usize),
+    /// A count the joint model doesn't represent: an announced X, "any number",
+    /// an aggregate threshold, a dynamic quantity, a random discard, or an
+    /// unchosen `OneOf` branch. Such a leg may never compete with another leg
+    /// for an object (it fails closed instead).
+    Unmodeled,
+}
+
+/// CR 118.3 + CR 601.2h: one leg of a composite cost that is paid with chosen
+/// objects the payment uses up (CR 701.21a sacrifice, CR 701.13a exile,
+/// CR 701.9a discard, or a return to hand). An object used to pay one such leg
+/// is gone (or has become a new object, CR 400.7) and can't pay another.
+#[derive(Debug, Clone)]
+struct ObjectCostLeg<'a> {
+    leaf: &'a AbilityCost,
+    demand: ObjectLegDemand,
+    candidates: Vec<ObjectId>,
+}
+
+/// True when `cost` (a leaf or a container) holds a leg paid with objects the
+/// payment uses up. This is the classification authority for the joint model;
+/// tapping, revealing, beholding, removing counters, unattaching and blighting
+/// choose objects without using them up, and mill is not a choice.
+fn uses_up_chosen_objects(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::Sacrifice(_)
+        | AbilityCost::Discard { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::ExileWithAggregate { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::NinjutsuFamily { .. } => true,
+        AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+            costs.iter().any(uses_up_chosen_objects)
+        }
+        AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::TapCreatures { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::PerCounter { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::GetPlayerCounters { .. }
+        | AbilityCost::Unimplemented { .. } => false,
+    }
+}
+
+/// Number of object-using legs, counted without reading the game state. A
+/// `OneOf` holding any such leg counts once.
+fn object_cost_leg_count(cost: &AbilityCost) -> usize {
+    match cost {
+        AbilityCost::Composite { costs } => costs.iter().map(object_cost_leg_count).sum(),
+        other => usize::from(uses_up_chosen_objects(other)),
+    }
+}
+
+/// The demand and the candidate objects of one object-using leaf, read with
+/// the same eligibility helpers as the leaf's own per-leg gate.
+fn object_leg_demand_and_candidates(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
+    leaf: &AbilityCost,
+) -> (ObjectLegDemand, Vec<ObjectId>) {
+    let source_in = |zone: Zone| {
+        state
+            .objects
+            .get(&source)
+            .is_some_and(|o| o.zone == zone)
+            .then_some(source)
+            .into_iter()
+            .collect::<Vec<_>>()
+    };
+    match leaf {
+        AbilityCost::Sacrifice(cost) => {
+            let candidates = if matches!(cost.target, TargetFilter::SelfRef) {
+                if super::static_abilities::player_cant_sacrifice_as_cost(state, player, source) {
+                    Vec::new()
+                } else {
+                    source_in(Zone::Battlefield)
+                }
+            } else {
+                super::casting::find_eligible_sacrifice_targets(
+                    state,
+                    player,
+                    source,
+                    granting_object,
+                    &cost.target,
+                )
+            };
+            let demand = match cost.requirement.fixed_count() {
+                // CR 107.3a: the X sentinel is announced later.
+                Some(count) if count != u32::MAX => ObjectLegDemand::Exactly(count as usize),
+                _ => ObjectLegDemand::Unmodeled,
+            };
+            (demand, candidates)
+        }
+        AbilityCost::Discard {
+            count,
+            filter,
+            selection,
+            self_scope,
+        } => {
+            if self_scope.is_source_card() {
+                return (ObjectLegDemand::Exactly(1), source_in(Zone::Hand));
+            }
+            let effective_filter = cost_filter_before_x_announcement(filter.as_ref());
+            let ctx =
+                FilterContext::from_source(state, source).with_granting_object(granting_object);
+            let candidates = state
+                .players
+                .get(player.0 as usize)
+                .map(|p| {
+                    p.hand
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            id != source
+                                && effective_filter
+                                    .as_ref()
+                                    .is_none_or(|f| matches_target_filter(state, id, f, &ctx))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let demand = match (count, selection) {
+                (QuantityExpr::Fixed { value }, CardSelectionMode::Chosen) => {
+                    ObjectLegDemand::Exactly((*value).max(0) as usize)
+                }
+                _ => ObjectLegDemand::Unmodeled,
+            };
+            (demand, candidates)
+        }
+        AbilityCost::Exile {
+            count,
+            zone,
+            filter,
+        } => {
+            if matches!(filter, Some(TargetFilter::SelfRef)) {
+                // Mirrors the per-leg gate: an explicit zone is authoritative,
+                // otherwise the source pays from wherever it is.
+                let candidates = match zone {
+                    Some(z) => source_in(*z),
+                    None => state
+                        .objects
+                        .contains_key(&source)
+                        .then_some(source)
+                        .into_iter()
+                        .collect(),
+                };
+                return (ObjectLegDemand::Exactly(1), candidates);
+            }
+            let effective_zone = exile_cost_effective_zone(*zone, filter.as_ref());
+            let effective_filter = cost_filter_before_x_announcement(filter.as_ref());
+            let candidates = eligible_exile_cost_objects(
+                state,
+                player,
+                source,
+                granting_object,
+                effective_zone,
+                effective_filter.as_ref(),
+                *count,
+            );
+            let demand = if *count == EXILE_COST_X {
+                ObjectLegDemand::Unmodeled
+            } else {
+                ObjectLegDemand::Exactly(*count as usize)
+            };
+            (demand, candidates)
+        }
+        AbilityCost::ReturnToHand { count, filter, .. } => (
+            ObjectLegDemand::Exactly(*count as usize),
+            super::casting::find_eligible_return_to_hand_targets(
+                state,
+                player,
+                source,
+                granting_object,
+                filter.as_ref(),
+            ),
+        ),
+        AbilityCost::ExileMaterials { materials, .. } => (
+            ObjectLegDemand::Unmodeled,
+            eligible_craft_materials(state, player, source, materials),
+        ),
+        AbilityCost::ExileWithAggregate { filter, zone, .. } => (
+            ObjectLegDemand::Unmodeled,
+            eligible_exile_with_aggregate_objects(state, player, source, filter, *zone),
+        ),
+        // CR 701.59a: collect evidence exiles cards of the player's choice from
+        // their graveyard.
+        AbilityCost::CollectEvidence { .. } => (
+            ObjectLegDemand::Unmodeled,
+            state.graveyard_of(player).iter().copied().collect(),
+        ),
+        // CR 702.49a: ninjutsu returns an unblocked attacker the player controls.
+        AbilityCost::NinjutsuFamily { variant, .. } => (
+            ObjectLegDemand::Unmodeled,
+            super::keywords::returnable_creatures_for_variant(state, player, variant),
+        ),
+        // `uses_up_chosen_objects` routes only the leaves above here.
+        _ => (ObjectLegDemand::Unmodeled, Vec::new()),
+    }
+}
+
+/// Collects the object-using legs of `cost` in the same depth-first order the
+/// activation cost walkers (`casting::find_non_self_sacrifice_cost` and its
+/// siblings) use to pick the next leg to pay. A `OneOf` that holds such legs
+/// becomes one unmodeled leg over the union of its branches' candidates.
+fn collect_object_cost_legs<'a>(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
+    cost: &'a AbilityCost,
+    legs: &mut Vec<ObjectCostLeg<'a>>,
+) {
+    match cost {
+        AbilityCost::Composite { costs } => {
+            for leg in costs {
+                collect_object_cost_legs(state, player, source, granting_object, leg, legs);
+            }
+        }
+        AbilityCost::OneOf { costs } if uses_up_chosen_objects(cost) => {
+            let mut branch_legs = Vec::new();
+            for branch in costs {
+                collect_object_cost_legs(
+                    state,
+                    player,
+                    source,
+                    granting_object,
+                    branch,
+                    &mut branch_legs,
+                );
+            }
+            let mut candidates: Vec<ObjectId> = branch_legs
+                .into_iter()
+                .flat_map(|leg| leg.candidates)
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            legs.push(ObjectCostLeg {
+                leaf: cost,
+                demand: ObjectLegDemand::Unmodeled,
+                candidates,
+            });
+        }
+        leaf if uses_up_chosen_objects(leaf) => {
+            let (demand, candidates) =
+                object_leg_demand_and_candidates(state, player, source, granting_object, leaf);
+            legs.push(ObjectCostLeg {
+                leaf,
+                demand,
+                candidates,
+            });
+        }
+        _ => {}
+    }
+}
+
+fn is_chosen_hand_discard(cost: &AbilityCost) -> bool {
+    matches!(
+        cost,
+        AbilityCost::Discard {
+            selection: CardSelectionMode::Chosen,
+            self_scope: DiscardSelfScope::FromHand,
+            ..
+        }
+    )
+}
+
+/// CR 118.3 + CR 601.2h: Can every modeled leg be paid with its own distinct
+/// objects? A bipartite matching of objects to leg slots (each leg expanded to
+/// its demand), found with augmenting paths. Unmodeled legs take no slot; the
+/// caller has already refused any overlap they could cause.
+fn object_legs_have_joint_assignment(legs: &[ObjectCostLeg<'_>]) -> bool {
+    let mut slots: Vec<&[ObjectId]> = Vec::new();
+    for leg in legs {
+        if let ObjectLegDemand::Exactly(demand) = leg.demand {
+            if leg.candidates.len() < demand {
+                return false;
+            }
+            slots.extend(std::iter::repeat_n(leg.candidates.as_slice(), demand));
+        }
+    }
+    let mut owner: std::collections::HashMap<ObjectId, usize> = std::collections::HashMap::new();
+    for slot in 0..slots.len() {
+        let mut visited = std::collections::HashSet::new();
+        if !augment_object_slot(slot, &slots, &mut owner, &mut visited) {
+            return false;
+        }
+    }
+    true
+}
+
+fn augment_object_slot(
+    slot: usize,
+    slots: &[&[ObjectId]],
+    owner: &mut std::collections::HashMap<ObjectId, usize>,
+    visited: &mut std::collections::HashSet<ObjectId>,
+) -> bool {
+    for &candidate in slots[slot] {
+        if !visited.insert(candidate) {
+            continue;
+        }
+        let free = match owner.get(&candidate).copied() {
+            None => true,
+            Some(other) => augment_object_slot(other, slots, owner, visited),
+        };
+        if free {
+            owner.insert(candidate, slot);
+            return true;
+        }
+    }
+    false
+}
+
+/// CR 118.3 + CR 601.2h: the overlap policy plus the joint assignment.
+fn object_legs_jointly_payable(legs: &[ObjectCostLeg<'_>], payment: ObjectLegPayment) -> bool {
+    for (index, leg) in legs.iter().enumerate() {
+        for other in &legs[index + 1..] {
+            if !leg
+                .candidates
+                .iter()
+                .any(|id| other.candidates.contains(id))
+            {
+                continue;
+            }
+            let unmodeled = leg.demand == ObjectLegDemand::Unmodeled
+                || other.demand == ObjectLegDemand::Unmodeled;
+            let unguided = payment == ObjectLegPayment::Unguided
+                && !(is_chosen_hand_discard(leg.leaf) && is_chosen_hand_discard(other.leaf));
+            if unmodeled || unguided {
+                return false;
+            }
+        }
+    }
+    object_legs_have_joint_assignment(legs)
+}
+
+/// CR 118.3 + CR 601.2h + CR 602.2b: Joint payability of a composite cost's
+/// object-using legs ("Sacrifice a Swamp and a Forest"). Each leg's own gate
+/// counts eligible objects against the whole board, so one Swamp Forest
+/// satisfies both legs; but one object can pay only one leg, because paying
+/// uses it up. The cost is payable only if every leg can be given its own
+/// distinct objects at once.
+///
+/// `payment` says whether the payment step guides later choices
+/// ([`ObjectLegPayment`]); without that guidance, any overlap between legs
+/// fails closed.
+pub(crate) fn object_cost_legs_jointly_payable(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
+    costs: &[AbilityCost],
+    payment: ObjectLegPayment,
+) -> bool {
+    if costs.iter().map(object_cost_leg_count).sum::<usize>() < 2 {
+        return true;
+    }
+    let mut legs = Vec::new();
+    for cost in costs {
+        collect_object_cost_legs(state, player, source, granting_object, cost, &mut legs);
+    }
+    object_legs_jointly_payable(&legs, payment)
+}
+
+/// CR 118.3 + CR 601.2h + CR 602.2b: Whether an activation's unpaid residual
+/// cost can still be paid in full with distinct objects. The guided dispatcher
+/// checks this before every prompt, so a selection that would leave a later leg
+/// unpayable is refused before anything is paid for that selection.
+pub(crate) fn activation_residual_jointly_payable(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    granting_object: Option<ObjectIncarnationRef>,
+    residual: &AbilityCost,
+) -> bool {
+    object_cost_legs_jointly_payable(
+        state,
+        player,
+        source,
+        granting_object,
+        std::slice::from_ref(residual),
+        ObjectLegPayment::GuidedActivation,
+    )
+}
+
+/// CR 118.3 + CR 601.2h + CR 602.2b: Narrows a surfaced activation-cost prompt
+/// to the objects that still let every other unpaid object-using leg be paid
+/// with distinct objects. With one Overgrown Tomb and one basic Swamp, "Sacrifice
+/// a Swamp and a Forest" offers only the basic Swamp to the Swamp leg; the
+/// Tomb must be kept for the Forest leg.
+///
+/// The prompt's own `choices` stay the authority for the leg being paid; this
+/// only removes choices. Prompts for kinds that the dispatcher removes from the
+/// residual before surfacing, or that don't use objects up, pass through.
+pub(crate) fn restrict_activation_prompt_to_joint_payment(
+    state: &GameState,
+    mut waiting_for: WaitingFor,
+) -> WaitingFor {
+    let WaitingFor::PayCost {
+        player,
+        kind,
+        choices,
+        resume: CostResume::Spell { spell },
+        ..
+    } = &mut waiting_for
+    else {
+        return waiting_for;
+    };
+    let is_current_leg: fn(&AbilityCost) -> bool = match kind {
+        PayCostKind::Sacrifice => |c| super::casting::find_non_self_sacrifice_cost(c).is_some(),
+        PayCostKind::Discard => |c| super::casting::find_non_self_discard(c).is_some(),
+        PayCostKind::ExileFromZone { .. } => |c| super::casting::find_non_self_exile(c).is_some(),
+        PayCostKind::ExilePermanent { .. } => {
+            |c| super::casting::find_battlefield_exile_cost(c).is_some()
+        }
+        PayCostKind::ReturnToHand => |c| super::casting::find_return_to_hand_cost(c).is_some(),
+        PayCostKind::Reveal
+        | PayCostKind::ExileMaterials { .. }
+        | PayCostKind::ExileFromManaZone { .. }
+        | PayCostKind::UnattachFrom { .. }
+        | PayCostKind::RemoveCounter { .. }
+        | PayCostKind::TapCreatures { .. }
+        | PayCostKind::Behold { .. }
+        | PayCostKind::ExileAggregate { .. } => return waiting_for,
+    };
+    let Some(residual) = spell.activation_cost.as_ref() else {
+        return waiting_for;
+    };
+    if object_cost_leg_count(residual) < 2 {
+        return waiting_for;
+    }
+    let mut legs = Vec::new();
+    collect_object_cost_legs(
+        state,
+        *player,
+        spell.object_id,
+        spell.ability.context.granting_object,
+        residual,
+        &mut legs,
+    );
+    let Some(current) = legs.iter().position(|leg| is_current_leg(leg.leaf)) else {
+        return waiting_for;
+    };
+    let ObjectLegDemand::Exactly(demand) = legs[current].demand else {
+        return waiting_for;
+    };
+    if demand == 0 {
+        return waiting_for;
+    }
+    legs[current].candidates = choices.clone();
+    choices.retain(|&choice| {
+        let mut rest = legs.clone();
+        rest[current].demand = ObjectLegDemand::Exactly(demand - 1);
+        for leg in &mut rest {
+            leg.candidates.retain(|&id| id != choice);
+        }
+        object_legs_have_joint_assignment(&rest)
+    });
+    waiting_for
+}
+
 impl AbilityCost {
     /// CR 605.3a + CR 602.2b + CR 601.2g-h: Payability gate for ACTIVATED
     /// MANA ABILITIES specifically. Unlike [`is_payable`] (which defers mana
@@ -505,6 +1019,9 @@ impl AbilityCost {
             }
             // Same {T}+TapCreatures source-exclusion logic as `is_payable`'s
             // Composite arm, but Mana sub-costs use the mana-specific check.
+            // CR 118.3 + CR 601.2h: the mana-ability payment path prompts its
+            // object-using legs without look-ahead, so they are checked
+            // `Unguided`.
             //
             // EXCLUSION (fail closed): the mana-ability payment path resolves a
             // chosen hand-discard through `find_non_self_discard`, which returns
@@ -548,7 +1065,14 @@ impl AbilityCost {
                     other => {
                         other.is_payable_for_mana_ability(state, player, source, ability_index)
                     }
-                })
+                }) && object_cost_legs_jointly_payable(
+                    state,
+                    player,
+                    source,
+                    granter,
+                    costs,
+                    ObjectLegPayment::Unguided,
+                )
             }
             // Every other kind has no mana-pool component — defer to the
             // generic 601.2b gate, which already handles it correctly.
@@ -975,7 +1499,9 @@ impl AbilityCost {
             // CR 601.2b: Every sub-cost must be payable. When the composite
             // includes {T}, the source is committed to the tap cost and must be
             // excluded from any TapCreatures eligibility count — it will be
-            // tapped before TapCreatures is paid.
+            // tapped before TapCreatures is paid. CR 118.3 + CR 601.2h: legs
+            // that use up chosen objects must also be payable together, each
+            // with its own objects.
             AbilityCost::Composite { costs } => {
                 let has_tap = costs.iter().any(|c| matches!(c, AbilityCost::Tap));
                 costs.iter().all(|c| match c {
@@ -993,6 +1519,14 @@ impl AbilityCost {
                     ),
                     other => other.is_payable_for_activation(state, player, source, ability_index),
                 }) && discard_legs_jointly_payable(state, player, source, granting_object, costs)
+                    && object_cost_legs_jointly_payable(
+                        state,
+                        player,
+                        source,
+                        granting_object,
+                        costs,
+                        ObjectLegPayment::for_ability_index(ability_index),
+                    )
             }
             // CR 118.12a: Disjunctive — payable if **any** sub-cost is
             // payable. The interactive choice is surfaced at resolution via
@@ -1826,6 +2360,154 @@ mod tests {
         assert!(!two_legs.is_payable_for_mana_ability(&state, P0, source, 0));
         // The ordinary gate is unaffected by the mana-ability exclusion.
         assert!(two_legs.is_payable(&state, P0, source));
+    }
+
+    fn object_leg<'a>(
+        leaf: &'a AbilityCost,
+        demand: ObjectLegDemand,
+        candidates: &[u64],
+    ) -> ObjectCostLeg<'a> {
+        ObjectCostLeg {
+            leaf,
+            demand,
+            candidates: candidates.iter().copied().map(ObjectId).collect(),
+        }
+    }
+
+    fn sacrifice_leaf() -> AbilityCost {
+        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 1))
+    }
+
+    /// CR 118.3 + CR 601.2h: one object pays at most one leg; the assignment
+    /// search must re-route an earlier pick (augmenting path) and honour counts.
+    #[test]
+    fn object_legs_need_a_distinct_object_per_slot() {
+        use ObjectLegDemand::Exactly;
+        let leaf = sacrifice_leaf();
+        let assign = |legs: &[ObjectCostLeg<'_>]| object_legs_have_joint_assignment(legs);
+        // One dual land for a Swamp leg and a Forest leg.
+        assert!(!assign(&[
+            object_leg(&leaf, Exactly(1), &[1]),
+            object_leg(&leaf, Exactly(1), &[1]),
+        ]));
+        // Dual land + basic Swamp: the Swamp leg must give the dual land up.
+        assert!(assign(&[
+            object_leg(&leaf, Exactly(1), &[1, 2]),
+            object_leg(&leaf, Exactly(1), &[1]),
+        ]));
+        // Three Herald legs over a two-colour creature plus one other.
+        assert!(!assign(&[
+            object_leg(&leaf, Exactly(1), &[1]),
+            object_leg(&leaf, Exactly(1), &[1, 2]),
+            object_leg(&leaf, Exactly(1), &[2]),
+        ]));
+        // Counts: "two lands and a permanent".
+        assert!(assign(&[
+            object_leg(&leaf, Exactly(2), &[1, 2]),
+            object_leg(&leaf, Exactly(1), &[1, 2, 3]),
+        ]));
+        assert!(!assign(&[
+            object_leg(&leaf, Exactly(2), &[1, 2]),
+            object_leg(&leaf, Exactly(1), &[1, 2]),
+        ]));
+        // A zero-count leg takes nothing.
+        assert!(assign(&[
+            object_leg(&leaf, Exactly(0), &[]),
+            object_leg(&leaf, Exactly(1), &[1]),
+        ]));
+    }
+
+    /// Without guided prompts any overlap fails closed (except two chosen
+    /// hand-discards, which the printed-order discard check governs); an
+    /// unmodeled leg may never overlap another leg.
+    #[test]
+    fn object_leg_overlap_policy() {
+        use ObjectLegDemand::{Exactly, Unmodeled};
+        use ObjectLegPayment::{GuidedActivation, Unguided};
+        let sacrifice = sacrifice_leaf();
+        let discard = chosen_hand_discard(None);
+        let overlapping = [
+            object_leg(&sacrifice, Exactly(1), &[1, 2]),
+            object_leg(&sacrifice, Exactly(1), &[1]),
+        ];
+        assert!(object_legs_jointly_payable(&overlapping, GuidedActivation));
+        assert!(!object_legs_jointly_payable(&overlapping, Unguided));
+        let disjoint = [
+            object_leg(&sacrifice, Exactly(1), &[2]),
+            object_leg(&sacrifice, Exactly(1), &[1]),
+        ];
+        assert!(object_legs_jointly_payable(&disjoint, Unguided));
+        let discards = [
+            object_leg(&discard, Exactly(1), &[1, 2]),
+            object_leg(&discard, Exactly(1), &[1]),
+        ];
+        assert!(object_legs_jointly_payable(&discards, Unguided));
+        let unmodeled_overlap = [
+            object_leg(&sacrifice, Unmodeled, &[1, 2]),
+            object_leg(&sacrifice, Exactly(1), &[1]),
+        ];
+        assert!(!object_legs_jointly_payable(
+            &unmodeled_overlap,
+            GuidedActivation
+        ));
+        let unmodeled_disjoint = [
+            object_leg(&sacrifice, Unmodeled, &[2]),
+            object_leg(&sacrifice, Exactly(1), &[1]),
+        ];
+        assert!(object_legs_jointly_payable(
+            &unmodeled_disjoint,
+            GuidedActivation
+        ));
+    }
+
+    /// The gate reads the board: two sacrifice legs over one permanent that
+    /// matches both filters are unpayable, while distinct permanents pay them.
+    #[test]
+    fn composite_gate_refuses_one_permanent_for_two_sacrifice_legs() {
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_creature(P0, "Source", 1, 1).id();
+        let dual = scenario.add_creature(P0, "Dual", 1, 1).id();
+        scenario
+            .state
+            .objects
+            .get_mut(&dual)
+            .unwrap()
+            .card_types
+            .subtypes = vec!["Swamp".to_string(), "Forest".to_string()];
+        let subtype = |name: &str| {
+            AbilityCost::Sacrifice(SacrificeCost::count(
+                TargetFilter::Typed(TypedFilter::default().subtype(name.to_string())),
+                1,
+            ))
+        };
+        let cost = AbilityCost::Composite {
+            costs: vec![subtype("Swamp"), subtype("Forest")],
+        };
+        // Reach guard: each leg alone is payable by the dual.
+        assert!(subtype("Swamp").is_payable(&scenario.state, P0, source));
+        assert!(subtype("Forest").is_payable(&scenario.state, P0, source));
+        assert!(!cost.is_payable_for_activation(&scenario.state, P0, source, Some(0)));
+        assert!(!cost.is_payable(&scenario.state, P0, source));
+
+        let swamp = scenario.add_creature(P0, "Swamp Creature", 1, 1).id();
+        scenario
+            .state
+            .objects
+            .get_mut(&swamp)
+            .unwrap()
+            .card_types
+            .subtypes = vec!["Swamp".to_string()];
+        assert!(cost.is_payable_for_activation(&scenario.state, P0, source, Some(0)));
+        // Unguided (spell) payment would let the Swamp leg strand the Forest
+        // leg, so the overlapping shape fails closed there, and on the
+        // mana-ability path, which prompts its legs the same way.
+        assert!(!cost.is_payable(&scenario.state, P0, source));
+        assert!(!cost.is_payable_for_mana_ability(&scenario.state, P0, source, 0));
+        // Reach guard: the mana-ability arm still offers a lone leg.
+        let lone = AbilityCost::Composite {
+            costs: vec![subtype("Forest")],
+        };
+        assert!(lone.is_payable_for_mana_ability(&scenario.state, P0, source, 0));
     }
 
     #[test]
