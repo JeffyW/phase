@@ -1080,8 +1080,7 @@ fn resolve_mana_option_for_trigger_probe(
         else {
             return false;
         };
-        let override_value =
-            casting_costs::production_override_for_option(&probe, &ability_def, option);
+        let override_value = casting_costs::production_override_for_option(&ability_def, option);
         if mana_abilities::resolve_mana_ability(
             &mut probe,
             option.object_id,

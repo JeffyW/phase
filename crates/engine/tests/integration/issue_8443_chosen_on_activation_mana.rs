@@ -3,10 +3,12 @@
 //! whether a spell can be cast, whether auto-pass skips the priority window,
 //! and how auto-tap pays.
 //!
-//! CR 106.1 + CR 607.2d: "the chosen color" on Sunken Citadel is linked to its
-//! as-enters choice, and an unset linked choice produces no mana (CR 106.5).
-//! Astral Cornucopia, Nykthos and Nyx Lotus have no linked chooser; the color
-//! is chosen while the ability resolves, so any color is available.
+//! CR 106.1 + CR 608.2d + CR 607.2d: "Choose a color. Add ... of that color"
+//! (Astral Cornucopia, Nykthos, Nyx Lotus, Three Tree City) chooses as the
+//! ability resolves, so it is mana of any one color and that provenance travels
+//! with the ability. "Add one mana of the chosen color" (Sunken Citadel,
+//! Heraldic Banner) refers to a linked choice; unset or undefined, it adds no
+//! mana (CR 106.5, CR 607.5a).
 
 use engine::ai_support::{auto_pass_recommended, flat_priority_actions, legal_actions};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
@@ -17,12 +19,13 @@ use engine::types::ability::{
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::{CastPaymentMode, ManaChoice, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, ManaChoice, ManaChoicePrompt, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
+use std::sync::Arc;
 
 const ASTRAL: &str = "This artifact enters with X charge counters on it.\n{T}: Choose a color. Add one mana of that color for each charge counter on this artifact.";
 const NYKTHOS: &str = "{T}: Add {C}.\n{2}, {T}: Choose a color. Add an amount of mana of that color equal to your devotion to that color.";
@@ -91,31 +94,21 @@ fn spell_zone(runner: &GameRunner, spell: ObjectId) -> Zone {
     runner.state().objects[&spell].zone
 }
 
-/// Reach guard shared by every Astral leg: the printed ability is a pure
-/// chosen-color production with no color chosen and no linked chooser.
+/// Reach guard shared by every Astral leg: the printed "Choose a color. Add
+/// ..." ability carries its activation-time choice as mana of any one of the
+/// five colors, and no color is stored on the object.
 fn assert_astral_reach(runner: &GameRunner, astral: ObjectId) {
     assert!(
         matches!(
             produced_of(runner, astral, 0),
-            ManaProduction::ChosenColor {
-                fixed_alternative: None,
-                ..
-            }
+            ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
         ),
-        "Astral Cornucopia must parse to a pure chosen-color production"
+        "Astral Cornucopia's choice is made on activation (any one color)"
     );
-    let obj = &runner.state().objects[&astral];
     assert_eq!(
-        obj.chosen_color(),
+        runner.state().objects[&astral].chosen_color(),
         None,
         "no color chosen before activation"
-    );
-    assert!(
-        obj.replacement_definitions
-            .iter_unchecked()
-            .filter_map(|replacement| replacement.execute.as_deref())
-            .all(|execute| !matches!(&*execute.effect, Effect::Choose { .. })),
-        "Astral Cornucopia has no linked color chooser"
     );
 }
 
@@ -280,10 +273,7 @@ fn nykthos_plans_each_color_with_its_own_devotion() {
     assert!(
         matches!(
             produced_of(&runner, nykthos, 1),
-            ManaProduction::ChosenColor {
-                fixed_alternative: None,
-                ..
-            }
+            ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
         ),
         "reach: Nykthos's second ability is a pure chosen-color production"
     );
@@ -356,10 +346,7 @@ fn nyx_lotus_plans_each_color_with_its_own_devotion() {
     let (mut runner, lotus, spell) = build(cost(vec![ManaCostShard::Green], 2), false);
     assert!(matches!(
         produced_of(&runner, lotus, 0),
-        ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        }
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
     ));
     assert_eq!(priority_facts(&runner, spell), (true, false));
     assert_eq!(
@@ -397,49 +384,758 @@ fn nyx_lotus_plans_each_color_with_its_own_devotion() {
     );
 }
 
-/// CR 106.5 + CR 607.2d fail-closed control for the chooser traversal: a
-/// persisted color chooser nested inside an inline branch carrier
-/// (`ChooseOneOf`) is still a linked chooser, so the unset source adds no mana.
-#[test]
-fn linked_color_chooser_inside_a_branch_carrier_counts_as_linked() {
+/// Astral Cornucopia with four charge counters, Leatherback Baloth (devotion
+/// to green 3) and Harmonize {2}{G}{G} ("Draw three cards.") in P0's hand.
+fn astral_harmonize_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(
+        P0,
+        &[
+            "Library A",
+            "Library B",
+            "Library C",
+            "Library D",
+            "Library E",
+        ],
+    );
     let astral = scenario
         .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
         .id();
-    scenario.with_counter(astral, charge(), 3);
-    let spell = add_instant(&mut scenario, cost(vec![ManaCostShard::Red], 0));
-    let mut runner = scenario.build();
-    assert!(
-        priority_facts(&runner, spell).0,
-        "reach: without a linked chooser the source pays {{R}}"
-    );
+    scenario.with_counter(astral, charge(), 4);
+    let baloth = scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ))
+        .id();
+    let harmonize = scenario
+        .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
+        .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
+        .id();
+    (scenario.build(), astral, baloth, harmonize)
+}
 
-    let nested_chooser = AbilityDefinition::new(
-        AbilityKind::Spell,
-        Effect::ChooseOneOf {
-            chooser: PlayerFilter::Controller,
-            branches: vec![AbilityDefinition::new(
+fn persisted_color_choice() -> Effect {
+    Effect::Choose {
+        choice_type: ChoiceType::color(),
+        persist: true,
+        selection: TargetSelectionMode::Chosen,
+    }
+}
+
+/// Engine-shape fixtures: a persisted color chooser placed elsewhere on Astral
+/// Cornucopia, unrelated to its printed mana ability.
+#[derive(Clone, Copy, Debug)]
+enum UnrelatedChooser {
+    /// Inside a `ChooseOneOf` branch of an as-enters replacement.
+    ChooseOneOfBranch,
+    /// "{0}: You may draw a card. When you do, choose a color." (CR 603.12).
+    Reflexive,
+    /// An own "{0}: Choose a color" whose ability array a copy payload
+    /// installed for the Baloth shares (CR 707.2).
+    SharedWithCopyPayload,
+}
+
+fn install_unrelated_chooser(
+    runner: &mut GameRunner,
+    astral: ObjectId,
+    baloth: ObjectId,
+    shape: UnrelatedChooser,
+) {
+    let free = || AbilityCost::Mana {
+        cost: ManaCost::generic(0),
+    };
+    // As-enters replacements: they apply only to Cornucopia entering the
+    // battlefield, so they never fire in these boards.
+    let push_replacement = |runner: &mut GameRunner, execute: AbilityDefinition| {
+        let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .execute(execute);
+        let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+        Arc::make_mut(&mut obj.base_replacement_definitions).push(replacement.clone());
+        obj.replacement_definitions.push(replacement);
+    };
+    match shape {
+        UnrelatedChooser::ChooseOneOfBranch => {
+            let branch = AbilityDefinition::new(
                 AbilityKind::Spell,
-                Effect::Choose {
-                    choice_type: ChoiceType::color(),
-                    persist: true,
-                    selection: TargetSelectionMode::Chosen,
+                Effect::ChooseOneOf {
+                    chooser: PlayerFilter::Controller,
+                    branches: vec![AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        persisted_color_choice(),
+                    )],
                 },
-            )],
-        },
+            );
+            push_replacement(runner, branch);
+        }
+        UnrelatedChooser::Reflexive => {
+            let mut reflexive =
+                AbilityDefinition::new(AbilityKind::Spell, persisted_color_choice());
+            reflexive.condition = Some(AbilityCondition::WhenYouDo);
+            let mut draw = AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )
+            .cost(free());
+            draw.optional = true;
+            let draw = draw.sub_ability(reflexive);
+            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+            Arc::make_mut(&mut obj.base_abilities).push(draw.clone());
+            Arc::make_mut(&mut obj.abilities).push(draw);
+        }
+        UnrelatedChooser::SharedWithCopyPayload => {
+            let chooser = AbilityDefinition::new(AbilityKind::Activated, persisted_color_choice())
+                .cost(free());
+            {
+                let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+                Arc::make_mut(&mut obj.base_abilities).push(chooser);
+                obj.abilities = Arc::clone(&obj.base_abilities);
+            }
+            let values = engine::game::printed_cards::intrinsic_copiable_values(
+                &runner.state().objects[&astral],
+            );
+            let copy_onto_baloth = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GenericEffect {
+                    static_abilities: vec![StaticDefinition::continuous()
+                        .affected(TargetFilter::SpecificObject { id: baloth })
+                        .modifications(vec![ContinuousModification::CopyValues {
+                            values: Box::new(values),
+                            display_source: Default::default(),
+                            printed_ref: None,
+                            token_image_ref: None,
+                            token_art: None,
+                        }])],
+                    duration: Some(Duration::UntilEndOfTurn),
+                    target: None,
+                    end_cost: None,
+                },
+            );
+            push_replacement(runner, copy_onto_baloth);
+        }
+    }
+}
+
+/// CR 106.1 + CR 608.2d + CR 607.2d (corrects the r1-r4 fixtures): Astral
+/// Cornucopia's printed choice is made as its own ability resolves, so a
+/// persisted color chooser elsewhere on the object does not turn it into a
+/// reference to that choice. Every shape keeps Harmonize payable, and a blue
+/// stored by that chooser does not make the printed ability blue only.
+#[test]
+fn an_unrelated_color_chooser_does_not_change_an_activation_choice() {
+    for shape in [
+        UnrelatedChooser::ChooseOneOfBranch,
+        UnrelatedChooser::Reflexive,
+        UnrelatedChooser::SharedWithCopyPayload,
+    ] {
+        let (mut runner, astral, baloth, harmonize) = astral_harmonize_board();
+        let replacements_before = runner.state().objects[&astral]
+            .replacement_definitions
+            .iter_unchecked()
+            .count();
+        install_unrelated_chooser(&mut runner, astral, baloth, shape);
+        let obj = &runner.state().objects[&astral];
+        let added_abilities = obj.abilities.len() - 1;
+        let added_replacements =
+            obj.replacement_definitions.iter_unchecked().count() - replacements_before;
+        assert_eq!(
+            (added_abilities, added_replacements),
+            match shape {
+                UnrelatedChooser::ChooseOneOfBranch => (0, 1),
+                UnrelatedChooser::Reflexive => (1, 0),
+                UnrelatedChooser::SharedWithCopyPayload => (1, 1),
+            },
+            "{shape:?}: reach: the chooser is installed"
+        );
+        assert_astral_reach(&runner, astral);
+        assert_eq!(
+            priority_facts(&runner, harmonize),
+            (true, false),
+            "{shape:?}: Harmonize is offered and auto-pass holds"
+        );
+        let hand = runner.state().players[0].hand.len();
+        runner.cast(harmonize).resolve();
+        assert_eq!(spell_zone(&runner, harmonize), Zone::Graveyard, "{shape:?}");
+        assert!(runner.state().objects[&astral].tapped, "{shape:?}");
+        assert_eq!(
+            runner.state().players[0].hand.len(),
+            hand - 1 + 3,
+            "{shape:?}: Harmonize drew three"
+        );
+    }
+
+    // The reflexive chooser stores blue on Cornucopia through real actions;
+    // the printed ability still chooses green for Harmonize.
+    let (mut runner, astral, baloth, harmonize) = astral_harmonize_board();
+    install_unrelated_chooser(&mut runner, astral, baloth, UnrelatedChooser::Reflexive);
+    runner
+        .activate(astral, 1)
+        .accept_optional()
+        .choose_option("Blue")
+        .resolve();
+    assert_eq!(
+        runner.state().objects[&astral].chosen_color(),
+        Some(ManaColor::Blue),
+        "reach: the unrelated choice persisted blue on Cornucopia"
     );
-    let replacement = ReplacementDefinition::new(ReplacementEvent::Moved).execute(nested_chooser);
+    assert_eq!(priority_facts(&runner, harmonize), (true, false));
+    runner.cast(harmonize).resolve();
+    assert_eq!(spell_zone(&runner, harmonize), Zone::Graveyard);
+    assert_eq!(
+        runner.state().objects[&astral].chosen_color(),
+        Some(ManaColor::Blue),
+        "paying with green leaves the stored blue alone"
+    );
+}
+
+/// Disclosed limitation, not a migration: an object serialized before this
+/// change carries the old collapsed form ("Choose a color. Add ..." as a
+/// chosen-color production with no linked chooser). It behaves as before the
+/// fix: the unset chosen color is undefined, so nothing is planned from it
+/// (CR 106.5).
+#[test]
+fn legacy_collapsed_chosen_color_form_plans_no_mana() {
+    let (mut runner, astral, _, harmonize) = astral_harmonize_board();
+    assert!(
+        priority_facts(&runner, harmonize).0,
+        "reach: printed form pays"
+    );
     {
         let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
-        // Both the live list and its layer base, so a layer pass keeps it.
-        std::sync::Arc::make_mut(&mut obj.base_replacement_definitions).push(replacement.clone());
-        obj.replacement_definitions.push(replacement);
+        for abilities in [&mut obj.abilities, &mut obj.base_abilities] {
+            let ability = &mut Arc::make_mut(abilities)[0];
+            let Effect::Mana { produced, .. } = &mut *ability.effect else {
+                panic!("Astral's first ability is its mana ability");
+            };
+            let ManaProduction::AnyOneColor {
+                count,
+                contribution,
+                ..
+            } = produced.clone()
+            else {
+                panic!("printed form is any one color");
+            };
+            *produced = ManaProduction::ChosenColor {
+                count,
+                contribution,
+                fixed_alternative: None,
+            };
+        }
     }
+    assert!(matches!(
+        produced_of(&runner, astral, 0),
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        }
+    ));
+    assert_eq!(priority_facts(&runner, harmonize), (false, true));
+}
+
+/// Nyx Lotus (untapped), Leatherback Baloth and Merfolk of the Pearl Trident:
+/// devotion G3 / U1, empty pool, precombat main. `stored` puts an unrelated
+/// persisted color on the Lotus.
+fn nyx_lotus_devotion_board(stored: Option<ManaColor>) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let lotus = scenario
+        .add_artifact_from_oracle(P0, "Nyx Lotus", NYX_LOTUS)
+        .id();
+    scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ));
+    scenario
+        .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+    let mut runner = scenario.build();
+    if let Some(color) = stored {
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&lotus)
+            .unwrap()
+            .chosen_attributes
+            .push(ChosenAttribute::Color(color));
+    }
+    let state = runner.state();
+    assert!(!state.objects[&lotus].tapped);
+    assert_eq!(state.players[0].mana_pool.total(), 0);
+    assert_eq!(state.objects[&lotus].chosen_color(), stored);
+    for (color, devotion) in [(ManaColor::Green, 3), (ManaColor::Blue, 1)] {
+        assert_eq!(
+            engine::game::devotion::count_devotion(state, P0, &[color]),
+            devotion
+        );
+    }
+    assert!(matches!(
+        produced_of(&runner, lotus, 0),
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
+    ));
+    (runner, lotus)
+}
+
+/// Activates Nyx Lotus by hand and answers its color prompt with `color`.
+fn activate_lotus_choosing(runner: &mut GameRunner, lotus: ObjectId, color: ManaType) {
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: lotus,
+            ability_index: 0,
+        })
+        .expect("Nyx Lotus can be activated");
+    match &runner.state().waiting_for {
+        WaitingFor::ChooseManaColor {
+            choice: ManaChoicePrompt::SingleColor { options },
+            ..
+        } => assert_eq!(options.len(), 5, "any of the five colors"),
+        other => panic!("expected the color prompt, got {other:?}"),
+    }
+    runner
+        .act(GameAction::ChooseManaColor {
+            choice: ManaChoice::SingleColor(color),
+            count: 1,
+        })
+        .expect("the chosen color is legal");
+}
+
+/// Reviewer probes A and B (#8443 m1, M1-01 / M1-02): activating Nyx Lotus by
+/// hand asks for a color even though its amount depends on that color, and
+/// green adds GGG (CR 608.2d, CR 700.5). The color chosen for the activation
+/// is what its devotion reads: an unrelated blue stored on the Lotus is
+/// neither read nor changed, and the same holds for planning.
+#[test]
+fn nyx_lotus_manual_activation_counts_the_color_chosen_for_it() {
+    for stored in [None, Some(ManaColor::Blue)] {
+        let (mut runner, lotus) = nyx_lotus_devotion_board(stored);
+        activate_lotus_choosing(&mut runner, lotus, ManaType::Green);
+        let pool = &runner.state().players[0].mana_pool;
+        assert_eq!(pool.count_color(ManaType::Green), 3, "{stored:?}");
+        assert_eq!(pool.total(), 3, "{stored:?}");
+        assert!(runner.state().objects[&lotus].tapped);
+        assert_eq!(
+            runner.state().objects[&lotus].chosen_color(),
+            stored,
+            "the stored color is unchanged"
+        );
+
+        let (mut runner, _) = nyx_lotus_devotion_board(stored);
+        let spell = green_triple_spell(&mut runner);
+        assert_eq!(
+            priority_facts(&runner, spell),
+            (true, false),
+            "{stored:?}: planning reads green devotion for green"
+        );
+    }
+
+    // Blue adds one: the amount follows the color chosen.
+    let (mut runner, lotus) = nyx_lotus_devotion_board(None);
+    activate_lotus_choosing(&mut runner, lotus, ManaType::Blue);
+    assert_eq!(
+        runner.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Blue),
+        1
+    );
+    assert_eq!(runner.state().players[0].mana_pool.total(), 1);
+}
+
+const NYX_PLANE: &str = "Nontoken creatures are enchantments in addition to their other types.\nConstellation — Whenever an enchantment you control enters, you gain 1 life.\nWhenever chaos ensues, choose a color. Add an amount of mana of that color equal to your devotion to that color.";
+
+/// Reviewer probe A, Nyx leg (#8443 m1, M1-01): with Nyx as P0's active plane,
+/// rolling chaos on the planar die (CR 901.9b) triggers "choose a color. Add
+/// an amount of mana of that color equal to your devotion to that color".
+/// The trigger uses the stack (it is not a mana ability, CR 605.1b), asks for
+/// a color, and green adds GGG (devotion G3 / U1).
+#[test]
+fn nyx_chaos_trigger_prompts_and_adds_devotion_to_the_chosen_color() {
+    use engine::database::synthesis::synthesize_planechase;
+    use engine::game::planechase::PlanarDieFace;
+    use engine::game::printed_cards::apply_card_face_to_object;
+    use engine::types::card::CardFace;
+    use engine::types::card_type::CoreType;
+    use engine::types::events::GameEvent;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ));
+    scenario
+        .add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+    let mut runner = scenario.build();
+    let nyx = {
+        let state = runner.state_mut();
+        state.format_config.format = engine::types::format::GameFormat::Planechase;
+        let nyx = engine::game::zones::create_object(
+            state,
+            engine::types::identifiers::CardId(8_444),
+            P0,
+            "Nyx".to_string(),
+            Zone::Command,
+        );
+        let mut card_types = state.objects[&nyx].card_types.clone();
+        card_types.core_types.push(CoreType::Plane);
+        let parsed = engine::parser::oracle::parse_oracle_text(
+            NYX_PLANE,
+            "Nyx",
+            &[],
+            &["Plane".to_string()],
+            &["Theros".to_string()],
+        );
+        let mut face = CardFace {
+            name: "Nyx".to_string(),
+            card_type: card_types,
+            triggers: parsed.triggers,
+            static_abilities: parsed.statics,
+            ..Default::default()
+        };
+        synthesize_planechase(&mut face);
+        apply_card_face_to_object(state.objects.get_mut(&nyx).unwrap(), &face);
+        state.command_zone.push_back(nyx);
+        state.planar_controller = Some(P0);
+        nyx
+    };
+    let chaos_mana = runner.state().objects[&nyx]
+        .trigger_definitions
+        .iter_unchecked()
+        .find_map(
+            |entry| match entry.definition.execute.as_deref().map(|d| &*d.effect) {
+                Some(Effect::Mana { produced, .. }) => Some(produced.clone()),
+                _ => None,
+            },
+        )
+        .expect("reach: Nyx's chaos trigger adds mana");
+    assert!(
+        matches!(&chaos_mana, ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5),
+        "reach: the chaos trigger's color is chosen as it resolves, got {chaos_mana:?}"
+    );
+
+    // The planar die is random (CR 901.3a); find a seed that rolls chaos.
+    let chaos_seed = (0..512_u64)
+        .find(|seed| {
+            let mut probe = GameRunner::from_state(runner.state().clone());
+            probe.state_mut().rng = engine::types::game_state::GameRng::seed_from_u64(*seed);
+            probe.act(GameAction::RollPlanarDie).is_ok_and(|result| {
+                result.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        GameEvent::PlanarDieRolled {
+                            face: PlanarDieFace::Chaos,
+                            ..
+                        }
+                    )
+                })
+            })
+        })
+        .expect("some seed rolls chaos");
+    runner.state_mut().rng = engine::types::game_state::GameRng::seed_from_u64(chaos_seed);
+    runner
+        .act(GameAction::RollPlanarDie)
+        .expect("P0 rolls the planar die");
+    assert!(
+        runner
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.source_id == nyx),
+        "reach: Nyx's chaos trigger is on the stack"
+    );
+    for _ in 0..4 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::ChooseManaColor { .. }
+        ) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("priority passes resolve the trigger");
+    }
+    match &runner.state().waiting_for {
+        WaitingFor::ChooseManaColor {
+            choice: ManaChoicePrompt::SingleColor { options },
+            ..
+        } => assert_eq!(options.len(), 5),
+        other => panic!("expected Nyx's color prompt, got {other:?}"),
+    }
+    let green_before = runner.state().players[0]
+        .mana_pool
+        .count_color(ManaType::Green);
+    runner
+        .act(GameAction::ChooseManaColor {
+            choice: ManaChoice::SingleColor(ManaType::Green),
+            count: 1,
+        })
+        .expect("green is a legal choice");
+    assert_eq!(
+        runner.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Green)
+            - green_before,
+        3,
+        "devotion to green is 3"
+    );
+}
+
+const MYR_WELDER: &str = "Imprint — {T}: Exile target artifact card from a graveyard.\nThis creature has all activated abilities of all cards exiled with it.";
+const HERALDIC_BANNER: &str = "As this artifact enters, choose a color.\nCreatures you control of the chosen color get +1/+0.\n{T}: Add one mana of the chosen color.";
+
+/// Myr Welder beside Leatherback Baloth (devotion to green 3), having
+/// imprinted `artifact` from P0's graveyard through its real ability, then
+/// untapped. Returns the runner and the Welder.
+fn welder_with_imprinted(name: &str, oracle: &str) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let welder = scenario
+        .add_creature_from_oracle(P0, "Myr Welder", 1, 4, MYR_WELDER)
+        .id();
+    scenario
+        .add_creature(P0, "Leatherback Baloth", 4, 5)
+        .with_mana_cost(cost(
+            vec![
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ));
+    let artifact = scenario.add_artifact_from_oracle(P0, name, oracle).id();
+    let mut runner = scenario.build();
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        artifact,
+        Zone::Graveyard,
+        &mut Vec::new(),
+    );
+    runner.activate(welder, 0).target_object(artifact).resolve();
+    assert_eq!(
+        runner.state().objects[&artifact].zone,
+        Zone::Exile,
+        "reach: {name} was exiled with the Welder"
+    );
+    {
+        let state = runner.state_mut();
+        state.objects.get_mut(&welder).unwrap().tapped = false;
+        engine::game::layers::evaluate_layers(state);
+    }
+    (runner, welder)
+}
+
+fn green_triple_spell(runner: &mut GameRunner) -> ObjectId {
+    let state = runner.state_mut();
+    let id = engine::game::zones::create_object(
+        state,
+        engine::types::identifiers::CardId(8_445),
+        P0,
+        "Green Triple".to_string(),
+        Zone::Hand,
+    );
+    let obj = state.objects.get_mut(&id).unwrap();
+    obj.card_types
+        .core_types
+        .push(engine::types::card_type::CoreType::Instant);
+    obj.base_card_types = obj.card_types.clone();
+    obj.mana_cost = cost(
+        vec![
+            ManaCostShard::Green,
+            ManaCostShard::Green,
+            ManaCostShard::Green,
+        ],
+        0,
+    );
+    let draw = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 0 },
+            target: TargetFilter::Controller,
+        },
+    );
+    Arc::make_mut(&mut obj.abilities).push(draw.clone());
+    Arc::make_mut(&mut obj.base_abilities).push(draw);
+    id
+}
+
+/// CR 607.5a + CR 106.5: Myr Welder gains Heraldic
+/// Banner's "{T}: Add one mana of the chosen color" without the linked "As
+/// this artifact enters, choose a color", so the choice is undefined and the
+/// acquired ability makes no mana: a {G}{G}{G} spell is not offered. The
+/// paired positive is Nyx Lotus's "{T}: Choose a color. Add ...", whose choice
+/// is made as the acquired ability resolves: the Welder adds GGG.
+#[test]
+fn myr_welder_acquired_linked_choice_is_undefined() {
+    // Negative: Heraldic Banner.
+    let (mut runner, welder) = welder_with_imprinted("Heraldic Banner", HERALDIC_BANNER);
+    assert!(
+        runner.state().objects[&welder]
+            .abilities
+            .iter()
+            .any(|ability| matches!(
+                &*ability.effect,
+                Effect::Mana {
+                    produced: ManaProduction::ChosenColor {
+                        fixed_alternative: None,
+                        ..
+                    },
+                    ..
+                }
+            )),
+        "reach: the Welder has Banner's chosen-color mana ability"
+    );
+    assert_eq!(runner.state().objects[&welder].chosen_color(), None);
+    let spell = green_triple_spell(&mut runner);
     assert_eq!(
         priority_facts(&runner, spell),
         (false, true),
-        "a nested linked chooser left unset produces no mana (CR 106.5)"
+        "the undefined choice adds no mana (CR 607.5a)"
+    );
+
+    // Positive: Nyx Lotus.
+    let (mut runner, welder) = welder_with_imprinted("Nyx Lotus", NYX_LOTUS);
+    assert!(
+        runner.state().objects[&welder]
+            .abilities
+            .iter()
+            .any(|ability| matches!(
+                &*ability.effect,
+                Effect::Mana {
+                    produced: ManaProduction::AnyOneColor { color_options, .. },
+                    ..
+                } if color_options.len() == 5
+            )),
+        "reach: the Welder has Nyx Lotus's activation-choice mana ability"
+    );
+    let spell = green_triple_spell(&mut runner);
+    assert_eq!(priority_facts(&runner, spell), (true, false));
+    runner.cast(spell).resolve();
+    assert_eq!(spell_zone(&runner, spell), Zone::Graveyard);
+    assert!(runner.state().objects[&welder].tapped, "the Welder paid");
+}
+
+const THREE_TREE_CITY: &str = "As Three Tree City enters, choose a creature type.\n{T}: Add {C}.\n{2}, {T}: Choose a color. Add an amount of mana of that color equal to the number of creatures you control of the chosen type.";
+
+/// Three Tree City played from hand (choosing `chosen` as it enters, when
+/// given) or placed directly with no type chosen, beside `elves` Elves (no
+/// mana abilities), one Goblin, two Plains to pay {2}, and a {G}{G}{G} spell
+/// only City can pay.
+fn three_tree_city_board(chosen: Option<&str>, elves: usize) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for index in 0..elves {
+        scenario
+            .add_creature(P0, &format!("Elf {index}"), 1, 1)
+            .with_subtypes(vec!["Elf"]);
+    }
+    scenario
+        .add_creature(P0, "Goblin", 1, 1)
+        .with_subtypes(vec!["Goblin"]);
+    scenario.add_basic_land(P0, ManaColor::White);
+    scenario.add_basic_land(P0, ManaColor::White);
+    let city = match chosen {
+        Some(_) => scenario
+            .add_land_to_hand(P0, "Three Tree City")
+            .from_oracle_text(THREE_TREE_CITY)
+            .id(),
+        None => scenario
+            .add_land_from_oracle(P0, "Three Tree City", THREE_TREE_CITY)
+            .id(),
+    };
+    let mut runner = scenario.build();
+    if let Some(creature_type) = chosen {
+        let card_id = runner.state().objects[&city].card_id;
+        runner
+            .act(GameAction::PlayLand {
+                object_id: city,
+                card_id,
+            })
+            .expect("P0 plays Three Tree City");
+        runner
+            .act(GameAction::ChooseOption {
+                choice: creature_type.to_string(),
+            })
+            .expect("the creature type is chosen as City enters");
+    }
+    let spell = green_triple_spell(&mut runner);
+    let state = runner.state();
+    assert_eq!(state.objects[&city].zone, Zone::Battlefield);
+    assert!(!state.objects[&city].tapped);
+    assert_eq!(
+        state.objects[&city].chosen_creature_type(),
+        chosen,
+        "reach: the chosen type"
+    );
+    assert!(matches!(
+        produced_of(&runner, city, 1),
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
+    ));
+    let creatures = state
+        .battlefield
+        .iter()
+        .filter(|id| {
+            state.objects[id]
+                .card_types
+                .core_types
+                .contains(&engine::types::card_type::CoreType::Creature)
+        })
+        .count();
+    assert_eq!(creatures, elves + 1, "reach: the Elves and the Goblin");
+    let untapped_plains = state
+        .battlefield
+        .iter()
+        .filter(|id| state.objects[id].name == "Plains" && !state.objects[id].tapped)
+        .count();
+    assert_eq!(untapped_plains, 2, "reach: the fuel for {{2}}");
+    (runner, city, spell)
+}
+
+/// CR 106.1 + CR 608.2d + CR 607.2d: Three Tree City played from hand with Elf
+/// chosen, beside three Elves and a Goblin: {2}, {T} adds three mana of one
+/// color, so a {G}{G}{G} spell only City can pay is offered, cast and paid.
+/// With no type chosen, or with two Elves, it is not offered.
+#[test]
+fn three_tree_city_pays_with_the_chosen_type_count() {
+    let (mut runner, city, spell) = three_tree_city_board(Some("Elf"), 3);
+    assert_eq!(priority_facts(&runner, spell), (true, false));
+    runner.cast(spell).resolve();
+    assert_eq!(spell_zone(&runner, spell), Zone::Graveyard);
+    assert!(runner.state().objects[&city].tapped, "City paid");
+
+    let (runner, _, spell) = three_tree_city_board(None, 3);
+    assert_eq!(
+        priority_facts(&runner, spell),
+        (false, true),
+        "no type chosen: no creatures of the chosen type"
+    );
+
+    let (runner, _, spell) = three_tree_city_board(Some("Elf"), 2);
+    assert_eq!(
+        priority_facts(&runner, spell),
+        (false, true),
+        "two Elves add two mana"
     );
 }
 
@@ -504,10 +1200,7 @@ fn nyx_lotus_surplus_color_pays_generic_alongside_ironworks() {
     let (runner, lotus, _, _, harmonize) = build(true);
     assert!(matches!(
         produced_of(&runner, lotus, 0),
-        ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        }
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
     ));
     assert_eq!(runner.state().objects[&lotus].chosen_color(), None);
 
@@ -679,10 +1372,7 @@ fn nyx_lotus_covers_part_of_the_colored_shards_and_leaves_the_rest() {
     );
     assert!(matches!(
         produced_of(&board.runner, board.lotus, 0),
-        ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        }
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
     ));
     assert_eq!(
         board.runner.state().objects[&board.lotus].chosen_color(),
@@ -792,10 +1482,7 @@ fn nyx_lotus_generic_capacity_follows_the_chosen_color() {
     let board = build(false);
     assert!(matches!(
         produced_of(&board.runner, board.lotus, 0),
-        ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        }
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
     ));
     for (color, devotion) in [
         (ManaColor::Green, 3),
@@ -876,10 +1563,7 @@ fn nyx_lotus_pays_generic_with_its_best_color() {
     let mut runner = scenario.build();
     assert!(matches!(
         produced_of(&runner, lotus, 0),
-        ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        }
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
     ));
     assert_eq!(priority_facts(&runner, spell), (true, false));
     assert_eq!(
@@ -889,84 +1573,6 @@ fn nyx_lotus_pays_generic_with_its_best_color() {
     runner.cast(spell).resolve();
     assert_eq!(spell_zone(&runner, spell), Zone::Graveyard);
     assert!(runner.state().objects[&lotus].tapped);
-}
-
-/// Reviewer probe board (#8443 r2, R2a, engine-shape fixture): an ability on
-/// Astral Cornucopia that grants a color chooser to another object (CR 611.2)
-/// is that object's chooser, not a linked chooser for Cornucopia.
-#[test]
-fn chooser_granted_to_another_object_is_not_linked() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_library_top(P0, &["Library A", "Library B", "Library C"]);
-    let astral = scenario
-        .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
-        .id();
-    scenario.with_counter(astral, charge(), 4);
-    let baloth = scenario
-        .add_creature(P0, "Leatherback Baloth", 4, 5)
-        .with_mana_cost(cost(
-            vec![
-                ManaCostShard::Green,
-                ManaCostShard::Green,
-                ManaCostShard::Green,
-            ],
-            0,
-        ))
-        .id();
-    let harmonize = scenario
-        .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
-        .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
-        .id();
-    let mut runner = scenario.build();
-    assert!(
-        priority_facts(&runner, harmonize).0,
-        "reach: plain Cornucopia pays Harmonize"
-    );
-
-    let grant = AbilityDefinition::new(
-        AbilityKind::Activated,
-        Effect::GenericEffect {
-            static_abilities: vec![StaticDefinition::continuous()
-                .affected(TargetFilter::SpecificObject { id: baloth })
-                .modifications(vec![ContinuousModification::GrantAbility {
-                    definition: Box::new(AbilityDefinition::new(
-                        AbilityKind::Spell,
-                        Effect::Choose {
-                            choice_type: ChoiceType::color(),
-                            persist: true,
-                            selection: TargetSelectionMode::Chosen,
-                        },
-                    )),
-                }])],
-            duration: Some(Duration::UntilEndOfTurn),
-            target: None,
-            end_cost: None,
-        },
-    )
-    .cost(AbilityCost::Mana {
-        cost: cost(vec![], 9),
-    });
-    {
-        let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
-        std::sync::Arc::make_mut(&mut obj.base_abilities).push(grant.clone());
-        std::sync::Arc::make_mut(&mut obj.abilities).push(grant);
-    }
-    assert!(
-        matches!(
-            &*runner.state().objects[&astral].abilities[1].effect,
-            Effect::GenericEffect { static_abilities, .. }
-                if matches!(
-                    &static_abilities[0].affected,
-                    Some(TargetFilter::SpecificObject { id }) if *id == baloth
-                )
-        ),
-        "reach: the grant targets the Baloth"
-    );
-    assert!(
-        priority_facts(&runner, harmonize).0,
-        "a chooser granted to the Baloth does not make Cornucopia's color linked"
-    );
 }
 
 /// CR 107.3 + CR 601.2f + CR 700.5 (fail closed, #8443 r3 ruling): the {X}
@@ -1034,10 +1640,7 @@ fn x_ceiling_leaves_out_a_color_dependent_activation_amount() {
     let (mut runner, lotus, spell) = build(0);
     assert!(matches!(
         produced_of(&runner, lotus, 0),
-        ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        }
+        ManaProduction::AnyOneColor { color_options, .. } if color_options.len() == 5
     ));
     assert_eq!(runner.state().objects[&lotus].chosen_color(), None);
     for (color, devotion) in [(ManaColor::Green, 3), (ManaColor::Blue, 1)] {
@@ -1067,337 +1670,6 @@ fn x_ceiling_leaves_out_a_color_dependent_activation_amount() {
     // Control: with UU floating the Island alone counts toward X.
     let (mut runner, _, spell) = build(2);
     assert_eq!(x_ceiling(&mut runner, spell), 1);
-}
-
-/// CR 607.2d + CR 603.12 + CR 106.5 (fail closed, #8443 r3 ruling): a persisted
-/// color chooser in this object's own reflexive "when you do" ability still
-/// writes the color to this object, so the unset source is linked and adds no
-/// mana until the choice is made. Once it is made through real actions, the
-/// color persists on the object and supplies that color. Engine-shape fixture.
-#[test]
-fn reflexive_color_chooser_on_the_same_object_counts_as_linked() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
-    let astral = scenario
-        .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
-        .id();
-    scenario.with_counter(astral, charge(), 4);
-    scenario
-        .add_creature(P0, "Leatherback Baloth", 4, 5)
-        .with_mana_cost(cost(
-            vec![
-                ManaCostShard::Green,
-                ManaCostShard::Green,
-                ManaCostShard::Green,
-            ],
-            0,
-        ));
-    let harmonize = scenario
-        .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
-        .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
-        .id();
-    let mut runner = scenario.build();
-    assert!(
-        priority_facts(&runner, harmonize).0,
-        "reach: plain Cornucopia pays Harmonize"
-    );
-
-    // "{0}: You may draw a card. When you do, choose a color." with the color
-    // persisted on this object.
-    let mut reflexive = AbilityDefinition::new(
-        AbilityKind::Spell,
-        Effect::Choose {
-            choice_type: ChoiceType::color(),
-            persist: true,
-            selection: TargetSelectionMode::Chosen,
-        },
-    );
-    reflexive.condition = Some(AbilityCondition::WhenYouDo);
-    let mut draw = AbilityDefinition::new(
-        AbilityKind::Activated,
-        Effect::Draw {
-            count: QuantityExpr::Fixed { value: 1 },
-            target: TargetFilter::Controller,
-        },
-    )
-    .cost(AbilityCost::Mana {
-        cost: ManaCost::generic(0),
-    });
-    draw.optional = true;
-    let draw = draw.sub_ability(reflexive);
-    {
-        let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
-        std::sync::Arc::make_mut(&mut obj.base_abilities).push(draw.clone());
-        std::sync::Arc::make_mut(&mut obj.abilities).push(draw);
-    }
-    assert!(
-        !priority_facts(&runner, harmonize).0,
-        "a same-object reflexive chooser left unset gives no mana (CR 106.5)"
-    );
-
-    runner
-        .activate(astral, 1)
-        .accept_optional()
-        .choose_option("Green")
-        .resolve();
-    assert_eq!(
-        runner.state().objects[&astral].chosen_color(),
-        Some(ManaColor::Green),
-        "the reflexive choice persisted on Cornucopia"
-    );
-    assert!(
-        priority_facts(&runner, harmonize).0,
-        "the chosen green pays {{2}}{{G}}{{G}}"
-    );
-}
-
-/// Reviewer probe board (#8443 r4, R4-01, engine-shape fixture): Cornucopia's
-/// own "{0}: Choose a color" is linked even when the same definition (shared
-/// by allocation through its copiable values) also appears inside a copy
-/// effect installed on another object. The payload is pruned where it
-/// occurs, never by address (CR 607.2d, CR 106.5, CR 707.2).
-#[test]
-fn own_chooser_shared_with_a_copy_payload_stays_linked() {
-    let build = |with_copy_payload: bool| {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
-        let astral = scenario
-            .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
-            .id();
-        scenario.with_counter(astral, charge(), 4);
-        let baloth = scenario
-            .add_creature(P0, "Leatherback Baloth", 4, 5)
-            .with_mana_cost(cost(
-                vec![
-                    ManaCostShard::Green,
-                    ManaCostShard::Green,
-                    ManaCostShard::Green,
-                ],
-                0,
-            ))
-            .id();
-        let harmonize = scenario
-            .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
-            .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
-            .id();
-        let mut runner = scenario.build();
-        assert!(
-            priority_facts(&runner, harmonize).0,
-            "reach: plain Cornucopia pays Harmonize"
-        );
-
-        let chooser = AbilityDefinition::new(
-            AbilityKind::Activated,
-            Effect::Choose {
-                choice_type: ChoiceType::color(),
-                persist: true,
-                selection: TargetSelectionMode::Chosen,
-            },
-        )
-        .cost(AbilityCost::Mana {
-            cost: ManaCost::generic(0),
-        });
-        {
-            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
-            std::sync::Arc::make_mut(&mut obj.base_abilities).push(chooser);
-            obj.abilities = std::sync::Arc::clone(&obj.base_abilities);
-        }
-        if with_copy_payload {
-            let values = engine::game::printed_cards::intrinsic_copiable_values(
-                &runner.state().objects[&astral],
-            );
-            let copy_onto_baloth = AbilityDefinition::new(
-                AbilityKind::Spell,
-                Effect::GenericEffect {
-                    static_abilities: vec![StaticDefinition::continuous()
-                        .affected(TargetFilter::SpecificObject { id: baloth })
-                        .modifications(vec![ContinuousModification::CopyValues {
-                            values: Box::new(values),
-                            display_source: Default::default(),
-                            printed_ref: None,
-                            token_image_ref: None,
-                            token_art: None,
-                        }])],
-                    duration: Some(Duration::UntilEndOfTurn),
-                    target: None,
-                    end_cost: None,
-                },
-            );
-            let replacement =
-                ReplacementDefinition::new(ReplacementEvent::Moved).execute(copy_onto_baloth);
-            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
-            std::sync::Arc::make_mut(&mut obj.base_replacement_definitions)
-                .push(replacement.clone());
-            obj.replacement_definitions.push(replacement);
-        }
-        (runner, astral, harmonize)
-    };
-
-    let (runner, astral, harmonize) = build(true);
-    // Reach: the copy payload shares Cornucopia's ability array, so the own
-    // chooser and the payload's chooser are the same allocation.
-    let obj = &runner.state().objects[&astral];
-    let payload_abilities = obj
-        .replacement_definitions
-        .iter_unchecked()
-        .find_map(
-            |replacement| match replacement.execute.as_deref().map(|d| &*d.effect) {
-                Some(Effect::GenericEffect {
-                    static_abilities, ..
-                }) => static_abilities[0]
-                    .modifications
-                    .iter()
-                    .find_map(|modification| match modification {
-                        ContinuousModification::CopyValues { values, .. } => {
-                            Some(std::sync::Arc::clone(&values.abilities))
-                        }
-                        _ => None,
-                    }),
-                _ => None,
-            },
-        )
-        .expect("the copy payload is installed");
-    assert!(std::sync::Arc::ptr_eq(&payload_abilities, &obj.abilities));
-    assert!(std::ptr::eq(
-        &*payload_abilities[1].effect,
-        &*obj.abilities[1].effect
-    ));
-    assert!(
-        !priority_facts(&runner, harmonize).0,
-        "the own chooser left unset keeps Cornucopia linked (CR 106.5)"
-    );
-    // The check prunes a throwaway copy: the payload and the shared arrays
-    // are unchanged after the legal-action query.
-    let obj = &runner.state().objects[&astral];
-    assert!(std::sync::Arc::ptr_eq(&payload_abilities, &obj.abilities));
-    assert!(matches!(
-        &*payload_abilities[1].effect,
-        Effect::Choose { persist: true, .. }
-    ));
-    assert!(obj
-        .replacement_definitions
-        .iter_unchecked()
-        .any(|replacement| matches!(
-            replacement.execute.as_deref().map(|d| &*d.effect),
-            Some(Effect::GenericEffect { static_abilities, .. }) if !static_abilities.is_empty()
-        )));
-
-    // Control: without the copy payload, still linked.
-    let (runner, _, harmonize) = build(false);
-    assert!(!priority_facts(&runner, harmonize).0);
-
-    // Choosing green through real actions persists it and pays Harmonize.
-    let (mut runner, astral, harmonize) = build(true);
-    runner.activate(astral, 1).choose_option("Green").resolve();
-    assert_eq!(
-        runner.state().objects[&astral].chosen_color(),
-        Some(ManaColor::Green)
-    );
-    assert!(priority_facts(&runner, harmonize).0);
-}
-
-/// Reviewer probe board (#8443 r5, R5-01, engine-shape fixture): a grant to
-/// another object nested directly inside another effect (here a draw
-/// replacement's substitute effect) is pruned like one at an ability root, so
-/// a chooser granted to the Baloth never makes Cornucopia's color linked
-/// (CR 607.2d, CR 611.2).
-#[test]
-fn chooser_granted_inside_a_nested_effect_is_not_linked() {
-    let build = |nested: bool| {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
-        let astral = scenario
-            .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
-            .id();
-        scenario.with_counter(astral, charge(), 4);
-        let baloth = scenario
-            .add_creature(P0, "Leatherback Baloth", 4, 5)
-            .with_mana_cost(cost(
-                vec![
-                    ManaCostShard::Green,
-                    ManaCostShard::Green,
-                    ManaCostShard::Green,
-                ],
-                0,
-            ))
-            .id();
-        let harmonize = scenario
-            .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
-            .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
-            .id();
-        let mut runner = scenario.build();
-        assert!(
-            priority_facts(&runner, harmonize).0,
-            "reach: plain Cornucopia pays Harmonize"
-        );
-
-        let grant_to_baloth = Effect::GenericEffect {
-            static_abilities: vec![StaticDefinition::continuous()
-                .affected(TargetFilter::SpecificObject { id: baloth })
-                .modifications(vec![ContinuousModification::GrantAbility {
-                    definition: Box::new(
-                        AbilityDefinition::new(
-                            AbilityKind::Activated,
-                            Effect::Choose {
-                                choice_type: ChoiceType::color(),
-                                persist: true,
-                                selection: TargetSelectionMode::Chosen,
-                            },
-                        )
-                        .cost(AbilityCost::Mana {
-                            cost: ManaCost::generic(0),
-                        }),
-                    ),
-                }])],
-            duration: Some(Duration::UntilEndOfTurn),
-            target: None,
-            end_cost: None,
-        };
-        let root = if nested {
-            Effect::CreateDrawReplacement {
-                replacement_effect: Box::new(grant_to_baloth),
-            }
-        } else {
-            grant_to_baloth
-        };
-        let carrier =
-            AbilityDefinition::new(AbilityKind::Activated, root).cost(AbilityCost::Mana {
-                cost: cost(vec![], 9),
-            });
-        {
-            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
-            std::sync::Arc::make_mut(&mut obj.base_abilities).push(carrier.clone());
-            std::sync::Arc::make_mut(&mut obj.abilities).push(carrier);
-        }
-        (runner, astral, harmonize)
-    };
-
-    let (runner, astral, harmonize) = build(true);
-    assert!(
-        matches!(
-            &*runner.state().objects[&astral].abilities[1].effect,
-            Effect::CreateDrawReplacement { replacement_effect }
-                if matches!(&**replacement_effect, Effect::GenericEffect { .. })
-        ),
-        "reach: the grant sits inside a draw replacement's substitute effect"
-    );
-    assert!(
-        priority_facts(&runner, harmonize).0,
-        "a chooser granted to the Baloth does not make Cornucopia's color linked"
-    );
-
-    // Control: the same grant at the ability root.
-    let (runner, _, harmonize) = build(false);
-    assert!(priority_facts(&runner, harmonize).0);
-
-    // Cast and resolve with the nested grant present.
-    let (mut runner, _, harmonize) = build(true);
-    runner.cast(harmonize).resolve();
-    assert_eq!(spell_zone(&runner, harmonize), Zone::Graveyard);
-    assert_eq!(runner.state().players[0].hand.len(), 3);
 }
 
 /// CR 106.5 + CR 607.2d control: Sunken Citadel's "the chosen color" is linked
@@ -1530,12 +1802,15 @@ fn fixed_color_sources_still_pay() {
 /// CR 105.1 + CR 106.5: "Choose a color of a permanent you control / of a card
 /// in your graveyard" restricts the color domain to game state the engine does
 /// not model. The clause stays unsupported, so neither card is a mana source
-/// that could pay any color.
+/// that could pay any color. The unrestricted "Choose a color. Add one mana of
+/// that color." on the same board is the control: it pays the {R} spell.
 #[test]
 fn color_of_a_game_object_choice_stays_unsupported() {
-    for (name, oracle) in [
-        ("Meteor Crater", METEOR_CRATER),
-        ("Corrupted Grafstone", CORRUPTED_GRAFSTONE),
+    const PLAIN_CHOOSER: &str = "{T}: Choose a color. Add one mana of that color.";
+    for (name, oracle, supported) in [
+        ("Meteor Crater", METEOR_CRATER, false),
+        ("Corrupted Grafstone", CORRUPTED_GRAFSTONE, false),
+        ("Plain Color Chooser", PLAIN_CHOOSER, true),
     ] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -1547,19 +1822,25 @@ fn color_of_a_game_object_choice_stays_unsupported() {
         let spell = add_instant(&mut scenario, cost(vec![ManaCostShard::Red], 0));
         let runner = scenario.build();
 
+        assert!(
+            !runner.state().objects[&source].tapped,
+            "{name}: the source is untapped, so only its ability decides"
+        );
         let ability = runner.state().objects[&source]
             .abilities
             .last()
             .expect("the tap ability parses")
             .clone();
-        assert!(
-            matches!(&*ability.effect, Effect::Unimplemented { .. }),
-            "{name}: the restricted color choice must be unsupported, got {:?}",
+        assert_eq!(
+            !matches!(&*ability.effect, Effect::Unimplemented { .. }),
+            supported,
+            "{name}: unexpected support for the color choice, got {:?}",
             ability.effect
         );
-        assert!(
-            !priority_facts(&runner, spell).0,
-            "{name}: not counted as mana, so the {{R}} spell is not offered"
+        assert_eq!(
+            priority_facts(&runner, spell).0,
+            supported,
+            "{name}: the {{R}} spell is offered only from the unrestricted chooser"
         );
     }
 }

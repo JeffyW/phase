@@ -14466,7 +14466,7 @@ fn auto_tap_mana_sources_inner(
                 // so sources can't change state between collection and resolution. If a
                 // source is somehow invalid (e.g., removed by a replacement effect), we
                 // skip it silently — the player can still manually tap other sources.
-                let override_value = production_override_for_option(state, &ability_def, &option);
+                let override_value = production_override_for_option(&ability_def, &option);
                 // CR 605.3c: Resolve via the exclusion-aware entry so the
                 // in-flight chain (`excluded`, including this source when it has a
                 // mana sub-cost) threads into the ability's own mana sub-cost
@@ -14550,7 +14550,6 @@ fn auto_tap_mana_sources_inner(
 }
 
 pub(crate) fn production_override_for_option(
-    state: &GameState,
     ability_def: &crate::types::ability::AbilityDefinition,
     option: &ManaSourceOption,
 ) -> Option<crate::types::game_state::ProductionOverride> {
@@ -14599,14 +14598,6 @@ pub(crate) fn production_override_for_option(
         } => Some(crate::types::game_state::ProductionOverride::SingleColor(
             option.mana_type,
         )),
-        // CR 106.1 + CR 607.2d: a color chosen during activation (Astral
-        // Cornucopia) — replay the planned row's color as that choice.
-        crate::types::ability::ManaProduction::ChosenColor {
-            fixed_alternative: None,
-            ..
-        } if super::effects::mana::chooses_color_on_activation(state, option.object_id) => Some(
-            crate::types::game_state::ProductionOverride::SingleColor(option.mana_type),
-        ),
         crate::types::ability::ManaProduction::Fixed { .. }
         | crate::types::ability::ManaProduction::Colorless { .. }
         | crate::types::ability::ManaProduction::Mixed { .. }

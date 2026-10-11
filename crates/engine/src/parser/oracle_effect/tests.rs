@@ -19877,16 +19877,19 @@ fn choose_color_then_add_mana_of_that_color_collapses_to_mana_effect() {
     let Effect::Mana { produced, .. } = &*def.effect else {
         panic!("expected collapsed mana effect, got {:?}", def.effect);
     };
+    // CR 106.1 + CR 608.2d: the choice is made as the ability resolves, so it
+    // is mana of any one color, not a reference to a linked choice.
     assert!(matches!(
         produced,
-        ManaProduction::ChosenColor {
+        ManaProduction::AnyOneColor {
             count: QuantityExpr::Ref {
                 qty: QuantityRef::Devotion {
                     colors: crate::types::ability::DevotionColors::ChosenColor
                 }
             },
+            color_options,
             ..
-        }
+        } if color_options.len() == 5
     ));
     assert!(
         def.sub_ability.is_none(),

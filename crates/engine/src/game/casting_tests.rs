@@ -505,29 +505,6 @@ fn create_tap_mana_source(state: &mut GameState, name: &str, produced: ManaProdu
     source
 }
 
-/// CR 607.2d: give `source` the as-enters "choose a color" replacement that
-/// "the chosen color" links to (Sunken Citadel). Without a linked chooser, a
-/// pure chosen-color ability chooses its color during activation instead
-/// (Astral Cornucopia).
-fn add_linked_color_chooser(state: &mut GameState, source: ObjectId) {
-    state
-        .objects
-        .get_mut(&source)
-        .unwrap()
-        .replacement_definitions
-        .push(
-            ReplacementDefinition::new(crate::types::replacements::ReplacementEvent::Moved)
-                .execute(AbilityDefinition::new(
-                    AbilityKind::Spell,
-                    Effect::Choose {
-                        choice_type: crate::types::ability::ChoiceType::color(),
-                        persist: true,
-                        selection: crate::types::ability::TargetSelectionMode::Chosen,
-                    },
-                )),
-        );
-}
-
 fn create_black_red_filter_land(state: &mut GameState, card_id: u64) -> ObjectId {
     let filter_land = create_object(
         state,
@@ -1144,7 +1121,6 @@ fn pure_chosen_color_without_choice_does_not_auto_pay_from_preview_colors() {
             fixed_alternative: None,
         },
     );
-    add_linked_color_chooser(&mut state, source);
     let options =
         crate::game::mana_sources::activatable_land_mana_options(&state, source, PlayerId(0));
     assert!(
@@ -1742,7 +1718,7 @@ fn x_spell_cap_excludes_mana_restricted_to_activated_abilities() {
 #[test]
 fn worldsouls_rage_offered_x_is_payable_with_an_unchosen_citadel_copy() {
     let mut state = setup_game_at_main_phase();
-    let citadel_copy = create_tap_mana_source(
+    create_tap_mana_source(
         &mut state,
         "Unchosen Sunken Citadel Copy",
         ManaProduction::ChosenColor {
@@ -1751,7 +1727,6 @@ fn worldsouls_rage_offered_x_is_payable_with_an_unchosen_citadel_copy() {
             fixed_alternative: None,
         },
     );
-    add_linked_color_chooser(&mut state, citadel_copy);
     for (name, color, count) in [
         ("Forest Stand-In", ManaColor::Green, 2),
         ("Island Stand-In", ManaColor::Blue, 4),

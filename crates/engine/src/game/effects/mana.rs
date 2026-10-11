@@ -1,3 +1,4 @@
+use crate::game::mana_sources::mana_type_to_color;
 use crate::game::quantity::{resolve_quantity, resolve_quantity_with_targets};
 use crate::game::{mana_payment, mana_sources};
 #[cfg(test)]
@@ -6,14 +7,13 @@ use crate::types::ability::{
     ChoiceValue, Effect, EffectError, EffectKind, LinkedExileScope, ManaProduction,
     ManaSpendRestriction, ManaTargetRole, ManaTargetSlot, ObjectScope, ResolvedAbility, TargetRef,
 };
-use crate::types::ability_visit::{effects_mut, visit_ability_def};
+use crate::types::ability::{DevotionColors, QuantityRef};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, ManaChoice, ManaChoiceContext, ManaChoicePrompt, MayTriggerOrigin, WaitingFor,
 };
 use crate::types::mana::{ManaColor, ManaRestriction, ManaType};
 use crate::types::player::PlayerId;
-use std::ops::ControlFlow;
 
 /// CR 601.2c + CR 608.2b: A view of `ability` whose `targets` contain only the
 /// target chosen for `slot`, re-validated against that slot's own filter.
@@ -254,7 +254,13 @@ pub fn resolve(
                 // Resolve the count from the production descriptor, then produce
                 // that many units of the override color — mirrors the behavior of
                 // `resolve_single_color_override` in `mana_abilities.rs`.
-                let count = resolve_mana_types_with_ability(produced, &*state, count_ability).len();
+                let count = match mana_type_to_color(color) {
+                    Some(chosen) => {
+                        let bound = bind_any_one_color_choice(produced, chosen);
+                        resolve_mana_types_with_ability(&bound, &*state, count_ability).len()
+                    }
+                    None => resolve_mana_types_with_ability(produced, &*state, count_ability).len(),
+                };
                 vec![color; count]
             }
             Some(crate::types::game_state::ProductionOverride::Combination(types)) => types,
@@ -499,7 +505,13 @@ fn chosen_mana_types_for_prompt(
                     "Chosen color is not among the legal options".to_string(),
                 ));
             }
-            let count = resolve_mana_types_for_ability(produced, state, ability).len();
+            let count = match mana_type_to_color(color) {
+                Some(chosen) => {
+                    let bound = bind_any_one_color_choice(produced, chosen);
+                    resolve_mana_types_for_ability(&bound, state, ability).len()
+                }
+                None => resolve_mana_types_for_ability(produced, state, ability).len(),
+            };
             Ok(vec![color; count])
         }
         (ManaChoicePrompt::Combination { options }, ManaChoice::Combination(combo)) => {
@@ -1105,223 +1117,78 @@ pub(crate) fn chosen_color_for_mana(
         })
 }
 
-/// CR 607.2d: Whether a pure chosen-color mana ability on `source_id` makes
-/// its color choice as part of its own activation.
-///
-/// "Add one mana of the chosen color" is linked to an ability printed on the
-/// same object that makes the choice (Sunken Citadel's "As it enters, choose a
-/// color"); when that linked choice was never made, the color is undefined and
-/// the ability adds no mana (CR 106.5). An ability such as Astral Cornucopia's
-/// "Choose a color. Add one mana of that color for each charge counter" has no
-/// linked chooser: the choice is made while the ability resolves, so any of
-/// the five colors is available. Any persisted chooser that could name a color
-/// counts as linked, so an unrecognized chooser fails closed.
-///
-/// Boundary (a conservative fallback): every persisted color chooser anywhere
-/// in the object's own activated abilities, triggers and replacements, at any
-/// resolution depth (inline links, reflexive "when you do" abilities, delayed
-/// triggers, CR 603.7 + CR 603.12), counts as linked, since each of those
-/// still resolves with this object as its source. The only choosers left out
-/// are those inside payloads installed on another object
-/// ([`registers_for_another_object`]: a `GenericEffect` grant, a token or
-/// emblem, a replacement added to a target), which are that object's
-/// (CR 611.2). Exclusion is by path: a payload is pruned where it occurs, so a
-/// chooser this object owns is never cancelled by the same definition also
-/// appearing in a payload (copiable values share allocations). Static
-/// abilities are not walked: their effects apply to what their text names
-/// (CR 611.3), and an ability granted to this object is already among its
-/// live `abilities`.
-pub(crate) fn chooses_color_on_activation(
-    state: &GameState,
-    source_id: crate::types::identifiers::ObjectId,
-) -> bool {
-    let Some(obj) = state.objects.get(&source_id) else {
+/// CR 700.5 + CR 608.2d: Whether an any-one-color production's amount reads
+/// the color chosen for it ("equal to your devotion to that color": Nykthos,
+/// Nyx Lotus, the plane Nyx). Within `AnyOneColor` the only choice such a
+/// count can name is the production's own, since the parser emits it only for
+/// "Choose a color. Add ... of that color".
+pub(crate) fn any_one_color_count_reads_choice(produced: &ManaProduction) -> bool {
+    let ManaProduction::AnyOneColor { count, .. } = produced else {
         return false;
     };
-    if obj.chosen_color().is_some() {
-        return false;
-    }
-    let trigger_executes = obj
-        .trigger_definitions
-        .iter_all()
-        .filter_map(|entry| entry.definition.execute.as_deref());
-    let replacement_executes = obj
-        .replacement_definitions
-        .iter_all()
-        .filter_map(|replacement| replacement.execute.as_deref());
-    let linked = obj
-        .abilities
-        .iter()
-        .chain(trigger_executes)
-        .chain(replacement_executes)
-        .any(has_own_linked_color_chooser);
-    !linked
-}
-
-/// CR 607.2d: Whether `def` carries a linked color chooser outside every
-/// payload it installs on another object. Without such a payload the shared
-/// walk answers directly; otherwise a copy is searched after the shared
-/// mutable effect walk (`effects_mut`, pre-order) prunes each payload at every
-/// effect node where it occurs, including effects nested directly in other
-/// effects or in costs.
-fn has_own_linked_color_chooser(def: &crate::types::ability::AbilityDefinition) -> bool {
-    let has_foreign_payload = visit_ability_def(def, &mut |effect: &Effect| {
-        if registers_for_another_object(effect) {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    })
-    .is_break();
-    let find_chooser = &mut |effect: &Effect| {
-        if is_linked_color_chooser(effect) {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    };
-    if !has_foreign_payload {
-        return visit_ability_def(def, find_chooser).is_break();
-    }
-    let mut own = def.clone();
-    let _ = effects_mut::visit_ability_def(&mut own, &mut |effect: &mut Effect| {
-        prune_payload_for_another_object(effect);
-        ControlFlow::Continue(())
-    });
-    visit_ability_def(&own, find_chooser).is_break()
-}
-
-/// CR 607.2d: A persisted choice whose answer could be a color, i.e. a choice
-/// "the chosen color" can refer back to.
-fn is_linked_color_chooser(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::Choose {
-            choice_type,
-            persist: true,
-            ..
-        } if choice_type_can_name_a_color(choice_type)
-    )
-}
-
-/// CR 611.2 + CR 111.1 + CR 114.1: An effect whose nested abilities are
-/// installed on another object (a granted static, a token, an emblem, a
-/// replacement added to a target, a countered spell's rider), so a chooser
-/// inside belongs to that object. Any carrier not listed here is treated as
-/// this object's own, which keeps the linked-chooser check fail-closed. Keep
-/// in step with [`prune_payload_for_another_object`].
-fn registers_for_another_object(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::GenericEffect { .. }
-            | Effect::Token { .. }
-            | Effect::CreateEmblem { .. }
-            | Effect::AddTargetReplacement { .. }
-            | Effect::Counter {
-                source_rider: Some(_),
-                ..
+    count.any_ref(&mut |qty| {
+        matches!(
+            qty,
+            QuantityRef::Devotion {
+                colors: DevotionColors::ChosenColor
             }
-    )
+        )
+    })
 }
 
-/// Drop the payload of a [`registers_for_another_object`] carrier, so a walk
-/// of the definition no longer reaches abilities that belong to another
-/// object. Used only on a throwaway copy.
-fn prune_payload_for_another_object(effect: &mut Effect) {
-    match effect {
-        Effect::GenericEffect {
-            static_abilities, ..
-        }
-        | Effect::Token {
-            static_abilities, ..
-        } => static_abilities.clear(),
-        Effect::CreateEmblem { statics, triggers } => {
-            statics.clear();
-            triggers.clear();
-        }
-        Effect::AddTargetReplacement { replacement, .. } => {
-            replacement.execute = None;
-            replacement.mode = crate::types::ability::ReplacementMode::Mandatory;
-        }
-        Effect::Counter { source_rider, .. } => *source_rider = None,
-        _ => {}
+/// CR 106.1 + CR 605.3b + CR 608.2d: `produced` with its amount bound to
+/// `color`, the color chosen for this production as it resolves. A count that
+/// reads "that color" reads `color` itself, never a color stored on the source
+/// or left over from another choice; nothing in the game state is written.
+/// Other productions are returned unchanged.
+pub(crate) fn bind_any_one_color_choice(
+    produced: &ManaProduction,
+    color: ManaColor,
+) -> std::borrow::Cow<'_, ManaProduction> {
+    if !any_one_color_count_reads_choice(produced) {
+        return std::borrow::Cow::Borrowed(produced);
     }
-}
-
-/// CR 105.1: Whether a choice of this type can answer with a color. Labeled
-/// options count when any label is a color word (Unknown Event Shores' "choose
-/// white, blue, black, red, or green").
-fn choice_type_can_name_a_color(choice_type: &crate::types::ability::ChoiceType) -> bool {
-    use crate::types::ability::ChoiceType;
-    match choice_type {
-        ChoiceType::Color { .. } | ChoiceType::TwoColors => true,
-        ChoiceType::Labeled { options } => options
-            .iter()
-            .any(|option| option.parse::<ManaColor>().is_ok()),
-        ChoiceType::CreatureType { .. }
-        | ChoiceType::OddOrEven
-        | ChoiceType::BasicLandType
-        | ChoiceType::CardType { .. }
-        | ChoiceType::CardName
-        | ChoiceType::NumberRange { .. }
-        | ChoiceType::LandType
-        | ChoiceType::CardPredicate { .. }
-        | ChoiceType::CardPredicateGuess { .. }
-        | ChoiceType::Opponent { .. }
-        | ChoiceType::Player { .. }
-        | ChoiceType::Word
-        | ChoiceType::Artist
-        | ChoiceType::Keyword { .. }
-        | ChoiceType::CounterKind { .. } => false,
+    let mut bound = produced.clone();
+    if let ManaProduction::AnyOneColor { count, .. } = &mut bound {
+        count.each_ref_mut(&mut |qty| {
+            if let QuantityRef::Devotion { colors } = qty {
+                if *colors == DevotionColors::ChosenColor {
+                    *colors = DevotionColors::Fixed(vec![color]);
+                }
+            }
+        });
     }
+    std::borrow::Cow::Owned(bound)
 }
 
-/// CR 106.1 + CR 605.3b + CR 607.2d: The mana a pure chosen-color ability that
-/// chooses on activation (see [`chooses_color_on_activation`]) could add, one
-/// entry per color choice, for planning a payment before activating it.
-///
-/// Mirrors the activation path, which prompts for any of the five colors and
-/// evaluates the amount under that choice (`resolve_single_color_override`),
-/// so a count that depends on the color (Nykthos's devotion to that color) is
-/// right per color. Colors that would add no mana are omitted. Every other
-/// production shape returns empty: a linked chooser left unset produces no mana
-/// (CR 106.5), and a set color is already resolvable directly.
-pub(crate) fn activation_chosen_color_outputs(
+/// CR 106.1 + CR 608.2d: The amount an any-one-color production adds for each
+/// color it could be activated for, when that amount depends on the color
+/// (see [`any_one_color_count_reads_choice`]); empty otherwise. Colors that
+/// would add no mana are omitted, and the rest are best first (ties keep the
+/// printed order), so a planner taking one row for generic mana takes the
+/// color that adds the most.
+pub(crate) fn any_one_color_outputs(
     state: &GameState,
     produced: &ManaProduction,
     ability: &ResolvedAbility,
 ) -> Vec<(ManaType, usize)> {
-    let ManaProduction::ChosenColor {
-        count,
-        fixed_alternative: None,
-        ..
-    } = produced
-    else {
+    let ManaProduction::AnyOneColor { color_options, .. } = produced else {
         return Vec::new();
     };
-    if !chooses_color_on_activation(state, ability.source_id) {
+    if !any_one_color_count_reads_choice(produced) {
         return Vec::new();
     }
-    // The amount can read the choice (devotion to that color) from
-    // `last_named_choice`, so it is evaluated on one copy with each color
-    // written in turn; only the scalar count is resolved.
-    let mut probe = state.clone();
-    let mut outputs = Vec::new();
-    for color in ManaColor::ALL.iter().copied() {
-        probe.last_named_choice = Some(ChoiceValue::Color(color));
-        let amount = resolve_count(
-            count,
-            &probe,
-            Some(ability),
-            ability.controller,
-            ability.source_id,
-        );
-        if amount > 0 {
-            outputs.push((mana_color_to_type(&color), amount));
-        }
-    }
-    // Best first (ties keep W, U, B, R, G order): a planner that takes one
-    // row of the source for generic mana takes the color that adds the most.
+    let mut outputs: Vec<(ManaType, usize)> = color_options
+        .iter()
+        .map(|color| {
+            let bound = bind_any_one_color_choice(produced, *color);
+            (
+                mana_color_to_type(color),
+                resolve_mana_types_for_ability(&bound, state, ability).len(),
+            )
+        })
+        .filter(|(_, amount)| *amount > 0)
+        .collect();
     outputs.sort_by_key(|(_, amount)| std::cmp::Reverse(*amount));
     outputs
 }
