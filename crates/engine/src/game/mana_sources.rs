@@ -2351,16 +2351,16 @@ fn mana_capacity(
         })
         .filter_map(|(_, ability)| match &*ability.effect {
             Effect::Mana { produced, .. } => {
+                let sizing =
+                    largest_sizing_resolution(state, produced, ability, object_id, controller);
                 if capacity_use == CapacityUse::XCeiling
-                    && activation_amount_depends_on_color(
-                        state, produced, ability, object_id, controller,
-                    )
+                    && sizing.as_ref().is_some_and(|(resolved, _)| {
+                        activation_amount_depends_on_color(state, produced, resolved)
+                    })
                 {
                     return None;
                 }
-                let gross =
-                    largest_sizing_resolution(state, produced, ability, object_id, controller)
-                        .map_or(0, |(_, gross)| gross);
+                let gross = sizing.map_or(0, |(_, gross)| gross);
                 // CR 605.3b: Net the mana paid to activate. Non-mana cost
                 // components (Sacrifice / Discard / PayLife / Exile) have no
                 // mana sub-cost, so `mana_sub_cost_of` returns `None` and the
@@ -2534,12 +2534,18 @@ fn planned_gross_mana(
 fn activation_amount_depends_on_color(
     state: &GameState,
     produced: &ManaProduction,
-    ability: &AbilityDefinition,
-    object_id: ObjectId,
-    controller: PlayerId,
+    resolved: &ResolvedAbility,
 ) -> bool {
-    let resolved = super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-    let outputs = super::effects::mana::activation_chosen_color_outputs(state, produced, &resolved);
+    if !matches!(
+        produced,
+        ManaProduction::ChosenColor {
+            fixed_alternative: None,
+            ..
+        }
+    ) {
+        return false;
+    }
+    let outputs = super::effects::mana::activation_chosen_color_outputs(state, produced, resolved);
     let Some(&(_, first)) = outputs.first() else {
         return false;
     };

@@ -1050,6 +1050,14 @@ fn x_ceiling_leaves_out_a_color_dependent_activation_amount() {
     runner
         .act(GameAction::ChooseX { value: 0 })
         .expect("X = 0 is payable: blue from the Lotus and the Island");
+    assert!(
+        runner.state().stack.iter().any(|entry| entry.id == spell),
+        "Mind Spring is on the stack, paid"
+    );
+    assert!(
+        runner.state().objects[&lotus].tapped,
+        "the Lotus paid {{U}}"
+    );
     assert_eq!(
         runner.state().objects[&lotus].zone,
         Zone::Battlefield,
@@ -1142,6 +1150,137 @@ fn reflexive_color_chooser_on_the_same_object_counts_as_linked() {
         priority_facts(&runner, harmonize).0,
         "the chosen green pays {{2}}{{G}}{{G}}"
     );
+}
+
+/// Reviewer probe board (#8443 r4, R4-01, engine-shape fixture): Cornucopia's
+/// own "{0}: Choose a color" is linked even when the same definition (shared
+/// by allocation through its copiable values) also appears inside a copy
+/// effect installed on another object. The payload is pruned where it
+/// occurs, never by address (CR 607.2d, CR 106.5, CR 707.2).
+#[test]
+fn own_chooser_shared_with_a_copy_payload_stays_linked() {
+    let build = |with_copy_payload: bool| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &["Library A", "Library B", "Library C", "Library D"]);
+        let astral = scenario
+            .add_artifact_from_oracle(P0, "Astral Cornucopia", ASTRAL)
+            .id();
+        scenario.with_counter(astral, charge(), 4);
+        let baloth = scenario
+            .add_creature(P0, "Leatherback Baloth", 4, 5)
+            .with_mana_cost(cost(
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                ],
+                0,
+            ))
+            .id();
+        let harmonize = scenario
+            .add_spell_to_hand_from_oracle(P0, "Harmonize", false, "Draw three cards.")
+            .with_mana_cost(cost(vec![ManaCostShard::Green, ManaCostShard::Green], 2))
+            .id();
+        let mut runner = scenario.build();
+        assert!(
+            priority_facts(&runner, harmonize).0,
+            "reach: plain Cornucopia pays Harmonize"
+        );
+
+        let chooser = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Choose {
+                choice_type: ChoiceType::color(),
+                persist: true,
+                selection: TargetSelectionMode::Chosen,
+            },
+        )
+        .cost(AbilityCost::Mana {
+            cost: ManaCost::generic(0),
+        });
+        {
+            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+            std::sync::Arc::make_mut(&mut obj.base_abilities).push(chooser);
+            obj.abilities = std::sync::Arc::clone(&obj.base_abilities);
+        }
+        if with_copy_payload {
+            let values = engine::game::printed_cards::intrinsic_copiable_values(
+                &runner.state().objects[&astral],
+            );
+            let copy_onto_baloth = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GenericEffect {
+                    static_abilities: vec![StaticDefinition::continuous()
+                        .affected(TargetFilter::SpecificObject { id: baloth })
+                        .modifications(vec![ContinuousModification::CopyValues {
+                            values: Box::new(values),
+                            display_source: Default::default(),
+                            printed_ref: None,
+                            token_image_ref: None,
+                            token_art: None,
+                        }])],
+                    duration: Some(Duration::UntilEndOfTurn),
+                    target: None,
+                    end_cost: None,
+                },
+            );
+            let replacement =
+                ReplacementDefinition::new(ReplacementEvent::Moved).execute(copy_onto_baloth);
+            let obj = runner.state_mut().objects.get_mut(&astral).unwrap();
+            std::sync::Arc::make_mut(&mut obj.base_replacement_definitions)
+                .push(replacement.clone());
+            obj.replacement_definitions.push(replacement);
+        }
+        (runner, astral, harmonize)
+    };
+
+    let (runner, astral, harmonize) = build(true);
+    // Reach: the copy payload shares Cornucopia's ability array, so the own
+    // chooser and the payload's chooser are the same allocation.
+    let obj = &runner.state().objects[&astral];
+    let payload_abilities = obj
+        .replacement_definitions
+        .iter_unchecked()
+        .find_map(
+            |replacement| match replacement.execute.as_deref().map(|d| &*d.effect) {
+                Some(Effect::GenericEffect {
+                    static_abilities, ..
+                }) => static_abilities[0]
+                    .modifications
+                    .iter()
+                    .find_map(|modification| match modification {
+                        ContinuousModification::CopyValues { values, .. } => {
+                            Some(std::sync::Arc::clone(&values.abilities))
+                        }
+                        _ => None,
+                    }),
+                _ => None,
+            },
+        )
+        .expect("the copy payload is installed");
+    assert!(std::sync::Arc::ptr_eq(&payload_abilities, &obj.abilities));
+    assert!(std::ptr::eq(
+        &*payload_abilities[1].effect,
+        &*obj.abilities[1].effect
+    ));
+    assert!(
+        !priority_facts(&runner, harmonize).0,
+        "the own chooser left unset keeps Cornucopia linked (CR 106.5)"
+    );
+
+    // Control: without the copy payload, still linked.
+    let (runner, _, harmonize) = build(false);
+    assert!(!priority_facts(&runner, harmonize).0);
+
+    // Choosing green through real actions persists it and pays Harmonize.
+    let (mut runner, astral, harmonize) = build(true);
+    runner.activate(astral, 1).choose_option("Green").resolve();
+    assert_eq!(
+        runner.state().objects[&astral].chosen_color(),
+        Some(ManaColor::Green)
+    );
+    assert!(priority_facts(&runner, harmonize).0);
 }
 
 /// CR 106.5 + CR 607.2d control: Sunken Citadel's "the chosen color" is linked

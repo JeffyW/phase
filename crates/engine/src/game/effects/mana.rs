@@ -6,7 +6,7 @@ use crate::types::ability::{
     ChoiceValue, Effect, EffectError, EffectKind, LinkedExileScope, ManaProduction,
     ManaSpendRestriction, ManaTargetRole, ManaTargetSlot, ObjectScope, ResolvedAbility, TargetRef,
 };
-use crate::types::ability_visit::{visit_ability_def, visit_effect};
+use crate::types::ability_visit::{nodes_mut, visit_ability_def, DefinitionNodeMut};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, ManaChoice, ManaChoiceContext, ManaChoicePrompt, MayTriggerOrigin, WaitingFor,
@@ -1125,9 +1125,12 @@ pub(crate) fn chosen_color_for_mana(
 /// are those inside payloads installed on another object
 /// ([`registers_for_another_object`]: a `GenericEffect` grant, a token or
 /// emblem, a replacement added to a target), which are that object's
-/// (CR 611.2). Static abilities are not walked: their effects apply to what
-/// their text names (CR 611.3), and an ability granted to this object is
-/// already among its live `abilities`.
+/// (CR 611.2). Exclusion is by path: a payload is pruned where it occurs, so a
+/// chooser this object owns is never cancelled by the same definition also
+/// appearing in a payload (copiable values share allocations). Static
+/// abilities are not walked: their effects apply to what their text names
+/// (CR 611.3), and an ability granted to this object is already among its
+/// live `abilities`.
 pub(crate) fn chooses_color_on_activation(
     state: &GameState,
     source_id: crate::types::identifiers::ObjectId,
@@ -1146,35 +1149,46 @@ pub(crate) fn chooses_color_on_activation(
         .replacement_definitions
         .iter_all()
         .filter_map(|replacement| replacement.execute.as_deref());
-    // Choosers by node identity: every one reachable from this object's own
-    // definitions, and those reached through another object's payload.
-    let mut choosers: Vec<*const Effect> = Vec::new();
-    let mut elsewhere: Vec<*const Effect> = Vec::new();
-    for def in obj
+    let linked = obj
         .abilities
         .iter()
         .chain(trigger_executes)
         .chain(replacement_executes)
-    {
-        let _ = visit_ability_def(def, &mut |effect: &Effect| {
-            if is_linked_color_chooser(effect) {
-                choosers.push(effect);
-            }
-            if registers_for_another_object(effect) {
-                let _ = visit_effect(effect, &mut |inner: &Effect| {
-                    if is_linked_color_chooser(inner) {
-                        elsewhere.push(inner);
-                    }
-                    ControlFlow::Continue(())
-                });
-            }
-            ControlFlow::Continue(())
-        });
-    }
-    let linked = choosers
-        .iter()
-        .any(|chooser| !elsewhere.iter().any(|other| std::ptr::eq(*chooser, *other)));
+        .any(has_own_linked_color_chooser);
     !linked
+}
+
+/// CR 607.2d: Whether `def` carries a linked color chooser outside every
+/// payload it installs on another object. Without such a payload the shared
+/// walk answers directly; otherwise a copy with each payload pruned where it
+/// occurs (pre-order, by the shared mutable walk) is searched.
+fn has_own_linked_color_chooser(def: &crate::types::ability::AbilityDefinition) -> bool {
+    let has_foreign_payload = visit_ability_def(def, &mut |effect: &Effect| {
+        if registers_for_another_object(effect) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break();
+    let find_chooser = &mut |effect: &Effect| {
+        if is_linked_color_chooser(effect) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    };
+    if !has_foreign_payload {
+        return visit_ability_def(def, find_chooser).is_break();
+    }
+    let mut own = def.clone();
+    let _ = nodes_mut::visit_ability_def(&mut own, &mut |node| {
+        if let DefinitionNodeMut::Ability(def) = node {
+            prune_payload_for_another_object(&mut def.effect);
+        }
+        ControlFlow::Continue(())
+    });
+    visit_ability_def(&own, find_chooser).is_break()
 }
 
 /// CR 607.2d: A persisted choice whose answer could be a color, i.e. a choice
@@ -1194,7 +1208,8 @@ fn is_linked_color_chooser(effect: &Effect) -> bool {
 /// installed on another object (a granted static, a token, an emblem, a
 /// replacement added to a target, a countered spell's rider), so a chooser
 /// inside belongs to that object. Any carrier not listed here is treated as
-/// this object's own, which keeps the linked-chooser check fail-closed.
+/// this object's own, which keeps the linked-chooser check fail-closed. Keep
+/// in step with [`prune_payload_for_another_object`].
 fn registers_for_another_object(effect: &Effect) -> bool {
     matches!(
         effect,
@@ -1207,6 +1222,30 @@ fn registers_for_another_object(effect: &Effect) -> bool {
                 ..
             }
     )
+}
+
+/// Drop the payload of a [`registers_for_another_object`] carrier, so a walk
+/// of the definition no longer reaches abilities that belong to another
+/// object. Used only on a throwaway copy.
+fn prune_payload_for_another_object(effect: &mut Effect) {
+    match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        }
+        | Effect::Token {
+            static_abilities, ..
+        } => static_abilities.clear(),
+        Effect::CreateEmblem { statics, triggers } => {
+            statics.clear();
+            triggers.clear();
+        }
+        Effect::AddTargetReplacement { replacement, .. } => {
+            replacement.execute = None;
+            replacement.mode = crate::types::ability::ReplacementMode::Mandatory;
+        }
+        Effect::Counter { source_rider, .. } => *source_rider = None,
+        _ => {}
+    }
 }
 
 /// CR 105.1: Whether a choice of this type can answer with a color. Labeled
