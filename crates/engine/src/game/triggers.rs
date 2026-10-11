@@ -11581,6 +11581,18 @@ pub(crate) fn collect_delayed_triggers_into_deferred(state: &mut GameState, even
         .extend(consumed_events);
 }
 
+/// [`collect_delayed_triggers_into_deferred`] for a caller that claims the
+/// batch itself: `events` is a filtered slice of the action buffer, so the
+/// occurrences the matcher would record are not identities in that buffer.
+pub(crate) fn collect_delayed_trigger_contexts_into_deferred(
+    state: &mut GameState,
+    events: &[GameEvent],
+) {
+    let pending =
+        collect_matching_delayed_triggers(state, events, DelayedTriggerEventScope::Any).contexts;
+    state.deferred_triggers.extend(pending);
+}
+
 /// Delayed counterpart to [`collect_sba_choice_triggers_into_deferred`].
 pub(crate) fn collect_sba_choice_delayed_triggers_into_deferred(
     state: &mut GameState,

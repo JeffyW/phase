@@ -56,11 +56,27 @@ fn unclaimed_events(state: &GameState, events: &[GameEvent], start: usize) -> Ve
 /// the occurrences exactly as they would without a carrier.
 fn claim_ordinary(state: &mut GameState, events: &[GameEvent], start: usize, end: usize) {
     let end = end.min(events.len());
-    let occurrences: Vec<ConsumedTriggerEventOccurrence> = (start..end)
+    claim_indices(
+        state,
+        events,
+        start..end,
+        ConsumedTriggerEventScope::OrdinaryCollectorsOnly,
+    );
+}
+
+/// Records the occurrences at `indices` of the full action buffer `events`.
+fn claim_indices(
+    state: &mut GameState,
+    events: &[GameEvent],
+    indices: impl IntoIterator<Item = usize>,
+    scope: ConsumedTriggerEventScope,
+) {
+    let occurrences: Vec<ConsumedTriggerEventOccurrence> = indices
+        .into_iter()
         .map(|index| ConsumedTriggerEventOccurrence {
             event: events[index].clone(),
             occurrence: triggers::trigger_event_occurrence(events, index),
-            scope: ConsumedTriggerEventScope::OrdinaryCollectorsOnly,
+            scope,
         })
         .collect();
     state
@@ -299,13 +315,37 @@ pub(crate) fn commit_spell_announcement(
         .into_iter()
         .filter(|event| !retained.contains(event))
         .collect();
+    // CR 603.7b: delayed triggered abilities whose trigger event is in this
+    // announcement (the finishing `SpellCast` included) trigger with the rest
+    // of it. Collected here, before the announcement's settlement can pause on
+    // an ordering or target choice that would end the action before the
+    // priority pipeline's delayed scan.
+    let delayed_events: Vec<GameEvent> = triggers::filter_consumed_trigger_events_from(
+        events,
+        start,
+        triggers::TriggerCollectionRequester::Delayed,
+        &state.consumed_before_priority_trigger_events,
+    )
+    .into_iter()
+    .filter(|event| !retained.contains(event))
+    .collect();
     collection.collect(state, &new_events);
     let mut deferred = std::mem::take(&mut state.deferred_triggers);
     collection.commit_into(state, &mut deferred);
     state.deferred_triggers = deferred;
-    // Delayed triggered abilities (CR 603.7b) keyed on this fragment are left
-    // to the priority pipeline's delayed scan, exactly as without a carrier.
-    claim_ordinary(state, events, start, events.len());
+    // The span is claimed below by its identities in the full buffer.
+    triggers::collect_delayed_trigger_contexts_into_deferred(state, &delayed_events);
+    // CR 603.2c: each occurrence is collected once, by this commit, for both
+    // collectors; events a cost root still owns stay with that root.
+    let owned: Vec<usize> = (start..events.len())
+        .filter(|&index| !retained.contains(&events[index]))
+        .collect();
+    claim_indices(
+        state,
+        events,
+        owned,
+        ConsumedTriggerEventScope::AllCollectors,
+    );
 }
 
 /// CR 602.2b: the activation reached the stack; the announcement no longer

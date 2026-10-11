@@ -50,6 +50,8 @@ const GOBLIN_BOMBARDMENT: &str =
     "Sacrifice a creature: This enchantment deals 1 damage to any target.";
 const HEX_PARASITE: &str = "{X}{B/P}: Remove up to X counters from target permanent. For each counter removed this way, this creature gets +1/+0 until end of turn. ({B/P} can be paid with either {B} or 2 life.)";
 const SHREWD_HATCHLING: &str = "This creature enters with four -1/-1 counters on it.\n{U/R}: Target creature can't block this creature this turn.\nWhenever you cast a blue spell, remove a -1/-1 counter from this creature.\nWhenever you cast a red spell, remove a -1/-1 counter from this creature.";
+const DOUBLECAST: &str = "When you next cast an instant or sorcery spell this turn, copy that spell. You may choose new targets for the copy.";
+const TAUREAN_MAULER: &str = "Changeling (This card is every creature type.)\nWhenever an opponent casts a spell, you may put a +1/+1 counter on this creature.";
 
 // ---------------------------------------------------------------------------
 // Board helpers
@@ -742,6 +744,88 @@ fn ward_and_the_casters_prowess_go_on_the_stack_in_apnap_order() {
         |kind, _| matches!(kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == swiftspear),
     );
     assert!(ward_at > prowess_at, "ward (non-active player) is on top");
+}
+
+/// CR 603.7b + CR 603.3b: Doublecast's delayed trigger watches for the
+/// caster's next instant or sorcery. It triggers on that spell's `SpellCast`
+/// and joins the same batch as the opponent's target and cast triggers, even
+/// when that opponent's two triggers make the settlement pause for an ordering
+/// choice before any player receives priority. Control: without Taurean
+/// Mauler, P1 has one trigger and nothing pauses.
+#[test]
+fn a_delayed_cast_trigger_joins_a_batch_that_pauses_for_ordering() {
+    for with_mauler in [true, false] {
+        let mut sc = board();
+        let sanctuary = sc
+            .add_enchantment_from_oracle(P1, "Shapers' Sanctuary", SHAPERS_SANCTUARY)
+            .id();
+        let mauler = with_mauler.then(|| {
+            sc.add_creature(P1, "Taurean Mauler", 2, 2)
+                .from_oracle_text_with_keywords(&["Changeling"], TAUREAN_MAULER)
+                .id()
+        });
+        let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+        let doublecast = sc
+            .add_spell_to_hand_from_oracle(P0, "Doublecast", false, DOUBLECAST)
+            .with_mana_cost(mana(&[ManaCostShard::Red, ManaCostShard::Red], 0))
+            .id();
+        let spell = shock(&mut sc, P0);
+        sc.with_mana_pool(P0, pool(&[ManaType::Red, ManaType::Red, ManaType::Red]));
+        let mut runner = sc.build();
+
+        cast(&mut runner, doublecast, CastPaymentMode::Auto);
+        resolve_all(&mut runner, false);
+        assert_eq!(
+            runner.state().objects[&doublecast].zone,
+            Zone::Graveyard,
+            "reach guard: Doublecast resolved and left its delayed trigger"
+        );
+
+        cast(&mut runner, spell, CastPaymentMode::Manual);
+        let prompts = drive(
+            &mut runner,
+            &Answers {
+                target: Some(bears),
+                ..Default::default()
+            },
+        );
+        assert_eq!(prompts, ["TargetSelection", "ManaPayment"]);
+        if with_mauler {
+            let WaitingFor::OrderTriggers { player, .. } = runner.state().waiting_for.clone()
+            else {
+                panic!(
+                    "reach guard: P1 orders Sanctuary and Mauler, got {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            assert_eq!(player, P1);
+            runner
+                .act(GameAction::OrderTriggers { order: vec![0, 1] })
+                .expect("order P1's triggers");
+        }
+        assert!(spell_on_stack(&runner, spell));
+        assert_eq!(triggers_from(&runner, sanctuary), 1);
+        if let Some(mauler) = mauler {
+            assert_eq!(triggers_from(&runner, mauler), 1);
+        }
+        assert_eq!(
+            triggers_from(&runner, doublecast),
+            1,
+            "with_mauler={with_mauler}: exactly one Doublecast copy trigger"
+        );
+        let copy_at = stack_position(
+            &runner,
+            |kind, _| matches!(kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == doublecast),
+        );
+        let sanctuary_at = stack_position(
+            &runner,
+            |kind, _| matches!(kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == sanctuary),
+        );
+        assert!(
+            copy_at < sanctuary_at,
+            "one APNAP batch: the active player's delayed trigger is below the opponent's"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
