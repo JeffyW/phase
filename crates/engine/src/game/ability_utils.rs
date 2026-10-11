@@ -1878,8 +1878,9 @@ pub fn random_select_modal_indices(
     };
     let min = modal.min_choices.min(max);
     if max == 0 {
-        // "Choose up to one ... at random" with no legal mode to pick resolves
-        // with no instructions (CR 700.2a) — represented by an empty index set.
+        // "Choose up to one ... at random" with no legal mode to pick chooses no
+        // mode: an empty index set. A triggered caller removes the ability from
+        // the stack (CR 603.3c + CR 700.2b).
         return Some(Vec::new());
     }
 

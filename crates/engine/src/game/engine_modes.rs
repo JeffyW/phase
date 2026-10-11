@@ -50,6 +50,16 @@ pub(super) fn handle_ability_mode_choice(
         (false, _) => None,
     };
 
+    // CR 603.3c + CR 700.2b: a modal triggered ability answered with zero modes
+    // ("choose up to one" / "choose any number") is removed from the stack. It
+    // is never finalized as a no-op entry, and no mode usage is recorded.
+    if activated_ability_index.is_none() && indices.is_empty() {
+        let produced = remove_modal_trigger_with_no_mode(state, player, events);
+        return Ok(triggers::finish_trigger_construction_action(
+            state, events, produced,
+        ));
+    }
+
     record_modal_mode_choices(state, source_id, &modal, &indices);
 
     let mut resolved =
@@ -96,6 +106,20 @@ pub(super) fn handle_ability_mode_choice(
     }?;
 
     Ok(waiting_for)
+}
+
+/// CR 603.3c + CR 700.2b: "If no mode is chosen, the ability is removed from
+/// the stack." Drops the push-first in-construction entry through the single
+/// mid-construction removal authority, then announces any sibling triggers
+/// deferred behind it (CR 603.3b), exactly as a completed construction does.
+fn remove_modal_trigger_with_no_mode(
+    state: &mut GameState,
+    player: crate::types::player::PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> WaitingFor {
+    super::engine::drop_mid_construction_pending_trigger(state);
+    triggers::drain_deferred_triggers_after_trigger_construction(state, events)
+        .unwrap_or(WaitingFor::Priority { player })
 }
 
 struct ActivatedModeChoice {
@@ -338,8 +362,9 @@ struct TriggeredModeChoice {
 /// `dispatch_pending_trigger_context`): `state.pending_trigger` is set and its
 /// stack entry is already pushed and tracked by `state.pending_trigger_entry`.
 ///
-/// Returns `Ok(None)` when no mode can be chosen (CR 603.3c); the caller drops
-/// the pushed entry through `drop_mid_construction_pending_trigger`.
+/// Returns `Ok(None)` when no mode is chosen, whether none can be or an "up to"
+/// draw chose zero (CR 603.3c); the caller drops the pushed entry through
+/// `drop_mid_construction_pending_trigger`.
 pub(super) fn resolve_random_modal_trigger(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
@@ -349,11 +374,13 @@ pub(super) fn resolve_random_modal_trigger(
     unavailable_modes: &[usize],
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
+    // CR 603.3c + CR 700.2b: no mode can be chosen, or an "up to" draw chose
+    // none. Either way the ability is removed from the stack; the caller drops
+    // the pushed entry through `drop_mid_construction_pending_trigger`.
     let Some(indices) =
         super::ability_utils::random_select_modal_indices(state, &modal, unavailable_modes)
+            .filter(|indices| !indices.is_empty())
     else {
-        // CR 603.3c: No mode can be chosen. The caller drops the pushed entry
-        // through `drop_mid_construction_pending_trigger`.
         return Ok(None);
     };
 
