@@ -11,6 +11,9 @@
 //! mana (CR 106.5, CR 607.5a).
 
 use engine::ai_support::{auto_pass_recommended, flat_priority_actions, legal_actions};
+use engine::database::synthesis::synthesize_planechase;
+use engine::game::planechase::PlanarDieFace;
+use engine::game::printed_cards::apply_card_face_to_object;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ChosenAttribute,
@@ -18,7 +21,10 @@ use engine::types::ability::{
     ReplacementDefinition, StaticDefinition, TargetFilter, TargetSelectionMode,
 };
 use engine::types::actions::GameAction;
+use engine::types::card::CardFace;
+use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, ManaChoice, ManaChoicePrompt, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -736,7 +742,7 @@ fn nyx_lotus_manual_activation_counts_the_color_chosen_for_it() {
         );
 
         let (mut runner, _) = nyx_lotus_devotion_board(stored);
-        let spell = green_triple_spell(&mut runner);
+        let spell = green_spell(&mut runner, 3);
         assert_eq!(
             priority_facts(&runner, spell),
             (true, false),
@@ -765,13 +771,6 @@ const NYX_PLANE: &str = "Nontoken creatures are enchantments in addition to thei
 /// a color, and green adds GGG (devotion G3 / U1).
 #[test]
 fn nyx_chaos_trigger_prompts_and_adds_devotion_to_the_chosen_color() {
-    use engine::database::synthesis::synthesize_planechase;
-    use engine::game::planechase::PlanarDieFace;
-    use engine::game::printed_cards::apply_card_face_to_object;
-    use engine::types::card::CardFace;
-    use engine::types::card_type::CoreType;
-    use engine::types::events::GameEvent;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario
@@ -905,25 +904,32 @@ fn nyx_chaos_trigger_prompts_and_adds_devotion_to_the_chosen_color() {
 const MYR_WELDER: &str = "Imprint — {T}: Exile target artifact card from a graveyard.\nThis creature has all activated abilities of all cards exiled with it.";
 const HERALDIC_BANNER: &str = "As this artifact enters, choose a color.\nCreatures you control of the chosen color get +1/+0.\n{T}: Add one mana of the chosen color.";
 
-/// Myr Welder beside Leatherback Baloth (devotion to green 3), having
-/// imprinted `artifact` from P0's graveyard through its real ability, then
-/// untapped. Returns the runner and the Welder.
-fn welder_with_imprinted(name: &str, oracle: &str) -> (GameRunner, ObjectId) {
+/// Myr Welder, having imprinted `artifact` from P0's graveyard through its
+/// real ability, then untapped. With `baloth`, Leatherback Baloth (devotion to
+/// green 3, no mana ability) is beside it. Returns the runner, the Welder and
+/// the imprinted card.
+fn welder_with_imprinted(
+    name: &str,
+    oracle: &str,
+    baloth: bool,
+) -> (GameRunner, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let welder = scenario
         .add_creature_from_oracle(P0, "Myr Welder", 1, 4, MYR_WELDER)
         .id();
-    scenario
-        .add_creature(P0, "Leatherback Baloth", 4, 5)
-        .with_mana_cost(cost(
-            vec![
-                ManaCostShard::Green,
-                ManaCostShard::Green,
-                ManaCostShard::Green,
-            ],
-            0,
-        ));
+    if baloth {
+        scenario
+            .add_creature(P0, "Leatherback Baloth", 4, 5)
+            .with_mana_cost(cost(
+                vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                ],
+                0,
+            ));
+    }
     let artifact = scenario.add_artifact_from_oracle(P0, name, oracle).id();
     let mut runner = scenario.build();
     engine::game::zones::move_to_zone(
@@ -933,26 +939,58 @@ fn welder_with_imprinted(name: &str, oracle: &str) -> (GameRunner, ObjectId) {
         &mut Vec::new(),
     );
     runner.activate(welder, 0).target_object(artifact).resolve();
-    assert_eq!(
-        runner.state().objects[&artifact].zone,
-        Zone::Exile,
-        "reach: {name} was exiled with the Welder"
-    );
     {
         let state = runner.state_mut();
         state.objects.get_mut(&welder).unwrap().tapped = false;
         engine::game::layers::evaluate_layers(state);
     }
-    (runner, welder)
+    let state = runner.state();
+    assert_eq!(
+        state.objects[&artifact].zone,
+        Zone::Exile,
+        "reach: {name} was exiled"
+    );
+    assert!(
+        state
+            .exile_links
+            .iter()
+            .any(|link| link.exiled_id == artifact && link.source_id == welder),
+        "reach: {name} was exiled with the Welder"
+    );
+    let welder_obj = &state.objects[&welder];
+    assert!(
+        !welder_obj.tapped && !welder_obj.summoning_sick,
+        "reach: the Welder can tap"
+    );
+    assert_eq!(welder_obj.chosen_color(), None, "reach: no stored color");
+    assert_eq!(state.players[0].mana_pool.total(), 0, "reach: empty pool");
+    let mana_sources: Vec<ObjectId> = state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| {
+            state.objects[id]
+                .abilities
+                .iter()
+                .any(|ability| matches!(&*ability.effect, Effect::Mana { .. }))
+        })
+        .collect();
+    assert_eq!(
+        mana_sources,
+        vec![welder],
+        "reach: the Welder is the only mana source"
+    );
+    (runner, welder, artifact)
 }
 
-fn green_triple_spell(runner: &mut GameRunner) -> ObjectId {
+/// A {G}... instant with `green` green pips and no other effect.
+fn green_spell(runner: &mut GameRunner, green: usize) -> ObjectId {
     let state = runner.state_mut();
     let id = engine::game::zones::create_object(
         state,
         engine::types::identifiers::CardId(8_445),
         P0,
-        "Green Triple".to_string(),
+        "Green Spell".to_string(),
         Zone::Hand,
     );
     let obj = state.objects.get_mut(&id).unwrap();
@@ -960,14 +998,7 @@ fn green_triple_spell(runner: &mut GameRunner) -> ObjectId {
         .core_types
         .push(engine::types::card_type::CoreType::Instant);
     obj.base_card_types = obj.card_types.clone();
-    obj.mana_cost = cost(
-        vec![
-            ManaCostShard::Green,
-            ManaCostShard::Green,
-            ManaCostShard::Green,
-        ],
-        0,
-    );
+    obj.mana_cost = cost(vec![ManaCostShard::Green; green], 0);
     let draw = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Draw {
@@ -980,16 +1011,17 @@ fn green_triple_spell(runner: &mut GameRunner) -> ObjectId {
     id
 }
 
-/// CR 607.5a + CR 106.5: Myr Welder gains Heraldic
-/// Banner's "{T}: Add one mana of the chosen color" without the linked "As
-/// this artifact enters, choose a color", so the choice is undefined and the
-/// acquired ability makes no mana: a {G}{G}{G} spell is not offered. The
-/// paired positive is Nyx Lotus's "{T}: Choose a color. Add ...", whose choice
-/// is made as the acquired ability resolves: the Welder adds GGG.
+/// CR 607.5a + CR 106.5: Myr Welder gains Heraldic Banner's "{T}: Add one
+/// mana of the chosen color" without the linked "As this artifact enters,
+/// choose a color", so the choice is undefined and the acquired ability makes
+/// no mana: a {G} spell, with the Welder as the only mana source, is not
+/// offered. The paired positive is Nyx Lotus's "{T}: Choose a color. Add
+/// ...", whose choice is made as the acquired ability resolves: beside
+/// Leatherback Baloth the Welder pays the same {G}.
 #[test]
 fn myr_welder_acquired_linked_choice_is_undefined() {
     // Negative: Heraldic Banner.
-    let (mut runner, welder) = welder_with_imprinted("Heraldic Banner", HERALDIC_BANNER);
+    let (mut runner, welder, _) = welder_with_imprinted("Heraldic Banner", HERALDIC_BANNER, false);
     assert!(
         runner.state().objects[&welder]
             .abilities
@@ -1004,18 +1036,17 @@ fn myr_welder_acquired_linked_choice_is_undefined() {
                     ..
                 }
             )),
-        "reach: the Welder has Banner's chosen-color mana ability"
+        "reach: the Welder acquired Banner's chosen-color mana ability"
     );
-    assert_eq!(runner.state().objects[&welder].chosen_color(), None);
-    let spell = green_triple_spell(&mut runner);
+    let spell = green_spell(&mut runner, 1);
     assert_eq!(
         priority_facts(&runner, spell),
         (false, true),
         "the undefined choice adds no mana (CR 607.5a)"
     );
 
-    // Positive: Nyx Lotus.
-    let (mut runner, welder) = welder_with_imprinted("Nyx Lotus", NYX_LOTUS);
+    // Positive: Nyx Lotus, beside the Baloth.
+    let (mut runner, welder, _) = welder_with_imprinted("Nyx Lotus", NYX_LOTUS, true);
     assert!(
         runner.state().objects[&welder]
             .abilities
@@ -1027,9 +1058,9 @@ fn myr_welder_acquired_linked_choice_is_undefined() {
                     ..
                 } if color_options.len() == 5
             )),
-        "reach: the Welder has Nyx Lotus's activation-choice mana ability"
+        "reach: the Welder acquired Nyx Lotus's activation-choice mana ability"
     );
-    let spell = green_triple_spell(&mut runner);
+    let spell = green_spell(&mut runner, 1);
     assert_eq!(priority_facts(&runner, spell), (true, false));
     runner.cast(spell).resolve();
     assert_eq!(spell_zone(&runner, spell), Zone::Graveyard);
@@ -1079,7 +1110,7 @@ fn three_tree_city_board(chosen: Option<&str>, elves: usize) -> (GameRunner, Obj
             })
             .expect("the creature type is chosen as City enters");
     }
-    let spell = green_triple_spell(&mut runner);
+    let spell = green_spell(&mut runner, 3);
     let state = runner.state();
     assert_eq!(state.objects[&city].zone, Zone::Battlefield);
     assert!(!state.objects[&city].tapped);
@@ -1122,7 +1153,16 @@ fn three_tree_city_pays_with_the_chosen_type_count() {
     assert_eq!(priority_facts(&runner, spell), (true, false));
     runner.cast(spell).resolve();
     assert_eq!(spell_zone(&runner, spell), Zone::Graveyard);
-    assert!(runner.state().objects[&city].tapped, "City paid");
+    let state = runner.state();
+    assert!(state.objects[&city].tapped, "City paid");
+    assert!(
+        state
+            .battlefield
+            .iter()
+            .filter(|id| state.objects[id].name == "Plains")
+            .all(|id| state.objects[id].tapped),
+        "both Plains paid City's {{2}}"
+    );
 
     let (runner, _, spell) = three_tree_city_board(None, 3);
     assert_eq!(

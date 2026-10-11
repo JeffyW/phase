@@ -6865,6 +6865,8 @@ mod paid_object_label_tests {
     use super::*;
     use crate::game::scenario::{GameRunner, GameScenario, P0};
     use crate::game::scenario_db::GameScenarioDbExt;
+    use crate::types::ability::ChosenAttribute;
+    use crate::types::mana::ManaCost;
 
     /// `member` on P0's battlefield with `others` placed there before it.
     fn board(member: &str, others: &[&str]) -> (GameRunner, ObjectId) {
@@ -6906,8 +6908,6 @@ mod paid_object_label_tests {
     /// unchanged.
     #[test]
     fn color_dependent_amount_labels_each_row_with_its_own_color() {
-        use crate::types::ability::ChosenAttribute;
-        use crate::types::mana::ManaCost;
         for stored in [None, Some(ManaColor::Blue)] {
             let mut scenario = GameScenario::new();
             let lotus = scenario

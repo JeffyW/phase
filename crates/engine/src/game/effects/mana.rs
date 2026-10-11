@@ -1181,16 +1181,43 @@ pub(crate) fn any_one_color_outputs(
     let mut outputs: Vec<(ManaType, usize)> = color_options
         .iter()
         .map(|color| {
-            let bound = bind_any_one_color_choice(produced, *color);
             (
                 mana_color_to_type(color),
-                resolve_mana_types_for_ability(&bound, state, ability).len(),
+                any_one_color_amount(produced, state, ability, *color),
             )
         })
         .filter(|(_, amount)| *amount > 0)
         .collect();
     outputs.sort_by_key(|(_, amount)| std::cmp::Reverse(*amount));
     outputs
+}
+
+/// CR 106.1 + CR 608.2d: The amount an any-one-color production adds when
+/// `color` is chosen for it, as a scalar: the count is bound to `color`
+/// ([`bind_any_one_color_choice`]) and resolved directly, with no mana units
+/// built. The scalar authority for planning; resolution builds its units from
+/// the same bound count.
+fn any_one_color_amount(
+    produced: &ManaProduction,
+    state: &GameState,
+    ability: &ResolvedAbility,
+    color: ManaColor,
+) -> usize {
+    let bound = bind_any_one_color_choice(produced, color);
+    match &*bound {
+        ManaProduction::AnyOneColor {
+            count,
+            color_options,
+            ..
+        } if !color_options.is_empty() => resolve_count(
+            count,
+            state,
+            Some(ability),
+            ability.controller,
+            ability.source_id,
+        ),
+        _ => 0,
+    }
 }
 
 /// CR 106.1b: The first mana type noted by a past `Effect::NoteManaSpent`
