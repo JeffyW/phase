@@ -7175,6 +7175,7 @@ pub(super) fn push_ability_entry(
                 }
             }));
     }
+    super::announcement_triggers::end_activation_announcement(state);
     priority::clear_priority_passes(state);
 
     Ok(WaitingFor::Priority { player })

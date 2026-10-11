@@ -1557,9 +1557,7 @@ fn apply_action_boundary_core(
     // carrier is held by `announcement_triggers` for this action. The boundary
     // snapshot above still holds it on its `PendingCast`, so every restore path
     // below returns it there.
-    let continues_announcement =
-        super::announcement_triggers::action_continues_announcement(state, &action);
-    super::announcement_triggers::begin_action(state, continues_announcement);
+    super::announcement_triggers::begin_action(state);
     let mut result = match if payment_transaction::owns_action(state, &action) {
         // All staged-payment actions enter through this admission point. The
         // authenticated actor is recorded for deterministic replay; the

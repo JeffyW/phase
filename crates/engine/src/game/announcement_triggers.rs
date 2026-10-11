@@ -14,10 +14,10 @@
 //! keeps that carrier with whichever [`PendingCastOwner`] holds the
 //! announcement, and commits or drops it when the announcement ends.
 
-use crate::types::actions::GameAction;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    GameState, InFlightSpellTriggerCarrier, PendingCastOwner, PendingCostMoveResume, WaitingFor,
+    AnnouncementEventScope, GameState, InFlightSpellTriggerCarrier, PendingCastOwner,
+    PendingCostMoveResume, WaitingFor,
 };
 use crate::types::identifiers::ObjectId;
 
@@ -131,7 +131,10 @@ pub(crate) fn stage_announcement_trigger_events(
     events: &[GameEvent],
     event_start: usize,
 ) {
-    let start = event_start.max(state.announcement_events_staged_through);
+    let AnnouncementEventScope::From { start: owned_from } = state.announcement_event_scope else {
+        return;
+    };
+    let start = event_start.max(owned_from);
     if start >= events.len() {
         return;
     }
@@ -143,7 +146,7 @@ pub(crate) fn stage_announcement_trigger_events(
         .into_iter()
         .filter(|event| !retained.contains(event))
         .collect();
-    state.announcement_events_staged_through = events.len();
+    state.announcement_event_scope = state.announcement_event_scope.advanced_to(events.len());
     if new_events.is_empty() {
         return;
     }
@@ -179,55 +182,39 @@ pub(crate) fn stage_announcement_trigger_events(
     claim_ordinary(state, events, start, events.len());
 }
 
-/// Whether `action`'s event buffer belongs to an announcement from its first
-/// event: it answers the live announcement, starts one from priority, or is a
-/// cast-family action that starts one from a resolution prompt. A priority pass
-/// can resolve a stack object that begins a cast part-way through the buffer,
-/// and a concession, debug or preference action never announces anything.
-pub(crate) fn action_continues_announcement(state: &GameState, action: &GameAction) -> bool {
-    if action.is_actor_scoped_preference()
-        || matches!(action, GameAction::Concede { .. } | GameAction::Debug(..))
-    {
-        return false;
+/// CR 601.2a + CR 602.2a: an announcement begins at `events_len` in the
+/// current action's buffer. Called by the announcing authority (the spell's
+/// stack announcement, the activation's announcement), so an announcement that
+/// begins part-way through an action (a cast offered by a resolving ability)
+/// owns only the events from its inception on.
+pub(crate) fn begin_announcement(state: &mut GameState, events_len: usize) {
+    if state.announcement_event_scope == AnnouncementEventScope::Unowned {
+        state.announcement_event_scope = AnnouncementEventScope::From { start: events_len };
     }
-    if !state.live_pending_cast_owners().is_empty() {
-        return true;
-    }
-    let starts_cast = matches!(
-        action,
-        GameAction::CastSpell { .. }
-            | GameAction::CastSpellForFree { .. }
-            | GameAction::CastSpellAsMiracle { .. }
-            | GameAction::CastSpellAsMadness { .. }
-            | GameAction::CastSpellAsSneak { .. }
-            | GameAction::CastSpellAsWebSlinging { .. }
-            | GameAction::CastPreparedCopy { .. }
-            | GameAction::CastParadigmCopy { .. }
-    );
-    starts_cast
-        || (matches!(state.waiting_for, WaitingFor::Priority { .. })
-            && !matches!(action, GameAction::PassPriority))
 }
 
-/// Action entry: a spell announcement's carrier leaves its `PendingCast` for
-/// the duration of the action, because spell continuations rebuild their
-/// `PendingCast` without it. Activations thread their carrier explicitly.
-///
-/// `continues_announcement` is false for an action that neither starts an
-/// announcement nor answers the live one (a concession, a debug or preference
-/// action, or a priority pass whose resolution may begin a cast part-way
-/// through its buffer). Such an action's events belong to whatever else it
-/// did, so staging is disarmed for it.
-pub(crate) fn begin_action(state: &mut GameState, continues_announcement: bool) {
-    state.announcement_events_staged_through = if continues_announcement {
-        0
-    } else {
-        usize::MAX
-    };
+/// CR 800.4a: the departure sweep owns its own events (objects leaving the
+/// game). A surviving player's paused announcement does not.
+pub(crate) fn disown_events_through(state: &mut GameState, end: usize) {
+    state.announcement_event_scope = state.announcement_event_scope.advanced_to(end);
+}
+
+/// Action entry: an announcement already live owns the action's buffer from
+/// its start; otherwise none does until an announcement begins
+/// ([`begin_announcement`]). A spell announcement's carrier also leaves its
+/// `PendingCast` for the duration of the action, because spell continuations
+/// rebuild their `PendingCast` without it. Activations thread their carrier
+/// explicitly.
+pub(crate) fn begin_action(state: &mut GameState) {
     debug_assert!(
         state.in_flight_spell_trigger_carrier.is_none(),
         "a spell trigger carrier outlived its action"
     );
+    state.announcement_event_scope = if state.live_pending_cast_owners().is_empty() {
+        AnnouncementEventScope::Unowned
+    } else {
+        AnnouncementEventScope::From { start: 0 }
+    };
     let Some(object_id) = live_spell_announcement(state) else {
         return;
     };
@@ -270,11 +257,17 @@ pub(crate) fn end_action(state: &mut GameState, events: &[GameEvent]) {
     if state.cancelled_casts.contains(&carrier.object_id) {
         return;
     }
-    // Every finished spell commits at CR 601.2i finalization and every
+    // A spell that became cast commits at CR 601.2i finalization and an
     // abandoned one at its controller's departure; neither leaves a carrier.
+    // What remains is an announcement the game reversed as illegal (a cast
+    // during resolution, CR 608.2g, whose proposed spell is rejected, CR
+    // 601.2e): no abilities trigger as a result of it (CR 733.1).
+    if !state.stack_paid_facts.contains_key(&carrier.object_id) {
+        return;
+    }
     debug_assert!(
         false,
-        "spell trigger carrier for {:?} ended without finalization, cancellation or departure",
+        "spell trigger carrier for {:?} outlived its CR 601.2i finalization",
         carrier.object_id
     );
     let mut deferred = std::mem::take(&mut state.deferred_triggers);
@@ -293,39 +286,32 @@ pub(crate) fn commit_spell_announcement(
     object_id: ObjectId,
     events: &[GameEvent],
 ) {
+    let scope = std::mem::take(&mut state.announcement_event_scope);
     let Some(mut collection) = take_announcing(state, object_id) else {
         return;
     };
-    let start = state.announcement_events_staged_through.min(events.len());
+    let start = match scope {
+        AnnouncementEventScope::From { start } => start.min(events.len()),
+        AnnouncementEventScope::Unowned => events.len(),
+    };
     let retained = retained_by_cost_owners(state);
     let new_events: Vec<GameEvent> = unclaimed_events(state, events, start)
         .into_iter()
         .filter(|event| !retained.contains(event))
         .collect();
-    let delayed_events = triggers::filter_consumed_trigger_events_from(
-        events,
-        start,
-        triggers::TriggerCollectionRequester::Delayed,
-        &state.consumed_before_priority_trigger_events,
-    );
     collection.collect(state, &new_events);
     let mut deferred = std::mem::take(&mut state.deferred_triggers);
     collection.commit_into(state, &mut deferred);
     state.deferred_triggers = deferred;
-    // CR 603.7b: this fragment's delayed triggers join the same batch.
-    triggers::collect_delayed_triggers_into_deferred(state, &delayed_events);
-    let end = events.len();
-    let occurrences: Vec<ConsumedTriggerEventOccurrence> = (start..end)
-        .map(|index| ConsumedTriggerEventOccurrence {
-            event: events[index].clone(),
-            occurrence: triggers::trigger_event_occurrence(events, index),
-            scope: ConsumedTriggerEventScope::AllCollectors,
-        })
-        .collect();
-    state
-        .consumed_before_priority_trigger_events
-        .extend(occurrences);
-    state.announcement_events_staged_through = end;
+    // Delayed triggered abilities (CR 603.7b) keyed on this fragment are left
+    // to the priority pipeline's delayed scan, exactly as without a carrier.
+    claim_ordinary(state, events, start, events.len());
+}
+
+/// CR 602.2b: the activation reached the stack; the announcement no longer
+/// owns this action's later events.
+pub(crate) fn end_activation_announcement(state: &mut GameState) {
+    state.announcement_event_scope = AnnouncementEventScope::Unowned;
 }
 
 /// CR 800.4a: the announcement's controller left the game. The events it

@@ -8800,13 +8800,20 @@ impl GameState {
         }
     }
 
-    /// Retires `owner`'s [`PendingCast`] without finalizing or cancelling it.
-    /// A spell's prompt hands priority to the active player. An activation's
-    /// prompt, and an external payment prompt left without its `PendingCast`,
-    /// become a priority wait for the same player, which the departure sweep
-    /// re-points past a player who has left (CR 800.4a) exactly as it would
-    /// have re-pointed the prompt.
-    pub(crate) fn retire_pending_cast_owner(&mut self, owner: PendingCastOwner) {
+    /// Retires `owner`'s [`PendingCast`] — and the prompt it parked behind —
+    /// without finalizing or cancelling it, because `departing_player` left
+    /// (CR 800.4a). A spell's prompt hands priority to the active player. An
+    /// activation's prompt, an external payment prompt left without its
+    /// `PendingCast`, and a typed cost root's orphaned child prompt become a
+    /// priority wait for the same player, which the departure sweep re-points
+    /// past a player who has left exactly as it would have re-pointed the
+    /// prompt. Turning the prompt into priority here, before the departure's
+    /// trigger settlement, lets that settlement run in the same pass (CR 603.3).
+    pub(crate) fn retire_pending_cast_owner(
+        &mut self,
+        owner: PendingCastOwner,
+        departing_player: PlayerId,
+    ) {
         match owner {
             PendingCastOwner::External => {
                 self.pending_cast = None;
@@ -8832,9 +8839,36 @@ impl GameState {
                 };
                 self.waiting_for = WaitingFor::Priority { player };
             }
-            PendingCastOwner::DeferredLifeCost => self.pending_deferred_life_cost_resume = None,
-            PendingCastOwner::CostMove => self.pending_cost_move_resume = None,
-            PendingCastOwner::DiscardForCost => self.pending_discard_for_cost = None,
+            PendingCastOwner::DeferredLifeCost => {
+                self.pending_deferred_life_cost_resume = None;
+                self.retire_orphaned_cost_child_prompt(departing_player);
+            }
+            PendingCastOwner::CostMove => {
+                self.pending_cost_move_resume = None;
+                self.retire_orphaned_cost_child_prompt(departing_player);
+            }
+            PendingCastOwner::DiscardForCost => {
+                self.pending_discard_for_cost = None;
+                self.retire_orphaned_cost_child_prompt(departing_player);
+            }
+        }
+    }
+
+    /// CR 616.1: a typed cost root parks its announcement behind a child prompt
+    /// (a replacement choice). Once the departing chooser's replacement record
+    /// is gone, that prompt has no owner left.
+    fn retire_orphaned_cost_child_prompt(&mut self, departing_player: PlayerId) {
+        let orphaned = self.pending_replacement.is_none()
+            && !matches!(
+                self.waiting_for,
+                WaitingFor::Priority { .. } | WaitingFor::GameOver { .. }
+            )
+            && !self.waiting_for.has_pending_cast()
+            && self.waiting_for.acting_player() == Some(departing_player);
+        if orphaned {
+            self.waiting_for = WaitingFor::Priority {
+                player: departing_player,
+            };
         }
     }
 }
@@ -8875,6 +8909,32 @@ pub(crate) struct InFlightSpellTriggerCarrier {
     /// The announced spell (CR 601.2a) the carrier belongs to.
     pub(crate) object_id: ObjectId,
     pub(crate) collection: Box<crate::game::triggers::PendingActivationTriggerCollection>,
+}
+
+/// Which events of the current action's buffer a live announcement owns.
+/// See [`GameState::announcement_event_scope`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AnnouncementEventScope {
+    /// No announcement owns any unstaged event of this buffer: none is live,
+    /// or the events belong to another authority (a departure, CR 800.4a).
+    #[default]
+    Unowned,
+    /// CR 601.2a + CR 602.2a: the announcement owns `events[start..]`. `start`
+    /// is the announcement's inception offset (0 when it was already live at
+    /// action entry) and advances past every event already staged or scanned.
+    From { start: usize },
+}
+
+impl AnnouncementEventScope {
+    /// The scope after an authority has accounted for `events[..end]`.
+    pub(crate) fn advanced_to(self, end: usize) -> Self {
+        match self {
+            AnnouncementEventScope::Unowned => AnnouncementEventScope::Unowned,
+            AnnouncementEventScope::From { start } => AnnouncementEventScope::From {
+                start: start.max(end),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22993,10 +23053,13 @@ declare_game_state! {
     /// serialized and never part of state equality.
     #[serde(skip)]
     pub(crate) in_flight_spell_trigger_carrier: Option<InFlightSpellTriggerCarrier>,
-    /// How far the current action's event buffer has already been staged into
-    /// an announcement's trigger carrier. Reset at action entry; transient.
+    /// The part of the current action's event buffer owned by a live
+    /// announcement and not yet staged into its carrier. Established at action
+    /// entry (an announcement already live) or at the announcement's inception
+    /// part-way through the buffer; reset at the next action entry. Never
+    /// serialized and never part of state equality.
     #[serde(skip)]
-    pub(crate) announcement_events_staged_through: usize,
+    pub(crate) announcement_event_scope: AnnouncementEventScope,
 
     /// CR 701.54: Per-player ring level (0-3, 4 levels total).
     #[serde(default)]
@@ -28746,7 +28809,7 @@ impl GameState {
             pending_discard_for_cost: None,
             pending_cast: None,
             in_flight_spell_trigger_carrier: None,
-            announcement_events_staged_through: 0,
+            announcement_event_scope: AnnouncementEventScope::Unowned,
             ring_level: HashMap::new(),
             ring_bearer: HashMap::new(),
             dungeon_progress: HashMap::new(),
@@ -31762,7 +31825,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_discard_for_cost: _,
         pending_cast: _,
         in_flight_spell_trigger_carrier: _,
-        announcement_events_staged_through: _,
+        announcement_event_scope: _,
         ring_level: _,
         ring_bearer: _,
         dungeon_progress: _,

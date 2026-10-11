@@ -57,7 +57,7 @@ fn abandon_pending_casts(
             continue;
         }
         super::announcement_triggers::publish_abandoned_announcement(state, owner);
-        state.retire_pending_cast_owner(owner);
+        state.retire_pending_cast_owner(owner, departing_player);
     }
 }
 
@@ -535,6 +535,9 @@ pub fn eliminate_players_simultaneously(
             }
         }
     }
+    // CR 800.4a: the departure's events belong to the departure, not to a
+    // surviving player's paused announcement.
+    super::announcement_triggers::disown_events_through(state, events.len());
 }
 
 /// CR 103.5 + CR 800.4a: Prune eliminated players from the in-flight
@@ -716,7 +719,20 @@ fn drain_or_clear_deferred_triggers_after_elimination(
         return;
     }
     if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-        if let Some(wf) = super::triggers::drain_deferred_trigger_queue(state, events) {
+        // CR 603.3 + CR 117.5: abilities that triggered are put on the stack
+        // before the next player receives priority. With no resolution in
+        // progress, a spell still on the stack is a passive announced object
+        // (another player's spell below an abandoned announcement), so the
+        // post-announcement settlement authority applies; a live resolution
+        // keeps the resolution-safe drain (issue #1793).
+        let resolution_live =
+            state.resolving_stack_entry.is_some() || !state.resolution_stack.is_empty();
+        let settled = if resolution_live {
+            super::triggers::drain_deferred_trigger_queue(state, events)
+        } else {
+            super::triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
+        };
+        if let Some(wf) = settled {
             state.waiting_for = wf;
         }
     }

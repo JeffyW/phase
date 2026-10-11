@@ -130,10 +130,9 @@ fn run_post_action_pipeline_from_with_policy(
         drain_policy,
         carried_priority_recipient,
     );
-    // The pass scanned the buffer through its end; end-of-action announcement
-    // staging must start after it.
-    state.announcement_events_staged_through =
-        state.announcement_events_staged_through.max(events.len());
+    // The pass scanned the buffer through its end; later announcement staging
+    // in this action starts after it.
+    state.announcement_event_scope = state.announcement_event_scope.advanced_to(events.len());
     settled
 }
 

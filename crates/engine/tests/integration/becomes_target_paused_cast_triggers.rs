@@ -1081,3 +1081,199 @@ fn a_departed_observers_staged_trigger_is_not_put_on_the_stack() {
         .iter()
         .all(|context| context.pending.controller != P1));
 }
+
+/// CR 800.4a + CR 603.3: the caster concedes while a replacement choice raised
+/// by its sacrifice cost is open (Rest in Peace and Leyline of the Void), so
+/// the cast is parked in a typed cost root, not a prompt. Sanctuary's staged
+/// trigger is on the stack before any player receives priority. Control: the
+/// same board answered normally triggers Sanctuary once.
+#[test]
+fn a_caster_leaving_at_a_cost_replacement_choice_still_puts_the_target_trigger_on_the_stack() {
+    for concede in [false, true] {
+        let mut sc = three_player_board();
+        let sanctuary = sc
+            .add_enchantment_from_oracle(P1, "Shapers' Sanctuary", SHAPERS_SANCTUARY)
+            .id();
+        sc.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+        sc.add_enchantment_from_oracle(P1, "Leyline of the Void", LEYLINE_OF_THE_VOID);
+        let target = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+        let fodder = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let spell = bone_splinters(&mut sc, P0);
+        sc.with_mana_pool(P0, pool(&[ManaType::Black]));
+        let mut runner = sc.build();
+
+        cast(&mut runner, spell, CastPaymentMode::Manual);
+        let prompts = drive(
+            &mut runner,
+            &Answers {
+                target: Some(target),
+                sacrifice: Some(fodder),
+                stop_at: concede.then_some("ReplacementChoice"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            prompts.iter().any(|p| p == "ReplacementChoice"),
+            "reach guard: the cost raised a replacement choice: {prompts:?}"
+        );
+        if concede {
+            runner
+                .act(GameAction::Concede { player_id: P0 })
+                .expect("P0 concedes at the replacement choice");
+            assert!(runner.state().players[P0.0 as usize].is_eliminated);
+            assert!(!spell_on_stack(&runner, spell), "the announcement is gone");
+            assert!(runner.state().deferred_triggers.is_empty());
+        } else {
+            assert!(spell_on_stack(&runner, spell));
+        }
+        assert_eq!(
+            triggers_from(&runner, sanctuary),
+            1,
+            "concede={concede}: Sanctuary is on the stack, wait {:?}",
+            runner.state().waiting_for
+        );
+    }
+}
+
+/// CR 603.3 + CR 117.5: the caster responds to another player's spell and
+/// concedes at the payment prompt. That spell stays on the stack as a passive
+/// object; Sanctuary's trigger still goes on the stack, above it, before any
+/// player receives priority. Control: no spell underneath.
+#[test]
+fn a_caster_leaving_above_another_spell_still_puts_the_target_trigger_on_the_stack() {
+    for underneath in [false, true] {
+        let mut sc = three_player_board();
+        let sanctuary = sc
+            .add_enchantment_from_oracle(P1, "Shapers' Sanctuary", SHAPERS_SANCTUARY)
+            .id();
+        let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+        let p2_shock = shock(&mut sc, P2);
+        let p0_shock = shock(&mut sc, P0);
+        sc.with_mana_pool(P0, pool(&[ManaType::Red]));
+        sc.with_mana_pool(P2, pool(&[ManaType::Red]));
+        let mut runner = sc.build();
+
+        if underneath {
+            // P0 and P1 pass; P2 casts Shock at P1, then passes back to P0.
+            runner.act(GameAction::PassPriority).expect("P0 passes");
+            runner.act(GameAction::PassPriority).expect("P1 passes");
+            cast(&mut runner, p2_shock, CastPaymentMode::Auto);
+            if matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ) {
+                runner
+                    .act(GameAction::SelectTargets {
+                        targets: vec![TargetRef::Player(P1)],
+                    })
+                    .expect("P2 targets P1");
+            }
+            assert!(spell_on_stack(&runner, p2_shock), "reach guard");
+            runner.act(GameAction::PassPriority).expect("P2 passes");
+            assert_eq!(
+                runner.state().waiting_for,
+                WaitingFor::Priority { player: P0 },
+                "reach guard: P0 may respond"
+            );
+        }
+
+        cast(&mut runner, p0_shock, CastPaymentMode::Manual);
+        let prompts = drive(
+            &mut runner,
+            &Answers {
+                target: Some(bears),
+                stop_at: Some("ManaPayment"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(prompts, ["TargetSelection", "ManaPayment"]);
+        runner
+            .act(GameAction::Concede { player_id: P0 })
+            .expect("P0 concedes mid-payment");
+        assert!(!spell_on_stack(&runner, p0_shock));
+        assert_eq!(spell_on_stack(&runner, p2_shock), underneath);
+        assert_eq!(
+            triggers_from(&runner, sanctuary),
+            1,
+            "underneath={underneath}: Sanctuary is on the stack, wait {:?}",
+            runner.state().waiting_for
+        );
+        assert!(runner.state().deferred_triggers.is_empty());
+        if underneath {
+            assert!(
+                stack_position(&runner, |kind, _| matches!(
+                    kind,
+                    StackEntryKind::TriggeredAbility { .. }
+                )) > stack_position(&runner, |_, id| id == p2_shock),
+                "Sanctuary goes above P2's Shock"
+            );
+        }
+    }
+}
+
+const TOSHIRO_UMEZAWA: &str = "Bushido 1 (Whenever this creature blocks or becomes blocked, it gets +1/+1 until end of turn.)\nWhenever a creature an opponent controls dies, you may cast target instant card from your graveyard. If that spell would be put into a graveyard, exile it instead.";
+
+/// CR 601.2a + CR 601.2c: an announcement that begins part-way through an
+/// action. Toshiro Umezawa's trigger offers Disenchant from P0's graveyard
+/// while it resolves; the offered cast automatically targets Forsaken Wastes
+/// (its only legal target) and pauses at payment in the same action that
+/// resolved the trigger. Forsaken Wastes triggers; P0 loses 5 life.
+#[test]
+fn a_cast_offered_by_a_resolving_ability_keeps_its_target_trigger() {
+    let mut sc = board();
+    let wastes = forsaken_wastes(&mut sc, P1);
+    let victim = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    sc.add_creature(P0, "Toshiro Umezawa", 2, 2)
+        .from_oracle_text_with_keywords(&["Bushido"], TOSHIRO_UMEZAWA);
+    let offered = sc
+        .add_spell_to_graveyard(P0, "Disenchant", true)
+        .from_oracle_text(DISENCHANT)
+        .with_mana_cost(mana(&[ManaCostShard::White], 1))
+        .id();
+    let spell = shock(&mut sc, P0);
+    sc.with_mana_pool(
+        P0,
+        pool(&[ManaType::Red, ManaType::White, ManaType::Colorless]),
+    );
+    let mut runner = sc.build();
+
+    cast(&mut runner, spell, CastPaymentMode::Auto);
+    drive(
+        &mut runner,
+        &Answers {
+            target: Some(victim),
+            ..Default::default()
+        },
+    );
+    let mut prompts = Vec::new();
+    for _ in 0..32 {
+        let wf = runner.state().waiting_for.clone();
+        let action = match wf {
+            WaitingFor::Priority { .. } if spell_on_stack(&runner, offered) => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::TriggerTargetSelection { .. } => GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(offered)],
+            },
+            WaitingFor::OptionalEffectChoice { .. } => {
+                GameAction::DecideOptionalEffect { accept: true }
+            }
+            WaitingFor::CastOffer { .. } => GameAction::GraveyardPaidCastChoice {
+                choice: engine::types::actions::CastChoice::Cast,
+            },
+            WaitingFor::ManaPayment { .. } => GameAction::PassPriority,
+            other => panic!("unexpected prompt {other:?}"),
+        };
+        prompts.push(prompt_name(&runner.state().waiting_for));
+        runner.act(action).expect("the prompt accepts its answer");
+    }
+    assert!(
+        prompts.iter().any(|p| p == "CastOffer") && prompts.iter().any(|p| p == "ManaPayment"),
+        "reach guard: the offered cast paused at payment: {prompts:?}"
+    );
+    assert!(spell_on_stack(&runner, offered));
+    assert_eq!(triggers_from(&runner, wastes), 1);
+
+    let life = runner.state().players[P0.0 as usize].life;
+    resolve_all(&mut runner, false);
+    assert_eq!(runner.state().players[P0.0 as usize].life, life - 5);
+}
