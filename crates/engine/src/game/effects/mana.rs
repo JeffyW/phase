@@ -6,7 +6,7 @@ use crate::types::ability::{
     ChoiceValue, Effect, EffectError, EffectKind, LinkedExileScope, ManaProduction,
     ManaSpendRestriction, ManaTargetRole, ManaTargetSlot, ObjectScope, ResolvedAbility, TargetRef,
 };
-use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
+use crate::types::ability_visit::{visit_ability_def, visit_effect};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     GameState, ManaChoice, ManaChoiceContext, ManaChoicePrompt, MayTriggerOrigin, WaitingFor,
@@ -1117,17 +1117,17 @@ pub(crate) fn chosen_color_for_mana(
 /// the five colors is available. Any persisted chooser that could name a color
 /// counts as linked, so an unrecognized chooser fails closed.
 ///
-/// Boundary: the object's own activated abilities, triggers and replacements,
-/// each walked over its own resolution with the shared `ability_visit`
-/// traversal at `ResolutionScope::OwnResolutionOnly`. That descends every
-/// inline carrier (sub, else and modal links, `ChooseOneOf` branches) but
-/// stops where an effect registers an ability for another object (a
-/// `GenericEffect` grant, a token or emblem payload): a chooser granted to
-/// another object is that object's, not this one's (CR 611.2). The same scope
-/// also stops at a reflexive "when you do" ability (CR 603.12); no printed
-/// linked color chooser sits there. Static abilities are not walked: their
-/// effects apply to what their text names (CR 611.3), and an ability granted
-/// to this object is already among its live `abilities`.
+/// Boundary (a conservative fallback): every persisted color chooser anywhere
+/// in the object's own activated abilities, triggers and replacements, at any
+/// resolution depth (inline links, reflexive "when you do" abilities, delayed
+/// triggers, CR 603.7 + CR 603.12), counts as linked, since each of those
+/// still resolves with this object as its source. The only choosers left out
+/// are those inside payloads installed on another object
+/// ([`registers_for_another_object`]: a `GenericEffect` grant, a token or
+/// emblem, a replacement added to a target), which are that object's
+/// (CR 611.2). Static abilities are not walked: their effects apply to what
+/// their text names (CR 611.3), and an ability granted to this object is
+/// already among its live `abilities`.
 pub(crate) fn chooses_color_on_activation(
     state: &GameState,
     source_id: crate::types::identifiers::ObjectId,
@@ -1146,33 +1146,67 @@ pub(crate) fn chooses_color_on_activation(
         .replacement_definitions
         .iter_all()
         .filter_map(|replacement| replacement.execute.as_deref());
-    let linked = obj
+    // Choosers by node identity: every one reachable from this object's own
+    // definitions, and those reached through another object's payload.
+    let mut choosers: Vec<*const Effect> = Vec::new();
+    let mut elsewhere: Vec<*const Effect> = Vec::new();
+    for def in obj
         .abilities
         .iter()
         .chain(trigger_executes)
         .chain(replacement_executes)
-        .any(|def| {
-            visit_ability_def_scoped(
-                def,
-                ResolutionScope::OwnResolutionOnly,
-                &mut break_on_linked_color_chooser,
-            )
-            .is_break()
+    {
+        let _ = visit_ability_def(def, &mut |effect: &Effect| {
+            if is_linked_color_chooser(effect) {
+                choosers.push(effect);
+            }
+            if registers_for_another_object(effect) {
+                let _ = visit_effect(effect, &mut |inner: &Effect| {
+                    if is_linked_color_chooser(inner) {
+                        elsewhere.push(inner);
+                    }
+                    ControlFlow::Continue(())
+                });
+            }
+            ControlFlow::Continue(())
         });
+    }
+    let linked = choosers
+        .iter()
+        .any(|chooser| !elsewhere.iter().any(|other| std::ptr::eq(*chooser, *other)));
     !linked
 }
 
-/// CR 607.2d: Stop the traversal at a persisted choice whose answer could be a
-/// color, i.e. a choice "the chosen color" can refer back to.
-fn break_on_linked_color_chooser(effect: &Effect) -> ControlFlow<()> {
-    match effect {
+/// CR 607.2d: A persisted choice whose answer could be a color, i.e. a choice
+/// "the chosen color" can refer back to.
+fn is_linked_color_chooser(effect: &Effect) -> bool {
+    matches!(
+        effect,
         Effect::Choose {
             choice_type,
             persist: true,
             ..
-        } if choice_type_can_name_a_color(choice_type) => ControlFlow::Break(()),
-        _ => ControlFlow::Continue(()),
-    }
+        } if choice_type_can_name_a_color(choice_type)
+    )
+}
+
+/// CR 611.2 + CR 111.1 + CR 114.1: An effect whose nested abilities are
+/// installed on another object (a granted static, a token, an emblem, a
+/// replacement added to a target, a countered spell's rider), so a chooser
+/// inside belongs to that object. Any carrier not listed here is treated as
+/// this object's own, which keeps the linked-chooser check fail-closed.
+fn registers_for_another_object(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::GenericEffect { .. }
+            | Effect::Token { .. }
+            | Effect::CreateEmblem { .. }
+            | Effect::AddTargetReplacement { .. }
+            | Effect::Counter {
+                source_rider: Some(_),
+                ..
+            }
+    )
 }
 
 /// CR 105.1: Whether a choice of this type can answer with a color. Labeled

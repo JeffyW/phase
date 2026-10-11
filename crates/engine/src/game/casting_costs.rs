@@ -14841,19 +14841,20 @@ pub(super) fn max_x_value_excluding(
     // max(mana yield, tap-keyword yield), never the sum, or the X cap inflates
     // above what the caster can actually pay.
     //
-    // CR 117.1d + CR 601.2g: Use `feasible_mana_capacity` (not the auto-tap-
-    // only `max_mana_yield`) so sacrifice-/discard-/life-cost mana abilities
-    // the controller could activate manually are counted. Without this, KCI
-    // (and similar non-tap mana sources) understate the X cap for X-spells
-    // — see #562. The per-permanent sum can over-count chain-sacrifice
-    // configurations (tracked in #1235); colored-shard non-tap feasibility
-    // is deferred separately (tracked in #1234).
+    // CR 117.1d + CR 601.2g: Use `x_ceiling_mana_capacity` (the feasible
+    // capacity, not the auto-tap-only `max_mana_yield`) so sacrifice-/discard-/
+    // life-cost mana abilities the controller could activate manually are
+    // counted. Without this, KCI (and similar non-tap mana sources) understate
+    // the X cap for X-spells — see #562. A source whose amount depends on the
+    // color it is activated for is left out (fails closed). The per-permanent
+    // sum can over-count chain-sacrifice configurations (tracked in #1235);
+    // colored-shard non-tap feasibility is deferred separately (tracked in #1234).
     let permanent_capacity: u32 = state
         .battlefield
         .iter()
         .filter(|id| !excluded_sources.contains(id))
         .map(|&id| {
-            let mana = mana_sources::feasible_mana_capacity(state, id, player, spell_ctx.as_ref());
+            let mana = mana_sources::x_ceiling_mana_capacity(state, id, player, spell_ctx.as_ref());
             let tap = pred
                 .filter(|p| state.objects.get(&id).is_some_and(|o| p(o, player)))
                 .map_or(0, |_| 1);

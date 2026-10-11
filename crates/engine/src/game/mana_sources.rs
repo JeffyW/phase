@@ -2253,11 +2253,56 @@ fn mana_ability_allowed_for_payment(
         .all(|restriction| restriction.allows(ctx))
 }
 
+/// Which payment estimate a mana capacity serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityUse {
+    /// Castability: colored shards are assigned first, and a color chosen on
+    /// activation is charged for what that color adds.
+    Castability,
+    /// The {X} ceiling sums capacities with no per-color accounting, so a
+    /// source whose amount depends on the color it is activated for (Nyx Lotus
+    /// with unequal devotion) is left out: the ceiling fails closed.
+    XCeiling,
+}
+
+/// CR 107.3 + CR 601.2f: One permanent's mana capacity toward the largest {X}
+/// the controller can announce (see [`CapacityUse::XCeiling`]).
+pub(crate) fn x_ceiling_mana_capacity(
+    state: &GameState,
+    object_id: ObjectId,
+    controller: PlayerId,
+    payment_context: Option<&PaymentContext<'_>>,
+) -> u32 {
+    mana_capacity(
+        state,
+        object_id,
+        controller,
+        payment_context,
+        CapacityUse::XCeiling,
+    )
+}
+
 pub(crate) fn feasible_mana_capacity(
     state: &GameState,
     object_id: ObjectId,
     controller: PlayerId,
     payment_context: Option<&PaymentContext<'_>>,
+) -> u32 {
+    mana_capacity(
+        state,
+        object_id,
+        controller,
+        payment_context,
+        CapacityUse::Castability,
+    )
+}
+
+fn mana_capacity(
+    state: &GameState,
+    object_id: ObjectId,
+    controller: PlayerId,
+    payment_context: Option<&PaymentContext<'_>>,
+    capacity_use: CapacityUse,
 ) -> u32 {
     let Some(obj) = state.objects.get(&object_id) else {
         return 0;
@@ -2306,6 +2351,13 @@ pub(crate) fn feasible_mana_capacity(
         })
         .filter_map(|(_, ability)| match &*ability.effect {
             Effect::Mana { produced, .. } => {
+                if capacity_use == CapacityUse::XCeiling
+                    && activation_amount_depends_on_color(
+                        state, produced, ability, object_id, controller,
+                    )
+                {
+                    return None;
+                }
                 let gross =
                     largest_sizing_resolution(state, produced, ability, object_id, controller)
                         .map_or(0, |(_, gross)| gross);
@@ -2474,6 +2526,24 @@ fn planned_gross_mana(
             .max()
             .unwrap_or(0);
     resolved_production_count(produced, state, resolved).max(on_activation)
+}
+
+/// CR 106.1 + CR 607.2d: Whether this ability chooses its color on activation
+/// and adds a different amount for some color (including colors that would
+/// add none), i.e. Nyx Lotus with unequal devotion but not Astral Cornucopia.
+fn activation_amount_depends_on_color(
+    state: &GameState,
+    produced: &ManaProduction,
+    ability: &AbilityDefinition,
+    object_id: ObjectId,
+    controller: PlayerId,
+) -> bool {
+    let resolved = super::ability_utils::build_resolved_from_def(ability, object_id, controller);
+    let outputs = super::effects::mana::activation_chosen_color_outputs(state, produced, &resolved);
+    let Some(&(_, first)) = outputs.first() else {
+        return false;
+    };
+    outputs.len() != ManaColor::ALL.len() || outputs.iter().any(|(_, amount)| *amount != first)
 }
 
 fn profile_kind_from_production(
