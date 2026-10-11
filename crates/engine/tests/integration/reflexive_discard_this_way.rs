@@ -152,6 +152,36 @@ fn life_total(runner: &GameRunner, player: PlayerId) -> i32 {
     runner.state().players[player.0 as usize].life
 }
 
+/// CR 603.12 + CR 603.3d: drive the reflexive triggered ability a "When you
+/// discard … this way" head created through the real stack — its target is
+/// chosen as it is put on the stack (after the discard), then it resolves.
+/// Returns how many reflexive target prompts opened (0 when its single legal
+/// target was auto-selected) and whether a reflexive reached the stack at all.
+fn resolve_created_reflexive(runner: &mut GameRunner, target: TargetRef) -> (usize, bool) {
+    let mut prompts = 0;
+    let mut reached_stack = false;
+    for _ in 0..16 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection { .. } => {
+                prompts += 1;
+                reached_stack = true;
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(target.clone()),
+                    })
+                    .expect("choose the reflexive's target");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                reached_stack = true;
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    (prompts, reached_stack)
+}
+
 /// CR 601.2c + CR 603.12 + CR 701.9a — Cragganwick Cremator's reflexive
 /// damage keeps its independently selected player target. The discarded card
 /// is only the value referent for the damage amount; it is not the recipient.
@@ -192,50 +222,35 @@ fn cragganwick_cremator_damages_selected_player_not_discarded_card() {
     assert_eq!(runner.state().objects[&discarded].zone, Zone::Graveyard);
 }
 
-/// CR 601.2c + CR 603.12 + CR 701.9a — Narset's reflexive damage keeps its
-/// independently selected creature target while the discarded card supplies
-/// only the mana-value amount.
+/// CR 603.12 + CR 603.3d (fail closed): Narset's −2 reflexive ("When you discard
+/// a nonland card this way, Narset deals damage equal to that card's mana value
+/// to target creature or planeswalker") has its explicit recipient misbound to
+/// the parent's target by the gated-anaphor rewrite. A reflexive created by a
+/// discard has no parent target to inherit, so the clause is honestly
+/// unsupported rather than a damage effect that can never choose its target.
 #[test]
-fn narset_damages_selected_creature_not_discarded_card() {
-    let mut scenario = GameScenario::new();
-    let source = scenario
-        .add_creature(P0, "Narset of the Ancient Way", 1, 1)
-        .id();
-    let target = scenario.add_creature(P1, "Target Giant", 3, 10).id();
-    let discarded = scenario.add_card_to_hand(P0, "Nonland MV5");
-    scenario.with_library_top(P0, &["Drawn Card"]);
-    let mut runner = scenario.build();
-    runner
-        .state_mut()
-        .objects
-        .get_mut(&discarded)
-        .unwrap()
-        .card_types = CardType {
-        supertypes: vec![],
-        core_types: vec![CoreType::Sorcery],
-        subtypes: vec![],
-    };
-    set_mv(&mut runner, discarded, 5);
-
+fn narset_reflexive_with_a_misbound_recipient_fails_closed() {
     let def = parse_effect_chain(NARSET_BODY, AbilityKind::Spell);
-    let ability = ResolvedAbility {
-        targets: vec![TargetRef::Object(target)],
-        ..build_resolved_from_def(&def, source, P0)
-    };
-    let mut events = Vec::new();
-    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
-        .expect("draw resolves and optional discard is offered");
-    runner
-        .act(GameAction::DecideOptionalEffect { accept: true })
-        .expect("accept Narset's optional discard");
-    runner
-        .act(GameAction::SelectCards {
-            cards: vec![discarded],
-        })
-        .expect("choose the nonland card to discard");
-
-    assert_eq!(runner.state().objects[&target].damage_marked, 5);
-    assert_eq!(runner.state().objects[&discarded].zone, Zone::Graveyard);
+    let reflexive = def
+        .sub_ability
+        .as_deref()
+        .and_then(|discard| discard.sub_ability.as_deref())
+        .expect("draw, discard, then the reflexive clause");
+    assert!(
+        matches!(
+            def.sub_ability.as_deref().map(|d| d.effect.as_ref()),
+            Some(Effect::Discard { .. })
+        ),
+        "reach guard: the reflexive rides the discard"
+    );
+    assert!(
+        matches!(
+            reflexive.effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "zone_change_reflexive_unbound_referent"
+        ),
+        "got {:?}",
+        reflexive.effect
+    );
 }
 
 /// CR 603.12 + CR 701.9a: Talion's Messenger — after the forced single discard,
@@ -261,14 +276,9 @@ fn talion_messenger_discard_this_way_puts_counter_on_faerie() {
     let mut runner = scenario.build();
 
     let def = parse_effect_chain(TALION_BODY, AbilityKind::Spell);
-    // The reflexive sub targets "target Faerie you control"; supply it up front
-    // so the inline-resolved gated sub binds to the Faerie (parent-target
-    // propagation seeds the sub's target).
+    // CR 603.3d: no target is supplied up front — the reflexive chooses
+    // "target Faerie you control" as it is put on the stack, after the discard.
     let ability: ResolvedAbility = build_resolved_from_def(&def, faerie, P0);
-    let ability = ResolvedAbility {
-        targets: vec![TargetRef::Object(faerie)],
-        ..ability
-    };
 
     assert_eq!(
         p1p1_on(&runner, faerie),
@@ -279,6 +289,13 @@ fn talion_messenger_discard_this_way_puts_counter_on_faerie() {
     let mut events = Vec::new();
     resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
         .expect("draw→discard→reflexive chain resolves");
+    assert_eq!(
+        p1p1_on(&runner, faerie),
+        0,
+        "the counter waits for the reflexive's own resolution"
+    );
+    let (_, reached_stack) = resolve_created_reflexive(&mut runner, TargetRef::Object(faerie));
+    assert!(reached_stack, "reach: the reflexive was put on the stack");
 
     assert_eq!(
         p1p1_on(&runner, faerie),
@@ -310,14 +327,18 @@ fn talion_messenger_no_discard_no_counter() {
 
     let def = parse_effect_chain(TALION_BODY, AbilityKind::Spell);
     let ability = build_resolved_from_def(&def, faerie, P0);
-    let ability = ResolvedAbility {
-        targets: vec![TargetRef::Object(faerie)],
-        ..ability
-    };
 
     let mut events = Vec::new();
     resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
         .expect("chain resolves even with nothing to discard");
+    assert!(
+        runner.state().stack.is_empty()
+            && !matches!(
+                runner.state().waiting_for,
+                WaitingFor::TriggerTargetSelection { .. }
+            ),
+        "CR 603.12: with no discard the reflexive never triggers"
+    );
 
     assert_eq!(
         p1p1_on(&runner, faerie),
@@ -362,18 +383,18 @@ fn the_ancient_one_mills_equal_to_discarded_card_mana_value() {
     let opp_lib_before = runner.state().players[P1.0 as usize].library.len();
 
     let def = parse_effect_chain(ANCIENT_BODY, AbilityKind::Spell);
-    let mut ability = build_resolved_from_def(&def, source, P0);
-    // The declaring sub announces its own player slot.
-    let declaring = ability
-        .sub_ability
-        .as_mut()
-        .and_then(|discard| discard.sub_ability.as_mut())
-        .expect("draw, discard, then the declaring mill");
-    declaring.targets = vec![TargetRef::Player(P1)];
+    let ability = build_resolved_from_def(&def, source, P0);
 
     let mut events = Vec::new();
     resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
         .expect("draw→discard→reflexive mill chain resolves");
+    // CR 603.3d: the mill's player is chosen as the reflexive is put on the
+    // stack, after the discard.
+    let (prompts, _) = resolve_created_reflexive(&mut runner, TargetRef::Player(P1));
+    assert_eq!(
+        prompts, 1,
+        "reach: the reflexive asked for its player target"
+    );
 
     let opp_lib_after = runner.state().players[P1.0 as usize].library.len();
     let milled = opp_lib_before - opp_lib_after;
@@ -477,10 +498,6 @@ fn talion_messenger_interactive_discard_puts_counter_on_faerie() {
 
     let def = parse_effect_chain(TALION_BODY, AbilityKind::Spell);
     let ability = build_resolved_from_def(&def, faerie, P0);
-    let ability = ResolvedAbility {
-        targets: vec![TargetRef::Object(faerie)],
-        ..ability
-    };
 
     assert_eq!(
         p1p1_on(&runner, faerie),
@@ -512,6 +529,8 @@ fn talion_messenger_interactive_discard_puts_counter_on_faerie() {
             cards: vec![hand_card],
         })
         .expect("discard choice resolves and the reflexive sub fires");
+    let (_, reached_stack) = resolve_created_reflexive(&mut runner, TargetRef::Object(faerie));
+    assert!(reached_stack, "reach: the reflexive was put on the stack");
 
     assert_eq!(
         p1p1_on(&runner, faerie),
@@ -567,14 +586,7 @@ fn the_ancient_one_interactive_discard_mills_discarded_card_mana_value() {
     let opp_lib_before = runner.state().players[P1.0 as usize].library.len();
 
     let def = parse_effect_chain(ANCIENT_BODY, AbilityKind::Spell);
-    let mut ability = build_resolved_from_def(&def, source, P0);
-    // The declaring sub announces its own player slot.
-    let declaring = ability
-        .sub_ability
-        .as_mut()
-        .and_then(|discard| discard.sub_ability.as_mut())
-        .expect("draw, discard, then the declaring mill");
-    declaring.targets = vec![TargetRef::Player(P1)];
+    let ability = build_resolved_from_def(&def, source, P0);
 
     let mut events = Vec::new();
     resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
@@ -596,6 +608,11 @@ fn the_ancient_one_interactive_discard_mills_discarded_card_mana_value() {
             cards: vec![discard_target],
         })
         .expect("discard choice resolves and the reflexive mill fires");
+    let (prompts, _) = resolve_created_reflexive(&mut runner, TargetRef::Player(P1));
+    assert_eq!(
+        prompts, 1,
+        "reach: the reflexive asked for its player target"
+    );
 
     let opp_lib_after = runner.state().players[P1.0 as usize].library.len();
     let milled = opp_lib_before - opp_lib_after;
@@ -916,113 +933,28 @@ fn narset_minus_two_ability() -> engine::types::ability::AbilityDefinition {
     minus_two
 }
 
-/// CR 603.12 + CR 701.9a + CR 601.2c — Narset of the Ancient Way's -2 (PR
-/// #8250 review, negative space of the Silvan Reveler rebind): "Draw a card,
-/// then you may discard a card. When you discard a nonland card this way,
-/// Narset deals damage equal to that card's mana value to target creature or
-/// planeswalker." The drawn card (MV 5, a nonland) is the only hand card and
-/// is discarded after accepting the optional discard, so the reflexive damage
-/// must equal 5 and land on the TARGETED creature — not be redirected onto
-/// the discarded card.
-///
-/// DISCRIMINATION: on the pre-#8250-fix blanket rebind, `DealDamage.target`
-/// is rewritten from `ParentTarget` (the declared "target creature or
-/// planeswalker", CR 601.2c) to `TargetFilter::LastZoneChanged` (the
-/// discarded card). The first assertion below pins the AST field directly:
-/// on a revert to the blanket walk it reads `LastZoneChanged` instead of
-/// `ParentTarget` and fails immediately. (Verified locally: reinstating the
-/// blanket walk flips this assertion.) The runtime resolution afterward is an
-/// additional sanity check that a supplied target actually receives damage.
+/// CR 603.12 + CR 701.9a (fail closed): the full printed Narset −2 through the
+/// production parser. The #8250 rebind never redirects the recipient onto the
+/// discarded card (no `LastZoneChanged`), and the misbound reflexive clause is
+/// honestly unsupported (see `narset_reflexive_with_a_misbound_recipient_fails_closed`).
 #[test]
 fn narset_deals_damage_to_targeted_permanent_not_discarded_card() {
-    let mut scenario = GameScenario::new();
-
-    let source = scenario
-        .add_creature(P0, "Narset of the Ancient Way", 0, 0)
-        .id();
-    // Drawn-then-discarded card (the referent for "that card's mana value").
-    let drawn = scenario.add_card_to_library_top(P0, "MV5 Nonland Card");
-    // Damage recipient: "target creature or planeswalker".
-    let target = scenario.add_creature(P1, "Target Bear", 2, 2).id();
-
-    let mut runner = scenario.build();
-    set_mv(&mut runner, drawn, 5);
-
     let def = narset_minus_two_ability();
-
-    // Parse-level check — the actual discriminating assertion, pinning the
-    // exact field the #8250 review flagged. Structure: Draw -> Discard ->
-    // (ZoneChangedThisWay-gated) DealDamage.
-    let reflexive_damage = def
+    let reflexive = def
         .sub_ability
         .as_deref()
         .and_then(|discard| discard.sub_ability.as_deref())
-        .expect("the reflexive damage sub-ability must exist under Draw -> Discard");
+        .expect("the reflexive clause must exist under Draw -> Discard");
     assert!(
         matches!(
-            reflexive_damage.condition,
-            Some(AbilityCondition::ZoneChangedThisWay {
-                destination: None,
-                ..
-            })
+            reflexive.effect.as_ref(),
+            Effect::Unimplemented { name, .. } if name == "zone_change_reflexive_unbound_referent"
         ),
-        "the reflexive 'when you discard a nonland card this way' gate must be present, got {:?}",
-        reflexive_damage.condition
-    );
-    match reflexive_damage.effect.as_ref() {
-        Effect::DealDamage { target, .. } => assert_eq!(
-            *target,
-            TargetFilter::ParentTarget,
-            "Narset's damage recipient ('target creature or planeswalker') \
-             must remain the ability's own declared target — not be \
-             redirected to the discarded card (LastZoneChanged)"
-        ),
-        other => panic!("expected a DealDamage reflexive rider, got {other:?}"),
-    }
-
-    let ability = build_resolved_from_def(&def, source, P0);
-    let ability = ResolvedAbility {
-        targets: vec![TargetRef::Object(target)],
-        ..ability
-    };
-
-    let mut events = Vec::new();
-    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
-        .expect("draw resolves; the optional discard pauses for a decision");
-
-    assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::OptionalEffectChoice { .. }
-        ),
-        "the optional 'you may discard a card' must pause for a decision, got {:?}",
-        runner.state().waiting_for
-    );
-    assert_eq!(
-        runner.state().objects[&target].damage_marked,
-        0,
-        "no damage may land before the optional discard is accepted"
-    );
-
-    // Accept the optional discard through the REAL production pipeline. With
-    // exactly one hand card (the just-drawn MV5 card), the discard itself
-    // resolves inline with no further choice.
-    runner
-        .act(GameAction::DecideOptionalEffect { accept: true })
-        .expect("accepting the optional discard resolves the reflexive damage");
-
-    assert_eq!(
-        runner.state().objects[&target].damage_marked,
-        5,
-        "the TARGETED creature must take damage equal to the discarded \
-         card's mana value (5) — not have the damage redirected to the \
-         discarded card itself"
+        "got {:?}",
+        reflexive.effect
     );
     assert!(
-        runner.state().players[P0.0 as usize]
-            .graveyard
-            .iter()
-            .any(|&id| id == drawn),
-        "the drawn card must have been discarded this way"
+        !format!("{def:?}").contains("LastZoneChanged"),
+        "the recipient is never redirected to the discarded card"
     );
 }

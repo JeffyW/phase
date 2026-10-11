@@ -54833,7 +54833,21 @@ fn attach_just_moved_gilgamesh_any_number_equipment_reflexive_attach() {
         }
         other => panic!("expected Attach sub_ability, got {other:?}"),
     }
-    match &attach.condition {
+    // CR 603.12: the "When … this way" head is the reflexive creation gate
+    // carrying the zone change as its event.
+    assert!(
+        attach
+            .condition
+            .as_ref()
+            .is_some_and(AbilityCondition::has_when_you_do_marker),
+        "expected the reflexive creation gate, got {:?}",
+        attach.condition
+    );
+    match attach
+        .condition
+        .as_ref()
+        .and_then(AbilityCondition::zone_changed_this_way_head)
+    {
         Some(AbilityCondition::ZoneChangedThisWay {
             filter,
             destination: Some(Zone::Battlefield),
@@ -56455,10 +56469,18 @@ fn source_and_other_cant_be_blocked_splits_into_two_grants() {
 /// sibling is preserved.
 #[test]
 fn reflexive_sacrifice_this_way_taps_and_draws_that_many() {
-    let def = super::parse_effect_chain(
-            "When you sacrifice one or more artifacts this way, tap up to that many target creatures and draw that many cards",
+    // Nyssa of Traken's attack trigger body (verbatim): the reflexive gate rides
+    // the sacrifice instruction that performs its event.
+    let parent = super::parse_effect_chain(
+            "Sacrifice any number of artifacts. When you sacrifice one or more artifacts this way, tap up to that many target creatures and draw that many cards",
             AbilityKind::Spell,
         );
+    assert!(
+        matches!(parent.effect.as_ref(), Effect::Sacrifice { .. }),
+        "reach guard: the producer is the sacrifice, got {:?}",
+        parent.effect
+    );
+    let def = parent.sub_ability.as_ref().expect("the reflexive body");
 
     // Tap with a dynamic up-to count + the reflexive sacrifice condition.
     let Effect::SetTapState {
@@ -56476,8 +56498,13 @@ fn reflexive_sacrifice_this_way_taps_and_draws_that_many() {
         })),
         "tap must surface up-to-that-many target slots",
     );
+    // CR 603.12: the reflexive creation gate carrying the sacrifice event.
+    assert!(def
+        .condition
+        .as_ref()
+        .is_some_and(AbilityCondition::has_when_you_do_marker));
     assert!(matches!(
-        def.condition,
+        def.condition.as_ref().and_then(AbilityCondition::zone_changed_this_way_head),
         Some(AbilityCondition::ZoneChangedThisWay {
             filter: TargetFilter::Typed(TypedFilter { ref type_filters, .. }),
             destination: None,

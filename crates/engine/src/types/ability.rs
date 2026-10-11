@@ -28272,6 +28272,40 @@ impl AbilityCondition {
         }
     }
 
+    /// CR 608.2c + CR 603.12: the "… this way" zone-change head of a clause
+    /// gate — the `ZoneChangedThisWay` condition itself (an "if" head), or the
+    /// trigger-event member of a reflexive creation gate built by
+    /// `when_you_do_with_guard` ("When <zone change> this way"). Lets a body
+    /// rewrite or runtime binder that keys on the zone-change head read both
+    /// connectors.
+    ///
+    /// Contract: a root `ZoneChangedThisWay` member beside `WhenYouDo` is always
+    /// the reflexive's trigger event. The parser refuses a zone-change
+    /// intervening "if" on a reflexive (`has_root_zone_changed_this_way` at the
+    /// "When you do, if …" composition sites), so the role is never ambiguous.
+    pub fn zone_changed_this_way_head(&self) -> Option<&AbilityCondition> {
+        match self {
+            AbilityCondition::ZoneChangedThisWay { .. } => Some(self),
+            AbilityCondition::And { conditions } if self.has_when_you_do_marker() => conditions
+                .iter()
+                .find(|member| matches!(member, AbilityCondition::ZoneChangedThisWay { .. })),
+            _ => None,
+        }
+    }
+
+    /// Whether `ZoneChangedThisWay` is this condition or a member of its flat
+    /// root `And`. Used to refuse a zone-change guard as a reflexive's
+    /// intervening "if" (see `zone_changed_this_way_head`).
+    pub fn has_root_zone_changed_this_way(&self) -> bool {
+        let is_zone_change = |condition: &AbilityCondition| {
+            matches!(condition, AbilityCondition::ZoneChangedThisWay { .. })
+        };
+        match self {
+            AbilityCondition::And { conditions } => conditions.iter().any(is_zone_change),
+            condition => is_zone_change(condition),
+        }
+    }
+
     /// Removes only root-level CR 603.12 creation markers from `condition`.
     /// The residual ordinary guard is preserved for the separately-created
     /// trigger, and the root collapses from zero/one/many members to

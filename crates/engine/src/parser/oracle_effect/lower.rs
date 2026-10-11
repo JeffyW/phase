@@ -3019,10 +3019,11 @@ fn is_exile_resolving_return_rider(sub: &AbilityDefinition) -> bool {
 pub(super) fn rewire_result_anchored_subchain(def: &mut AbilityDefinition) {
     if let Some(sub) = def.sub_ability.as_mut() {
         let sub_is_attach_with_zone_changed_cond = matches!(*sub.effect, Effect::Attach { .. })
-            && matches!(
-                sub.condition,
-                Some(AbilityCondition::ZoneChangedThisWay { .. })
-            );
+            && sub
+                .condition
+                .as_ref()
+                .and_then(AbilityCondition::zone_changed_this_way_head)
+                .is_some();
         let parent_moves_to_battlefield = matches!(
             *def.effect,
             Effect::Dig {

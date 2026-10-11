@@ -15,6 +15,7 @@ pub(crate) mod sequence;
 pub(crate) mod subject;
 mod text_change;
 pub(crate) mod token;
+mod zone_change_reflexive;
 
 pub(crate) use search::parse_search_name_reference_suffix;
 
@@ -42209,6 +42210,23 @@ fn parse_effect_chain_ir_body(
             );
             continue;
         }
+        // CR 603.12 + CR 603.4: a zone-change guard cannot be a reflexive's
+        // intervening "if" (see `AbilityCondition::zone_changed_this_way_head`).
+        if if_you_do
+            .as_ref()
+            .is_some_and(AbilityCondition::has_when_you_do_marker)
+            && guard_condition
+                .as_ref()
+                .is_some_and(AbilityCondition::has_root_zone_changed_this_way)
+        {
+            unimplemented_clause(
+                &mut builder,
+                "when_you_do_guard",
+                normalized_text,
+                chunk.boundary_after,
+            );
+            continue;
+        }
         let condition = match (if_you_do, guard_condition) {
             (Some(reflexive), Some(guard)) if reflexive.has_when_you_do_marker() => {
                 Some(reflexive.with_when_you_do_guard(guard))
@@ -45045,9 +45063,27 @@ fn parse_effect_chain_ir_body(
         // was rebound to `Power{Source}` (the spell, power 0). Restore it to
         // `Anaphoric` so the runtime reads the entering creature's power via the
         // trigger-event-source slot. Gated to `ZoneChangedThisWay` so a true
-        // self-reference clause is untouched.
-        if matches!(condition, Some(AbilityCondition::ZoneChangedThisWay { .. })) {
+        // self-reference clause is untouched. A "When … this way" head reaches
+        // here as the reflexive creation gate carrying that zone change.
+        if condition
+            .as_ref()
+            .and_then(AbilityCondition::zone_changed_this_way_head)
+            .is_some()
+        {
             restore_this_way_trigger_anaphor(&mut clause.effect);
+        }
+        // CR 603.12 + CR 608.2c: a "When <zone change> this way" reflexive is
+        // supported only when its gate reads the instruction that performed the
+        // zone change and its body's object reference reaches the stack object.
+        if let Some(gap) = zone_change_reflexive::unsupported_zone_change_reflexive(
+            condition.as_ref(),
+            &clause.effect,
+            &normalized_text.to_lowercase(),
+            &text_lower,
+            builder.clauses(),
+        ) {
+            unimplemented_clause(&mut builder, gap, normalized_text, chunk.boundary_after);
+            continue;
         }
 
         // CR 614.1a + CR 614.6: LAST RESORT for an "instead" override whose

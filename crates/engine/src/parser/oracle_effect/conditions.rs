@@ -986,141 +986,176 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     // the multi-word "put onto the battlefield" verb, with subtype filters
     // (Aura/Equipment/...) via `parse_type_phrase_folding`. Replaces the prior
     // hand-rolled past-tense / single-word / top-level-type-only matcher.
-    if let Ok((rest, _)) =
-        alt((tag::<_, _, OracleError<'_>>("if "), tag("when "))).parse(lower.as_str())
+    if let Ok((rest, connector)) = alt((
+        value(ThisWayConnector::If, tag::<_, _, OracleError<'_>>("if ")),
+        value(ThisWayConnector::When, tag("when ")),
+    ))
+    .parse(lower.as_str())
     {
-        use crate::parser::oracle_nom::condition as nom_cond;
-        // CR 400.7 + CR 608.2c: active-voice reflexive gates that resolve to a
-        // full `AbilityCondition` (not just a type filter). These run under BOTH
-        // "if" and "when" prefixes — "If you put an artifact onto the battlefield
-        // this way" (Oviya), "If you put a Town card into your hand this way"
-        // (Town Greeter), "If you control a Squirrel or returned a Squirrel card
-        // to your hand this way" (Cache Grab), "If you draw one or more cards
-        // this way" (Transcendent Archaic) — where previously only "when" reached
-        // the active combinators.
-        if let Ok((after_clause, condition)) =
-            nom_cond::parse_you_control_or_returned_this_way_condition(rest)
-                .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
-                .or_else(|_| nom_cond::parse_you_put_counters_on_type_this_way_condition(rest))
-                .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (Some(condition), text[offset..].to_string());
+        if let (Some(condition), body) = strip_this_way_head(text, rest) {
+            return (Some(connector.gate(condition)), body);
         }
-        // CR 603.12 + CR 608.2c: active-voice "you put [type] onto the battlefield
-        // this way" — also hoisted to run under "if" (Oviya, Spelunking).
-        if let Ok((after_clause, (filter, _negated))) =
-            nom_cond::parse_you_put_onto_battlefield_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: Some(Zone::Battlefield),
-                }),
-                text[offset..].to_string(),
-            );
+    }
+    (None, text.to_string())
+}
+
+/// The connector word in front of a "… this way" head.
+#[derive(Clone, Copy)]
+enum ThisWayConnector {
+    If,
+    When,
+}
+
+impl ThisWayConnector {
+    /// CR 603.12: "when [something happens] this way" creates a reflexive
+    /// triggered ability whose trigger event is the zone change the head names,
+    /// so a zone-change head under "when" becomes the `WhenYouDo` creation gate
+    /// guarded by that zone change (its targets are chosen as the reflexive
+    /// ability is put on the stack, CR 603.3d). Under "if" the head is an
+    /// ordinary resolution-time condition (CR 608.2c). The non-zone-change
+    /// heads keep their condition unchanged under either connector.
+    fn gate(self, condition: AbilityCondition) -> AbilityCondition {
+        match (self, &condition) {
+            (ThisWayConnector::When, AbilityCondition::ZoneChangedThisWay { .. }) => {
+                AbilityCondition::when_you_do_with_guard(condition)
+            }
+            (ThisWayConnector::When | ThisWayConnector::If, _) => condition,
         }
-        // CR 608.2c + CR 701.25a: active-voice "you put [type] into your
-        // graveyard this way" — the condition following a preceding
-        // "surveil N" instruction (Chandra, Chill of Compliance; Enlightened
-        // Confidant). Runs under both prefixes for the same reason as the
-        // put-onto-battlefield sibling above. Unlike discard/sacrifice/exile
-        // below (cause-bound: the graveyard is inherent to the verb), a
-        // surveilled card's fate is a genuine choice, so this clause stays
-        // destination-bound like put-onto-battlefield — a redirect away from
-        // the graveyard as the card moves defeats it.
-        if let Ok((after_clause, (filter, _negated))) =
-            nom_cond::parse_you_put_into_graveyard_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: Some(Zone::Graveyard),
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 603.12 + CR 701.16a: active-voice "you exile[d] a[n] X this way,
-        // [body]" — the reflexive gate created by a preceding "exile [target]
-        // X" instruction. Runs under BOTH prefixes because the printed idiom
-        // appears in both tenses: past "If you exiled a card this way, …"
-        // (Ardyn, the Usurper's actual Oracle text, issue #5989) and present
-        // "When you exile a card this way, …". The exile's move into the
-        // (public, CR 400.2) exile zone publishes the card into
-        // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-        if let Ok((after_clause, (filter, _negated))) =
-            nom_cond::parse_you_exile_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: None,
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        if let Ok((after_clause, (filter, _negated, destination))) =
-            nom_cond::parse_zone_changed_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination,
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 701.9a: "if/when you discard a[n] X this way, [body]" —
-        // the condition following a preceding "discard a card" instruction.
-        // Runs under BOTH prefixes, like the put-onto-battlefield
-        // and exile siblings above: "When you discard a card this way, ..."
-        // (Talion's Messenger, The Ancient One) and "If you discard a land
-        // card this way, ..." (Silvan Reveler, issue #8122) are the same
-        // resolution-local condition in the two connectors —
-        // nothing about the discard-then-back-reference shape is tied to
-        // "when" specifically. The discard's hand → graveyard move publishes
-        // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-        if let Ok((after_clause, (filter, _negated))) =
-            crate::parser::oracle_nom::condition::parse_you_discard_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: None,
-                }),
-                text[offset..].to_string(),
-            );
-        }
-        // CR 701.21a: "if/when you sacrifice one or more X this
-        // way, [body]" — the condition following a preceding "sacrifice
-        // [quantifier] X" instruction (Nyssa of Traken). Runs under both
-        // prefixes for the same reason as the discard sibling above. The
-        // sacrifice's battlefield → graveyard move publishes the permanents
-        // into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-        if let Ok((after_clause, (filter, _negated))) =
-            crate::parser::oracle_nom::condition::parse_you_sacrifice_this_way_clause(rest)
-        {
-            let body_lower = strip_reflexive_conditional_body_separator(after_clause);
-            let offset = text.len() - body_lower.len();
-            return (
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    filter,
-                    destination: None,
-                }),
-                text[offset..].to_string(),
-            );
-        }
+    }
+}
+
+/// CR 400.7 + CR 608.2c: the "… this way" head after its connector word: the
+/// condition it names and the body text after it.
+fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, String) {
+    use crate::parser::oracle_nom::condition as nom_cond;
+    // CR 400.7 + CR 608.2c: active-voice reflexive gates that resolve to a
+    // full `AbilityCondition` (not just a type filter). These run under BOTH
+    // "if" and "when" prefixes — "If you put an artifact onto the battlefield
+    // this way" (Oviya), "If you put a Town card into your hand this way"
+    // (Town Greeter), "If you control a Squirrel or returned a Squirrel card
+    // to your hand this way" (Cache Grab), "If you draw one or more cards
+    // this way" (Transcendent Archaic) — where previously only "when" reached
+    // the active combinators.
+    if let Ok((after_clause, condition)) =
+        nom_cond::parse_you_control_or_returned_this_way_condition(rest)
+            .or_else(|_| nom_cond::parse_you_put_into_hand_this_way_condition(rest))
+            .or_else(|_| nom_cond::parse_you_put_counters_on_type_this_way_condition(rest))
+            .or_else(|_| nom_cond::parse_you_draw_this_way_condition(rest))
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (Some(condition), text[offset..].to_string());
+    }
+    // CR 603.12 + CR 608.2c: active-voice "you put [type] onto the battlefield
+    // this way" — also hoisted to run under "if" (Oviya, Spelunking).
+    if let Ok((after_clause, (filter, _negated))) =
+        nom_cond::parse_you_put_onto_battlefield_this_way_clause(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: Some(Zone::Battlefield),
+            }),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 608.2c + CR 701.25a: active-voice "you put [type] into your
+    // graveyard this way" — the condition following a preceding
+    // "surveil N" instruction (Chandra, Chill of Compliance; Enlightened
+    // Confidant). Runs under both prefixes for the same reason as the
+    // put-onto-battlefield sibling above. Unlike discard/sacrifice/exile
+    // below (cause-bound: the graveyard is inherent to the verb), a
+    // surveilled card's fate is a genuine choice, so this clause stays
+    // destination-bound like put-onto-battlefield — a redirect away from
+    // the graveyard as the card moves defeats it.
+    if let Ok((after_clause, (filter, _negated))) =
+        nom_cond::parse_you_put_into_graveyard_this_way_clause(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: Some(Zone::Graveyard),
+            }),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 603.12 + CR 701.13a: active-voice "you exile[d] a[n] X this way,
+    // [body]" — the gate on a preceding "exile [target] X" instruction. The
+    // printed idiom appears in both tenses: past "If you exiled a card this
+    // way, …" (Ardyn, the Usurper, issue #5989) and present "When you exile a
+    // card this way, …" (Cait Sith, Fortune Teller); the connector decides
+    // whether it is a resolution-time condition or a reflexive trigger
+    // (`ThisWayConnector::gate`). The exile's move into the
+    // (public, CR 400.2) exile zone publishes the card into
+    // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+    if let Ok((after_clause, (filter, _negated))) = nom_cond::parse_you_exile_this_way_clause(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: None,
+            }),
+            text[offset..].to_string(),
+        );
+    }
+    if let Ok((after_clause, (filter, _negated, destination))) =
+        nom_cond::parse_zone_changed_this_way_clause(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination,
+            }),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 701.9a: "if/when you discard a[n] X this way, [body]" —
+    // the gate on a preceding "discard a card" instruction. Both connectors
+    // print it: "When you discard a card this way, ..." (Talion's Messenger,
+    // The Ancient One) is a CR 603.12 reflexive trigger, while "If you discard
+    // a land card this way, ..." (Silvan Reveler, issue #8122) is a CR 608.2c
+    // resolution-time condition (`ThisWayConnector::gate`). Both read the same
+    // zone change: the discard's hand → graveyard move publishes
+    // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+    if let Ok((after_clause, (filter, _negated))) =
+        crate::parser::oracle_nom::condition::parse_you_discard_this_way_clause(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: None,
+            }),
+            text[offset..].to_string(),
+        );
+    }
+    // CR 701.21a: "if/when you sacrifice one or more X this
+    // way, [body]" — the condition following a preceding "sacrifice
+    // [quantifier] X" instruction (Nyssa of Traken). Runs under both
+    // prefixes for the same reason as the discard sibling above. The
+    // sacrifice's battlefield → graveyard move publishes the permanents
+    // into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
+    if let Ok((after_clause, (filter, _negated))) =
+        crate::parser::oracle_nom::condition::parse_you_sacrifice_this_way_clause(rest)
+    {
+        let body_lower = strip_reflexive_conditional_body_separator(after_clause);
+        let offset = text.len() - body_lower.len();
+        return (
+            Some(AbilityCondition::ZoneChangedThisWay {
+                filter,
+                destination: None,
+            }),
+            text[offset..].to_string(),
+        );
     }
     (None, text.to_string())
 }
@@ -1175,6 +1210,18 @@ pub(super) fn strip_if_you_do_conditional_with_context(
 
     let (guard, body) = strip_routed_leading_general_conditional(&remainder, ctx);
     match guard {
+        // CR 603.12 + CR 603.4: a zone-change guard ("When you do, if a card was
+        // exiled this way, …") on a reflexive would share the root with the
+        // zone-change trigger EVENT of a "When … this way" head, and the runtime
+        // settles every such root member at creation as that event. The role is
+        // not representable, so keep it distinguishable and let the chain
+        // parser fail it closed with the other unparsed reflexive guards.
+        Some((guard, _)) if guard.has_root_zone_changed_this_way() => {
+            ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+                condition,
+                remainder,
+            }
+        }
         Some((guard, route)) => ReflexiveConditionalStrip::Parsed {
             condition: Some(condition.with_when_you_do_guard(guard)),
             guard_route: Some(route),
@@ -10546,12 +10593,16 @@ mod tests {
             "when you put one or more equipment onto the battlefield this way, you may attach one of them to a samurai you control",
         );
         assert_eq!(body, "you may attach one of them to a samurai you control");
+        // CR 603.12: "When … this way" is a reflexive trigger: the `WhenYouDo`
+        // creation gate carrying the zone change as its event.
+        let condition = condition.expect("the when-head yields a condition");
+        assert!(condition.has_when_you_do_marker(), "{condition:?}");
         let Some(AbilityCondition::ZoneChangedThisWay {
             filter,
             destination: Some(Zone::Battlefield),
-        }) = condition
+        }) = condition.zone_changed_this_way_head().cloned()
         else {
-            panic!("expected ZoneChangedThisWay condition, got {condition:?}");
+            panic!("expected ZoneChangedThisWay event, got {condition:?}");
         };
         match filter {
             TargetFilter::Typed(TypedFilter { type_filters, .. }) => {
@@ -10640,12 +10691,16 @@ mod tests {
             "when you discard a card this way, target player mills cards equal to its mana value",
         );
         assert_eq!(body, "target player mills cards equal to its mana value");
+        // CR 603.12: "When … this way" is a reflexive trigger: the `WhenYouDo`
+        // creation gate carrying the zone change as its event.
+        let condition = condition.expect("the when-head yields a condition");
+        assert!(condition.has_when_you_do_marker(), "{condition:?}");
         let Some(AbilityCondition::ZoneChangedThisWay {
             filter,
             destination: None,
-        }) = condition
+        }) = condition.zone_changed_this_way_head().cloned()
         else {
-            panic!("expected ZoneChangedThisWay condition, got {condition:?}");
+            panic!("expected ZoneChangedThisWay event, got {condition:?}");
         };
         match filter {
             TargetFilter::Typed(TypedFilter { type_filters, .. }) => {

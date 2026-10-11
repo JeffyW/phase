@@ -3493,13 +3493,93 @@ fn try_begin_deferred_else_branch_target_selection(
 /// Every OTHER chain condition — `EffectOutcome`, `QuantityCheck`, intervening
 /// `if` gates — is left intact and is still re-checked at resolution (CR 603.4).
 fn consume_reflexive_creation_gate(ability: &mut ResolvedAbility) {
-    AbilityCondition::take_when_you_do_marker(&mut ability.condition);
+    if AbilityCondition::take_when_you_do_marker(&mut ability.condition) {
+        settle_reflexive_zone_change_event(&mut ability.condition);
+    }
     if let Some(sub) = ability.sub_ability.as_deref_mut() {
         consume_reflexive_creation_gate(sub);
     }
     if let Some(alt) = ability.else_ability.as_deref_mut() {
         consume_reflexive_creation_gate(alt);
     }
+}
+
+/// CR 603.12 + CR 400.7 + CR 608.2b: the attachment pool of a reflexive
+/// "attach one of them" (`Attach { attachment: ParentTarget }`) created by a
+/// zone-change event. The pool is the event-scoped moved set — already bound by
+/// a `forward_result` hand-off, or read now from the creating resolution's
+/// ledger — and it is the ONLY carrier of that operand on the stack object: the
+/// forwarded copy the legacy hand-off wrote into `targets` would be judged as a
+/// declared host target when the reflexive resolves (CR 608.2b) and fizzle it,
+/// so it is dropped. A declared host is chosen as the reflexive is put on the
+/// stack (CR 603.3d). `None` when the reflexive is not such an attach or the
+/// event moved nothing matching.
+fn freeze_reflexive_attachment_pool(
+    state: &GameState,
+    reflexive: &ResolvedAbility,
+) -> Option<ResolvedAbility> {
+    if !matches!(
+        reflexive.effect,
+        Effect::Attach {
+            attachment: TargetFilter::ParentTarget,
+            ..
+        }
+    ) || reflexive
+        .condition
+        .as_ref()
+        .and_then(AbilityCondition::zone_changed_this_way_head)
+        .is_none()
+    {
+        return None;
+    }
+    let candidates = if reflexive.attach_attachment_candidates().is_empty() {
+        attach::attachment_candidates_from_zone_change(
+            state,
+            reflexive,
+            state.last_zone_changed_ids.as_slice(),
+        )
+    } else {
+        reflexive.attach_attachment_candidates().to_vec()
+    };
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut owned = reflexive.clone();
+    owned.bind_attach_attachment_candidates(candidates);
+    owned.set_unpinned_targets(Vec::new());
+    Some(owned)
+}
+
+/// CR 603.12: a reflexive triggered ability "trigger[s] based on whether the
+/// trigger event or events occurred earlier during the resolution of the spell
+/// or ability that created" it. For "When <a zone change> this way, …" that
+/// event is the root `ZoneChangedThisWay` member of the creation gate, read from
+/// the creating resolution's own zone-change ledger (`last_zone_changed_ids`).
+/// It was checked when the trigger was created, and it is not an intervening
+/// "if" (CR 603.4): the zone change already happened, and the ledger it reads
+/// belongs to the creating resolution, not to the reflexive ability's own
+/// resolution. Remove it from the stack object, collapsing the residual root
+/// like `take_when_you_do_marker` does. The parser never composes a
+/// zone-change intervening "if" with `WhenYouDo` (see
+/// `AbilityCondition::zone_changed_this_way_head`), so every root
+/// `ZoneChangedThisWay` member here is that trigger event. Only root members are
+/// settled; a `ZoneChangedThisWay` inside `Or`/`Not`/nested `And` is a different
+/// expression and stays.
+fn settle_reflexive_zone_change_event(condition: &mut Option<AbilityCondition>) {
+    let is_zone_change_event =
+        |member: &AbilityCondition| matches!(member, AbilityCondition::ZoneChangedThisWay { .. });
+    *condition = match condition.take() {
+        Some(AbilityCondition::And { mut conditions }) => {
+            conditions.retain(|member| !is_zone_change_event(member));
+            match conditions.len() {
+                0 => None,
+                1 => conditions.pop(),
+                _ => Some(AbilityCondition::And { conditions }),
+            }
+        }
+        Some(member) if is_zone_change_event(&member) => None,
+        other => other,
+    };
 }
 
 /// CR 603.12 + CR 603.3: Build one complete synthetic reflexive trigger from an
@@ -3652,6 +3732,24 @@ fn try_materialize_reflexive_trigger_inner(
         apply_parent_chain_context(&mut owned, parent, effect_context_object, state);
         reflexive_context_owned = owned;
         &reflexive_context_owned
+    } else {
+        reflexive
+    };
+
+    // CR 603.12 + CR 400.7 + CR 608.2c: "When you put one or more Equipment onto
+    // the battlefield this way, you may attach one of them …" — "them" is the
+    // set the zone change moved. The creating resolution's ledger names that
+    // set only until this reflexive leaves it, so freeze the incarnation-pinned
+    // attachment pool now, while the creation gate is still being evaluated.
+    let frozen_pool_owned;
+    let reflexive = if creates_reflexive_trigger {
+        match freeze_reflexive_attachment_pool(state, reflexive) {
+            Some(owned) => {
+                frozen_pool_owned = owned;
+                &frozen_pool_owned
+            }
+            None => reflexive,
+        }
     } else {
         reflexive
     };
@@ -9499,6 +9597,15 @@ fn when_you_do_mandatory_parent_did_nothing(
         && !mandatory_parent_effect_performed(&parent.effect, parent_events)
 }
 
+/// CR 608.2c: Effect kinds that only grant a play or cast permission over cards
+/// an earlier instruction moved ("You may play that card this turn"), rather
+/// than moving cards themselves, so they never replace the zone-change ledger a
+/// following "… this way" head reads. Deliberately excludes `CastFromZone`,
+/// which can also cast during resolution.
+fn effect_only_grants_play_permission(effect: &Effect) -> bool {
+    matches!(effect, Effect::GrantCastingPermission { .. })
+}
+
 /// CR 603.12: Effect kinds whose reflexive "when you do" needs an actual move
 /// event even though their "if you do" (CR 118.12) treats a started-but-empty
 /// move as performed.
@@ -9550,6 +9657,71 @@ pub(crate) fn condition_has_reveal_until_matched_guard(condition: &AbilityCondit
     match condition {
         AbilityCondition::And { conditions } => conditions.iter().any(is_guard),
         condition => is_guard(condition),
+    }
+}
+
+#[cfg(test)]
+mod settle_reflexive_zone_change_event_tests {
+    use super::settle_reflexive_zone_change_event;
+    use crate::types::ability::{AbilityCondition, TargetFilter};
+
+    fn event() -> AbilityCondition {
+        AbilityCondition::ZoneChangedThisWay {
+            filter: TargetFilter::Any,
+            destination: None,
+        }
+    }
+
+    /// CR 603.12 + CR 603.4: only the root zone-change event is settled; an
+    /// ordinary guard and any nested expression ride onto the stack object.
+    #[test]
+    fn settles_only_the_root_zone_change_event() {
+        let mut alone = Some(event());
+        settle_reflexive_zone_change_event(&mut alone);
+        assert_eq!(alone, None);
+
+        let mut with_guard = Some(AbilityCondition::And {
+            conditions: vec![event(), AbilityCondition::IsYourTurn],
+        });
+        settle_reflexive_zone_change_event(&mut with_guard);
+        assert_eq!(with_guard, Some(AbilityCondition::IsYourTurn));
+
+        let nested = AbilityCondition::Or {
+            conditions: vec![event(), AbilityCondition::IsYourTurn],
+        };
+        let negated = AbilityCondition::Not {
+            condition: Box::new(event()),
+        };
+        for kept in [nested, negated] {
+            let mut condition = Some(kept.clone());
+            settle_reflexive_zone_change_event(&mut condition);
+            assert_eq!(condition, Some(kept));
+        }
+
+        let mut nested_and = Some(AbilityCondition::And {
+            conditions: vec![
+                AbilityCondition::IsYourTurn,
+                AbilityCondition::And {
+                    conditions: vec![event(), AbilityCondition::IsMonarch],
+                },
+            ],
+        });
+        let before = nested_and.clone();
+        settle_reflexive_zone_change_event(&mut nested_and);
+        assert_eq!(nested_and, before, "a nested And is a different expression");
+    }
+
+    /// The parser never composes a zone-change guard with `WhenYouDo`, so the
+    /// root member is the event by contract (see
+    /// `AbilityCondition::zone_changed_this_way_head`).
+    #[test]
+    fn the_reflexive_gate_names_its_event() {
+        let gate = AbilityCondition::when_you_do_with_guard(event());
+        assert_eq!(gate.zone_changed_this_way_head(), Some(&event()));
+        assert!(gate.has_root_zone_changed_this_way());
+        assert!(AbilityCondition::IsYourTurn
+            .zone_changed_this_way_head()
+            .is_none());
     }
 }
 
@@ -17253,13 +17425,21 @@ fn resolve_chain_body(
 
     // CR 608.2c: Populate last_zone_changed_ids for ZoneChangedThisWay condition evaluation.
     // Scans ZoneChanged events emitted by this effect, mirroring the forward_result pattern.
-    state.last_zone_changed_ids = events[events_before..]
+    let zone_changed_ids: Vec<ObjectId> = events[events_before..]
         .iter()
         .filter_map(|e| match e {
             GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
             _ => None,
         })
         .collect();
+    // CR 608.2c: "… this way" names the earlier instruction that moved the
+    // cards. A play permission over those cards ("You may play that card this
+    // turn") is not that instruction, so it leaves the moving instruction's
+    // ledger in place for a following "… this way" head (Cait Sith, Fortune
+    // Teller; Hidetsugu, Devouring Chaos).
+    if !effect_only_grants_play_permission(&ability.effect) {
+        state.last_zone_changed_ids = zone_changed_ids;
+    }
     let linked_batch =
         linked_exile_batch_from_events(state, ability.source_id, &events[events_before..]);
     if let Some(scope) = state.resolving_player_scope_linked_exile.as_mut() {
