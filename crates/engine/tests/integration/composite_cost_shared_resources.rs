@@ -13,8 +13,12 @@
 //! one sacrifice leg.
 
 use engine::game::casting::can_activate_ability_now;
-use engine::game::scenario::{GameRunner, GameScenario, P0};
-use engine::types::ability::AbilityCost;
+use engine::game::game_object::AttachTarget;
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::ability::{
+    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr,
+    SacrificeCost, TargetFilter, TargetRef, TypedFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{PayCostKind, WaitingFor};
@@ -27,6 +31,8 @@ const JARAD: &str = "Jarad gets +1/+1 for each creature card in your graveyard.\
 const OVERGROWN_TOMB: &str =
     "({T}: Add {B} or {G}.)\nAs this land enters, you may pay 2 life. If you don't, it enters tapped.";
 const RECURRING_NIGHTMARE: &str = "Sacrifice a creature, Return this enchantment to its owner's hand: Return target creature card from your graveyard to the battlefield. Activate only as a sorcery.";
+const REST_IN_PEACE: &str = "When this enchantment enters, exile all graveyards.\nIf a card or token would be put into a graveyard from anywhere, exile it instead.";
+const WHEEL_OF_SUN_AND_MOON: &str = "Enchant player\nIf a card would be put into enchanted player's graveyard from anywhere, instead that card is revealed and put on the bottom of that player's library.";
 
 #[derive(Clone, Copy)]
 enum Lands {
@@ -237,16 +243,28 @@ struct NightmareBoard {
     ability: usize,
 }
 
+/// The creatures beside the animated Recurring Nightmare.
+#[derive(Clone, Copy)]
+enum NightmareFodder {
+    /// The Nightmare is P0's only creature.
+    NightmareOnly,
+    /// A Grizzly Bears is also on the battlefield.
+    Bear,
+}
+
 /// Recurring Nightmare turned into a creature (an Opalescence-style board) is both a
 /// creature it could sacrifice and the permanent its other leg returns to hand.
-fn nightmare_board(with_bear: bool) -> NightmareBoard {
+fn nightmare_board(fodder: NightmareFodder) -> NightmareBoard {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let nightmare = scenario
         .add_creature(P0, "Recurring Nightmare", 3, 3)
         .from_oracle_text(RECURRING_NIGHTMARE)
         .id();
-    let bear = with_bear.then(|| scenario.add_creature(P0, "Grizzly Bears", 2, 2).id());
+    let bear = match fodder {
+        NightmareFodder::NightmareOnly => None,
+        NightmareFodder::Bear => Some(scenario.add_creature(P0, "Grizzly Bears", 2, 2).id()),
+    };
     scenario.add_creature_to_graveyard(P0, "Gravedigger", 2, 2);
     let mut runner = scenario.build();
     let obj = runner.state_mut().objects.get_mut(&nightmare).unwrap();
@@ -279,12 +297,12 @@ fn nightmare_board(with_bear: bool) -> NightmareBoard {
 
 #[test]
 fn recurring_nightmare_creature_cant_pay_both_legs_alone() {
-    let board = nightmare_board(true);
+    let board = nightmare_board(NightmareFodder::Bear);
     assert!(
         can_activate_ability_now(board.runner.state(), P0, board.nightmare, board.ability),
         "reach: with another creature to sacrifice the ability is activatable"
     );
-    let board = nightmare_board(false);
+    let board = nightmare_board(NightmareFodder::NightmareOnly);
     assert!(
         !can_activate_ability_now(board.runner.state(), P0, board.nightmare, board.ability),
         "the Nightmare can't be both the sacrificed creature and the returned enchantment"
@@ -298,7 +316,7 @@ fn recurring_nightmare_sacrifice_leg_excludes_the_returned_permanent() {
         nightmare,
         bear,
         ability,
-    } = nightmare_board(true);
+    } = nightmare_board(NightmareFodder::Bear);
     let bear = bear.unwrap();
     runner
         .act(GameAction::ActivateAbility {
@@ -317,7 +335,7 @@ fn recurring_nightmare_sacrifice_leg_excludes_the_returned_permanent() {
             .expect("target card");
         runner
             .act(GameAction::SelectTargets {
-                targets: vec![engine::types::ability::TargetRef::Object(target)],
+                targets: vec![TargetRef::Object(target)],
             })
             .expect("target chosen");
     }
@@ -334,4 +352,248 @@ fn recurring_nightmare_sacrifice_leg_excludes_the_returned_permanent() {
         "sacrificing the Nightmare itself is refused"
     );
     assert_eq!(runner.state().objects[&nightmare].zone, Zone::Battlefield);
+}
+
+// --- Review probe board (r1, R1): a multi-object leg that overlaps another leg. ---
+//
+// Synthetic typed cost, not a printed card: "Sacrifice two Swamps and a Forest".
+// With two Overgrown Tombs and one basic Swamp a joint assignment exists (basic
+// Swamp + Tomb A for the Swamp leg, Tomb B for the Forest leg), but a player who
+// picks both Tombs for the Swamp leg strands the Forest leg. Narrowing the
+// prompt one object at a time can't prevent that set, so the shape fails closed
+// at activation.
+
+fn land_with_subtype(subtype: &str) -> TargetFilter {
+    TypedFilter::land()
+        .subtype(subtype.to_string())
+        .controller(ControllerRef::You)
+        .into()
+}
+
+fn two_swamps_and_a_forest() -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        },
+    )
+    .cost(AbilityCost::Composite {
+        costs: vec![
+            AbilityCost::Sacrifice(SacrificeCost::count(land_with_subtype("Swamp"), 2)),
+            AbilityCost::Sacrifice(SacrificeCost::count(land_with_subtype("Forest"), 1)),
+        ],
+    })
+}
+
+/// P0's lands on the probe board.
+#[derive(Clone, Copy)]
+enum ProbeLands {
+    /// Two Overgrown Tombs and one basic Swamp (the board under review).
+    TwoTombsAndBasicSwamp,
+    /// Two basic Swamps and one basic Forest: no leg overlaps (reach control).
+    BasicSwampsAndForest,
+}
+
+/// Whether P1's graveyard replacements are on the battlefield.
+#[derive(Clone, Copy)]
+enum ProbeReplacements {
+    /// Rest in Peace, and Wheel of Sun and Moon enchanting P0, already settled
+    /// (the board as written; the Wheel's replacement is not implemented by the
+    /// engine, so only Rest in Peace's is live).
+    RestInPeaceAndWheel,
+    /// Supplementary, not the board: two Rest in Peace, so a sacrifice must
+    /// pause for P0 to order the two replacements (CR 616.1).
+    TwoRestInPeace,
+    None,
+}
+
+struct ProbeBoard {
+    runner: GameRunner,
+    source: ObjectId,
+    lands: Vec<ObjectId>,
+}
+
+fn probe_board(lands: ProbeLands, replacements: ProbeReplacements) -> ProbeBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_enchantment_from_oracle(P0, "Synthetic Swamp-and-Forest Altar", "")
+        .with_ability_definition(two_swamps_and_a_forest())
+        .id();
+    let land_ids = match lands {
+        ProbeLands::TwoTombsAndBasicSwamp => {
+            let mut ids: Vec<ObjectId> = (0..2)
+                .map(|_| {
+                    scenario
+                        .add_land_from_oracle(P0, "Overgrown Tomb", OVERGROWN_TOMB)
+                        .with_subtypes(vec!["Swamp", "Forest"])
+                        .id()
+                })
+                .collect();
+            ids.push(scenario.add_basic_land(P0, ManaColor::Black));
+            ids
+        }
+        ProbeLands::BasicSwampsAndForest => vec![
+            scenario.add_basic_land(P0, ManaColor::Black),
+            scenario.add_basic_land(P0, ManaColor::Black),
+            scenario.add_basic_land(P0, ManaColor::Green),
+        ],
+    };
+    let (rest_in_peace_count, wheel) = match replacements {
+        ProbeReplacements::RestInPeaceAndWheel => {
+            scenario.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+            let wheel = scenario
+                .add_enchantment_from_oracle(P1, "Wheel of Sun and Moon", WHEEL_OF_SUN_AND_MOON)
+                .with_subtypes(vec!["Aura"])
+                .id();
+            (1, Some(wheel))
+        }
+        ProbeReplacements::TwoRestInPeace => {
+            for _ in 0..2 {
+                scenario.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+            }
+            (2, None)
+        }
+        ProbeReplacements::None => (0, None),
+    };
+    let mut runner = scenario.build();
+    if let Some(wheel) = wheel {
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&wheel)
+            .unwrap()
+            .attached_to = Some(AttachTarget::Player(P0));
+    }
+    let live_rest_in_peace = runner
+        .state()
+        .battlefield
+        .iter()
+        .map(|id| &runner.state().objects[id])
+        .filter(|obj| obj.name == "Rest in Peace" && !obj.replacement_definitions.is_empty())
+        .count();
+    assert_eq!(
+        live_rest_in_peace, rest_in_peace_count,
+        "reach: every Rest in Peace carries its graveyard replacement"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == P0)
+            && runner.state().stack.is_empty(),
+        "reach: P0 has priority with an empty stack"
+    );
+    ProbeBoard {
+        runner,
+        source,
+        lands: land_ids,
+    }
+}
+
+/// Answers every pending replacement-order choice with its first option and
+/// returns how many it answered.
+fn settle_replacement_choices(runner: &mut GameRunner) -> usize {
+    let mut answered = 0;
+    for _ in 0..10 {
+        if !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ) {
+            break;
+        }
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("replacement order chosen");
+        answered += 1;
+    }
+    answered
+}
+
+#[test]
+fn probe_multi_object_leg_overlapping_another_leg_is_refused_without_payment() {
+    for replacements in [
+        ProbeReplacements::RestInPeaceAndWheel,
+        ProbeReplacements::TwoRestInPeace,
+        ProbeReplacements::None,
+    ] {
+        let ProbeBoard {
+            mut runner,
+            source,
+            lands,
+        } = probe_board(ProbeLands::TwoTombsAndBasicSwamp, replacements);
+        assert!(
+            !can_activate_ability_now(runner.state(), P0, source, 0),
+            "an overlapping two-object leg is not offered"
+        );
+        let activated = runner.act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        });
+        assert!(
+            activated.is_err(),
+            "the activation is refused before any prompt, got {activated:?} / {:?}",
+            runner.state().waiting_for
+        );
+        let state = runner.state();
+        assert!(state.stack.is_empty());
+        assert!(state.pending_cast.is_none(), "no payment is in flight");
+        for land in lands {
+            assert_eq!(
+                state.objects[&land].zone,
+                Zone::Battlefield,
+                "no partial payment (CR 601.2h)"
+            );
+        }
+    }
+}
+
+/// Reach control: the same synthetic cost over lands that no two legs share is
+/// offered and paid in full, including through P1's graveyard replacements.
+#[test]
+fn probe_control_disjoint_lands_pay_through_the_replacements() {
+    for replacements in [
+        ProbeReplacements::RestInPeaceAndWheel,
+        ProbeReplacements::TwoRestInPeace,
+        ProbeReplacements::None,
+    ] {
+        let ProbeBoard {
+            mut runner,
+            source,
+            lands,
+        } = probe_board(ProbeLands::BasicSwampsAndForest, replacements);
+        assert!(can_activate_ability_now(runner.state(), P0, source, 0));
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            })
+            .expect("activation starts");
+        let (swamps, forest) = (vec![lands[0], lands[1]], lands[2]);
+        let mut first = sacrifice_choices(&runner);
+        first.sort();
+        let mut expected = swamps.clone();
+        expected.sort();
+        assert_eq!(first, expected, "the Swamp leg offers both basic Swamps");
+        runner
+            .act(GameAction::SelectCards { cards: swamps })
+            .expect("the Swamps pay the Swamp leg");
+        let mut paused = settle_replacement_choices(&mut runner);
+        assert_eq!(sacrifice_choices(&runner), vec![forest]);
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![forest],
+            })
+            .expect("the Forest pays the Forest leg");
+        paused += settle_replacement_choices(&mut runner);
+        if matches!(replacements, ProbeReplacements::TwoRestInPeace) {
+            assert!(
+                paused > 0,
+                "reach: two Rest in Peace pause the sacrifice for replacement ordering"
+            );
+        }
+        let state = runner.state();
+        assert_eq!(state.stack.len(), 1, "the ability is on the stack");
+        for land in lands {
+            assert_ne!(state.objects[&land].zone, Zone::Battlefield);
+        }
+    }
 }
