@@ -11,10 +11,9 @@
 //!
 //! CR references (verified against docs/MagicCompRules.txt):
 //!   - CR 607.2d: "the chosen player" refers only to the linked choice.
-//!   - CR 104.3a: a player who concedes loses the game.
 //!   - CR 104.3b: a player at 0 or less life loses the game (an SBA).
 //!   - CR 104.2b: an effect may state that a player wins the game.
-//!   - CR 104.4a / CR 704.3: losses found in one SBA check are simultaneous.
+//!   - CR 704.3: losses found in one SBA check are a single event.
 //!   - CR 800.4d: a triggered ability controlled by a player who has left the
 //!     game isn't put on the stack.
 //!
@@ -166,23 +165,9 @@ fn transform_and_choose(board: &mut Board, chosen: PlayerId) {
     );
 }
 
-/// Pass priority until the stack is empty, the game ends, or nothing advances.
-fn settle(runner: &mut GameRunner) {
-    for _ in 0..24 {
-        if matches!(runner.state().waiting_for, WaitingFor::GameOver { .. })
-            || runner.state().stack.is_empty()
-        {
-            return;
-        }
-        if runner.act(GameAction::PassPriority).is_err() {
-            return;
-        }
-    }
-}
-
 /// CR 104.3b: put each player in `losers` to 0 life and let state-based
 /// actions eliminate them all in one check. Returns the players still in the
-/// game right after that check (before the stack resolves), then settles.
+/// game right after that check, then resolves the stack.
 fn lose_by_life(runner: &mut GameRunner, losers: &[PlayerId]) -> Vec<PlayerId> {
     for loser in losers {
         runner.state_mut().players[loser.0 as usize].life = 0;
@@ -201,7 +186,7 @@ fn lose_by_life(runner: &mut GameRunner, losers: &[PlayerId]) -> Vec<PlayerId> {
         .filter(|p| !p.is_eliminated)
         .map(|p| p.id)
         .collect();
-    settle(runner);
+    runner.advance_until_stack_empty();
     remaining
 }
 
@@ -242,7 +227,7 @@ fn chosen_player_losing_wins_the_game_but_another_player_losing_does_not() {
     );
 }
 
-/// CR 704.3 + CR 104.4a: the chosen player losing alongside another opponent
+/// CR 704.3: the chosen player losing alongside another opponent
 /// in the same SBA check still fires the trigger; P3 remains in the game, so
 /// only the trigger can end it.
 #[test]
@@ -352,6 +337,6 @@ fn two_player_chosen_opponent_losing_ends_with_controller_winning() {
 
     runner.state_mut().players[P1.0 as usize].life = 0;
     runner.act(GameAction::PassPriority).expect("pass");
-    settle(runner);
+    runner.advance_until_stack_empty();
     assert_eq!(winner(runner), Some(Some(P0)));
 }
