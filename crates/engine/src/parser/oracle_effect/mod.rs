@@ -41960,7 +41960,7 @@ fn parse_effect_chain_ir_body(
         } else {
             None
         };
-        let (if_you_do, text, deferred_when_you_do_guard, reflexive_guard_route) =
+        let (if_you_do, text, deferred_when_you_do_guard, reflexive_guard_route, zone_change_head) =
             if let Some(remainder) = reveal_gate {
                 // CR 603.12 + CR 701.20a: the reflexive's trigger event is the
                 // reveal-until's until-condition, so its creation gate carries the
@@ -41974,21 +41974,30 @@ fn parse_effect_chain_ir_body(
                     remainder,
                     None,
                     None,
+                    None,
                 )
             } else if condition.is_none() {
                 match strip_if_you_do_conditional_with_context(&text, ctx) {
                     conditions::ReflexiveConditionalStrip::Parsed {
                         condition,
                         guard_route,
+                        zone_change_head,
                         remainder,
-                    } => (condition, remainder, None, guard_route),
+                    } => (condition, remainder, None, guard_route, zone_change_head),
                     conditions::ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
                         condition,
+                        zone_change_head,
                         remainder,
-                    } => (Some(condition.clone()), remainder, Some(condition), None),
+                    } => (
+                        Some(condition.clone()),
+                        remainder,
+                        Some(condition),
+                        None,
+                        zone_change_head,
+                    ),
                 }
             } else {
-                (None, text, None, None)
+                (None, text, None, None, None)
             };
         // CR 603.12 + CR 608.2c: a `When you do, if <guard>, <body>` guard is
         // stamped on the reflexive body exactly as a leading general conditional
@@ -45077,9 +45086,10 @@ fn parse_effect_chain_ir_body(
         // zone change and its body's object reference reaches the stack object.
         if let Some(gap) = zone_change_reflexive::unsupported_zone_change_reflexive(
             condition.as_ref(),
+            zone_change_head,
             &clause.effect,
-            &normalized_text.to_lowercase(),
             &text_lower,
+            player_scope.as_ref(),
             builder.clauses(),
         ) {
             unimplemented_clause(&mut builder, gap, normalized_text, chunk.boundary_after);

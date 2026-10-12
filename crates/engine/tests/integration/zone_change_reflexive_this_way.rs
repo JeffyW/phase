@@ -15,7 +15,9 @@ use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{AbilityDefinition, Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::{CastPaymentMode, StackEntryKind, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, PersistedGameState, PersistedRestoreFinalization, StackEntryKind, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -28,8 +30,10 @@ struct Drive {
     target_prompts: Vec<Zone>,
     /// Cards offered at each `EffectZoneChoice`, in order.
     zone_choices: Vec<Vec<ObjectId>>,
-    /// Priority windows with a triggered ability on top of the stack.
+    /// Distinct triggered abilities seen on top of the stack at a priority
+    /// window.
     triggers_on_stack: usize,
+    seen_triggers: Vec<ObjectId>,
 }
 
 struct Plan {
@@ -106,11 +110,15 @@ fn drive(r: &mut GameRunner, mut plan: Plan) -> Drive {
             }),
             WaitingFor::Priority { .. } if r.state().stack.is_empty() => break,
             WaitingFor::Priority { .. } => {
-                if matches!(
-                    r.state().stack.back().map(|entry| &entry.kind),
-                    Some(StackEntryKind::TriggeredAbility { .. })
-                ) {
-                    out.triggers_on_stack += 1;
+                if let Some(entry) =
+                    r.state().stack.back().filter(|entry| {
+                        matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                    })
+                {
+                    if !out.seen_triggers.contains(&entry.id) {
+                        out.seen_triggers.push(entry.id);
+                        out.triggers_on_stack += 1;
+                    }
                 }
                 r.act(GameAction::PassPriority)
             }
@@ -386,58 +394,30 @@ fn augusta_reflexive_over_a_player_iteration_fails_closed() {
 // Sacrifice heads ("that many")
 // ---------------------------------------------------------------------------
 
-/// Ravenous Rotbelly's reflexive: each opponent sacrifices "that many" — the
-/// number of Zombies sacrificed this way, carried onto the reflexive. (The
-/// printed "you may sacrifice up to three" head offers one; see the report.
-/// A fixed two keeps the count discriminating.)
+/// Probe board 3, Ravenous Rotbelly (fail closed): its reflexive body iterates
+/// over players ("each opponent sacrifices that many"), and a player-scoped
+/// reflexive body resolves inside the creating resolution instead of waiting
+/// on the stack as its own object, so the printed card is not claimed. (Its
+/// "up to three Zombies" head also offers only one; listed separately.)
 #[test]
-fn rotbelly_body_that_many_is_the_number_sacrificed() {
-    let mut s = GameScenario::new();
-    s.at_phase(Phase::PreCombatMain);
-    let spell = s
-        .add_spell_to_hand_from_oracle(
-            P0,
-            "Probe",
-            false,
-            "Sacrifice two Zombies. When you sacrifice one or more Zombies this way, each opponent sacrifices that many creatures of their choice.",
-        )
-        .id();
-    let z1 = s
-        .add_creature(P0, "Zombie One", 2, 2)
-        .with_subtypes(vec!["Zombie"])
-        .id();
-    let z2 = s
-        .add_creature(P0, "Zombie Two", 2, 2)
-        .with_subtypes(vec!["Zombie"])
-        .id();
-    s.add_creature(P0, "Zombie Three", 2, 2)
-        .with_subtypes(vec!["Zombie"]);
-    let o1 = s.add_creature(P1, "Opp One", 1, 1).id();
-    let o2 = s.add_creature(P1, "Opp Two", 1, 1).id();
-    let o3 = s.add_creature(P1, "Opp Three", 1, 1).id();
-    let mut r = s.build();
-    cast(&mut r, spell);
-    let out = drive(&mut r, Plan::new(z1).picks(vec![z1, z2, o1, o2]));
-    assert_eq!(
-        out.zone_choices.len(),
-        2,
-        "reach: the sacrifice and the opponent's choice"
+fn rotbelly_player_scoped_reflexive_body_fails_closed() {
+    let parsed = parse_oracle_text(
+        "When this creature enters, you may sacrifice up to three Zombies. When you sacrifice one or more Zombies this way, each opponent sacrifices that many creatures of their choice.",
+        "Ravenous Rotbelly",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let execute = parsed.triggers[0].execute.as_deref().expect("ETB body");
+    assert!(
+        matches!(execute.effect.as_ref(), Effect::Sacrifice { .. }),
+        "reach guard: the producer is the printed sacrifice"
     );
     assert_eq!(
-        r.state().objects[&z1].zone,
-        Zone::Graveyard,
-        "reach: sacrificed"
+        unimplemented_name(execute).as_deref(),
+        Some("zone_change_reflexive_scoped_body"),
+        "{execute:?}"
     );
-    assert_eq!(
-        r.state().objects[&z2].zone,
-        Zone::Graveyard,
-        "reach: sacrificed"
-    );
-    let opp_left = [o1, o2, o3]
-        .iter()
-        .filter(|id| r.state().objects[*id].zone == Zone::Battlefield)
-        .count();
-    assert_eq!(opp_left, 1, "the opponent sacrificed two (that many)");
 }
 
 /// Nyssa of Traken's attack-trigger body: "that many" bounds both the
@@ -510,6 +490,12 @@ fn entered_equipment_attaches_to_the_reflexive_target() {
         .add_artifact_to_hand_from_oracle(P0, "Hand Equipment", "Equip {2}")
         .with_subtypes(vec!["Equipment"])
         .id();
+    // A second Equipment in hand, so the put-onto-the-battlefield instruction
+    // pauses for its choice and the reflexive is created on the resumed path.
+    let other_equipment = s
+        .add_artifact_to_hand_from_oracle(P0, "Other Hand Equipment", "Equip {2}")
+        .with_subtypes(vec!["Equipment"])
+        .id();
     let bear = s.add_creature(P0, "Bear", 2, 2).id();
     s.add_creature(P0, "Cub", 1, 1);
     let mut r = s.build();
@@ -521,6 +507,16 @@ fn entered_equipment_attaches_to_the_reflexive_target() {
             .target(vec![TargetRef::Object(bear)]),
     );
     assert_eq!(
+        out.zone_choices.len(),
+        1,
+        "reach: the producer paused for its choice"
+    );
+    assert_eq!(
+        r.state().objects[&other_equipment].zone,
+        Zone::Hand,
+        "only the chosen Equipment moved"
+    );
+    assert_eq!(
         out.target_prompts,
         vec![Zone::Battlefield],
         "host chosen after entry"
@@ -529,6 +525,141 @@ fn entered_equipment_attaches_to_the_reflexive_target() {
         r.state().objects[&equipment].attached_to,
         Some(engine::game::game_object::AttachTarget::Object(bear))
     );
+}
+
+/// Probe boards 1 and 2 (fail closed): Adaptive Armorer and Masterpiece Vault
+/// put the drafted card onto the battlefield through the spellbook-draft
+/// resume, which does not publish the zone-change ledger the gate reads, so
+/// the reflexive could never be created; both printed cards are not claimed.
+/// (Masterpiece Vault's "up to one target" host is moot behind that.)
+#[test]
+fn spellbook_draft_entry_reflexives_fail_closed() {
+    for (name, text, types) in [
+        (
+            "Adaptive Armorer",
+            "Vigilance\nWhen this creature enters, draft a card from Adaptive Armorer's spellbook and put it onto the battlefield. When an Equipment enters this way, attach it to target creature you control.",
+            "Creature",
+        ),
+        (
+            "Masterpiece Vault",
+            "When this artifact is put into a graveyard from the battlefield, draft a card from Masterpiece Vault's spellbook and put it onto the battlefield. When an Equipment enters this way, attach it to up to one target creature you control.\n{5}: Sacrifice this artifact.",
+            "Artifact",
+        ),
+    ] {
+        let parsed = parse_oracle_text(text, name, &[], &[types.to_string()], &[]);
+        let execute = parsed
+            .triggers
+            .iter()
+            .find_map(|trigger| trigger.execute.as_deref())
+            .expect("trigger body");
+        assert!(
+            matches!(execute.effect.as_ref(), Effect::DraftFromSpellbook { .. }),
+            "reach guard: {name}'s producer is the spellbook draft"
+        );
+        assert_eq!(
+            unimplemented_name(execute).as_deref(),
+            Some("zone_change_reflexive_event_source"),
+            "{name}: {execute:?}"
+        );
+    }
+}
+
+/// Probe board 4 (CR 603.12a): "When you exile a card this way" counts one
+/// occurrence, so after an instruction that exiles two cards it would trigger
+/// twice, while the creation gate makes one trigger: fails closed. The
+/// aggregate head ("one or more cards") is one event and triggers once.
+#[test]
+fn single_occurrence_head_after_a_multi_card_producer_fails_closed() {
+    let single = spell_ability(
+        "Exile the top two cards of your library. When you exile a card this way, you gain 1 life.",
+        "Probe",
+    );
+    assert!(
+        matches!(single.effect.as_ref(), Effect::ExileTop { .. }),
+        "reach guard: the two-card exile"
+    );
+    assert_eq!(
+        unimplemented_name(&single).as_deref(),
+        Some("zone_change_reflexive_occurrence"),
+        "{single:?}"
+    );
+
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let spell = s
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Probe",
+            false,
+            "Exile the top two cards of your library. When you exile one or more cards this way, you gain 1 life.",
+        )
+        .id();
+    let first = s.add_card_to_library_top(P0, "First");
+    s.add_card_to_library_top(P0, "Second");
+    let mut r = s.build();
+    let life = r.life(P0);
+    cast(&mut r, spell);
+    let out = drive(&mut r, Plan::new(first));
+    assert_eq!(r.state().objects[&first].zone, Zone::Exile, "reach: exiled");
+    assert_eq!(out.triggers_on_stack, 1, "one reflexive on the stack");
+    assert_eq!(r.life(P0), life + 1, "the aggregate head triggers once");
+}
+
+/// CR 603.12: the reflexive survives a save/restore taken while its PRODUCER
+/// is paused on the discard choice; after the restore the choice is answered
+/// and the reflexive is created and targets as usual.
+#[test]
+fn reflexive_survives_save_and_restore_at_the_producers_discard_choice() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let spell = s
+        .add_spell_to_hand_from_oracle(P0, "Glacial Dragonhunt", false, GLACIAL_DRAGONHUNT)
+        .id();
+    let three = s
+        .add_spell_to_hand(P0, "Three Drop", false)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    s.add_spell_to_hand(P0, "Two Drop", false)
+        .with_mana_cost(ManaCost::generic(2));
+    s.add_card_to_library_top(P0, "Library Card");
+    let opp = s.add_creature(P1, "Opp Giant", 4, 4).id();
+    s.add_creature(P1, "Opp Cub", 1, 1);
+    let mut r = s.build();
+    cast(&mut r, spell);
+    for _ in 0..8 {
+        match r.state().waiting_for.clone() {
+            WaitingFor::DiscardChoice { .. } => break,
+            WaitingFor::OptionalEffectChoice { .. } => {
+                r.act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accept the optional discard");
+            }
+            WaitingFor::Priority { .. } => {
+                r.act(GameAction::PassPriority).expect("pass");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::DiscardChoice { .. }),
+        "reach: the producer is paused on its choice"
+    );
+    let json = serde_json::to_string(&PersistedGameState::capture(r.state().clone()))
+        .expect("state serializes");
+    let state = serde_json::from_str::<PersistedGameState>(&json)
+        .expect("persisted state decodes")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("persisted state is admissible")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("restored state is publishable");
+    let mut restored = GameRunner::from_state(state);
+    let out = drive(
+        &mut restored,
+        Plan::new(three)
+            .picks(vec![three])
+            .target(vec![TargetRef::Object(opp)]),
+    );
+    assert_eq!(out.target_prompts, vec![Zone::Graveyard]);
+    assert_eq!(restored.state().objects[&opp].damage_marked, 3);
 }
 
 /// CR 603.12 + CR 603.3d (fail closed): printed class members the reflexive

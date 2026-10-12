@@ -934,11 +934,11 @@ fn narset_minus_two_ability() -> engine::types::ability::AbilityDefinition {
 }
 
 /// CR 603.12 + CR 701.9a (fail closed): the full printed Narset −2 through the
-/// production parser. The #8250 rebind never redirects the recipient onto the
-/// discarded card (no `LastZoneChanged`), and the misbound reflexive clause is
-/// honestly unsupported (see `narset_reflexive_with_a_misbound_recipient_fails_closed`).
+/// production parser fails closed on its reflexive clause. The #8250
+/// recipient-rebind regression stays pinned on its supported "If" sibling,
+/// `cragganwick_cremator_damages_targeted_player_not_discarded_card`.
 #[test]
-fn narset_deals_damage_to_targeted_permanent_not_discarded_card() {
+fn narset_printed_minus_two_reflexive_fails_closed() {
     let def = narset_minus_two_ability();
     let reflexive = def
         .sub_ability
@@ -952,9 +952,5 @@ fn narset_deals_damage_to_targeted_permanent_not_discarded_card() {
         ),
         "got {:?}",
         reflexive.effect
-    );
-    assert!(
-        !format!("{def:?}").contains("LastZoneChanged"),
-        "the recipient is never redirected to the discarded card"
     );
 }

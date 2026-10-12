@@ -9597,13 +9597,23 @@ fn when_you_do_mandatory_parent_did_nothing(
         && !mandatory_parent_effect_performed(&parent.effect, parent_events)
 }
 
-/// CR 608.2c: Effect kinds that only grant a play or cast permission over cards
-/// an earlier instruction moved ("You may play that card this turn"), rather
-/// than moving cards themselves, so they never replace the zone-change ledger a
-/// following "… this way" head reads. Deliberately excludes `CastFromZone`,
-/// which can also cast during resolution.
-fn effect_only_grants_play_permission(effect: &Effect) -> bool {
-    matches!(effect, Effect::GrantCastingPermission { .. })
+/// CR 608.2c: Whether this node only grants a play or cast permission over cards
+/// an earlier instruction moved ("You may play that card this turn") and is
+/// directly followed by a "… this way" head that reads the earlier mover's
+/// zone-change ledger (Cait Sith, Fortune Teller; Hidetsugu, Devouring Chaos).
+/// Such a permission node moves nothing, so it leaves that ledger in place for
+/// the head. Scoped to the direct reader: other consumers after a permission
+/// node keep the established cleared ledger, because "cards exiled with this
+/// enchantment" readers (Court of Locthwain) would otherwise narrow to the
+/// current resolution's exile. Deliberately excludes `CastFromZone`, which can
+/// also cast during resolution.
+fn permission_node_keeps_ledger_for_this_way_head(ability: &ResolvedAbility) -> bool {
+    matches!(ability.effect, Effect::GrantCastingPermission { .. })
+        && ability
+            .sub_ability
+            .as_ref()
+            .and_then(|sub| sub.condition.as_ref())
+            .is_some_and(|condition| condition.zone_changed_this_way_head().is_some())
 }
 
 /// CR 603.12: Effect kinds whose reflexive "when you do" needs an actual move
@@ -17434,10 +17444,9 @@ fn resolve_chain_body(
         .collect();
     // CR 608.2c: "… this way" names the earlier instruction that moved the
     // cards. A play permission over those cards ("You may play that card this
-    // turn") is not that instruction, so it leaves the moving instruction's
-    // ledger in place for a following "… this way" head (Cait Sith, Fortune
-    // Teller; Hidetsugu, Devouring Chaos).
-    if !effect_only_grants_play_permission(&ability.effect) {
+    // turn") directly followed by a "this way" head is not that instruction,
+    // so it leaves the moving instruction's ledger in place for the head.
+    if !permission_node_keeps_ledger_for_this_way_head(ability) {
         state.last_zone_changed_ids = zone_changed_ids;
     }
     let linked_batch =

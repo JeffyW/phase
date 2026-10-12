@@ -1,112 +1,86 @@
 //! CR 603.12: support boundary for the "When <zone change> this way, <body>"
 //! reflexive triggered ability.
 //!
-//! `conditions::strip_if_you_do_conditional` lowers that head to the
-//! `WhenYouDo` creation gate guarded by `ZoneChangedThisWay`; the runtime then
-//! creates the reflexive after the zone change and chooses its targets as it is
-//! put on the stack (CR 603.3d). That gate reads the zone-change ledger the
-//! immediately preceding instruction published, and the reflexive's body reads
-//! only referents the stack object carries. This module decides, per clause,
-//! whether both hold; anything else fails closed.
+//! `conditions::strip_if_you_do_conditional_with_head` lowers that head to the
+//! `WhenYouDo` creation gate guarded by `ZoneChangedThisWay` and reports the
+//! head's typed verb and occurrence (`oracle_nom::condition::ThisWayHead`,
+//! produced by the shared "… this way" combinators). The runtime creates the
+//! reflexive after the zone change and chooses its targets as it is put on the
+//! stack (CR 603.3d). That gate reads the zone-change ledger the instruction
+//! just before it published, and the reflexive's body reads only referents the
+//! stack object carries. This module is the semantic boundary: per clause it
+//! decides whether both hold, and anything else fails closed.
 
-use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until};
-use nom::combinator::value;
-use nom::sequence::preceded;
+use nom::bytes::complete::tag;
 use nom::Parser;
 
+use super::super::oracle_nom::condition::{ThisWayHead, ThisWayOccurrence, ThisWayVerb};
 use super::super::oracle_nom::error::OracleError;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::{has_typed_target_widened, ClauseDisposition, ClauseIr};
-use crate::types::ability::{AbilityCondition, Effect, TargetFilter};
+use crate::types::ability::{AbilityCondition, Effect, PlayerFilter, QuantityExpr, TargetFilter};
+use crate::types::zones::Zone;
 
-/// The zone-change event a "When … this way" head names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThisWayEvent {
-    /// CR 701.9a
-    Discard,
-    /// CR 701.21a
-    Sacrifice,
-    /// CR 701.13a
-    Exile,
-    /// CR 701.17a
-    Mill,
-    /// "put … onto the battlefield" / "enters"
-    EnterBattlefield,
-    /// "put … into your graveyard" (surveil)
-    PutIntoGraveyard,
-}
-
-fn parse_this_way_event(input: &str) -> nom::IResult<&str, ThisWayEvent, OracleError<'_>> {
-    alt((
-        value(ThisWayEvent::Discard, tag("discard")),
-        value(ThisWayEvent::Sacrifice, tag("sacrific")),
-        value(ThisWayEvent::Exile, tag("exile")),
-        value(ThisWayEvent::Mill, tag("mill")),
-        value(ThisWayEvent::EnterBattlefield, tag("onto the battlefield")),
-        value(ThisWayEvent::EnterBattlefield, tag("enter")),
-        value(ThisWayEvent::PutIntoGraveyard, tag("into your graveyard")),
-    ))
-    .parse(input)
-}
-
-/// The event of a lowercase "when <head> this way, …" chunk: the verb right
-/// after "you " for the active voice ("when you discard a card this way"),
-/// otherwise the last event word before "this way" for the passive voice
-/// ("when a creature card is exiled this way").
-fn this_way_event(lower: &str) -> Option<ThisWayEvent> {
-    let (_, head) = preceded(
-        tag::<_, _, OracleError<'_>>("when "),
-        take_until(" this way"),
-    )
-    .parse(lower)
-    .ok()?;
-    if let Ok((_, event)) = preceded(tag("you "), parse_this_way_event).parse(head) {
-        return Some(event);
-    }
-    let mut last = None;
-    let mut remaining = head;
-    while let Some(event) = nom_primitives::scan_at_word_boundaries(remaining, |input| {
-        parse_this_way_event(input).map(|(rest, event)| (rest, (event, rest)))
-    }) {
-        last = Some(event.0);
-        remaining = event.1;
-    }
-    last
-}
-
-/// CR 608.2c: whether `effect` is an instruction that publishes the `event`'s
-/// zone change. Positive allowlist: an unlisted producer fails closed.
-fn publishes_event(effect: &Effect, event: ThisWayEvent) -> bool {
-    match event {
-        ThisWayEvent::Discard => {
-            matches!(effect, Effect::Discard { .. } | Effect::DiscardCard { .. })
+/// CR 608.2c: whether `effect` is an instruction whose every resolution path
+/// — the synchronous one and the resume after its player choice — publishes
+/// the zone change `verb` names into the ledger the gate reads. A positive
+/// allowlist of producers each covered by a runtime test on its paused path;
+/// an unlisted producer (a spellbook draft, an exile-until loop, a mill, a
+/// surveil, a mass move) fails closed.
+fn publishes_event(effect: &Effect, verb: ThisWayVerb) -> bool {
+    match verb {
+        ThisWayVerb::Discard => matches!(effect, Effect::Discard { .. }),
+        ThisWayVerb::Sacrifice => matches!(effect, Effect::Sacrifice { .. }),
+        ThisWayVerb::Exile => {
+            matches!(effect, Effect::ExileTop { .. } | Effect::ChangeZone { .. })
         }
-        ThisWayEvent::Sacrifice => matches!(effect, Effect::Sacrifice { .. }),
-        ThisWayEvent::Exile => matches!(
-            effect,
-            Effect::ExileTop { .. }
-                | Effect::ExileFromTopUntil { .. }
-                | Effect::ChangeZone { .. }
-                | Effect::ChangeZoneAll { .. }
-        ),
-        ThisWayEvent::Mill => matches!(effect, Effect::Mill { .. }),
-        ThisWayEvent::EnterBattlefield => matches!(
-            effect,
-            Effect::ChangeZone { .. }
-                | Effect::ChangeZoneAll { .. }
-                | Effect::Dig { .. }
-                | Effect::DraftFromSpellbook { .. }
-                | Effect::Conjure { .. }
-        ),
-        ThisWayEvent::PutIntoGraveyard => matches!(effect, Effect::Surveil { .. }),
+        ThisWayVerb::EnterBattlefield => {
+            matches!(effect, Effect::ChangeZone { .. } | Effect::Dig { .. })
+        }
+        ThisWayVerb::Mill
+        | ThisWayVerb::PutIntoGraveyard
+        | ThisWayVerb::Destroy
+        | ThisWayVerb::Return
+        | ThisWayVerb::Counter
+        | ThisWayVerb::Die => false,
     }
+}
+
+/// CR 603.12a: a reflexive whose head counts ONE occurrence ("When you exile a
+/// card this way") triggers once for each card the instruction moved, but the
+/// creation gate creates one trigger. Supported only when the producer moves
+/// at most one object.
+fn producer_moves_at_most_one(producer: &ClauseIr) -> bool {
+    let one = |count: &QuantityExpr| matches!(count, QuantityExpr::Fixed { value: 1 });
+    let single_instruction = producer.multi_target.is_none()
+        && producer.parsed.multi_target.is_none()
+        && producer.repeat_for.is_none();
+    single_instruction
+        && match &producer.parsed.effect {
+            Effect::Discard { count, .. }
+            | Effect::ExileTop { count, .. }
+            | Effect::Sacrifice { count, .. } => one(count),
+            // `keep_count: None` keeps one card, except in the all-seen
+            // library-to-library reorder mode.
+            Effect::Dig {
+                keep_count,
+                keep_count_expr: None,
+                destination,
+                ..
+            } => match keep_count {
+                Some(kept) => *kept == 1,
+                None => *destination != Some(Zone::Library),
+            },
+            Effect::ChangeZone { .. } => true,
+            _ => false,
+        }
 }
 
 /// CR 608.2c: a play permission over the moved cards ("You may play that card
-/// this turn") is not the moving instruction; the runtime leaves the ledger in
-/// place across it (`effect_only_grants_play_permission`, the same single
-/// effect kind).
+/// this turn") directly before the head is not the moving instruction; the
+/// runtime leaves the ledger in place across that one node
+/// (`permission_node_keeps_ledger_for_this_way_head`, the same single effect
+/// kind).
 fn grants_play_permission(effect: &Effect) -> bool {
     matches!(effect, Effect::GrantCastingPermission { .. })
 }
@@ -116,11 +90,14 @@ fn grants_play_permission(effect: &Effect) -> bool {
 ///
 /// * `zone_change_reflexive_event_source` — the instruction whose ledger the
 ///   gate reads (the nearest preceding instruction, skipping a play
-///   permission) is not one that performs the head's zone change: a later
-///   moving instruction ("Discard a card, then draw a card") or a structural
-///   mismatch ("sacrifice … unless you discard", a delayed sacrifice) would
-///   make the gate read the wrong cards; a producer iterated over players
-///   ("each player exiles a card") would create one reflexive per player.
+///   permission) is not one that performs the head's zone change on every
+///   resolution path; or it iterates over players ("each player exiles a
+///   card"), which would create one reflexive per player.
+/// * `zone_change_reflexive_occurrence` — the head counts one occurrence ("a
+///   card") but the producer can move several (CR 603.12a).
+/// * `zone_change_reflexive_scoped_body` — the body iterates over players
+///   ("each opponent sacrifices that many"); such a body resolves inside the
+///   creating resolution instead of as its own stack object.
 /// * `zone_change_reflexive_unbound_referent` — the body names an object the
 ///   reflexive stack object cannot carry: a bare `ParentTarget` operand (its
 ///   target, or a fight's subject) while no earlier instruction announced a
@@ -128,9 +105,10 @@ fn grants_play_permission(effect: &Effect) -> bool {
 ///   copy with no copy source.
 pub(super) fn unsupported_zone_change_reflexive(
     condition: Option<&AbilityCondition>,
+    head: Option<ThisWayHead>,
     effect: &Effect,
-    chunk_lower: &str,
     body_lower: &str,
+    body_player_scope: Option<&PlayerFilter>,
     clauses: &[ClauseIr],
 ) -> Option<&'static str> {
     let condition = condition?;
@@ -138,29 +116,31 @@ pub(super) fn unsupported_zone_change_reflexive(
         return None;
     }
     condition.zone_changed_this_way_head()?;
-    let producer = clauses
+    let mut preceding = clauses
         .iter()
         .rev()
-        .filter(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }))
-        .find(|clause| !grants_play_permission(&clause.parsed.effect));
-    let event_published = match (producer, this_way_event(chunk_lower)) {
-        // CR 603.12: a producer iterated over players ("each player exiles a
-        // card") resolves the gated clause once per player, so the one event
-        // the head names would create one reflexive per iteration.
-        (Some(producer), Some(event)) => {
-            producer.player_scope.is_none() && publishes_event(&producer.parsed.effect, event)
-        }
-        _ => false,
+        .filter(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }));
+    let producer = match preceding.next() {
+        Some(permission) if grants_play_permission(&permission.parsed.effect) => preceding.next(),
+        nearest => nearest,
     };
-    if !event_published {
+    let (Some(producer), Some(head)) = (producer, head) else {
         return Some("zone_change_reflexive_event_source");
+    };
+    if producer.player_scope.is_some() || !publishes_event(&producer.parsed.effect, head.verb) {
+        return Some("zone_change_reflexive_event_source");
+    }
+    if head.occurrence == ThisWayOccurrence::Single && !producer_moves_at_most_one(producer) {
+        return Some("zone_change_reflexive_occurrence");
+    }
+    if body_player_scope.is_some() {
+        return Some("zone_change_reflexive_scoped_body");
     }
     let body_names_a_target = nom_primitives::scan_at_word_boundaries(body_lower, |input| {
         tag::<_, _, OracleError<'_>>("target ").parse(input)
     })
     .is_some();
-    let parent_announced_a_target =
-        producer.is_some_and(|producer| has_typed_target_widened(&producer.parsed.effect));
+    let parent_announced_a_target = has_typed_target_widened(&producer.parsed.effect);
     // The body's object operands: its target, plus the fighting creature of a
     // fight ("it fights ~").
     let fight_subject = match effect {
@@ -177,59 +157,14 @@ pub(super) fn unsupported_zone_change_reflexive(
     }
     // A copy whose source lost its referent ("a token that's a copy of that
     // Aura" parsed with no source) names no object the stack object can carry.
-    let copies_nothing = matches!(
+    if matches!(
         effect,
         Effect::CopyTokenOf {
             target: TargetFilter::None,
             ..
         }
-    );
-    if copies_nothing {
+    ) {
         return Some("zone_change_reflexive_unbound_referent");
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{this_way_event, ThisWayEvent};
-
-    #[test]
-    fn classifies_active_and_passive_heads() {
-        let cases = [
-            (
-                "when you discard a nonland card this way, x",
-                ThisWayEvent::Discard,
-            ),
-            ("when you exile a card this way, x", ThisWayEvent::Exile),
-            (
-                "when you sacrifice one or more zombies this way, x",
-                ThisWayEvent::Sacrifice,
-            ),
-            (
-                "when you put one or more equipment onto the battlefield this way, x",
-                ThisWayEvent::EnterBattlefield,
-            ),
-            (
-                "when a creature card is exiled this way, x",
-                ThisWayEvent::Exile,
-            ),
-            (
-                "when one or more cards are milled this way, x",
-                ThisWayEvent::Mill,
-            ),
-            (
-                "when an equipment enters this way, x",
-                ThisWayEvent::EnterBattlefield,
-            ),
-            (
-                "when a creature is put onto the battlefield this way, x",
-                ThisWayEvent::EnterBattlefield,
-            ),
-        ];
-        for (text, expected) in cases {
-            assert_eq!(this_way_event(text), Some(expected), "{text}");
-        }
-        assert_eq!(this_way_event("when you do, x"), None);
-    }
 }

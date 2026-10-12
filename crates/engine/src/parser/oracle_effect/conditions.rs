@@ -964,6 +964,19 @@ pub(super) fn strip_guess_outcome_conditional(text: &str) -> (Option<AbilityCond
 }
 
 pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityCondition>, String) {
+    let (condition, _head, remainder) = strip_if_you_do_conditional_with_head(text);
+    (condition, remainder)
+}
+
+/// [`strip_if_you_do_conditional`] plus the typed "… this way" head metadata
+/// (verb and occurrence) when the condition came from a zone-change head.
+pub(super) fn strip_if_you_do_conditional_with_head(
+    text: &str,
+) -> (
+    Option<AbilityCondition>,
+    Option<nom_condition::ThisWayHead>,
+    String,
+) {
     let lower = text.to_lowercase();
 
     // CR 603.12 + CR 608.2c: strip a leading reflexive-conditional connector
@@ -975,7 +988,7 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     if let Some((condition, rest)) = nom_on_lower(text, &lower, |input| {
         crate::parser::oracle_nom::condition::parse_reflexive_conditional_connector(input)
     }) {
-        return (Some(condition), rest.to_string());
+        return (Some(condition), None, rest.to_string());
     }
 
     // CR 400.7 + CR 608.2c + CR 303.4f + CR 301.5b: "if a[n] [type] (is|was)
@@ -992,11 +1005,11 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     ))
     .parse(lower.as_str())
     {
-        if let (Some(condition), body) = strip_this_way_head(text, rest) {
-            return (Some(connector.gate(condition)), body);
+        if let (Some(condition), head, body) = strip_this_way_head(text, rest) {
+            return (Some(connector.gate(condition)), head, body);
         }
     }
-    (None, text.to_string())
+    (None, None, text.to_string())
 }
 
 /// The connector word in front of a "… this way" head.
@@ -1026,7 +1039,14 @@ impl ThisWayConnector {
 
 /// CR 400.7 + CR 608.2c: the "… this way" head after its connector word: the
 /// condition it names and the body text after it.
-fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, String) {
+fn strip_this_way_head(
+    text: &str,
+    rest: &str,
+) -> (
+    Option<AbilityCondition>,
+    Option<nom_condition::ThisWayHead>,
+    String,
+) {
     use crate::parser::oracle_nom::condition as nom_cond;
     // CR 400.7 + CR 608.2c: active-voice reflexive gates that resolve to a
     // full `AbilityCondition` (not just a type filter). These run under BOTH
@@ -1044,12 +1064,12 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
-        return (Some(condition), text[offset..].to_string());
+        return (Some(condition), None, text[offset..].to_string());
     }
     // CR 603.12 + CR 608.2c: active-voice "you put [type] onto the battlefield
     // this way" — also hoisted to run under "if" (Oviya, Spelunking).
-    if let Ok((after_clause, (filter, _negated))) =
-        nom_cond::parse_you_put_onto_battlefield_this_way_clause(rest)
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_put_onto_battlefield_this_way_head(rest)
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
@@ -1058,6 +1078,7 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
                 filter,
                 destination: Some(Zone::Battlefield),
             }),
+            Some(head),
             text[offset..].to_string(),
         );
     }
@@ -1070,8 +1091,8 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
     // surveilled card's fate is a genuine choice, so this clause stays
     // destination-bound like put-onto-battlefield — a redirect away from
     // the graveyard as the card moves defeats it.
-    if let Ok((after_clause, (filter, _negated))) =
-        nom_cond::parse_you_put_into_graveyard_this_way_clause(rest)
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_put_into_graveyard_this_way_head(rest)
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
@@ -1080,6 +1101,7 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
                 filter,
                 destination: Some(Zone::Graveyard),
             }),
+            Some(head),
             text[offset..].to_string(),
         );
     }
@@ -1092,7 +1114,8 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
     // (`ThisWayConnector::gate`). The exile's move into the
     // (public, CR 400.2) exile zone publishes the card into
     // `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-    if let Ok((after_clause, (filter, _negated))) = nom_cond::parse_you_exile_this_way_clause(rest)
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_exile_this_way_head(rest)
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
@@ -1101,11 +1124,15 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
                 filter,
                 destination: None,
             }),
+            Some(head),
             text[offset..].to_string(),
         );
     }
-    if let Ok((after_clause, (filter, _negated, destination))) =
-        nom_cond::parse_zone_changed_this_way_clause(rest)
+    if let Ok((after_clause, (filter, _negated, destination, head))) =
+        nom_cond::parse_zone_changed_this_way_head_scoped(
+            rest,
+            nom_cond::ThisWayVerbScope::AnyZoneChange,
+        )
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
@@ -1114,6 +1141,7 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
                 filter,
                 destination,
             }),
+            Some(head),
             text[offset..].to_string(),
         );
     }
@@ -1125,8 +1153,8 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
     // resolution-time condition (`ThisWayConnector::gate`). Both read the same
     // zone change: the discard's hand → graveyard move publishes
     // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-    if let Ok((after_clause, (filter, _negated))) =
-        crate::parser::oracle_nom::condition::parse_you_discard_this_way_clause(rest)
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_discard_this_way_head(rest)
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
@@ -1135,6 +1163,7 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
                 filter,
                 destination: None,
             }),
+            Some(head),
             text[offset..].to_string(),
         );
     }
@@ -1144,8 +1173,8 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
     // prefixes for the same reason as the discard sibling above. The
     // sacrifice's battlefield → graveyard move publishes the permanents
     // into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
-    if let Ok((after_clause, (filter, _negated))) =
-        crate::parser::oracle_nom::condition::parse_you_sacrifice_this_way_clause(rest)
+    if let Ok((after_clause, (filter, _negated, head))) =
+        nom_cond::parse_you_sacrifice_this_way_head(rest)
     {
         let body_lower = strip_reflexive_conditional_body_separator(after_clause);
         let offset = text.len() - body_lower.len();
@@ -1154,10 +1183,11 @@ fn strip_this_way_head(text: &str, rest: &str) -> (Option<AbilityCondition>, Str
                 filter,
                 destination: None,
             }),
+            Some(head),
             text[offset..].to_string(),
         );
     }
-    (None, text.to_string())
+    (None, None, text.to_string())
 }
 
 /// CR 603.12 + CR 603.4 + CR 608.2a: A reflexive connector can introduce a
@@ -1180,10 +1210,14 @@ pub(super) enum ReflexiveConditionalStrip {
         /// parser apply the same route-specific binding guard it applies to a
         /// leading general conditional.
         guard_route: Option<LeadingConditionRoute>,
+        /// The typed "? this way" head (verb, occurrence) when `condition`
+        /// came from a zone-change head; the reflexive support check reads it.
+        zone_change_head: Option<nom_condition::ThisWayHead>,
         remainder: String,
     },
     DeferredWhenYouDoGuard {
         condition: AbilityCondition,
+        zone_change_head: Option<nom_condition::ThisWayHead>,
         remainder: String,
     },
 }
@@ -1192,11 +1226,12 @@ pub(super) fn strip_if_you_do_conditional_with_context(
     text: &str,
     ctx: &mut ParseContext,
 ) -> ReflexiveConditionalStrip {
-    let (condition, remainder) = strip_if_you_do_conditional(text);
+    let (condition, zone_change_head, remainder) = strip_if_you_do_conditional_with_head(text);
     let Some(condition) = condition else {
         return ReflexiveConditionalStrip::Parsed {
             condition: None,
             guard_route: None,
+            zone_change_head,
             remainder,
         };
     };
@@ -1204,6 +1239,7 @@ pub(super) fn strip_if_you_do_conditional_with_context(
         return ReflexiveConditionalStrip::Parsed {
             condition: Some(condition),
             guard_route: None,
+            zone_change_head,
             remainder,
         };
     }
@@ -1219,12 +1255,14 @@ pub(super) fn strip_if_you_do_conditional_with_context(
         Some((guard, _)) if guard.has_root_zone_changed_this_way() => {
             ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
                 condition,
+                zone_change_head,
                 remainder,
             }
         }
         Some((guard, route)) => ReflexiveConditionalStrip::Parsed {
             condition: Some(condition.with_when_you_do_guard(guard)),
             guard_route: Some(route),
+            zone_change_head,
             remainder: body,
         },
         // A syntactically present leading guard must never be treated like an
@@ -1234,12 +1272,14 @@ pub(super) fn strip_if_you_do_conditional_with_context(
         None if split_leading_conditional(&remainder).is_some() => {
             ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
                 condition,
+                zone_change_head,
                 remainder,
             }
         }
         None => ReflexiveConditionalStrip::Parsed {
             condition: Some(condition),
             guard_route: None,
+            zone_change_head,
             remainder,
         },
     }
@@ -10483,6 +10523,7 @@ mod tests {
         let ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
             condition,
             remainder,
+            ..
         } = stripped
         else {
             panic!("an unsupported guard must stay distinct from a bare reflexive marker");
@@ -10499,6 +10540,7 @@ mod tests {
         let ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
             condition,
             remainder,
+            ..
         } = stripped
         else {
             panic!("the specialized card-type guard must remain available to its ordered parser");
