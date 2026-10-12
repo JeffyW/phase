@@ -1739,11 +1739,19 @@ pub(crate) fn resolved_object_ids_for_filter(
 /// creature" / "enchanted creature" recipient of a resolution-timed instruction
 /// is whatever the source is attached to as that instruction resolves. No target
 /// slot was announced for it (`ability.targets` is empty), so the host is read
-/// from the attachment relationship. Single authority for both the instruction's
-/// recipient (`counters::resolve_defined_or_targets`) and a condition whose
-/// anaphor names that recipient (`evaluate_condition`'s `TargetMatchesFilter`),
-/// so the two can never disagree about which object "it" is.
+/// from the attachment relationship. Single authority for the instruction's
+/// recipient (bound into the node by [`bind_resolution_attachment_hosts`], and
+/// read directly by `counters::resolve_defined_or_targets`) and for a condition
+/// whose anaphor names that recipient (`evaluate_condition`'s
+/// `TargetMatchesFilter`), so they can never disagree about which object "it" is.
 /// `None` when this node does not name such a recipient.
+///
+/// The host comes from the attachment itself, never from a scan of objects that
+/// happen to wear an Aura or Equipment: CR 608.2h — the source's current
+/// attachment while it is on the battlefield, else its last known one. The host
+/// must still be on the battlefield and phased in (CR 702.26b) and still meet the
+/// recipient's other constraints ("enchanted *creature*"); otherwise there is no
+/// such object and the instruction affects nothing.
 pub(crate) fn resolution_bound_attachment_hosts(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -1753,7 +1761,49 @@ pub(crate) fn resolution_bound_attachment_hosts(
         == TargetChoiceTiming::Resolution
         && ability.targets.is_empty()
         && recipient.contains_source_attachment_host();
-    names_resolution_bound_host.then(|| resolved_object_ids_for_filter(state, ability, recipient))
+    names_resolution_bound_host.then(|| {
+        let Some(crate::game::game_object::AttachTarget::Object(host)) =
+            resolve_source_attached_to(state, ability.source_id)
+        else {
+            return Vec::new();
+        };
+        let on_battlefield = state
+            .objects
+            .get(&host)
+            .is_some_and(|obj| obj.zone == Zone::Battlefield && obj.is_phased_in());
+        let ctx = super::filter::FilterContext::from_ability(ability);
+        let meets_rest = super::filter::matches_target_filter(
+            state,
+            host,
+            &recipient.without_source_attachment_host(),
+            &ctx,
+        );
+        (on_battlefield && meets_rest)
+            .then_some(host)
+            .into_iter()
+            .collect()
+    })
+}
+
+/// CR 115.10a + CR 608.2c: binds the host of a resolution-timed "enchanted /
+/// equipped X" instruction ([`resolution_bound_attachment_hosts`]) into the
+/// node's targets as it begins to resolve, so its effect handler, its
+/// conditions and the anaphors of the instructions after it ("It deals damage
+/// to you equal to its power") all read the same object. The host is affected,
+/// not targeted: it is bound after target legality was checked (CR 608.2b) and
+/// raises no targeting event. `None` when there is nothing to bind.
+pub(crate) fn bind_resolution_attachment_hosts(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<ResolvedAbility> {
+    let recipient = ability.effect.target_filter()?;
+    let hosts = resolution_bound_attachment_hosts(state, ability, recipient)?;
+    if hosts.is_empty() {
+        return None;
+    }
+    let mut bound = ability.clone();
+    bound.set_unpinned_targets(hosts.into_iter().map(TargetRef::Object).collect());
+    Some(bound)
 }
 
 /// Resolve a filter with a caller-supplied semantic context. This preserves the

@@ -15498,6 +15498,17 @@ fn resolve_chain_body(
     events: &mut Vec<GameEvent>,
     depth: u32,
 ) -> Result<(), EffectError> {
+    // CR 115.10a + CR 301.5f + CR 303.4b: an untargeted "enchanted/equipped X"
+    // recipient is bound to the source's host as this instruction begins to
+    // resolve, before its conditions, effect and inheriting sub-abilities read it.
+    let host_bound;
+    let ability = match crate::game::targeting::bind_resolution_attachment_hosts(state, ability) {
+        Some(bound) => {
+            host_bound = bound;
+            &host_bound
+        }
+        None => ability,
+    };
     // CR 608.2c: Snapshot the `pending_continuation` *value* at chain-body
     // entry so the sub_ability guard further down can compare by IDENTITY, not
     // mere presence. An unrelated outer continuation (e.g. a `player_scope`

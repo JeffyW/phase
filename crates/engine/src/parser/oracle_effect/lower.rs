@@ -2063,6 +2063,23 @@ pub(super) fn target_choice_timing_for_parsed(
             return TargetChoiceTiming::Resolution;
         }
     }
+    // CR 115.10a + CR 115.1b + CR 303.4b + CR 301.5f: "enchanted creature" /
+    // "equipped creature" in an Aura's or Equipment's own instruction names
+    // whatever the source is attached to. Unless the text says "target", the
+    // host is affected, not targeted: it claims no announcement slot, so it
+    // never "becomes the target" (ward, CR 702.21a) and shroud/hexproof can't
+    // stop the instruction. The runtime binds the host as the instruction
+    // resolves (`targeting::bind_resolution_attachment_hosts`). Keyed on the
+    // effect's own slot filter, so every effect kind that would otherwise
+    // announce one is covered rather than a hand-picked list.
+    if parsed
+        .effect
+        .target_filter()
+        .is_some_and(TargetFilter::contains_source_attachment_host)
+        && !nom_primitives::scan_contains(&lower, "target ")
+    {
+        return TargetChoiceTiming::Resolution;
+    }
     if let Effect::ChooseCounterKind { target, .. } = &parsed.effect {
         // CR 115.1 + CR 608.2d: "choose a counter on a permanent you
         // control" is an untargeted choice made while the ability resolves.

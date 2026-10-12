@@ -21890,6 +21890,31 @@ impl TargetFilter {
         }
     }
 
+    /// CR 303.4b + CR 301.5f: this filter with its "enchanted/equipped by the
+    /// source" relation removed, leaving the constraints the attachment host must
+    /// still meet ("enchanted *creature*", "equipped creature *you control*").
+    /// Pairs with [`Self::contains_source_attachment_host`]: callers that have
+    /// already established the host from the attachment relation itself check
+    /// the host against what remains. Covers the same shapes that predicate does.
+    pub fn without_source_attachment_host(&self) -> TargetFilter {
+        match self {
+            TargetFilter::Typed(typed) => {
+                let mut typed = typed.clone();
+                typed.properties.retain(|prop| {
+                    !matches!(prop, FilterProp::EnchantedBy | FilterProp::EquippedBy)
+                });
+                TargetFilter::Typed(typed)
+            }
+            TargetFilter::And { filters } => TargetFilter::And {
+                filters: filters
+                    .iter()
+                    .map(TargetFilter::without_source_attachment_host)
+                    .collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// CR 603.7c + CR 400.7: Returns true when this filter names ONE object that
     /// is already BOUND — a specific permanent or an anaphor to one — rather than
     /// a CLASS of objects re-matched against the live board on every check.

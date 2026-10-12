@@ -67,6 +67,7 @@ mod atomic_mana_payment;
 mod attach_plural_anaphor_coverage_honesty;
 mod attach_role_selection_timing;
 mod attached_to_declared_target;
+mod attachment_host_reference_untargeted;
 mod attack_qualifier_stack_conditions;
 mod attacks_alone_targeted_trigger;
 mod attacks_while_saddled_trigger;
