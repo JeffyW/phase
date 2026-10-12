@@ -286,6 +286,24 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
+  it.each([134, 135, 136, 137, 138])("rejects Full v%s before it can read the crew relation", async (version) => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: version }));
+
+    await expect(promise).rejects.toMatchObject({ kind: "protocol_mismatch" });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v139 crew-history protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 139 }));
+
+    await expect(promise).resolves.toBeDefined();
+    expect(ws.close).not.toHaveBeenCalled();
+  });
+
   it("rejects Full v133 before it can read the activation's stack entry", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];

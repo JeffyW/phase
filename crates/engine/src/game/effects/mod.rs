@@ -43202,9 +43202,10 @@ mod tests {
     /// resolver (`resolve_ability_chain`) with the crewing creature as the chosen
     /// target.
     ///
-    /// The placement head is an explicit parser gap (no filter expresses "that
-    /// crewed it this turn"), so this resolves the parsed conditional-doubling
-    /// sentence on its own. `counters_after_placement` is the crewer's +1/+1
+    /// The placement head targets a crewer through `FilterProp::CrewedThisTurn`
+    /// (covered end to end in `tests/integration/balthier_and_fran_crew_history.rs`);
+    /// this resolves the parsed conditional-doubling sentence on its own.
+    /// `counters_after_placement` is the crewer's +1/+1
     /// count once the head's counter is on it. Returns the final +1/+1 total;
     /// `subtype` selects whether the conditional doubling fires.
     fn run_turtle_van_chain(subtype: &str, counters_after_placement: u32) -> u32 {

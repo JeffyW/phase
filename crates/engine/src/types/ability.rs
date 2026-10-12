@@ -6545,6 +6545,18 @@ pub enum CombatRelation {
     BlockedBySubject { scope: CombatHistoryScope },
 }
 
+/// CR 702.122b + CR 702.122c: which side of a crew payment the candidate of a
+/// [`FilterProp::CrewedThisTurn`] stands on, relative to the filter source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CrewRelation {
+    /// The candidate crewed the source Vehicle this turn (was tapped to pay its
+    /// crew cost) — "creature that crewed it this turn".
+    CrewedSource,
+    /// The candidate is a Vehicle the source crewed this turn — "Vehicle crewed
+    /// by ~ this turn".
+    CrewedBySource,
+}
+
 /// Context object for a combat relationship filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CombatRelationSubject {
@@ -6679,6 +6691,16 @@ pub enum FilterProp {
     /// of `BlockingSource`; used by "choose a creature that saddled it this turn"
     /// (Calamity, Galloping Inferno).
     SaddledSource,
+    /// CR 702.122b + CR 702.122c: crew-payment relation between the candidate
+    /// and the filter source this turn, read from
+    /// `GameState::crew_history_this_turn` by both objects' exact incarnations
+    /// (CR 400.7). `CrewedSource` — "creature that crewed it this turn"
+    /// (Getaway Car, Golden Argosy); `CrewedBySource` — "Vehicle crewed by ~
+    /// this turn" (Balthier and Fran). Recorded at crew cost payment, so a crew
+    /// ability countered after payment still counts (CR 702.122c).
+    CrewedThisTurn {
+        relation: CrewRelation,
+    },
     /// CR 702.51c: Matches a creature that convoked the filter source — i.e. was
     /// tapped to pay the source spell's convoke cost, recorded in the source
     /// object's `convoked_creatures`. Source-relative, mirroring `SaddledSource`

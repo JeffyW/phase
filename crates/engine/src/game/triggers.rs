@@ -12807,6 +12807,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         | FilterProp::SameName
         | FilterProp::AttachedTo { to: AttachmentReferent::Source }
         | FilterProp::SaddledSource
+        | FilterProp::CrewedThisTurn { .. }
         | FilterProp::ConvokedSource
         | FilterProp::BlockingSource
         | FilterProp::PowerGTSource

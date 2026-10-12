@@ -3346,7 +3346,12 @@ mod tests {
         }
     }
 
-    /// The bump this number is at: `GameEvent::AbilityActivated` gains
+    /// v139: CR 702.122c per-turn crew relation —
+    /// `GameState::crew_history_this_turn` and `FilterProp::CrewedThisTurn`, both
+    /// inside `GameState`; a v138 peer cannot parse the new filter tag, so it
+    /// must be refused before it receives v139 state.
+    ///
+    /// v134: `GameEvent::AbilityActivated` gains
     /// `stack_entry`, the stack object a stack-using activation created, carried
     /// in `GameState`'s trigger events; an older peer drops it silently and
     /// resolves an activation trigger's "copy that ability" differently, so it
@@ -3534,8 +3539,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_134_for_activation_stack_entry() {
-        assert_eq!(PROTOCOL_VERSION, 134);
+    fn protocol_version_is_139_for_crew_history() {
+        assert_eq!(PROTOCOL_VERSION, 139);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3546,7 +3551,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_134_for_activation_stack_entry` stays
+    /// `protocol_version_is_139_for_crew_history` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
