@@ -11,7 +11,7 @@
 //! payer must not make that choice, or a sacrifice, when it isn't needed.
 
 use engine::game::mana_sources::activatable_mana_actions_for_player;
-use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{ContinuousModification, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -46,6 +46,10 @@ const URBORG_ORACLE: &str = "Each land is a Swamp in addition to its other land 
 const SOLDEVI_ADNATE_ORACLE: &str = "{T}, Sacrifice a black or artifact creature: Add an amount \
 of {B} equal to the sacrificed creature's mana value.";
 const VAMPIRE_NIGHTHAWK_ORACLE: &str = "Flying\nDeathtouch\nLifelink";
+const CETA_DISCIPLE_ORACLE: &str = "{R}, {T}: Target creature gets +2/+0 until end of turn.\n\
+{G}, {T}: Add one mana of any color.";
+const HAVENWOOD_BATTLEGROUND_ORACLE: &str =
+    "This land enters tapped.\n{T}: Add {G}.\n{T}, Sacrifice this land: Add {G}{G}.";
 const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
@@ -106,10 +110,7 @@ fn mana_added(events: &[GameEvent]) -> Vec<(ObjectId, ManaType)> {
 }
 
 /// Cast the witness through the default auto-pay path and assert it resolved.
-fn auto_pay_and_resolve(
-    runner: &mut GameRunner,
-    spell: ObjectId,
-) -> engine::game::scenario::CastOutcome {
+fn auto_pay_and_resolve(runner: &mut GameRunner, spell: ObjectId) -> CastOutcome {
     let outcome = runner.cast(spell).resolve();
     assert!(
         outcome.zone_of(spell) == Zone::Graveyard && outcome.life_delta(P0) == 1,
@@ -716,5 +717,151 @@ fn manual_activation_retry_still_avoids_drawback_rows() {
     assert_eq!(
         state.players[0].life, 20,
         "the retry used Tomb's plain {{B}}, not its {{C}}{{C}} row that deals 2 damage"
+    );
+}
+
+// --- A drawback-free plan whose selected source has its own mana cost ---
+
+/// The cast's selected sources, in `ManaAdded` order, restricted to `sources`.
+fn mana_added_by(events: &[GameEvent], sources: &[ObjectId]) -> Vec<(ObjectId, ManaType)> {
+    mana_added(events)
+        .into_iter()
+        .filter(|(source, _)| sources.contains(source))
+        .collect()
+}
+
+/// Azorius Signet, `drawback_land` and a Mountain, all untapped, with an empty
+/// pool, and a {W}{U}{R} witness. The drawback-free plan selects the Signet
+/// (its `{1}` is a mana sub-cost) for {W}{U} and the Mountain for {R}, and the
+/// Signet's `{1}` is funded by `drawback_land`'s plain `{T}: Add {R}`.
+fn signet_funded_by_plain_red_row(
+    drawback_land: (&str, &str),
+) -> (CastOutcome, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let signet = scenario
+        .add_artifact_from_oracle(P0, "Azorius Signet", AZORIUS_SIGNET_ORACLE)
+        .id();
+    let land = scenario
+        .add_land_from_oracle(P0, drawback_land.0, drawback_land.1)
+        .id();
+    let mountain = scenario.add_basic_land(P0, ManaColor::Red);
+    let spell = witness_spell(
+        &mut scenario,
+        cost(
+            &[
+                ManaCostShard::White,
+                ManaCostShard::Blue,
+                ManaCostShard::Red,
+            ],
+            0,
+        ),
+    );
+    let mut runner = build_untapped(scenario, &[signet, land, mountain]);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "reach: empty pool"
+    );
+    let outcome = auto_pay_and_resolve(&mut runner, spell);
+    assert_eq!(
+        mana_added_by(outcome.events(), &[signet]),
+        vec![(signet, ManaType::White), (signet, ManaType::Blue)],
+        "reach: the Signet's costed `{{1}}, {{T}}: Add {{W}}{{U}}` row was selected and resolved; \
+         mana added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(
+        mana_added_by(outcome.events(), &[mountain]),
+        vec![(mountain, ManaType::Red)],
+        "reach: the Mountain paid the spell's {{R}}"
+    );
+    (outcome, signet, land, mountain)
+}
+
+/// CR 601.2g + CR 605.3b + CR 701.43a: the drawback-free plan selects Azorius
+/// Signet, whose `{1}` is a mana sub-cost, and Arena of Glory's plain
+/// `{T}: Add {R}` funds it. Arena is tapped once for {R} and not exerted.
+#[test]
+fn signet_sub_cost_funded_by_arena_plain_row_does_not_exert() {
+    let (outcome, _signet, arena, _mountain) =
+        signet_funded_by_plain_red_row(("Arena of Glory", ARENA_OF_GLORY_ORACLE));
+    assert_eq!(
+        mana_added_by(outcome.events(), &[arena]),
+        vec![(arena, ManaType::Red)],
+        "Arena's plain row funded the Signet's {{1}}"
+    );
+    assert_eq!(
+        exert_markers(outcome.state(), arena),
+        0,
+        "mana added {:?}",
+        mana_added(outcome.events())
+    );
+}
+
+/// CR 601.2g + CR 605.3b + CR 701.21a: the same plan with Dwarven Ruins: its
+/// plain `{T}: Add {R}` funds the Signet's `{1}`, and the Ruins survive.
+#[test]
+fn signet_sub_cost_funded_by_dwarven_ruins_plain_row_keeps_ruins() {
+    let (outcome, _signet, ruins, _mountain) =
+        signet_funded_by_plain_red_row(("Dwarven Ruins", DWARVEN_RUINS_ORACLE));
+    assert_eq!(
+        mana_added_by(outcome.events(), &[ruins]),
+        vec![(ruins, ManaType::Red)],
+        "the Ruins' plain row funded the Signet's {{1}}"
+    );
+    assert_eq!(outcome.zone_of(ruins), Zone::Battlefield);
+}
+
+/// CR 601.2g + CR 605.3b + CR 701.21a: a {U}{G} witness with Ceta Disciple
+/// (`{G}, {T}: Add one mana of any color.`, no plain mana ability), Havenwood
+/// Battleground and a Forest. The drawback-free plan selects Ceta Disciple for
+/// {U} and the Forest for {G}, and Ceta Disciple's colored `{G}` sub-cost is
+/// funded by Havenwood's plain `{T}: Add {G}`. The nested sub-cost payment
+/// keeps the payment's policy: planning it with every row would sacrifice
+/// Havenwood for `{G}{G}`.
+#[test]
+fn colored_sub_cost_keeps_the_payment_row_policy() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let disciple = scenario
+        .add_creature_from_oracle(P0, "Ceta Disciple", 1, 1, CETA_DISCIPLE_ORACLE)
+        .id();
+    let havenwood = scenario
+        .add_land_from_oracle(P0, "Havenwood Battleground", HAVENWOOD_BATTLEGROUND_ORACLE)
+        .id();
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let spell = witness_spell(
+        &mut scenario,
+        cost(&[ManaCostShard::Blue, ManaCostShard::Green], 0),
+    );
+    let mut runner = build_untapped(scenario, &[disciple, havenwood, forest]);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "reach: empty pool"
+    );
+
+    let outcome = auto_pay_and_resolve(&mut runner, spell);
+    assert_eq!(
+        mana_added_by(outcome.events(), &[disciple]),
+        vec![(disciple, ManaType::Blue)],
+        "reach: Ceta Disciple's costed row was selected and resolved; mana added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(
+        mana_added_by(outcome.events(), &[forest]),
+        vec![(forest, ManaType::Green)],
+        "reach: the Forest paid the spell's {{G}}"
+    );
+    assert_eq!(
+        mana_added_by(outcome.events(), &[havenwood]),
+        vec![(havenwood, ManaType::Green)],
+        "Havenwood's plain row funded Ceta Disciple's {{G}}"
+    );
+    assert_eq!(
+        outcome.zone_of(havenwood),
+        Zone::Battlefield,
+        "Havenwood was not sacrificed"
     );
 }
