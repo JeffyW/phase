@@ -106,10 +106,11 @@ use engine::game::scenario::{GameRunner, GameScenario};
 use engine::parser::oracle::parse_oracle_text;
 use engine::parser::oracle_effect::parse_effect_chain;
 use engine::types::ability::{
-    AbilityCondition, AbilityKind, Effect, ResolvedAbility, TargetFilter, TargetRef,
+    AbilityCondition, AbilityKind, Effect, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
 use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
@@ -312,9 +313,9 @@ fn talion_messenger_discard_this_way_puts_counter_on_faerie() {
 /// CR 603.12: NEGATIVE — when no discard occurs (empty hand AND empty library so
 /// the draw fails too), the reflexive condition is false and NO counter lands.
 /// This proves the counter is gated on the discard event, not on the trigger
-/// firing. On revert the sub is `Unimplemented` (no-op) and would also leave 0
-/// counters, so this case alone does not discriminate — it pairs with the
-/// positive test to pin the gate semantics.
+/// firing. Reach guards: the body parses to the supported reflexive gate (so
+/// a fail-closed parse can't pass vacuously) and the discard instruction
+/// itself resolved.
 #[test]
 fn talion_messenger_no_discard_no_counter() {
     let mut scenario = GameScenario::new();
@@ -326,11 +327,36 @@ fn talion_messenger_no_discard_no_counter() {
     let mut runner = scenario.build();
 
     let def = parse_effect_chain(TALION_BODY, AbilityKind::Spell);
+    // Reach guard: the body is the supported reflexive shape, so "no counter"
+    // can't come from a fail-closed parse.
+    let mut node = Some(&def);
+    let mut gated = false;
+    while let Some(current) = node {
+        assert!(
+            !matches!(current.effect.as_ref(), Effect::Unimplemented { .. }),
+            "supported chain: {def:?}"
+        );
+        gated |= current.condition.as_ref().is_some_and(|condition| {
+            condition.has_when_you_do_marker() && condition.zone_changed_this_way_head().is_some()
+        });
+        node = current.sub_ability.as_deref();
+    }
+    assert!(gated, "the counter is gated by the zone-change reflexive");
     let ability = build_resolved_from_def(&def, faerie, P0);
 
     let mut events = Vec::new();
     resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
         .expect("chain resolves even with nothing to discard");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GameEvent::EffectResolved {
+                kind: EffectKind::Discard | EffectKind::DiscardCard,
+                ..
+            }
+        )),
+        "reach: the discard instruction resolved, discarding nothing"
+    );
     assert!(
         runner.state().stack.is_empty()
             && !matches!(

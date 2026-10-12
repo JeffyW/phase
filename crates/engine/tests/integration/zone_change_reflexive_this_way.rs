@@ -10,6 +10,7 @@
 
 use std::collections::VecDeque;
 
+use engine::game::combat::{has_cant_be_blocked_static, AttackTarget};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{AbilityDefinition, Effect, TargetRef};
@@ -19,7 +20,7 @@ use engine::types::game_state::{
     CastPaymentMode, PersistedGameState, PersistedRestoreFinalization, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::ManaCost;
+use engine::types::mana::{ManaColor, ManaCost};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -34,6 +35,12 @@ struct Drive {
     /// window.
     triggers_on_stack: usize,
     seen_triggers: Vec<ObjectId>,
+    /// `DiscardChoice` prompts answered.
+    discard_choices: usize,
+    /// `OptionalEffectChoice` prompts answered.
+    optional_prompts: usize,
+    /// `ReplacementChoice` prompts answered.
+    replacement_prompts: usize,
 }
 
 struct Plan {
@@ -41,6 +48,7 @@ struct Plan {
     targets: VecDeque<Vec<TargetRef>>,
     picks: Vec<ObjectId>,
     accept_optional: bool,
+    apply_replacement: bool,
 }
 
 impl Plan {
@@ -50,7 +58,12 @@ impl Plan {
             targets: VecDeque::new(),
             picks: Vec::new(),
             accept_optional: true,
+            apply_replacement: true,
         }
+    }
+    fn decline_replacement(mut self) -> Self {
+        self.apply_replacement = false;
+        self
     }
     fn target(mut self, targets: Vec<TargetRef>) -> Self {
         self.targets.push_back(targets);
@@ -82,48 +95,62 @@ fn drive(r: &mut GameRunner, mut plan: Plan) -> Drive {
             let text = format!("{:?}", r.state().waiting_for);
             eprintln!("TRACE {}", &text[..text.len().min(400)]);
         }
-        let result = match r.state().waiting_for.clone() {
-            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
-                out.target_prompts
-                    .push(r.state().objects[&plan.watched].zone);
-                let targets = plan.targets.pop_front().unwrap_or_default();
-                r.act(GameAction::SelectTargets { targets })
-            }
-            WaitingFor::DiscardChoice { cards, count, .. } => {
-                let chosen = pick(&plan, &cards, count);
-                r.act(GameAction::SelectCards { cards: chosen })
-            }
-            WaitingFor::EffectZoneChoice { cards, count, .. } => {
-                out.zone_choices.push(cards.clone());
-                let chosen = pick(&plan, &cards, count);
-                r.act(GameAction::SelectCards { cards: chosen })
-            }
-            WaitingFor::DigChoice {
-                cards, keep_count, ..
-            } => {
-                let chosen = pick(&plan, &cards, keep_count);
-                r.act(GameAction::SelectCards { cards: chosen })
-            }
-            WaitingFor::ScryChoice { .. } => r.act(GameAction::SelectCards { cards: vec![] }),
-            WaitingFor::OptionalEffectChoice { .. } => r.act(GameAction::DecideOptionalEffect {
-                accept: plan.accept_optional,
-            }),
-            WaitingFor::Priority { .. } if r.state().stack.is_empty() => break,
-            WaitingFor::Priority { .. } => {
-                if let Some(entry) =
-                    r.state().stack.back().filter(|entry| {
-                        matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
-                    })
-                {
-                    if !out.seen_triggers.contains(&entry.id) {
-                        out.seen_triggers.push(entry.id);
-                        out.triggers_on_stack += 1;
-                    }
+        let result =
+            match r.state().waiting_for.clone() {
+                WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
+                    out.target_prompts
+                        .push(r.state().objects[&plan.watched].zone);
+                    let targets = plan.targets.pop_front().unwrap_or_default();
+                    r.act(GameAction::SelectTargets { targets })
                 }
-                r.act(GameAction::PassPriority)
-            }
-            other => panic!("unexpected prompt {other:?}"),
-        };
+                WaitingFor::DiscardChoice { cards, count, .. } => {
+                    out.discard_choices += 1;
+                    let chosen = pick(&plan, &cards, count);
+                    r.act(GameAction::SelectCards { cards: chosen })
+                }
+                WaitingFor::EffectZoneChoice { cards, count, .. } => {
+                    out.zone_choices.push(cards.clone());
+                    let chosen = pick(&plan, &cards, count);
+                    r.act(GameAction::SelectCards { cards: chosen })
+                }
+                WaitingFor::DigChoice {
+                    cards, keep_count, ..
+                } => {
+                    let chosen = pick(&plan, &cards, keep_count);
+                    r.act(GameAction::SelectCards { cards: chosen })
+                }
+                WaitingFor::ScryChoice { .. } => r.act(GameAction::SelectCards { cards: vec![] }),
+                WaitingFor::OptionalEffectChoice { .. } => {
+                    out.optional_prompts += 1;
+                    r.act(GameAction::DecideOptionalEffect {
+                        accept: plan.accept_optional,
+                    })
+                }
+                WaitingFor::ReplacementChoice { candidates, .. } => {
+                    out.replacement_prompts += 1;
+                    let index = candidates
+                        .iter()
+                        .position(|candidate| {
+                            (candidate.description == "Decline") != plan.apply_replacement
+                        })
+                        .unwrap_or(0);
+                    r.act(GameAction::ChooseReplacement { index })
+                }
+                WaitingFor::ManaPayment { .. } => r.act(GameAction::PassPriority),
+                WaitingFor::Priority { .. } if r.state().stack.is_empty() => break,
+                WaitingFor::Priority { .. } => {
+                    if let Some(entry) = r.state().stack.back().filter(|entry| {
+                        matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                    }) {
+                        if !out.seen_triggers.contains(&entry.id) {
+                            out.seen_triggers.push(entry.id);
+                            out.triggers_on_stack += 1;
+                        }
+                    }
+                    r.act(GameAction::PassPriority)
+                }
+                other => panic!("unexpected prompt {other:?}"),
+            };
         result.expect("action accepted");
     }
     out
@@ -167,6 +194,24 @@ fn unimplemented_name(def: &AbilityDefinition) -> Option<String> {
         node = current.sub_ability.as_deref();
     }
     None
+}
+
+/// Reach guard for a negative: the printed chain is the supported reflexive
+/// shape (no `Unimplemented`, and a node gated by the `WhenYouDo` creation
+/// marker with a zone-change event), so "nothing happened" can't come from a
+/// fail-closed parse.
+fn assert_supported_zone_change_reflexive(def: &AbilityDefinition) {
+    assert_eq!(unimplemented_name(def), None, "supported chain: {def:?}");
+    let mut node = Some(def);
+    while let Some(current) = node {
+        if current.condition.as_ref().is_some_and(|condition| {
+            condition.has_when_you_do_marker() && condition.zone_changed_this_way_head().is_some()
+        }) {
+            return;
+        }
+        node = current.sub_ability.as_deref();
+    }
+    panic!("no zone-change reflexive gate in {def:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -214,10 +259,23 @@ fn glacial_dragonhunt_targets_after_the_discard() {
 /// CR 603.12: declining the optional discard means the event never happened.
 #[test]
 fn glacial_dragonhunt_decline_creates_no_reflexive() {
+    assert_supported_zone_change_reflexive(&spell_ability(
+        GLACIAL_DRAGONHUNT,
+        "Glacial Dragonhunt",
+    ));
     let (mut r, spell, three, opp) = glacial_fixture();
     cast(&mut r, spell);
     let out = drive(&mut r, Plan::new(three).decline_optional());
+    assert_eq!(
+        out.optional_prompts, 1,
+        "reach: the optional discard was offered, then declined"
+    );
+    assert_eq!(
+        out.discard_choices, 0,
+        "declined before any card was chosen"
+    );
     assert!(out.target_prompts.is_empty(), "no target prompt");
+    assert_eq!(out.triggers_on_stack, 0, "no reflexive on the stack");
     assert_eq!(
         r.state().objects[&three].zone,
         Zone::Hand,
@@ -259,6 +317,317 @@ fn borborygmos_body_twice_that_much_survives_the_stack() {
         4,
         "twice the two discarded"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Redirected discards (CR 701.9a + CR 702.35a): a discarded card a
+// replacement sends elsewhere is still discarded "this way".
+// ---------------------------------------------------------------------------
+
+const REST_IN_PEACE: &str = "When this enchantment enters, exile all graveyards.\nIf a card or token would be put into a graveyard from anywhere, exile it instead.";
+
+const LIBRARY_OF_LENG: &str = "You have no maximum hand size.\nIf an effect causes you to discard a card, discard it, but you may put it on top of your library instead of into your graveyard.";
+
+/// Probe P1: Glacial Dragonhunt's chosen discard is exiled by Rest in Peace on
+/// its way out of the hand; the reflexive still triggers and deals 3.
+#[test]
+fn glacial_dragonhunt_reflexive_fires_when_rest_in_peace_exiles_the_discard() {
+    let (mut r, spell, three, opp) = {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let spell = s
+            .add_spell_to_hand_from_oracle(P0, "Glacial Dragonhunt", false, GLACIAL_DRAGONHUNT)
+            .id();
+        let three = s
+            .add_spell_to_hand(P0, "Three Drop", false)
+            .with_mana_cost(ManaCost::generic(3))
+            .id();
+        s.add_card_to_library_top(P0, "Library Card");
+        let opp = s.add_creature(P1, "Opp Giant", 4, 4).id();
+        s.add_creature(P1, "Opp Cub", 1, 1);
+        s.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+        (s.build(), spell, three, opp)
+    };
+    cast(&mut r, spell);
+    let out = drive(
+        &mut r,
+        Plan::new(three)
+            .target(vec![TargetRef::Object(opp)])
+            .picks(vec![three]),
+    );
+    assert_eq!(out.discard_choices, 1, "reach: an actual discard choice");
+    assert_eq!(
+        r.state().objects[&three].zone,
+        Zone::Exile,
+        "reach: Rest in Peace sent the discarded card to exile"
+    );
+    assert_eq!(
+        out.target_prompts,
+        vec![Zone::Exile],
+        "one target prompt, after the card was discarded into exile"
+    );
+    assert_eq!(out.triggers_on_stack, 1, "one reflexive on the stack");
+    assert_eq!(r.state().objects[&opp].damage_marked, 3);
+}
+
+/// Control: a forced discard with no choice (the hand's only card) under Rest
+/// in Peace publishes through the synchronous chain path, unchanged.
+#[test]
+fn forced_discard_under_rest_in_peace_fires_the_reflexive() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let spell = s
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Probe",
+            false,
+            "Discard a card. When you discard a nonland card this way, Probe deals 3 damage to target creature.",
+        )
+        .id();
+    let three = s
+        .add_spell_to_hand(P0, "Three Drop", false)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    let opp = s.add_creature(P1, "Opp Giant", 4, 4).id();
+    s.add_creature(P1, "Opp Cub", 1, 1);
+    s.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+    let mut r = s.build();
+    cast(&mut r, spell);
+    let out = drive(
+        &mut r,
+        Plan::new(three).target(vec![TargetRef::Object(opp)]),
+    );
+    assert_eq!(out.discard_choices, 0, "reach: no choice, a forced discard");
+    assert_eq!(r.state().objects[&three].zone, Zone::Exile);
+    assert_eq!(out.target_prompts, vec![Zone::Exile]);
+    assert_eq!(r.state().objects[&opp].damage_marked, 3);
+}
+
+/// The replacement-paused path: Library of Leng asks whether the chosen discard
+/// goes on top of the library instead (modelled as hand → graveyard →
+/// library). Applied or declined, the card is discarded and the reflexive
+/// triggers. No instruction precedes the discard, so only this discard can
+/// satisfy the gate.
+fn library_of_leng_discard(apply: bool) {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let spell = s
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Probe",
+            false,
+            "Discard a card. When you discard a card this way, Probe deals 3 damage to target creature.",
+        )
+        .id();
+    let three = s
+        .add_spell_to_hand(P0, "Three Drop", false)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    s.add_spell_to_hand(P0, "Two Drop", false)
+        .with_mana_cost(ManaCost::generic(2));
+    let opp = s.add_creature(P1, "Opp Giant", 4, 4).id();
+    s.add_creature(P1, "Opp Cub", 1, 1);
+    s.add_enchantment_from_oracle(P0, "Library of Leng", LIBRARY_OF_LENG);
+    let mut r = s.build();
+    cast(&mut r, spell);
+    let plan = Plan::new(three)
+        .target(vec![TargetRef::Object(opp)])
+        .picks(vec![three]);
+    let plan = if apply {
+        plan
+    } else {
+        plan.decline_replacement()
+    };
+    let out = drive(&mut r, plan);
+    assert_eq!(out.discard_choices, 1, "reach: an actual discard choice");
+    assert_eq!(
+        out.replacement_prompts, 1,
+        "reach: the discard paused on Library of Leng's choice"
+    );
+    let landed = if apply {
+        Zone::Library
+    } else {
+        Zone::Graveyard
+    };
+    assert_eq!(r.state().objects[&three].zone, landed);
+    assert_eq!(out.target_prompts, vec![landed]);
+    assert_eq!(r.state().objects[&opp].damage_marked, 3);
+}
+
+#[test]
+fn library_of_leng_redirected_discard_still_triggers_the_reflexive() {
+    library_of_leng_discard(true);
+}
+
+#[test]
+fn library_of_leng_declined_discard_to_the_graveyard_is_unchanged() {
+    library_of_leng_discard(false);
+}
+
+const VOHAR: &str = "{T}: Draw a card, then discard a card. If you discarded an instant or sorcery card this way, each opponent loses 1 life and you gain 1 life.\n{2}, Sacrifice Vohar: You may cast target instant or sorcery card from your graveyard this turn. If that spell would be put into your graveyard, exile it instead. Activate only as a sorcery.";
+
+/// Vohar, Vodalian Desecrator: the "If" sibling over the same discard
+/// completion. With Rest in Peace the discarded instant is exiled, and is still
+/// "discarded this way".
+fn vohar_discards_an_instant(rest_in_peace: bool) {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let vohar = s
+        .add_creature_from_oracle(P0, "Vohar, Vodalian Desecrator", 1, 2, VOHAR)
+        .id();
+    let bolt = s.add_spell_to_hand(P0, "Bolt", true).id();
+    s.add_creature_to_hand(P0, "Hand Bear", 2, 2);
+    s.add_card_to_library_top(P0, "Library Card");
+    if rest_in_peace {
+        s.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE);
+    }
+    let mut r = s.build();
+    let (p0, p1) = (r.life(P0), r.life(P1));
+    r.act(GameAction::ActivateAbility {
+        source_id: vohar,
+        ability_index: 0,
+    })
+    .expect("activate");
+    let out = drive(&mut r, Plan::new(bolt).picks(vec![bolt]));
+    assert_eq!(out.discard_choices, 1, "reach: an actual discard choice");
+    let landed = if rest_in_peace {
+        Zone::Exile
+    } else {
+        Zone::Graveyard
+    };
+    assert_eq!(r.state().objects[&bolt].zone, landed);
+    assert_eq!(r.life(P1), p1 - 1, "each opponent loses 1 life");
+    assert_eq!(r.life(P0), p0 + 1, "you gain 1 life");
+}
+
+#[test]
+fn vohar_discarded_instant_drains() {
+    vohar_discards_an_instant(false);
+}
+
+#[test]
+fn vohar_discarded_instant_exiled_by_rest_in_peace_still_drains() {
+    vohar_discards_an_instant(true);
+}
+
+// ---------------------------------------------------------------------------
+// Printed discard-head reflexives through their production entry points
+// ---------------------------------------------------------------------------
+
+const EVIE_FRYE: &str = "Partner with Jacob Frye (When this creature enters, target player may put Jacob into their hand from their library, then shuffle.)\n{1}, {T}: Draw a card, then discard a card. When you discard a creature card this way, target creature you control can't be blocked this turn.";
+
+/// Evie Frye's activated ability: the reflexive's target is chosen after the
+/// creature card is discarded, and that creature can't be blocked.
+#[test]
+fn evie_frye_activation_reflexive_targets_after_the_discard() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let evie = s
+        .add_creature_from_oracle(P0, "Evie Frye", 2, 1, EVIE_FRYE)
+        .id();
+    s.add_basic_land(P0, ManaColor::Blue);
+    let ally = s.add_creature(P0, "Ally", 2, 2).id();
+    let hand_bear = s.add_creature_to_hand(P0, "Hand Bear", 2, 2).id();
+    s.add_card_to_library_top(P0, "Library Card");
+    let mut r = s.build();
+    r.act(GameAction::ActivateAbility {
+        source_id: evie,
+        ability_index: 0,
+    })
+    .expect("activate");
+    let out = drive(
+        &mut r,
+        Plan::new(hand_bear)
+            .target(vec![TargetRef::Object(ally)])
+            .picks(vec![hand_bear]),
+    );
+    assert_eq!(out.discard_choices, 1, "reach: an actual discard choice");
+    assert_eq!(
+        out.target_prompts,
+        vec![Zone::Graveyard],
+        "one target prompt, after the creature card was discarded"
+    );
+    assert!(has_cant_be_blocked_static(r.state(), ally));
+    assert!(!has_cant_be_blocked_static(r.state(), evie));
+}
+
+const SERUM_CORE_CHIMERA: &str = "Flying\nWhenever you cast a noncreature spell, put an oil counter on this creature.\nRemove three oil counters from this creature: Draw a card. Then you may discard a nonland card. When you discard a card this way, this creature deals 3 damage to target creature or planeswalker. Activate only as a sorcery.";
+
+/// Serum-Core Chimera's oil-counter activation: the damage's target is chosen
+/// after the optional nonland discard.
+#[test]
+fn serum_core_chimera_activation_reflexive_targets_after_the_discard() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let chimera = s
+        .add_creature_from_oracle(P0, "Serum-Core Chimera", 2, 4, SERUM_CORE_CHIMERA)
+        .id();
+    s.with_counter(chimera, CounterType::Generic("oil".to_string()), 3);
+    let three = s
+        .add_spell_to_hand(P0, "Three Drop", false)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    s.add_card_to_library_top(P0, "Library Card");
+    let opp = s.add_creature(P1, "Opp Giant", 4, 4).id();
+    s.add_creature(P1, "Opp Cub", 1, 1);
+    let mut r = s.build();
+    r.act(GameAction::ActivateAbility {
+        source_id: chimera,
+        ability_index: 0,
+    })
+    .expect("activate");
+    assert_eq!(
+        r.state().objects[&chimera]
+            .counters
+            .get(&CounterType::Generic("oil".to_string()))
+            .copied()
+            .unwrap_or(0),
+        0,
+        "reach: the three oil counters were removed as the cost"
+    );
+    let out = drive(
+        &mut r,
+        Plan::new(three)
+            .target(vec![TargetRef::Object(opp)])
+            .picks(vec![three]),
+    );
+    assert_eq!(out.optional_prompts, 1, "reach: the optional discard");
+    assert_eq!(out.discard_choices, 1, "reach: an actual discard choice");
+    assert_eq!(out.target_prompts, vec![Zone::Graveyard]);
+    assert_eq!(r.state().objects[&opp].damage_marked, 3);
+}
+
+const TEO: &str = "Flying\nWhenever one or more creatures you control with flying attack, draw a card, then discard a card. When you discard a nonland card this way, put a +1/+1 counter on target creature you control.";
+
+/// Teo, Spirited Glider's attack trigger: the counter's target is chosen after
+/// the nonland discard.
+#[test]
+fn teo_attack_trigger_reflexive_targets_after_the_discard() {
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let teo = s
+        .add_creature_from_oracle(P0, "Teo, Spirited Glider", 1, 4, TEO)
+        .id();
+    let ally = s.add_creature(P0, "Ally", 2, 2).id();
+    let three = s
+        .add_spell_to_hand(P0, "Three Drop", false)
+        .with_mana_cost(ManaCost::generic(3))
+        .id();
+    s.add_card_to_library_top(P0, "Library Card");
+    let mut r = s.build();
+    r.advance_to_phase(Phase::DeclareAttackers);
+    r.declare_attackers(&[(teo, AttackTarget::Player(P1))])
+        .expect("Teo attacks");
+    let out = drive(
+        &mut r,
+        Plan::new(three)
+            .target(vec![TargetRef::Object(ally)])
+            .picks(vec![three]),
+    );
+    assert_eq!(out.discard_choices, 1, "reach: an actual discard choice");
+    assert_eq!(out.target_prompts, vec![Zone::Graveyard]);
+    assert_eq!(counters(&r, ally), 1);
+    assert_eq!(counters(&r, teo), 0);
 }
 
 // ---------------------------------------------------------------------------

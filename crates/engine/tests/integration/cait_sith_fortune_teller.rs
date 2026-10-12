@@ -9,8 +9,10 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::game::zones::move_to_zone;
-use engine::types::ability::TargetRef;
+use engine::parser::oracle::parse_oracle_text;
+use engine::types::ability::{Effect, EffectKind, TargetRef};
 use engine::types::actions::GameAction;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
@@ -126,12 +128,78 @@ fn cait_sith_reflexive_pump_targets_after_the_exile() {
 
 #[test]
 fn cait_sith_with_nothing_exiled_creates_no_reflexive() {
+    // Reach guard: the printed trigger is the supported reflexive shape, so the
+    // missing prompt can't come from a fail-closed parse.
+    let parsed = parse_oracle_text(
+        CAIT_SITH,
+        "Cait Sith, Fortune Teller",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let execute = parsed.triggers[0].execute.as_deref().expect("trigger body");
+    let mut node = Some(execute);
+    let mut gated = false;
+    while let Some(current) = node {
+        assert!(
+            !matches!(current.effect.as_ref(), Effect::Unimplemented { .. }),
+            "supported chain: {execute:?}"
+        );
+        gated |= current.condition.as_ref().is_some_and(|condition| {
+            condition.has_when_you_do_marker() && condition.zone_changed_this_way_head().is_some()
+        });
+        node = current.sub_ability.as_deref();
+    }
+    assert!(gated, "the pump is gated by the zone-change reflexive");
+
     let Fixture {
-        mut runner, bear, ..
+        mut runner,
+        bear,
+        cait,
+        ..
     } = fixture(true);
-    let (_, prompted) = advance_to_reflexive_prompt(&mut runner);
+    // Drive to declare attackers, recording the trigger and its exile step.
+    let mut saw_trigger = false;
+    let mut events = Vec::new();
+    for _ in 0..24 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ScryChoice { .. } => {
+                let result = runner
+                    .act(GameAction::SelectCards { cards: vec![] })
+                    .expect("scry");
+                events.extend(result.events);
+            }
+            WaitingFor::Priority { .. } => {
+                if runner.state().phase == Phase::DeclareAttackers
+                    && runner.state().stack.is_empty()
+                {
+                    break;
+                }
+                saw_trigger |= runner
+                    .state()
+                    .stack
+                    .iter()
+                    .any(|entry| entry.source_id == cait);
+                let result = runner.act(GameAction::PassPriority).expect("pass");
+                events.extend(result.events);
+            }
+            WaitingFor::DeclareAttackers { .. } => break,
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    assert!(saw_trigger, "reach: Lucky Slots went on the stack");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GameEvent::EffectResolved {
+                kind: EffectKind::ExileTop,
+                source_id,
+                ..
+            } if *source_id == cait
+        )),
+        "reach: the exile instruction resolved, exiling nothing"
+    );
     // CR 603.12: no exile happened, so the reflexive never triggers.
-    assert!(!prompted, "no target prompt");
     assert!(runner.state().stack.is_empty());
     assert_eq!(
         runner.state().phase,

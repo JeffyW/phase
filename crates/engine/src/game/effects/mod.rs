@@ -14618,22 +14618,28 @@ pub(crate) fn finalize_discard_choice_completion(
     let PendingDiscardBatchCompletion::DiscardChoice { chosen } = completion else {
         return;
     };
-    let discarded_to_graveyard: Vec<ObjectId> = events
+    // CR 701.9a + CR 702.35a: a chosen card a replacement redirects on its way
+    // out of the hand (Rest in Peace, Leyline of the Void, madness → exile) is
+    // still discarded, so this completion — the single authority for what the
+    // discard moved, on both the synchronous and the replacement-paused path —
+    // publishes every chosen card's zone change, wherever it went. A public
+    // destination stays findable by the rest of the effect (CR 400.7j).
+    let discarded: Vec<ObjectId> = events
         .iter()
         .filter_map(|event| match event {
             GameEvent::ZoneChanged {
                 object_id,
-                to: Zone::Graveyard,
+                from: Some(Zone::Hand),
                 ..
-            } => Some(*object_id),
+            } if chosen.iter().any(|pick| pick.object_id == *object_id) => Some(*object_id),
             _ => None,
         })
         .collect();
-    if !discarded_to_graveyard.is_empty() {
-        state.last_zone_changed_ids = discarded_to_graveyard.clone();
+    if !discarded.is_empty() {
+        state.last_zone_changed_ids = discarded.clone();
         publish_tracked_set_with_causes(
             state,
-            discarded_to_graveyard
+            discarded
                 .into_iter()
                 .map(|id| (id, Some(ThisWayCause::Discarded)))
                 .collect(),
