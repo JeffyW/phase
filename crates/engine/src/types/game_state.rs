@@ -9218,6 +9218,33 @@ fn visit_mana_ability_resume_events(
 }
 
 impl ManaAbilityResume {
+    /// CR 601.2g + CR 605.3b: Whether resuming this root continues an automatic
+    /// payment that suspended while auto-tap was paying it, rather than opening
+    /// a prompt or starting a fresh payment. Exhaustive so a new root has to be
+    /// classified. Auto-tap plans the remainder of such a payment with every
+    /// row (see `casting_costs::AutoTapRowPolicy`).
+    pub fn resumes_automatic_payment(&self) -> bool {
+        match self {
+            // The outer cost authority retries the same automatic payment after
+            // an auto-tapped source's paused cost move completed.
+            ManaAbilityResume::CompanionToHand { .. }
+            | ManaAbilityResume::TurnFaceUp { .. }
+            | ManaAbilityResume::EndContinuousEffect { .. }
+            | ManaAbilityResume::EffectPayCost { .. }
+            | ManaAbilityResume::PhyrexianCastPayment { .. }
+            | ManaAbilityResume::FinalizePendingManaPayment { .. } => true,
+            // CR 605.3a + CR 602.2b: a mana ability activated by hand retries
+            // its own activation; its automatic payment starts there, fresh.
+            ManaAbilityResume::ManaAbilityManaPayment { .. } => false,
+            // These return to a player's prompt or to priority; no automatic
+            // payment is in progress.
+            ManaAbilityResume::Priority
+            | ManaAbilityResume::ManaPayment { .. }
+            | ManaAbilityResume::ManaSourceSelection { .. }
+            | ManaAbilityResume::UnlessPayment { .. } => false,
+        }
+    }
+
     /// CR 601.2h + CR 602.2b + CR 116.2: Whether the outer payment root this
     /// resumes is a cast, activation or special action (no priority until it
     /// completes) rather than a resolution. Exhaustive so a new root has to be

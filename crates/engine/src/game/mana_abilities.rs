@@ -3746,15 +3746,18 @@ pub(crate) fn resume_mana_ability_root(
     // CR 601.2g + CR 605.3b: the single authority for the row policy of a
     // resumed automatic payment. A synchronous auto-tap never reaches this
     // root (its direct resolver resumes to `Priority`; the payment root is
-    // promoted only when a cost move pauses), so whatever this resumes is the
-    // remainder of a payment that suspended, however it got here (a cost-move
-    // replacement, a triggered-mana prompt, a colour choice). The policy the
+    // promoted only when a cost move pauses). When the root continues an
+    // automatic payment that suspended, however it got here (a cost-move
+    // replacement, a triggered-mana prompt, a colour choice), the policy that
     // payment decided lived only in its call frames and is not persisted, so
     // every auto-tap below plans with every row: drawback avoidance applies
-    // only to a payment that completes without suspending.
-    let enclosing_row_policy = state
-        .active_auto_tap_row_policy
-        .replace(super::casting_costs::AutoTapRowPolicy::AllRows);
+    // only to a payment that completes without suspending. Any other root (a
+    // hand-activated mana ability retrying its activation, a prompt) keeps the
+    // enclosing policy, so a fresh payment it starts still decides.
+    let enclosing_row_policy = state.active_auto_tap_row_policy;
+    if resume.resumes_automatic_payment() {
+        state.active_auto_tap_row_policy = Some(super::casting_costs::AutoTapRowPolicy::AllRows);
+    }
     let resumed = resume_mana_ability_root_payment(state, mana_source_controller, resume, events);
     state.active_auto_tap_row_policy = enclosing_row_policy;
     resumed

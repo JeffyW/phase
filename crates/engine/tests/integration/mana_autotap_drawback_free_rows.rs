@@ -15,7 +15,7 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{ContinuousModification, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{CastPaymentMode, GameState, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, GameState, ManaChoice, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
 use engine::types::phase::Phase;
@@ -39,6 +39,13 @@ If a card or token would be put into a graveyard from anywhere, exile it instead
 const LEYLINE_OF_THE_VOID_ORACLE: &str = "If this card is in your opening hand, you may begin the \
 game with it on the battlefield.\n\
 If a card would be put into an opponent's graveyard from anywhere, exile it instead.";
+const CASCADING_CATARACTS_ORACLE: &str =
+    "Indestructible\n{T}: Add {C}.\n{5}, {T}: Add five mana in any combination of colors.";
+const ANCIENT_TOMB_ORACLE: &str = "{T}: Add {C}{C}. This land deals 2 damage to you.";
+const URBORG_ORACLE: &str = "Each land is a Swamp in addition to its other land types.";
+const SOLDEVI_ADNATE_ORACLE: &str = "{T}, Sacrifice a black or artifact creature: Add an amount \
+of {B} equal to the sacrificed creature's mana value.";
+const VAMPIRE_NIGHTHAWK_ORACLE: &str = "Flying\nDeathtouch\nLifelink";
 const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
@@ -574,5 +581,140 @@ fn resumed_payment_keeps_its_row_policy() {
     assert!(
         runner.state().battlefield.contains(&hobgoblin),
         "reach: the paid Hobgoblin resolves"
+    );
+}
+
+// --- A standalone manual activation's retry is not a resumed automatic payment ---
+
+/// CR 605.3a + CR 602.2b + CR 117.1d: P0 activates Cascading Cataracts'
+/// `{5}, {T}` ability by hand with an empty pool, which opens its own payment
+/// window (no source is tapped). Inside it, Soldevi Adnate sacrifices Vampire
+/// Nighthawk for {B}{B}{B}, and the Cataracts activation is retried. That retry
+/// is the first automatic payment of the remaining {2}, not the remainder of a
+/// suspended automatic payment, so it avoids drawbacks: Urborg makes Ancient
+/// Tomb a Swamp, so Tomb's plain {B} and Urborg's {B} pay it, and Tomb's
+/// `{C}{C}` row (2 damage) is not used. P0 stays at 20 life.
+#[test]
+fn manual_activation_retry_still_avoids_drawback_rows() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cataracts = scenario
+        .add_land_from_oracle(P0, "Cascading Cataracts", CASCADING_CATARACTS_ORACLE)
+        .id();
+    let tomb = scenario
+        .add_land_from_oracle(P0, "Ancient Tomb", ANCIENT_TOMB_ORACLE)
+        .id();
+    let urborg = scenario
+        .add_land_from_oracle(P0, "Urborg, Tomb of Yawgmoth", URBORG_ORACLE)
+        .id();
+    let adnate = scenario
+        .add_creature_from_oracle(P0, "Soldevi Adnate", 1, 2, SOLDEVI_ADNATE_ORACLE)
+        .with_mana_cost(cost(&[ManaCostShard::Black], 1))
+        .id();
+    let nighthawk = scenario
+        .add_creature_from_oracle(P0, "Vampire Nighthawk", 2, 3, VAMPIRE_NIGHTHAWK_ORACLE)
+        .with_mana_cost(cost(&[ManaCostShard::Black, ManaCostShard::Black], 1))
+        .id();
+    let mut runner = build_untapped(scenario, &[cataracts, tomb, urborg, adnate, nighthawk]);
+    assert_eq!(runner.state().players[0].life, 20, "reach: P0 starts at 20");
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "reach: empty pool"
+    );
+
+    let costed_mana_ability = |runner: &GameRunner, source: ObjectId, costed: bool| {
+        runner.state().objects[&source]
+            .abilities
+            .iter()
+            .position(|ability| {
+                engine::game::mana_abilities::is_mana_ability(ability)
+                    && matches!(
+                        ability.cost,
+                        Some(engine::types::ability::AbilityCost::Composite { .. })
+                    ) == costed
+            })
+            .expect("the mana ability")
+    };
+    let five = costed_mana_ability(&runner, cataracts, true);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cataracts,
+            ability_index: five,
+        })
+        .expect("Cataracts' {5} ability starts activating");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ManaAbilityManaPayment { .. }
+        ),
+        "reach: Cataracts' {{5}} opens its payment window, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        !runner.state().objects[&tomb].tapped && !runner.state().objects[&urborg].tapped,
+        "reach: opening the window taps neither Tomb nor Urborg"
+    );
+
+    let adnate_ability = runner.state().objects[&adnate]
+        .abilities
+        .iter()
+        .position(engine::game::mana_abilities::is_mana_ability)
+        .expect("Adnate's mana ability");
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: adnate,
+            ability_index: adnate_ability,
+        })
+        .expect("Adnate activates inside the window");
+    for _ in 0..8 {
+        match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => break,
+            WaitingFor::ReplacementChoice { .. } => {
+                panic!("reach: the board has no replacement that suspends the payment")
+            }
+            WaitingFor::ChooseManaColor { .. } => {
+                runner
+                    .act(GameAction::ChooseManaColor {
+                        choice: ManaChoice::Combination(vec![ManaType::Black; 5]),
+                        count: 1,
+                    })
+                    .expect("Cataracts' output choice");
+            }
+            _ => {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![nighthawk],
+                    })
+                    .expect("Adnate sacrifices Vampire Nighthawk");
+            }
+        }
+    }
+    let state = runner.state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        "the activation completes, got {:?}",
+        state.waiting_for
+    );
+    assert!(
+        !state.battlefield.contains(&nighthawk),
+        "reach: Nighthawk was sacrificed for {{B}}{{B}}{{B}}"
+    );
+    assert!(
+        state.objects[&cataracts].tapped,
+        "reach: Cataracts' ability was activated"
+    );
+    assert_eq!(
+        state.players[0].mana_pool.total(),
+        5,
+        "reach: Cataracts made five mana"
+    );
+    assert!(
+        state.objects[&tomb].tapped && state.objects[&urborg].tapped,
+        "Tomb and Urborg paid the remaining {{2}}"
+    );
+    assert_eq!(
+        state.players[0].life, 20,
+        "the retry used Tomb's plain {{B}}, not its {{C}}{{C}} row that deals 2 damage"
     );
 }
