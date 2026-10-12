@@ -14103,289 +14103,20 @@ fn auto_tap_mana_sources_inner(
     });
     let available = filtered.as_deref().unwrap_or(available);
 
-    let mut to_tap: Vec<ManaSourceOption> = Vec::new();
-    let mut used_sources: HashSet<ObjectId> = HashSet::new();
-
     // Build the typed shard-requirements list first — used by both the
     // combination pre-pass and the main MCV/LCV loop.
-    //
-    // CR 107.4f: Phyrexian shards can be paid with 2 life, so they should
-    // not block using flexible mana sources (dual lands) for strict colored
-    // requirements. We track Phyrexian shards separately and prioritize
-    // them after strict colored shards (MCV will sort them as least constrained).
-    let mut deferred_generic: usize = 0;
-    let mut needs: Vec<(Vec<ManaType>, bool, bool, bool)> = Vec::new();
-    for shard in shards {
-        use crate::game::mana_payment::{shard_to_mana_type, ShardRequirement};
-        match shard_to_mana_type(*shard) {
-            ShardRequirement::Single(color) => {
-                let acceptable = if mana_spend_permission
-                    .is_some_and(|permission| permission.allows_payment_as(color))
-                {
-                    Vec::new()
-                } else {
-                    vec![color]
-                };
-                needs.push((acceptable, false, false, false));
-            }
-            ShardRequirement::Phyrexian(color) => {
-                // CR 107.4f: Mark as phyrexian (4th field = true) so MCV deprioritizes it
-                // compared to strict Single color requirements. Phyrexian can be paid with
-                // life, so we should consume other mana sources for strict requirements first.
-                let acceptable = if mana_spend_permission
-                    .is_some_and(|permission| permission.allows_payment_as(color))
-                {
-                    Vec::new()
-                } else {
-                    vec![color]
-                };
-                needs.push((acceptable, false, false, true));
-            }
-            ShardRequirement::Hybrid(a, b) => {
-                let acceptable = if mana_spend_permission.is_some_and(|permission| {
-                    permission.allows_payment_as(a) || permission.allows_payment_as(b)
-                }) {
-                    Vec::new()
-                } else {
-                    vec![a, b]
-                };
-                needs.push((acceptable, false, false, false));
-            }
-            ShardRequirement::HybridPhyrexian(a, b) => {
-                // CR 107.4f: Hybrid Phyrexian also allows life payment, so deprioritize.
-                let acceptable = if mana_spend_permission.is_some_and(|permission| {
-                    permission.allows_payment_as(a) || permission.allows_payment_as(b)
-                }) {
-                    Vec::new()
-                } else {
-                    vec![a, b]
-                };
-                needs.push((acceptable, false, false, true));
-            }
-            ShardRequirement::TwoGenericHybrid(color) => {
-                let acceptable = if mana_spend_permission
-                    .is_some_and(|permission| permission.allows_payment_as(color))
-                {
-                    Vec::new()
-                } else {
-                    vec![color]
-                };
-                needs.push((acceptable, true, false, false));
-            }
-            // CR 107.4f: K'rrik promotion never reaches the auto-tap
-            // planner (`shard_to_mana_type` never emits this variant),
-            // but the arm is required for exhaustiveness. Same
-            // tap-planning shape as the unpromoted `TwoGenericHybrid` but
-            // with potential life payment, so deprioritize.
-            ShardRequirement::TwoGenericHybridPhyrexian(color) => {
-                let acceptable = if mana_spend_permission
-                    .is_some_and(|permission| permission.allows_payment_as(color))
-                {
-                    Vec::new()
-                } else {
-                    vec![color]
-                };
-                needs.push((acceptable, true, false, true));
-            }
-            ShardRequirement::ColorlessHybrid(color) => {
-                let acceptable = if mana_spend_permission
-                    .is_some_and(|permission| permission.allows_payment_as(color))
-                {
-                    Vec::new()
-                } else {
-                    vec![ManaType::Colorless, color]
-                };
-                needs.push((acceptable, false, false, false));
-            }
-            ShardRequirement::TwoOrMoreColorSource => {
-                needs.push((Vec::new(), false, true, false));
-            }
-            ShardRequirement::Snow | ShardRequirement::X => {
-                deferred_generic += 1;
-            }
-        }
-    }
-
-    let mut assigned = vec![false; needs.len()];
-
-    // Phase 0 (combo pre-pass): CR 605.3b + CR 106.1a — filter-land rows
-    // produce a full multi-mana combination atomically. A naive per-shard
-    // loop can't see that tapping one filter land satisfies two colored
-    // requirements. Pre-allocate combination sources against pairs of
-    // still-unfilled shards before falling through to the single-color loop.
-    assign_combination_sources(
+    let (needs, deferred_generic) = auto_tap_needs(shards, mana_spend_permission);
+    let AutoTapPlan {
+        mut to_tap,
+        used_sources,
+        ..
+    } = choose_auto_tap_plan(
+        state,
         available,
         &needs,
-        &mut assigned,
-        &mut used_sources,
-        &mut to_tap,
+        generic as usize + deferred_generic,
         effective_ctx,
     );
-
-    // Preserve a free, colorless source for each generic slot when another
-    // source can cover the colored shard. This keeps a painland's `{C}` mode
-    // available for generic payment instead of paying life for both mana.
-    // Only reserve options that need no mana sub-cost: those sources can still
-    // supply the generic slot without creating a recursive payment dependency.
-    let mut generic_reservations = HashSet::new();
-    let reservable_count = generic as usize + deferred_generic;
-    for option in available {
-        if generic_reservations.len() == reservable_count {
-            break;
-        }
-        let has_no_mana_sub_cost = option.ability_index.is_none_or(|ability_index| {
-            state
-                .objects
-                .get(&option.object_id)
-                .and_then(|obj| obj.abilities.get(ability_index))
-                .is_some_and(|ability| mana_abilities::mana_sub_cost_of(&ability.cost).is_none())
-        });
-        if option.atomic_combination.is_none()
-            && option.mana_type == ManaType::Colorless
-            && option_allowed_for_context(option, effective_ctx)
-            && option.penalty == mana_sources::ManaSourcePenalty::None
-            && has_no_mana_sub_cost
-        {
-            generic_reservations.insert(option.object_id);
-        }
-    }
-
-    // Phase 1: Assign remaining single-color sources to shards using MCV/LCV.
-    // The naive greedy approach (tap first matching source per shard) fails when
-    // a flexible source (dual land, multi-color dork) gets consumed for a color
-    // that a single-purpose source could have provided, leaving no source for
-    // a color only the flexible source can produce.
-    //
-    // MCV: process the most constrained shard first (fewest available sources).
-    // Phyrexian shards are deprioritized since they can be paid with life.
-    // LCV: for each shard, prefer the least flexible source (fewest color options).
-    for _ in 0..needs.len() {
-        let mut best_idx = None;
-        let mut min_sources = usize::MAX;
-        let mut best_priority = 1u8; // 0 = strict color (prioritized), 1 = phyrexian (deprioritized)
-        for (i, (acceptable, _, requires_two_or_more_color_source, is_phyrexian)) in
-            needs.iter().enumerate()
-        {
-            if assigned[i] {
-                continue;
-            }
-            let count = count_available_sources(
-                available,
-                &used_sources,
-                acceptable,
-                *requires_two_or_more_color_source,
-                effective_ctx,
-            );
-            let priority = if *is_phyrexian { 1u8 } else { 0u8 };
-            // CR 107.4f: Prioritize strict colored shards (priority 0) over Phyrexian
-            // shards (priority 1). Within the same priority tier, use MCV (fewest sources).
-            if priority < best_priority || (priority == best_priority && count < min_sources) {
-                min_sources = count;
-                best_priority = priority;
-                best_idx = Some(i);
-            }
-        }
-        let Some(idx) = best_idx else { break };
-        let (ref acceptable, two_generic_fallback, requires_two_or_more_color_source, _) =
-            &needs[idx];
-        if let Some(option) = find_least_flexible_source(
-            available,
-            &used_sources,
-            &generic_reservations,
-            acceptable,
-            *requires_two_or_more_color_source,
-            effective_ctx,
-        ) {
-            used_sources.insert(option.object_id);
-            to_tap.push(option);
-        } else if *two_generic_fallback {
-            deferred_generic += 2;
-        }
-        assigned[idx] = true;
-    }
-
-    // Phase 2: satisfy generic cost + deferred shards. CR 107.4b: generic mana
-    // in costs can be paid with any type of mana — including colorless — so a
-    // multi-mana source such as Sol Ring (`{T}: Add {C}{C}`) is valid generic
-    // filler. Sources are spent in a fixed priority so the plan both stays
-    // payable and matches player expectation:
-    //   class 0 — color-locked sources (every unit colorless): usable ONLY for
-    //             generic, so spend them first and keep flexible colored
-    //             sources open. This is why a colorless rock (Sol Ring, Mind
-    //             Stone) fills generic before a colored land is tapped. A
-    //             colorless row of a multicolor nonbasic land is excluded: it
-    //             stays flexible at the object level and must not leapfrog a
-    //             basic land.
-    //   class 1 — basic lands.
-    //   class 2 — other flexible single-mana sources, including colorless rows
-    //             of multicolor nonbasic lands.
-    //   class 3 — flexible (colored) combination sources: last resort. Burning
-    //             a 2-mana colored combo on generic wastes half its output when
-    //             a cheaper line exists, so a filter land's `{T}: Add {C}`
-    //             (class 0) is preferred over its colored combo for pure
-    //             generic (see `auto_tap_does_not_use_combo_for_pure_generic`).
-    // A combination source credits its full atomic width toward generic — one
-    // activation yields every unit at once. Previously ALL combination sources
-    // were skipped here, which stranded Sol Ring (a combo with no non-combo
-    // sibling ability) and made spells payable only by colorless rocks read as
-    // uncastable in the shared affordability preview.
-    let mut remaining_generic = generic as usize + deferred_generic;
-    let generic_priority = |option: &ManaSourceOption| -> u8 {
-        let color_locked = match &option.atomic_combination {
-            Some(combo) => combo.iter().all(|m| *m == ManaType::Colorless),
-            None => option.mana_type == ManaType::Colorless,
-        };
-        let object = state.objects.get(&option.object_id);
-        let is_basic_land = object.is_some_and(|obj| {
-            obj.card_types
-                .core_types
-                .contains(&crate::types::card_type::CoreType::Land)
-                && obj
-                    .card_types
-                    .supertypes
-                    .contains(&crate::types::card_type::Supertype::Basic)
-        });
-        let is_multicolor_nonbasic_land = object.is_some_and(|obj| {
-            obj.card_types
-                .core_types
-                .contains(&crate::types::card_type::CoreType::Land)
-                && !obj
-                    .card_types
-                    .supertypes
-                    .contains(&crate::types::card_type::Supertype::Basic)
-                && option.source_could_produce_two_or_more_colors
-        });
-        if color_locked && !is_multicolor_nonbasic_land {
-            0
-        } else if is_basic_land {
-            1
-        } else if option.atomic_combination.is_none() {
-            2
-        } else {
-            3
-        }
-    };
-    for class in 0u8..=3 {
-        if remaining_generic == 0 {
-            break;
-        }
-        for option in available {
-            if remaining_generic == 0 {
-                break;
-            }
-            if generic_priority(option) != class {
-                continue;
-            }
-            let eligible_width = option_mana_types_for_context(option, effective_ctx).len();
-            if !option_allowed_for_context(option, effective_ctx) || eligible_width == 0 {
-                continue;
-            }
-            if used_sources.insert(option.object_id) {
-                to_tap.push(option.clone());
-                remaining_generic = remaining_generic.saturating_sub(eligible_width);
-            }
-        }
-    }
 
     // Phase 3: activate each selected mana source.
     //
@@ -14583,6 +14314,481 @@ fn auto_tap_mana_sources_inner(
             });
         }
     }
+}
+
+/// One colored-shard requirement of an auto-tap plan: the acceptable mana
+/// types (empty = any), whether an unmet shard falls back to two generic
+/// (CR 107.4e), whether it needs a source that could produce two or more
+/// colors, and whether it is Phyrexian (CR 107.4f).
+type AutoTapNeed = (Vec<ManaType>, bool, bool, bool);
+
+/// Translate a cost's shards into auto-tap requirements. Returns the colored
+/// requirements and the number of shards deferred to generic payment.
+fn auto_tap_needs(
+    shards: &[crate::types::mana::ManaCostShard],
+    mana_spend_permission: Option<crate::types::ability::ManaSpendPermission>,
+) -> (Vec<AutoTapNeed>, usize) {
+    // CR 107.4f: Phyrexian shards can be paid with 2 life, so they should
+    // not block using flexible mana sources (dual lands) for strict colored
+    // requirements. We track Phyrexian shards separately and prioritize
+    // them after strict colored shards (MCV will sort them as least constrained).
+    let mut deferred_generic: usize = 0;
+    let mut needs: Vec<AutoTapNeed> = Vec::new();
+    for shard in shards {
+        use crate::game::mana_payment::{shard_to_mana_type, ShardRequirement};
+        match shard_to_mana_type(*shard) {
+            ShardRequirement::Single(color) => {
+                let acceptable = if mana_spend_permission
+                    .is_some_and(|permission| permission.allows_payment_as(color))
+                {
+                    Vec::new()
+                } else {
+                    vec![color]
+                };
+                needs.push((acceptable, false, false, false));
+            }
+            ShardRequirement::Phyrexian(color) => {
+                // CR 107.4f: Mark as phyrexian (4th field = true) so MCV deprioritizes it
+                // compared to strict Single color requirements. Phyrexian can be paid with
+                // life, so we should consume other mana sources for strict requirements first.
+                let acceptable = if mana_spend_permission
+                    .is_some_and(|permission| permission.allows_payment_as(color))
+                {
+                    Vec::new()
+                } else {
+                    vec![color]
+                };
+                needs.push((acceptable, false, false, true));
+            }
+            ShardRequirement::Hybrid(a, b) => {
+                let acceptable = if mana_spend_permission.is_some_and(|permission| {
+                    permission.allows_payment_as(a) || permission.allows_payment_as(b)
+                }) {
+                    Vec::new()
+                } else {
+                    vec![a, b]
+                };
+                needs.push((acceptable, false, false, false));
+            }
+            ShardRequirement::HybridPhyrexian(a, b) => {
+                // CR 107.4f: Hybrid Phyrexian also allows life payment, so deprioritize.
+                let acceptable = if mana_spend_permission.is_some_and(|permission| {
+                    permission.allows_payment_as(a) || permission.allows_payment_as(b)
+                }) {
+                    Vec::new()
+                } else {
+                    vec![a, b]
+                };
+                needs.push((acceptable, false, false, true));
+            }
+            ShardRequirement::TwoGenericHybrid(color) => {
+                let acceptable = if mana_spend_permission
+                    .is_some_and(|permission| permission.allows_payment_as(color))
+                {
+                    Vec::new()
+                } else {
+                    vec![color]
+                };
+                needs.push((acceptable, true, false, false));
+            }
+            // CR 107.4f: K'rrik promotion never reaches the auto-tap
+            // planner (`shard_to_mana_type` never emits this variant),
+            // but the arm is required for exhaustiveness. Same
+            // tap-planning shape as the unpromoted `TwoGenericHybrid` but
+            // with potential life payment, so deprioritize.
+            ShardRequirement::TwoGenericHybridPhyrexian(color) => {
+                let acceptable = if mana_spend_permission
+                    .is_some_and(|permission| permission.allows_payment_as(color))
+                {
+                    Vec::new()
+                } else {
+                    vec![color]
+                };
+                needs.push((acceptable, true, false, true));
+            }
+            ShardRequirement::ColorlessHybrid(color) => {
+                let acceptable = if mana_spend_permission
+                    .is_some_and(|permission| permission.allows_payment_as(color))
+                {
+                    Vec::new()
+                } else {
+                    vec![ManaType::Colorless, color]
+                };
+                needs.push((acceptable, false, false, false));
+            }
+            ShardRequirement::TwoOrMoreColorSource => {
+                needs.push((Vec::new(), false, true, false));
+            }
+            ShardRequirement::Snow | ShardRequirement::X => {
+                deferred_generic += 1;
+            }
+        }
+    }
+
+    (needs, deferred_generic)
+}
+
+/// The rows one auto-tap plan activates (Phases 0-2 of
+/// [`auto_tap_mana_sources_inner`]). Pure: nothing is tapped here.
+struct AutoTapPlan {
+    to_tap: Vec<ManaSourceOption>,
+    used_sources: HashSet<ObjectId>,
+    /// Every colored requirement and every generic unit has a planned source.
+    /// Mana sub-costs of the planned rows are not included; see
+    /// [`planned_mana_sub_costs_fundable`].
+    covers_cost: bool,
+}
+
+/// Plan which of `available` (sorted by `collect_sorted_auto_tap_source_options`)
+/// pay `needs` plus `generic_units` generic mana.
+fn plan_auto_tap_rows(
+    state: &GameState,
+    available: &[ManaSourceOption],
+    needs: &[AutoTapNeed],
+    generic_units: usize,
+    payment_context: Option<&PaymentContext<'_>>,
+) -> AutoTapPlan {
+    let mut to_tap: Vec<ManaSourceOption> = Vec::new();
+    let mut used_sources: HashSet<ObjectId> = HashSet::new();
+    let mut assigned = vec![false; needs.len()];
+    let mut unfilled_shards = 0usize;
+    let mut remaining_generic = generic_units;
+
+    // Phase 0 (combo pre-pass): CR 605.3b + CR 106.1a — filter-land rows
+    // produce a full multi-mana combination atomically. A naive per-shard
+    // loop can't see that tapping one filter land satisfies two colored
+    // requirements. Pre-allocate combination sources against pairs of
+    // still-unfilled shards before falling through to the single-color loop.
+    assign_combination_sources(
+        available,
+        needs,
+        &mut assigned,
+        &mut used_sources,
+        &mut to_tap,
+        payment_context,
+    );
+
+    // Preserve a free, colorless source for each generic slot when another
+    // source can cover the colored shard. This keeps a painland's `{C}` mode
+    // available for generic payment instead of paying life for both mana.
+    // Only reserve options that need no mana sub-cost: those sources can still
+    // supply the generic slot without creating a recursive payment dependency.
+    let mut generic_reservations = HashSet::new();
+    for option in available {
+        if generic_reservations.len() == generic_units {
+            break;
+        }
+        let has_no_mana_sub_cost = option.ability_index.is_none_or(|ability_index| {
+            state
+                .objects
+                .get(&option.object_id)
+                .and_then(|obj| obj.abilities.get(ability_index))
+                .is_some_and(|ability| mana_abilities::mana_sub_cost_of(&ability.cost).is_none())
+        });
+        if option.atomic_combination.is_none()
+            && option.mana_type == ManaType::Colorless
+            && option_allowed_for_context(option, payment_context)
+            && option.penalty == mana_sources::ManaSourcePenalty::None
+            && has_no_mana_sub_cost
+        {
+            generic_reservations.insert(option.object_id);
+        }
+    }
+
+    // Phase 1: Assign remaining single-color sources to shards using MCV/LCV.
+    // The naive greedy approach (tap first matching source per shard) fails when
+    // a flexible source (dual land, multi-color dork) gets consumed for a color
+    // that a single-purpose source could have provided, leaving no source for
+    // a color only the flexible source can produce.
+    //
+    // MCV: process the most constrained shard first (fewest available sources).
+    // Phyrexian shards are deprioritized since they can be paid with life.
+    // LCV: for each shard, prefer the least flexible source (fewest color options).
+    for _ in 0..needs.len() {
+        let mut best_idx = None;
+        let mut min_sources = usize::MAX;
+        let mut best_priority = 1u8; // 0 = strict color (prioritized), 1 = phyrexian (deprioritized)
+        for (i, (acceptable, _, requires_two_or_more_color_source, is_phyrexian)) in
+            needs.iter().enumerate()
+        {
+            if assigned[i] {
+                continue;
+            }
+            let count = count_available_sources(
+                available,
+                &used_sources,
+                acceptable,
+                *requires_two_or_more_color_source,
+                payment_context,
+            );
+            let priority = if *is_phyrexian { 1u8 } else { 0u8 };
+            // CR 107.4f: Prioritize strict colored shards (priority 0) over Phyrexian
+            // shards (priority 1). Within the same priority tier, use MCV (fewest sources).
+            if priority < best_priority || (priority == best_priority && count < min_sources) {
+                min_sources = count;
+                best_priority = priority;
+                best_idx = Some(i);
+            }
+        }
+        let Some(idx) = best_idx else { break };
+        let (ref acceptable, two_generic_fallback, requires_two_or_more_color_source, _) =
+            &needs[idx];
+        if let Some(option) = find_least_flexible_source(
+            available,
+            &used_sources,
+            &generic_reservations,
+            acceptable,
+            *requires_two_or_more_color_source,
+            payment_context,
+        ) {
+            used_sources.insert(option.object_id);
+            to_tap.push(option);
+        } else if *two_generic_fallback {
+            remaining_generic += 2;
+        } else {
+            unfilled_shards += 1;
+        }
+        assigned[idx] = true;
+    }
+
+    // Phase 2: satisfy generic cost + deferred shards. CR 107.4b: generic mana
+    // in costs can be paid with any type of mana — including colorless — so a
+    // multi-mana source such as Sol Ring (`{T}: Add {C}{C}`) is valid generic
+    // filler. Sources are spent in a fixed priority so the plan both stays
+    // payable and matches player expectation:
+    //   class 0 — color-locked sources (every unit colorless): usable ONLY for
+    //             generic, so spend them first and keep flexible colored
+    //             sources open. This is why a colorless rock (Sol Ring, Mind
+    //             Stone) fills generic before a colored land is tapped. A
+    //             colorless row of a multicolor nonbasic land is excluded: it
+    //             stays flexible at the object level and must not leapfrog a
+    //             basic land.
+    //   class 1 — basic lands.
+    //   class 2 — other flexible single-mana sources, including colorless rows
+    //             of multicolor nonbasic lands.
+    //   class 3 — flexible (colored) combination sources: last resort. Burning
+    //             a 2-mana colored combo on generic wastes half its output when
+    //             a cheaper line exists, so a filter land's `{T}: Add {C}`
+    //             (class 0) is preferred over its colored combo for pure
+    //             generic (see `auto_tap_does_not_use_combo_for_pure_generic`).
+    // A combination source credits its full atomic width toward generic — one
+    // activation yields every unit at once. Previously ALL combination sources
+    // were skipped here, which stranded Sol Ring (a combo with no non-combo
+    // sibling ability) and made spells payable only by colorless rocks read as
+    // uncastable in the shared affordability preview.
+    let generic_priority = |option: &ManaSourceOption| -> u8 {
+        let color_locked = match &option.atomic_combination {
+            Some(combo) => combo.iter().all(|m| *m == ManaType::Colorless),
+            None => option.mana_type == ManaType::Colorless,
+        };
+        let object = state.objects.get(&option.object_id);
+        let is_basic_land = object.is_some_and(|obj| {
+            obj.card_types
+                .core_types
+                .contains(&crate::types::card_type::CoreType::Land)
+                && obj
+                    .card_types
+                    .supertypes
+                    .contains(&crate::types::card_type::Supertype::Basic)
+        });
+        let is_multicolor_nonbasic_land = object.is_some_and(|obj| {
+            obj.card_types
+                .core_types
+                .contains(&crate::types::card_type::CoreType::Land)
+                && !obj
+                    .card_types
+                    .supertypes
+                    .contains(&crate::types::card_type::Supertype::Basic)
+                && option.source_could_produce_two_or_more_colors
+        });
+        if color_locked && !is_multicolor_nonbasic_land {
+            0
+        } else if is_basic_land {
+            1
+        } else if option.atomic_combination.is_none() {
+            2
+        } else {
+            3
+        }
+    };
+    for class in 0u8..=3 {
+        if remaining_generic == 0 {
+            break;
+        }
+        for option in available {
+            if remaining_generic == 0 {
+                break;
+            }
+            if generic_priority(option) != class {
+                continue;
+            }
+            let eligible_width = option_mana_types_for_context(option, payment_context).len();
+            if !option_allowed_for_context(option, payment_context) || eligible_width == 0 {
+                continue;
+            }
+            if used_sources.insert(option.object_id) {
+                to_tap.push(option.clone());
+                remaining_generic = remaining_generic.saturating_sub(eligible_width);
+            }
+        }
+    }
+
+    AutoTapPlan {
+        to_tap,
+        used_sources,
+        covers_cost: unfilled_shards == 0 && remaining_generic == 0,
+    }
+}
+
+/// CR 601.2g + CR 605.3b: Choose which mana-source rows auto-pay activates.
+///
+/// A source may offer a drawback-free mana ability beside a multi-mana one that
+/// costs or does more (`mana_sources::mana_source_option_has_drawback`): Arena of
+/// Glory's `{T}: Add {R}` beside its `{R}, {T}, Exert: Add {R}{R}`, Dwarven
+/// Ruins' `{T}: Add {R}` beside its `{T}, Sacrifice: Add {R}{R}`, a filter land's
+/// `{T}: Add {C}` beside its hybrid-costed pairs. The combination pre-pass
+/// (Phase 0) commits such a row whenever it covers a colored shard, before the
+/// per-source penalty ordering is consulted. Exerting (CR 701.43a: "you choose")
+/// and sacrificing (CR 701.21a) are the player's choices, and a mana sub-cost
+/// spends another source's mana, so none of them should be made when nothing
+/// needs them.
+///
+/// The planner therefore first withholds the drawback combination rows of every
+/// source that also has a drawback-free row, and uses that plan when it pays the
+/// whole cost, sub-costs included. Otherwise it plans with every row, as before,
+/// so a cost only the drawback row can pay is still paid with it.
+///
+/// Single-mana rows are never withheld: the source sort already ranks them by
+/// penalty, and withholding them would change choices between different sources
+/// (a painland's colored row vs. a mana creature). A source with no drawback-free
+/// row (a Signet, Darkwater Catacombs) keeps all its rows.
+fn choose_auto_tap_plan(
+    state: &GameState,
+    available: &[ManaSourceOption],
+    needs: &[AutoTapNeed],
+    generic_units: usize,
+    payment_context: Option<&PaymentContext<'_>>,
+) -> AutoTapPlan {
+    if let Some(drawback_free) = rows_without_avoidable_drawback_combinations(state, available) {
+        let plan = plan_auto_tap_rows(state, &drawback_free, needs, generic_units, payment_context);
+        if plan.covers_cost
+            && planned_mana_sub_costs_fundable(
+                state,
+                available,
+                &plan,
+                &mut plan.used_sources.clone(),
+            )
+        {
+            return plan;
+        }
+    }
+    plan_auto_tap_rows(state, available, needs, generic_units, payment_context)
+}
+
+/// `available` without the drawback combination rows (`atomic_combination`) of
+/// every source that also has a drawback-free row in `available`. `None` when no
+/// row is withheld.
+fn rows_without_avoidable_drawback_combinations(
+    state: &GameState,
+    available: &[ManaSourceOption],
+) -> Option<Vec<ManaSourceOption>> {
+    let drawbacks: Vec<bool> = available
+        .iter()
+        .map(|option| mana_sources::mana_source_option_has_drawback(state, option))
+        .collect();
+    let withheld_candidate = |option: &ManaSourceOption, has_drawback: bool| {
+        has_drawback && option.atomic_combination.is_some()
+    };
+    if !available
+        .iter()
+        .zip(&drawbacks)
+        .any(|(option, has_drawback)| withheld_candidate(option, *has_drawback))
+    {
+        return None;
+    }
+    let sources_with_free_row: HashSet<ObjectId> = available
+        .iter()
+        .zip(&drawbacks)
+        .filter(|(_, has_drawback)| !**has_drawback)
+        .map(|(option, _)| option.object_id)
+        .collect();
+    let rows: Vec<ManaSourceOption> = available
+        .iter()
+        .zip(&drawbacks)
+        .filter(|(option, has_drawback)| {
+            !withheld_candidate(option, **has_drawback)
+                || !sources_with_free_row.contains(&option.object_id)
+        })
+        .map(|(option, _)| option.clone())
+        .collect();
+    (rows.len() < available.len()).then_some(rows)
+}
+
+/// CR 605.3b + CR 118.3: True when every mana sub-cost of the rows `plan`
+/// activates can be paid by sources the plan leaves unused, recursively.
+/// `consumed` starts as the plan's own sources and grows as sub-costs claim more.
+///
+/// Phase 3 of [`auto_tap_mana_sources_inner`] pays each sub-cost with a nested
+/// auto-tap that excludes the outer plan's sources. This checks that payment the
+/// same way, with the same planner, but conservatively: mana already in the pool
+/// (including surplus from earlier activations) is not counted, and a sub-cost
+/// shape the planner cannot read counts as unfundable. A wrong `false` only makes
+/// [`choose_auto_tap_plan`] fall back to the plan with every row.
+fn planned_mana_sub_costs_fundable(
+    state: &GameState,
+    available: &[ManaSourceOption],
+    plan: &AutoTapPlan,
+    consumed: &mut HashSet<ObjectId>,
+) -> bool {
+    use crate::types::mana::ManaCost;
+
+    for option in &plan.to_tap {
+        let Some(ability_index) = option.ability_index else {
+            continue;
+        };
+        let Some(sub_cost) = state
+            .objects
+            .get(&option.object_id)
+            .and_then(|object| object.abilities.get(ability_index))
+            .and_then(|ability| mana_abilities::mana_sub_cost_of(&ability.cost))
+        else {
+            continue;
+        };
+        let (shards, generic) = match sub_cost {
+            ManaCost::NoCost => continue,
+            ManaCost::Cost { shards, generic } => (shards.as_slice(), *generic),
+            ManaCost::SelfManaCost
+            | ManaCost::SelfManaValue
+            | ManaCost::SelfManaCostReduced { .. } => return false,
+        };
+        let (needs, deferred_generic) = auto_tap_needs(shards, None);
+        let remaining: Vec<ManaSourceOption> = available
+            .iter()
+            .filter(|row| !consumed.contains(&row.object_id))
+            .cloned()
+            .collect();
+        let activation_context = super::casting::activation_payment_context(
+            state,
+            option.object_id,
+            Some(ability_index),
+        );
+        let activation_ctx = activation_context.as_payment_context();
+        let nested = plan_auto_tap_rows(
+            state,
+            &remaining,
+            &needs,
+            generic as usize + deferred_generic,
+            Some(&activation_ctx),
+        );
+        if !nested.covers_cost {
+            return false;
+        }
+        consumed.extend(nested.used_sources.iter().copied());
+        if !planned_mana_sub_costs_fundable(state, available, &nested, consumed) {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn production_override_for_option(
