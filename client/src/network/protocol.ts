@@ -106,9 +106,12 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  116 — game_setup and state_update carry GameState with the per-turn crew
+ *  121 — game_setup and state_update carry GameState with the per-turn crew
  *       relation (crew_history_this_turn) and FilterProp::CrewedThisTurn
- *       (CR 702.122c). Bumped in lockstep with full-game protocol 134.
+ *       (CR 702.122c). Bumped in lockstep with full-game protocol 139.
+ *  116 — game_setup and state_update carry GameState whose AbilityActivated trigger
+ *       events may name the activation's stack_entry. Bumped in lockstep with
+ *       full-game protocol 134.
  *  115 — game_setup and state_update carry GameState whose NamedChoice source
  *       binding may be PendingEntry (CR 614.12a pre-entry as-enters choices).
  *       Bumped in lockstep with full-game protocol 133.
@@ -662,7 +665,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 116 as const;
+export const WIRE_PROTOCOL_VERSION = 121 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

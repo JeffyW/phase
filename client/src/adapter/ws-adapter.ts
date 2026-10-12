@@ -210,10 +210,17 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 134 — CR 702.122c per-turn crew relation: GameState gains
+ * 139 — CR 702.122c per-turn crew relation: GameState gains
  *      crew_history_this_turn and FilterProp gains CrewedThisTurn — see
- *      PROTOCOL_VERSION's own `/// 134` entry in crates/lobby-broker/src/protocol.rs.
- *      A v133 peer cannot parse the new filter tag. Wire 116 moves with it.
+ *      PROTOCOL_VERSION's own `/// 139` entry in crates/lobby-broker/src/protocol.rs.
+ *      A v138 peer cannot parse the new filter tag. Wire 121 moves with it.
+ * 134 — GameEvent::AbilityActivated gains stack_entry, the stack object a
+ *      stack-using activation created, carried in GameState's trigger events —
+ *      see PROTOCOL_VERSION's own `/// 134` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v133 peer drops it silently and
+ *      resolves an activation trigger's "copy that ability" differently; the
+ *      exact-match version check at connect refuses the pairing. Wire 116
+ *      moves with it.
  * 133 — CR 614.12a pre-entry as-enters choices: NamedChoiceSourceBinding gains
  *      PendingEntry (WaitingFor.NamedChoice.source.binding), and the parked
  *      entry event / PendingReplacement carry the answers and the paused
@@ -841,7 +848,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 134;
+export const PROTOCOL_VERSION = 139;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
