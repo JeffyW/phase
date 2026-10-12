@@ -4623,7 +4623,9 @@ fn entering_object_projection(
 
 /// CR 614.12: the entering permanent "as it would exist on the battlefield"
 /// for an entrant whose as-enters choices are made before it enters
-/// (`replacement::object_has_pre_entry_choice`). Two typed boundaries:
+/// (`replacement::object_has_pre_entry_choice`), built for one consumer: the
+/// entry replacement or static whose filter is being matched. Two typed
+/// boundaries:
 ///
 /// * [`EntryProjection::proposed`] — while the entry is still a proposal. The
 ///   object is prepared as the NEW object (CR 400.7): its chosen attributes are
@@ -4634,23 +4636,26 @@ fn entering_object_projection(
 ///   reset, its choices installed), for the static "enters with an additional
 ///   counter" path that reads it before the layer pass runs.
 ///
-/// Both then apply the object's own static abilities that would apply to it on
-/// the battlefield (types and colours, CR 613.1d / CR 613.1e) through the layer
-/// pass's own per-object applier, within the completeness contract of
-/// [`entry_projection_supports_static`]. Other entrants are not projected.
+/// Both apply only the entrant's allowlisted own statics
+/// ([`entry_projection_allowlisted`]) through the layer pass's own applier.
+/// A projection exists only when it is proven for the consumer
+/// ([`entry_projection_proven_for`]); otherwise there is none and the consumer
+/// reads the entrant as staged. Other entrants are not projected.
 pub(crate) enum EntryProjection {}
 
 impl EntryProjection {
     /// CR 614.12 + CR 614.12a: `staged` (the entrant as currently staged) as it
-    /// would exist on the battlefield with `entry_choices` made. `None` when the
-    /// entrant has no pre-entry choice.
+    /// would exist on the battlefield with `entry_choices` made, for a consumer
+    /// matching `consumer`. `None` when the entrant has no pre-entry choice or
+    /// the projection isn't proven for that consumer.
     fn proposed(
         state: &GameState,
         mut staged: crate::game::game_object::GameObject,
         entry_choices: &[ChosenAttribute],
         controller_override: Option<PlayerId>,
+        consumer: &TargetFilter,
     ) -> Option<crate::game::game_object::GameObject> {
-        if !crate::game::replacement::object_has_pre_entry_choice(&staged) {
+        if !entry_projection_exists_for(&staged, consumer) {
             return None;
         }
         staged.chosen_attributes = entry_choices.to_vec();
@@ -4661,144 +4666,124 @@ impl EntryProjection {
         Some(staged)
     }
 
-    /// CR 614.12: the just-delivered entrant with its own statics applied.
-    /// `None` when it has no pre-entry choice.
+    /// CR 614.12: the just-delivered entrant with its allowlisted own statics
+    /// applied, for a consumer matching `consumer`. `None` when it has no
+    /// pre-entry choice or the projection isn't proven for that consumer.
     pub(crate) fn delivered(
         state: &GameState,
         object_id: ObjectId,
+        consumer: &TargetFilter,
     ) -> Option<crate::game::game_object::GameObject> {
-        let mut entered = state.objects.get(&object_id)?.clone();
-        if !crate::game::replacement::object_has_pre_entry_choice(&entered) {
+        let entered = state.objects.get(&object_id)?;
+        if !entry_projection_exists_for(entered, consumer) {
             return None;
         }
+        let mut entered = entered.clone();
         apply_entrant_own_statics(state, &mut entered);
         Some(entered)
     }
 }
 
-/// CR 614.12: the completeness contract of the entry projection — whether a
-/// static of the entrant is either outside its scope (no type or colour
-/// effect, not continuous, or affecting only the object an Aura or Equipment is
-/// attached to, which the entrant itself can never be) or one the projection
-/// applies exactly: an unconditional static whose type/colour modifications
-/// the shared applier performs. Anything else — a condition, a land-subtype set
-/// (CR 305.7's ability removal belongs to the layer pass), or a granted static
-/// carrying a type/colour effect — is unsupported: the runtime skips exactly
-/// these, and coverage marks such a face unsupported (`ENTRY_PROJECTION_GAP`).
-pub(crate) fn entry_projection_supports_static(
-    def: &crate::types::ability::StaticDefinition,
+/// CR 614.12: whether an entrant gets a projection for `consumer` — it has a
+/// pre-entry choice and the projection is proven for what `consumer` reads.
+fn entry_projection_exists_for(
+    entrant: &crate::game::game_object::GameObject,
+    consumer: &TargetFilter,
 ) -> bool {
-    if def.mode != StaticMode::Continuous
-        || !static_has_type_or_color_effect(def)
-        || static_affects_only_attachment_host(def)
-    {
-        return true;
-    }
-    def.condition.is_none()
-        && def
-            .modifications
-            .iter()
-            .all(|modification| match modification {
-                ContinuousModification::SetBasicLandType { .. }
-                | ContinuousModification::SetChosenBasicLandType => false,
-                ContinuousModification::GrantStaticAbility { definition } => {
-                    !static_has_type_or_color_effect(definition)
-                }
-                _ => true,
-            })
+    crate::game::replacement::object_has_pre_entry_choice(entrant)
+        && entry_projection_proven_for(
+            entrant.static_definitions.as_slice(),
+            target_filter_characteristic_reads(consumer),
+        )
 }
 
-/// Whether a static changes types or colours, directly or through a static it
-/// grants.
-fn static_has_type_or_color_effect(def: &crate::types::ability::StaticDefinition) -> bool {
-    def.modifications.iter().any(|modification| {
-        is_type_or_color_modification(modification)
-            || matches!(
-                modification,
-                ContinuousModification::GrantStaticAbility { definition }
-                    if static_has_type_or_color_effect(definition)
-            )
-    })
-}
-
-/// Whether a static is within the entry projection's scope: a continuous
-/// type/colour static that can apply to the entrant itself.
-fn static_in_entry_projection_scope(def: &crate::types::ability::StaticDefinition) -> bool {
+/// CR 614.12 + CR 613.1d + CR 613.1e: the projection's allowlist — the own
+/// static shapes it applies exactly. A functioning, unconditional `Continuous`
+/// static affecting only the entrant itself whose every modification adds the
+/// chosen subtype, the chosen colour, or every creature type (Metallic Mimic,
+/// Adaptive Automaton, Bloodline Pretender). These only add, and read no
+/// characteristic, so their written order and their affected set are exact.
+fn entry_projection_allowlisted(def: &crate::types::ability::StaticDefinition) -> bool {
     def.mode == StaticMode::Continuous
-        && static_has_type_or_color_effect(def)
-        && !static_affects_only_attachment_host(def)
+        && def.condition.is_none()
+        && matches!(def.affected, Some(TargetFilter::SelfRef))
+        && !def.modifications.is_empty()
+        && def.modifications.iter().all(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::AddChosenSubtype { .. }
+                    | ContinuousModification::AddChosenColor { .. }
+                    | ContinuousModification::AddAllCreatureTypes
+            )
+        })
 }
 
-/// CR 614.12 + CR 613.3 + CR 613.6 + CR 613.8: the projection's set-level
-/// contract for the static at `index` among the entrant's statics. The
-/// projection decides every static's affected-set membership once, up front,
-/// and applies the statics in written order within a layer. That is exact only
-/// when no other in-scope static of the entrant can change what this one's
-/// affected filter reads (CR 613.6 / CR 613.8 dependency) and no
-/// characteristic-defining static must jump the written order (CR 613.3).
-/// Anything else is unproven and fails closed: the runtime skips it and
-/// coverage marks the face (`ENTRY_PROJECTION_GAP`).
-pub(crate) fn entry_projection_proves_static(
+/// Whether an own static can apply to the entrant itself. An "other" filter
+/// excludes its source, and "enchanted/equipped" names the object an Aura or
+/// Equipment is attached to (CR 303.4 + CR 301.5), never the attachment;
+/// anything else is assumed to apply.
+fn static_can_apply_to_entrant(def: &crate::types::ability::StaticDefinition) -> bool {
+    !matches!(
+        &def.affected,
+        Some(TargetFilter::Typed(typed)) if typed.properties.iter().any(|prop| {
+            matches!(
+                prop,
+                FilterProp::Another | FilterProp::EnchantedBy | FilterProp::EquippedBy
+            )
+        })
+    )
+}
+
+/// CR 614.12 + CR 613.1: the characteristic kinds the entrant's own statics
+/// write on it that the projection doesn't apply — every own static that can
+/// apply to it, except the allowlisted ones.
+pub(crate) fn entry_projection_unprojected_writes(
     statics: &[crate::types::ability::StaticDefinition],
-    index: usize,
-) -> bool {
-    let def = &statics[index];
-    if !static_in_entry_projection_scope(def) {
-        return true;
-    }
-    if !entry_projection_supports_static(def) {
-        return false;
-    }
-    let others = || {
-        statics
-            .iter()
-            .enumerate()
-            .filter(move |(other, candidate)| {
-                *other != index && static_in_entry_projection_scope(candidate)
-            })
-            .map(|(_, candidate)| candidate)
-    };
-    // CR 613.3: a characteristic-defining ability applies before the other
-    // effects in its layer, which written order doesn't prove.
-    if (def.characteristic_defining && others().next().is_some())
-        || others().any(|other| other.characteristic_defining)
-    {
-        return false;
-    }
-    let reads = match crate::game::layers::static_affected_filter(def).as_ref() {
-        TargetFilter::SelfRef | TargetFilter::Any => CharacteristicKinds::EMPTY,
-        filter => target_filter_characteristic_reads(filter),
-    };
-    let writes = others().flat_map(|other| other.modifications.iter()).fold(
-        CharacteristicKinds::EMPTY,
-        |writes, modification| {
+) -> CharacteristicKinds {
+    statics
+        .iter()
+        .filter(|def| static_can_apply_to_entrant(def) && !entry_projection_allowlisted(def))
+        .flat_map(|def| def.modifications.iter())
+        .fold(CharacteristicKinds::EMPTY, |writes, modification| {
             writes.union(crate::game::layers::modification_characteristic_writes(
                 modification,
             ))
-        },
-    );
-    !reads.intersects(writes)
+        })
 }
 
-/// CR 614.12: whether the projection proves every static of a face or object
-/// — the face-level form of [`entry_projection_proves_static`] that coverage
-/// reads.
-pub(crate) fn entry_projection_supports_statics(
+/// CR 614.12: the single authority for the projection's completeness. It is
+/// exact for a consumer reading `consumer_reads` iff none of the entrant's
+/// unprojected own writes is of a kind the consumer reads. The runtime asks it
+/// per consumer filter; coverage asks it with [`ENTRY_CONSUMER_READS`].
+pub(crate) fn entry_projection_proven_for(
     statics: &[crate::types::ability::StaticDefinition],
+    consumer_reads: CharacteristicKinds,
 ) -> bool {
-    (0..statics.len()).all(|index| entry_projection_proves_static(statics, index))
+    !entry_projection_unprojected_writes(statics).intersects(consumer_reads)
 }
+
+/// The kinds entry consumers may read under coverage's contract — every kind
+/// a printed entry consumer reads: types (CR 613.1d — a subtype read also reads
+/// the Changeling ability, CR 702.73a, so abilities, CR 613.1f), colour
+/// (CR 613.1e), controller (CR 613.1b) and mana value (CR 202.3, Thunderous
+/// Velocipede).
+/// An entrant face is checked against it (`coverage::ENTRY_PROJECTION_GAP`); a
+/// consumer face reading outside it is unsupported
+/// (`coverage::ENTRY_CONSUMER_GAP`).
+pub(crate) const ENTRY_CONSUMER_READS: CharacteristicKinds = CharacteristicKinds::CARD_TYPES
+    .union(CharacteristicKinds::ABILITIES)
+    .union(CharacteristicKinds::COLOR)
+    .union(CharacteristicKinds::CONTROLLER)
+    .union(CharacteristicKinds::MANA_COST);
 
 /// CR 614.12 + CR 616.1e: whether the entrant's projection depends on its
-/// as-enters choices — an own static the projection applies that reads the
-/// chosen subtype or colour.
+/// as-enters choices — an allowlisted own static that adds the chosen subtype
+/// or colour.
 pub(crate) fn entry_projection_reads_choices(
     entrant: &crate::game::game_object::GameObject,
 ) -> bool {
-    let statics = entrant.static_definitions.as_slice();
-    statics.iter().enumerate().any(|(index, def)| {
-        static_in_entry_projection_scope(def)
-            && entry_projection_proves_static(statics, index)
+    entrant.static_definitions.as_slice().iter().any(|def| {
+        entry_projection_allowlisted(def)
             && def.modifications.iter().any(|modification| {
                 matches!(
                     modification,
@@ -4807,28 +4792,6 @@ pub(crate) fn entry_projection_reads_choices(
                 )
             })
     })
-}
-
-/// CR 613.1d + CR 613.1e: a type- or colour-changing modification.
-fn is_type_or_color_modification(modification: &ContinuousModification) -> bool {
-    is_color_modification(modification)
-        || matches!(
-            modification,
-            ContinuousModification::AddType { .. }
-                | ContinuousModification::RemoveType { .. }
-                | ContinuousModification::AddSubtype { .. }
-                | ContinuousModification::RemoveSubtype { .. }
-                | ContinuousModification::SetCardTypes { .. }
-                | ContinuousModification::RemoveAllSubtypes { .. }
-                | ContinuousModification::AddSupertype { .. }
-                | ContinuousModification::RemoveSupertype { .. }
-                | ContinuousModification::AddAllCreatureTypes
-                | ContinuousModification::AddAllBasicLandTypes
-                | ContinuousModification::AddAllLandTypes
-                | ContinuousModification::AddChosenSubtype { .. }
-                | ContinuousModification::SetBasicLandType { .. }
-                | ContinuousModification::SetChosenBasicLandType
-        )
 }
 
 /// CR 613.1e: a colour-changing (layer 5) modification.
@@ -4841,26 +4804,10 @@ fn is_color_modification(modification: &ContinuousModification) -> bool {
     )
 }
 
-/// CR 303.4 + CR 301.5: "enchanted/equipped [object]" names the object this
-/// Aura or Equipment is attached to — never the attachment itself.
-fn static_affects_only_attachment_host(def: &crate::types::ability::StaticDefinition) -> bool {
-    matches!(
-        &def.affected,
-        Some(TargetFilter::Typed(typed)) if typed.properties.iter().any(|prop| {
-            matches!(prop, FilterProp::EnchantedBy | FilterProp::EquippedBy)
-        })
-    )
-}
-
-/// CR 614.12: apply the entrant's own static abilities that would apply to it
-/// once it's on the battlefield — every functioning `Continuous` static whose
-/// affected set includes the entrant (its own `SelfRef` statics and global ones
-/// such as Painter's Servant's; an absent affected set is every object, as the
-/// layer pass reads it) — in layer order: types (CR 613.1d) before colours
-/// (CR 613.1e); within a layer the statics share the entrant's timestamp and
-/// apply in written order (CR 613.7a). Statics the projection can't prove
-/// (`entry_projection_proves_static`) are skipped; coverage marks such a face
-/// unsupported (`ENTRY_PROJECTION_GAP`).
+/// CR 614.12: apply the entrant's allowlisted own statics
+/// ([`entry_projection_allowlisted`]) that function on the battlefield, types
+/// (CR 613.1d) before colours (CR 613.1e). They only add, so their order within
+/// a layer doesn't change the result.
 fn apply_entrant_own_statics(
     state: &GameState,
     entrant: &mut crate::game::game_object::GameObject,
@@ -4868,39 +4815,14 @@ fn apply_entrant_own_statics(
     // `Definitions` is reference-counted: this clone is a refcount bump that
     // lets the walk read the statics while the entrant is modified.
     let statics = entrant.static_definitions.clone();
-    let statics = statics.as_slice();
-    let mut applicable = Vec::new();
-    for (index, def) in statics.iter().enumerate() {
-        if def.mode != StaticMode::Continuous
-            || !def.modifications.iter().any(is_type_or_color_modification)
-            || !entry_projection_proves_static(statics, index)
-            || !crate::game::functioning_abilities::static_functions_in_zone(entrant, def)
-        {
-            continue;
-        }
-        let applies = match crate::game::layers::static_affected_filter(def).as_ref() {
-            TargetFilter::SelfRef => true,
-            filter => filter_inner_for_object(
-                state,
-                entrant,
-                entrant.id,
-                filter,
-                entrant.id,
-                Some(entrant.controller),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                ControllerLookup::LiveOrLki,
-            ),
-        };
-        if applies {
-            applicable.push(def);
-        }
-    }
+    let applicable: Vec<&crate::types::ability::StaticDefinition> = statics
+        .as_slice()
+        .iter()
+        .filter(|def| {
+            entry_projection_allowlisted(def)
+                && crate::game::functioning_abilities::static_functions_in_zone(entrant, def)
+        })
+        .collect();
     for color_layer in [false, true] {
         for def in &applicable {
             for modification in &def.modifications {
@@ -4964,8 +4886,13 @@ fn entry_filter_matches_staged(
     filter: &TargetFilter,
     ctx: &FilterContext<'_>,
 ) -> bool {
-    let projected =
-        EntryProjection::proposed(state, staged.clone(), entry_choices, controller_override);
+    let projected = EntryProjection::proposed(
+        state,
+        staged.clone(),
+        entry_choices,
+        controller_override,
+        filter,
+    );
     filter_inner_for_object(
         state,
         projected.as_ref().unwrap_or(staged),
@@ -22136,7 +22063,7 @@ mod entry_projection_tests {
     //! shape, the projection's static-support contract, the shared type/colour
     //! applier, and the coverage label that fails unsupported faces closed.
     use super::*;
-    use crate::game::coverage::{card_face_gaps, ENTRY_PROJECTION_GAP};
+    use crate::game::coverage::{card_face_gaps, ENTRY_CONSUMER_GAP, ENTRY_PROJECTION_GAP};
     use crate::game::layers::{apply_type_or_color_modification, TypeColorModification};
     use crate::game::replacement::as_enters_choice_type;
     use crate::game::replacement::{
@@ -22223,114 +22150,192 @@ mod entry_projection_tests {
             .modifications(vec![modification])
     }
 
-    /// CR 614.12 completeness contract: unconditional type/colour statics are
-    /// projected; any condition (the chosen label included), the
-    /// ability-removing land-subtype sets and granted type/colour statics are
-    /// not, unless the static can only affect an attachment host.
-    #[test]
-    fn projection_static_support_contract() {
-        let chosen = ContinuousModification::AddChosenSubtype {
+    fn chosen_subtype() -> StaticDefinition {
+        self_static(ContinuousModification::AddChosenSubtype {
             kind: ChosenSubtypeKind::CreatureType,
+        })
+    }
+
+    /// CR 614.12 allowlist: the entrant's own unconditional SelfRef add-chosen
+    /// subtype / add-chosen colour / add-every-creature-type statics are projected
+    /// exactly; every other own static that can apply to the entrant is an
+    /// unprojected write of the kinds it writes. Statics that can't apply to the
+    /// entrant ("other", "enchanted/equipped") are outside.
+    #[test]
+    fn projection_allowlist_is_exact() {
+        let allowlisted = [
+            chosen_subtype(),
+            self_static(ContinuousModification::AddChosenColor {
+                mode: ColorChangeMode::Add,
+            }),
+            self_static(ContinuousModification::AddAllCreatureTypes),
+        ];
+        assert!(entry_projection_unprojected_writes(&allowlisted).is_empty());
+        let blue = || ContinuousModification::AddColor {
+            color: ManaColor::Blue,
         };
-        assert!(entry_projection_supports_static(&self_static(
-            chosen.clone()
-        )));
-        // Fail closed: any condition — the chosen label included — is outside
-        // what the projection proves (Primal Clay class).
-        assert!(!entry_projection_supports_static(
-            &self_static(ContinuousModification::AddType {
-                core_type: CoreType::Artifact
-            })
-            .condition(StaticCondition::ChosenLabelIs {
-                label: "1/6".to_string()
-            })
-        ));
-        // A granted static that carries a type/colour effect isn't projected.
-        assert!(!entry_projection_supports_static(&self_static(
-            ContinuousModification::GrantStaticAbility {
-                definition: Box::new(self_static(ContinuousModification::AddSubtype {
-                    subtype: "Angel".to_string(),
-                })),
-            }
-        )));
-        assert!(!entry_projection_supports_static(
-            &self_static(chosen).condition(StaticCondition::SourceIsAttacking)
-        ));
-        assert!(!entry_projection_supports_static(&self_static(
-            ContinuousModification::SetChosenBasicLandType
-        )));
+        let off_the_allowlist = [
+            // The Primal Clay class: label-gated types.
+            (
+                self_static(ContinuousModification::AddType {
+                    core_type: CoreType::Artifact,
+                })
+                .condition(StaticCondition::ChosenLabelIs {
+                    label: "1/6".to_string(),
+                }),
+                CharacteristicKinds::CARD_TYPES,
+            ),
+            (
+                chosen_subtype().condition(StaticCondition::SourceIsAttacking),
+                CharacteristicKinds::CARD_TYPES,
+            ),
+            // Painter's Servant: an absent affected set is every object.
+            (
+                StaticDefinition::continuous().modifications(vec![
+                    ContinuousModification::AddChosenColor {
+                        mode: ColorChangeMode::Add,
+                    },
+                ]),
+                CharacteristicKinds::COLOR,
+            ),
+            (self_static(blue()), CharacteristicKinds::COLOR),
+            (
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::creature().subtype("Angel".to_string()),
+                    ))
+                    .modifications(vec![blue()]),
+                CharacteristicKinds::COLOR,
+            ),
+            (
+                self_static(ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying,
+                }),
+                CharacteristicKinds::ABILITIES,
+            ),
+            (
+                self_static(ContinuousModification::AddPower { value: 1 }),
+                CharacteristicKinds::POWER_TOUGHNESS,
+            ),
+            (
+                self_static(ContinuousModification::SetTextName {
+                    name: "Projected".to_string(),
+                }),
+                CharacteristicKinds::NAME_TEXT,
+            ),
+        ];
+        for (def, kind) in off_the_allowlist {
+            assert_eq!(
+                entry_projection_unprojected_writes(&[chosen_subtype(), def.clone()]),
+                kind,
+                "{def:?}"
+            );
+        }
+        let other_creatures = StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Another]),
+            ))
+            .modifications(vec![ContinuousModification::AddPower { value: 1 }]);
         let enchanted_land = StaticDefinition::continuous()
             .affected(TargetFilter::Typed(
                 TypedFilter::land().properties(vec![FilterProp::EnchantedBy]),
             ))
             .modifications(vec![ContinuousModification::SetChosenBasicLandType]);
-        assert!(entry_projection_supports_static(&enchanted_land));
-        // A static that changes no type or colour is outside the contract.
-        assert!(entry_projection_supports_static(
-            &self_static(ContinuousModification::AddPower { value: 1 })
-                .condition(StaticCondition::SourceIsAttacking)
+        assert!(entry_projection_unprojected_writes(&[
+            chosen_subtype(),
+            other_creatures,
+            enchanted_land
+        ])
+        .is_empty());
+    }
+
+    /// CR 614.12, the single per-consumer authority: an unprojected write gaps
+    /// exactly the consumers that read its kind. A P/T writer (the Chameleon
+    /// Spirit shape) is unproven for a consumer reading P/T and proven for one
+    /// reading types; coverage checks entrant faces against the consumer
+    /// contract, so the face itself is supported.
+    #[test]
+    fn projection_is_proven_per_consumer_reads() {
+        let pt_writer = [self_static(ContinuousModification::AddPower { value: 1 })];
+        let pt_consumer = TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::PowerGTSource]),
+        );
+        let type_consumer =
+            TargetFilter::Typed(TypedFilter::creature().subtype("Angel".to_string()));
+        assert!(!entry_projection_proven_for(
+            &pt_writer,
+            target_filter_characteristic_reads(&pt_consumer)
+        ));
+        assert!(entry_projection_proven_for(
+            &pt_writer,
+            target_filter_characteristic_reads(&type_consumer)
+        ));
+        assert!(entry_projection_proven_for(
+            &pt_writer,
+            ENTRY_CONSUMER_READS
+        ));
+        // CR 702.73a: a subtype read also reads abilities (Changeling), so an
+        // ability writer is unproven for it.
+        assert!(!entry_projection_proven_for(
+            &[self_static(ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            })],
+            target_filter_characteristic_reads(&type_consumer)
         ));
     }
 
-    /// CR 613.3 + CR 613.6 + CR 613.8: the set-level contract. A static whose
-    /// affected filter reads a characteristic another own static writes, or a
-    /// characteristic-defining static beside another own static, is unproven;
-    /// independent statics (Mimic's own subtype + an unrelated self colour) are
-    /// proven.
+    /// N1: the runtime projection is all or nothing per consumer. An entrant
+    /// whose unprojected writes the consumer reads gets no projection at all —
+    /// not the allowlisted subset — and one proven for the consumer gets the
+    /// whole allowlisted projection.
     #[test]
-    fn projection_set_contract_rejects_unproven_dependencies() {
-        let chosen = self_static(ContinuousModification::AddChosenSubtype {
-            kind: ChosenSubtypeKind::CreatureType,
-        });
-        let self_blue = self_static(ContinuousModification::AddColor {
-            color: ManaColor::Blue,
-        });
-        assert!(entry_projection_supports_statics(&[
-            chosen.clone(),
-            self_blue.clone()
-        ]));
+    fn runtime_projection_is_all_or_nothing_per_consumer() {
+        use crate::types::ability::Comparator;
+        let state = GameState::new_two_player(9783);
+        let entrant = |statics: Vec<StaticDefinition>| {
+            let mut obj = GameObject::new(
+                ObjectId(1),
+                CardId(1),
+                PlayerId(0),
+                "Entrant".to_string(),
+                Zone::Hand,
+            );
+            obj.replacement_definitions =
+                vec![as_enters(choose(true, TargetSelectionMode::Chosen))].into();
+            obj.static_definitions = statics.into();
+            obj
+        };
+        let angel = [ChosenAttribute::CreatureType("Angel".to_string())];
+        let colorless =
+            TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::ColorCount {
+                    comparator: Comparator::EQ,
+                    count: 0,
+                }]),
+            );
+        let angels = TargetFilter::Typed(TypedFilter::creature().subtype("Angel".to_string()));
         let angels_blue = StaticDefinition::continuous()
-            .affected(TargetFilter::Typed(
-                TypedFilter::creature().subtype("Angel".to_string()),
-            ))
+            .affected(angels.clone())
             .modifications(vec![ContinuousModification::AddColor {
                 color: ManaColor::Blue,
             }]);
-        let set = [chosen.clone(), angels_blue.clone()];
-        assert!(entry_projection_proves_static(&set, 0));
-        assert!(
-            !entry_projection_proves_static(&set, 1),
-            "Angel membership depends on the chosen subtype"
-        );
-        assert!(!entry_projection_supports_statics(&set));
-        assert!(
-            entry_projection_supports_statics(&[angels_blue]),
-            "alone, nothing it reads is rewritten by an own static"
-        );
-        let mut cda = self_blue;
-        cda.characteristic_defining = true;
-        assert!(!entry_projection_supports_statics(&[chosen, cda]));
-    }
+        let dependent = entrant(vec![chosen_subtype(), angels_blue]);
 
-    /// CR 613.1: an absent affected set is every object — the layer pass's
-    /// reading and the projection's (one authority, `static_affected_filter`).
-    #[test]
-    fn absent_affected_set_reads_as_every_object() {
-        let absent = StaticDefinition::continuous().modifications(vec![
-            ContinuousModification::AddChosenColor {
-                mode: ColorChangeMode::Add,
-            },
-        ]);
-        assert_eq!(
-            crate::game::layers::static_affected_filter(&absent).as_ref(),
-            &TargetFilter::Any
+        assert!(
+            EntryProjection::proposed(&state, dependent.clone(), &angel, None, &colorless)
+                .is_none(),
+            "a colour reader gets no projection, not the chosen subtype alone"
         );
-        let explicit = absent.clone().affected(TargetFilter::SelfRef);
-        assert_eq!(
-            crate::game::layers::static_affected_filter(&explicit).as_ref(),
-            &TargetFilter::SelfRef
+        let for_angels = EntryProjection::proposed(&state, dependent, &angel, None, &angels)
+            .expect("the unprojected colour write isn't read by a subtype consumer");
+        assert!(for_angels.card_types.subtypes.iter().any(|s| s == "Angel"));
+        assert_eq!(for_angels.zone, Zone::Battlefield);
+
+        let mimic = entrant(vec![chosen_subtype()]);
+        assert!(
+            EntryProjection::proposed(&state, mimic, &angel, None, &colorless).is_some(),
+            "the allowlisted entrant is projected for every consumer"
         );
-        assert!(entry_projection_supports_static(&absent));
     }
 
     /// CR 613.1d + CR 613.1e: the shared applier performs exactly the type and
@@ -22393,32 +22398,64 @@ mod entry_projection_tests {
         );
     }
 
-    /// Fail closed: a face whose as-enters choice is made before entry but
-    /// whose own type static the projection can't evaluate is unsupported.
+    /// Fail closed: a face whose as-enters choice is made before entry but which
+    /// carries an own static off the allowlist that writes a kind in the
+    /// consumer contract is unsupported; a P/T writer isn't (no contract
+    /// consumer reads P/T). A consumer face whose entry filter reads outside the
+    /// contract is unsupported, and its type-reading twin isn't.
     #[test]
-    fn unsupported_projection_face_carries_the_coverage_gap() {
+    fn unsupported_projection_faces_carry_the_coverage_gaps() {
         let mut face = CardFace::default();
         face.replacements
             .push(as_enters(choose(true, TargetSelectionMode::Chosen)));
-        face.static_abilities
-            .push(self_static(ContinuousModification::AddChosenSubtype {
-                kind: ChosenSubtypeKind::CreatureType,
-            }));
+        face.static_abilities.push(chosen_subtype());
+        let has =
+            |face: &CardFace, label: &str| card_face_gaps(face).iter().any(|gap| gap == label);
         assert!(
-            !card_face_gaps(&face)
-                .iter()
-                .any(|gap| gap == ENTRY_PROJECTION_GAP),
+            !has(&face, ENTRY_PROJECTION_GAP),
             "the Metallic Mimic shape is supported"
         );
-        face.static_abilities.push(
+        let mut pt = face.clone();
+        pt.static_abilities
+            .push(self_static(ContinuousModification::AddPower { value: 1 }));
+        assert!(
+            !has(&pt, ENTRY_PROJECTION_GAP),
+            "the Chameleon Spirit shape"
+        );
+        for writer in [
             self_static(ContinuousModification::AddType {
                 core_type: CoreType::Artifact,
-            })
-            .condition(StaticCondition::SourceIsAttacking),
-        );
-        assert!(card_face_gaps(&face)
-            .iter()
-            .any(|gap| gap == ENTRY_PROJECTION_GAP));
+            }),
+            self_static(ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }),
+        ] {
+            let mut gapped = face.clone();
+            gapped.static_abilities.push(writer);
+            assert!(has(&gapped, ENTRY_PROJECTION_GAP));
+        }
+
+        let consumer = |valid_card: TargetFilter| {
+            let mut consumer = CardFace::default();
+            consumer.replacements.push(
+                ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+                    .valid_card(valid_card)
+                    .destination_zone(Zone::Battlefield),
+            );
+            consumer
+        };
+        assert!(has(
+            &consumer(TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::PowerGTSource]),
+            )),
+            ENTRY_CONSUMER_GAP
+        ));
+        assert!(!has(
+            &consumer(TargetFilter::Typed(
+                TypedFilter::creature().subtype("Angel".to_string()),
+            )),
+            ENTRY_CONSUMER_GAP
+        ));
     }
 
     const MIMIC: &str = "As this creature enters, choose a creature type.\nThis creature is the chosen type in addition to its other types.\nEach other creature you control of the chosen type enters with an additional +1/+1 counter on it.";

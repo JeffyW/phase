@@ -1716,7 +1716,7 @@ mod paused_search_audience_tests {
     use crate::game::zones::create_object;
     use crate::types::game_state::{
         HiddenSearchAudience, LibrarySearchDeliveryResume, PendingBatchDeliveries,
-        PendingZoneChangeDelivery,
+        PendingReplacement, PendingZoneChangeDelivery, ZoneMoveCompletion,
     };
     use crate::types::identifiers::CardId;
 
@@ -1812,7 +1812,6 @@ mod paused_search_audience_tests {
     /// proposal itself is not the owner's key.
     #[test]
     fn prevented_resume_settles_the_owner_through_the_pinned_boundary() {
-        use crate::types::game_state::{PendingReplacement, ZoneMoveCompletion};
         let mut state = GameState::new_two_player(9783);
         let entrant = create_object(
             &mut state,
@@ -1965,10 +1964,6 @@ fn enters_with_additional_counters_for_entry(
     static_defs: &[(ObjectId, StaticDefinition)],
 ) -> Vec<(CounterType, u32)> {
     let mut additional: Vec<(CounterType, u32)> = Vec::new();
-    // CR 614.12: an entrant whose as-enters choices were made before it entered
-    // is matched as it exists with its own statics applied — the layer pass
-    // hasn't run on it yet.
-    let projected = crate::game::filter::EntryProjection::delivered(state, object_id);
     for (source_id, def) in static_defs {
         let Some(source_obj) = state.objects.get(source_id) else {
             continue;
@@ -1986,6 +1981,10 @@ fn enters_with_additional_counters_for_entry(
         // CR 109.5: evaluate the "you control" + Other/Legendary/Nontoken filter
         // with the static's source as the context anchor.
         let ctx = crate::game::filter::FilterContext::from_source(state, source_obj.id);
+        // CR 614.12: an entrant whose as-enters choices were made before it
+        // entered is matched as it exists with its own statics applied — the
+        // layer pass hasn't run on it yet — when that's proven for this filter.
+        let projected = crate::game::filter::EntryProjection::delivered(state, object_id, affected);
         let matches = match projected.as_ref() {
             Some(entrant) => {
                 crate::game::filter::matches_target_filter_on_object(state, entrant, affected, &ctx)
