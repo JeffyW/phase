@@ -10598,6 +10598,54 @@ fn trigger_when_you_lose_control_maps_to_changes_controller() {
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
 }
 
+/// CR 603.2 + CR 603.10d: "Whenever an opponent gains control of a permanent
+/// from you" (Zidane, Tantalus Thief) is the opponent-gains half of the
+/// look-back control triggers: ChangesController, the changing permanent in
+/// `valid_card`, the gaining opponent in `valid_target`.
+#[test]
+fn trigger_opponent_gains_control_from_you_maps_to_changes_controller() {
+    let def = parse_trigger_line(
+        "Whenever an opponent gains control of a permanent from you, you create a Treasure token.",
+        "Zidane, Tantalus Thief",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesController);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::permanent()))
+    );
+    assert_eq!(
+        def.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+}
+
+/// Fail-closed boundaries of the control-change trigger class: a subject with
+/// its own controller (read after the change, not looked back on) and the
+/// gain side "you gain control of ~ from another player" (Risky Move — not a
+/// CR 603.10d look-back trigger) both stay `Unknown`.
+#[test]
+fn trigger_control_change_unsupported_shapes_stay_unknown() {
+    for (text, name) in [
+        (
+            "Whenever an opponent gains control of a creature you control from you, draw a card.",
+            "Probe",
+        ),
+        (
+            "When you gain control of this enchantment from another player, draw a card.",
+            "Risky Move",
+        ),
+    ] {
+        let def = parse_trigger_line(text, name);
+        assert!(
+            matches!(def.mode, TriggerMode::Unknown(_)),
+            "{text:?} must fail closed, got {:?}",
+            def.mode
+        );
+    }
+}
+
 /// CR 603.2c: Batched "one or more permanents … leave the battlefield" uses the plural
 /// verb form. The parser must accept "leave" alongside "leaves" for LTB triggers.
 #[test]

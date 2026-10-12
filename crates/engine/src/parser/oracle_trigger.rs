@@ -19217,6 +19217,44 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         return Some((TriggerMode::ChangesController, def));
     }
 
+    // CR 603.2 + CR 603.10d: "Whenever an opponent gains control of <subject>
+    // from you" — the opponent-gains half of CR 603.10d's look-back control
+    // triggers (Zidane, Tantalus Thief). Same ChangesController event as "you
+    // lose control of ~": `valid_card` scopes the changing permanent and
+    // `valid_target` names the gaining player, judged against the pre-event
+    // "you" (`match_changes_controller`).
+    fn parse_opponent_gains_control_from_you(i: &str) -> OracleResult<'_, &str> {
+        all_consuming(preceded(
+            (
+                alt((tag("when "), tag("whenever "))),
+                tag("an opponent gains control of "),
+            ),
+            terminated(take_until(" from you"), tag(" from you")),
+        ))
+        .parse(i)
+    }
+    if let Ok((_, subject_text)) = parse_opponent_gains_control_from_you(lower) {
+        let (subject, sub_rem) = parse_trigger_subject(subject_text, &mut ParseContext::default());
+        // "from you" fixes the losing controller. A subject that carries its own
+        // controller would be read after the change, not looked back on, so it
+        // fails closed (stays Unknown) rather than being half-supported.
+        let subject_is_controller_free = match &subject {
+            TargetFilter::SelfRef => true,
+            TargetFilter::Typed(typed) => typed.controller.is_none(),
+            _ => false,
+        };
+        if sub_rem.trim().is_empty() && subject_is_controller_free {
+            let mut def = make_base();
+            def.mode = TriggerMode::ChangesController;
+            def.valid_card = Some(subject);
+            def.valid_target = Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent),
+            ));
+            return Some((TriggerMode::ChangesController, def));
+        }
+        return None;
+    }
+
     if matches!(lower, "whenever you lose life" | "when you lose life") {
         let mut def = make_base();
         def.mode = TriggerMode::LifeLost;

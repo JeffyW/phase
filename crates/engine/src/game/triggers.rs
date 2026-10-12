@@ -3060,37 +3060,45 @@ fn collect_matching_triggers_inner(
                     &source_context,
                     state,
                 )
+            } else if trig_def.mode == TriggerMode::ChangesController {
+                // CR 603.10d: the look-back "you" must see a source that
+                // changed control in this same batch, which the per-event
+                // registry matcher cannot.
+                super::trigger_matchers::match_changes_controller_in_batch(
+                    event,
+                    event_batch,
+                    trig_def,
+                    &source_context,
+                    state,
+                )
             } else {
                 matcher(event, trig_def, &source_context, state)
             };
             if !admitted {
                 continue;
             }
-            // CR 603.10d + CR 603.3a: "when you lose control of ~" is
-            // controlled by the PRE-change controller — the player who just
-            // lost control — not by whoever controls the object now.
-            // `source_context.lki.controller` (captured into `controller`
-            // above) already reflects the POST-change live controller for a
-            // self-ref source: `collect_pending_triggers` flushes layers
-            // before this scan runs, so the changing object's own controller
-            // has already moved to `new_controller` by the time trigger
-            // sources are gathered. Mirror
-            // `trigger_matchers::match_changes_controller`'s own directional
-            // discriminant (`source_id == *object_id`) here rather than
-            // re-deriving it, since `admitted` above already confirms this
-            // trig_def's matcher accepted the event. The delayed /
-            // `SpecificObject` shape (Stolen Uniform, `source_id !=
-            // object_id`) is left UNCHANGED: its source is a different object
-            // whose own controller is already the right answer (CR 113.8).
-            let controller = match event {
-                GameEvent::ControllerChanged {
-                    object_id,
-                    old_controller,
-                    ..
-                } if trig_def.mode == TriggerMode::ChangesController && *object_id == obj_id => {
-                    *old_controller
-                }
-                _ => controller,
+            // CR 603.10d + CR 603.3a: a look-back control-change trigger
+            // ("when you lose control of ~", "whenever an opponent gains control
+            // of a permanent from you") is controlled by its source's controller
+            // immediately BEFORE the change — not by whoever controls the source
+            // now. `source_context.lki.controller` (captured into `controller`
+            // above) is the POST-change live controller whenever the source
+            // itself changed control in this batch: `collect_pending_triggers`
+            // flushes layers before this scan runs. The same authority the
+            // matcher used for "you" (`changes_controller_look_back_you`)
+            // answers here, so the matched "you" and the controller agree by
+            // construction. A source untouched by the batch keeps `controller`;
+            // so does the delayed / `SpecificObject` shape (Stolen Uniform),
+            // whose source is a different object (CR 113.8).
+            let controller = if trig_def.mode == TriggerMode::ChangesController {
+                super::trigger_matchers::changes_controller_look_back_you(
+                    event,
+                    event_batch,
+                    &source_context,
+                    state,
+                )
+            } else {
+                controller
             };
             if !check_trigger_constraint_with_ref(
                 state,
@@ -3116,7 +3124,7 @@ fn collect_matching_triggers_inner(
             // rebinding authority) to the possibly-overridden `controller` so
             // the ability's controller and its `PendingTrigger.controller`
             // agree by construction. A no-op for every trigger mode other
-            // than the self-ref `ChangesController` case above.
+            // than the look-back `ChangesController` case above.
             ability.set_controller_recursive(controller);
             // CR 603.4: Stamp the printed-trigger index so per-turn resolution
             // tracking (`AbilityCondition::AbilityUseCountThisTurn`) can identify

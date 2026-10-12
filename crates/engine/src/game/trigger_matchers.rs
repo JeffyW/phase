@@ -690,6 +690,20 @@ fn player_matches_filter(
     source_context: &TriggerSourceContext,
 ) -> bool {
     let trigger_controller = source_context.source_read(state).controller();
+    player_matches_filter_as(filter, state, player_id, trigger_controller, source_context)
+}
+
+/// [`player_matches_filter`] with an explicit "you" (CR 109.5). Callers whose
+/// trigger looks back in time (CR 603.10d) pass the pre-event controller, which
+/// can differ from the source's live controller when the source itself changed
+/// hands.
+fn player_matches_filter_as(
+    filter: &TargetFilter,
+    state: &GameState,
+    player_id: PlayerId,
+    trigger_controller: PlayerId,
+    source_context: &TriggerSourceContext,
+) -> bool {
     // CR 102.3: In games between teams, teammates are not opponents; use the
     // shared team-topology authority for every opponent-scoped player filter.
     match filter {
@@ -739,9 +753,9 @@ fn player_matches_filter(
         // player predicate. Delegates to the single-authority player-scope
         // matcher rather than re-implementing any predicate here.
         //
-        // `trigger_controller` is the TRIGGER SOURCE's controller (bound at the
-        // top of this function), NOT the attacking player — the `PlayerRelation`
-        // in the payload is relative to that, per CR 109.5 "you".
+        // `trigger_controller` is the trigger's "you" (CR 109.5): the TRIGGER
+        // SOURCE's controller, or the caller's look-back perspective — NOT the
+        // attacking player. The `PlayerRelation` in the payload is relative to it.
         //
         // This arm is load-bearing: the `_ => true` fallback below is
         // fail-OPEN, so omitting it would make every `PlayerMatching` predicate
@@ -775,13 +789,15 @@ fn player_matches_filter(
         // leaf, an opponent leaf or a bare type leaf that reads as the
         // wildcard, so they match exactly as they did through the fallback
         // (PR #8881).
-        TargetFilter::Not { filter } => !player_matches_filter(filter, state, player_id, source_context),
-        TargetFilter::Or { filters } => filters
-            .iter()
-            .any(|filter| player_matches_filter(filter, state, player_id, source_context)),
-        TargetFilter::And { filters } => filters
-            .iter()
-            .all(|filter| player_matches_filter(filter, state, player_id, source_context)),
+        TargetFilter::Not { filter } => {
+            !player_matches_filter_as(filter, state, player_id, trigger_controller, source_context)
+        }
+        TargetFilter::Or { filters } => filters.iter().any(|filter| {
+            player_matches_filter_as(filter, state, player_id, trigger_controller, source_context)
+        }),
+        TargetFilter::And { filters } => filters.iter().all(|filter| {
+            player_matches_filter_as(filter, state, player_id, trigger_controller, source_context)
+        }),
         _ => true,
     }
 }
@@ -3535,9 +3551,11 @@ pub(super) fn match_taps_for_mana(
 /// `layers::prune_end_of_turn_effects`: the latter only retains over
 /// `transient_continuous_effects` and pushes no events.)
 ///
-/// The only producers of this mode are "When you lose control of ~"
-/// abilities (Khârn the Betrayer, Duplicity, Gustha's Scepter, and the S25
-/// Stolen Uniform reflexive). Two guards keep it from over-firing:
+/// The producers of this mode are the CR 603.10d lose-side abilities: "When you
+/// lose control of ~" (Khârn the Betrayer, Duplicity, Gustha's Scepter), the S25
+/// Stolen Uniform reflexive, and "Whenever an opponent gains control of a
+/// permanent from you" (Zidane, Tantalus Thief — `valid_target` names the
+/// gaining player). Three guards keep it from over-firing:
 ///   * `valid_card` scopes the event to the tracked object (SelfRef for "~";
 ///     the bound Equipment for Stolen Uniform's `ParentTarget`). Without this
 ///     the trigger fired on *any* object's control change (the Portent trap).
@@ -3556,13 +3574,67 @@ pub(super) fn match_taps_for_mana(
 ///       `old_controller == source.controller` test correctly fires on the loss
 ///       (old == caster == source.controller) and NOT on the initial gain
 ///       (old == owner != caster).
+///   * CR 110.1: the changing object must be a permanent (on the battlefield);
+///     a spell changing control on the stack never matches.
+///
+/// Registry entry point: with no wider batch, the event is its own batch. The
+/// printed-trigger collector calls [`match_changes_controller_in_batch`] with
+/// the full simultaneous batch instead.
 pub(super) fn match_changes_controller(
     event: &GameEvent,
     trigger: &TriggerDefinition,
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
+    match_changes_controller_in_batch(
+        event,
+        std::slice::from_ref(event),
+        trigger,
+        source_context,
+        state,
+    )
+}
+
+/// CR 603.10d + CR 603.3a: the "you" of a look-back control-change trigger —
+/// its source's controller immediately before the control change.
+///
+/// Every trigger scan runs after `flush_layers`, so a source that itself
+/// changed control in `event_batch` already reads its NEW controller. The
+/// pre-event controller is then the `old_controller` of that change: of
+/// `event` itself when the source is the changing object, otherwise of the
+/// source's first control change in the batch (Zidane stolen together with
+/// another permanent, or exchanged for one). A source whose control did not
+/// change in the batch answers with its live controller.
+pub(crate) fn changes_controller_look_back_you(
+    event: &GameEvent,
+    event_batch: &[GameEvent],
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> PlayerId {
     let source_id = source_event_subject_id(source_context);
+    let old_controller_of_source = |candidate: &GameEvent| match candidate {
+        GameEvent::ControllerChanged {
+            object_id,
+            old_controller,
+            new_controller,
+        } if *object_id == source_id && old_controller != new_controller => Some(*old_controller),
+        _ => None,
+    };
+    old_controller_of_source(event)
+        .or_else(|| event_batch.iter().find_map(old_controller_of_source))
+        .unwrap_or_else(|| source_context.source_read(state).controller())
+}
+
+/// [`match_changes_controller`] over the simultaneous `event_batch` `event`
+/// belongs to, so the look-back "you" sees a source that changed control in
+/// the same batch.
+pub(crate) fn match_changes_controller_in_batch(
+    event: &GameEvent,
+    event_batch: &[GameEvent],
+    trigger: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> bool {
     let GameEvent::ControllerChanged {
         object_id,
         old_controller,
@@ -3574,24 +3646,36 @@ pub(super) fn match_changes_controller(
     if old_controller == new_controller {
         return false;
     }
+    // CR 110.1: every ChangesController subject is a permanent. A
+    // `ControllerChanged` on a stack object (CR 109.4 — e.g. Perplexing
+    // Chimera exchanging control of a spell) is not a permanent changing
+    // control, even when a type-only subject ("a permanent") would match the
+    // spell's card types.
+    if !state.battlefield.contains(object_id) {
+        return false;
+    }
     if !valid_card_matches(trigger, state, *object_id, source_context) {
         return false;
     }
-    if source_id == *object_id {
-        // CR 603.10d: "when you lose control of ~" looks back in time — the
-        // ability is intrinsically the pre-change controller's, i.e. the loser.
-        // The source IS the changing object, whose live `controller` already
-        // flushed to `new_controller` (flush_layers runs at the top of
-        // collect_pending_triggers, before this scan), so it can't gate the
-        // direction. `old != new` above already guarantees exactly one loser;
-        // fire for it.
-        return true;
+    // CR 603.10d: "you lose control of …" and "an opponent gains control of …
+    // from you" look back in time, so "you" is the trigger source's controller
+    // immediately before the change (`changes_controller_look_back_you`). When
+    // the source IS the changing object that is `old_controller` — the loser, by
+    // construction. For the delayed/`SpecificObject` case (Stolen Uniform) the
+    // source is the graveyard spell whose controller is the player who
+    // temporarily held the object, so the loss fires and the initial gain
+    // (old == owner != caster) does not.
+    let you = changes_controller_look_back_you(event, event_batch, source_context, state);
+    // CR 603.2: the lose side — the object left "your" control.
+    if *old_controller != you {
+        return false;
     }
-    // CR 603.2: delayed/`SpecificObject` case (Stolen Uniform). The source is the
-    // graveyard spell whose controller is the player who temporarily held the
-    // object; firing only when `old_controller == source.controller` fires on the
-    // loss and not on the initial gain.
-    source_context.source_read(state).controller() == *old_controller
+    // CR 603.10d + CR 102.2 / CR 102.3: the player who gained control, judged
+    // relative to the look-back "you" ("an opponent gains control … from you").
+    // `None` is "you lose control of …": any new controller.
+    trigger.valid_target.as_ref().is_none_or(|filter| {
+        player_matches_filter_as(filter, state, *new_controller, you, source_context)
+    })
 }
 
 /// CR 712.14: Transformed trigger — fires when an object transforms.
