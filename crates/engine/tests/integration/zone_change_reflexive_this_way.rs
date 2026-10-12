@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use engine::game::combat::{has_cant_be_blocked_static, AttackTarget};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{AbilityDefinition, Effect, TargetFilter, TargetRef};
+use engine::types::ability::{AbilityDefinition, Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
@@ -933,57 +933,62 @@ fn spellbook_draft_entry_reflexives_fail_closed() {
     }
 }
 
-/// Probe board 4 (CR 603.12a): "When you exile a card this way" counts one
-/// occurrence, so after an instruction that exiles two cards it would trigger
-/// twice, while the creation gate makes one trigger: fails closed. The
-/// aggregate head ("one or more cards") is one event and triggers once.
-/// CR 603.12a: a move whose target is inherited from an earlier clause
-/// ("Tap two target creatures. Exile them.") carries no cardinality of its own;
-/// it moves every inherited target. A single-occurrence head after it would
-/// trigger once per card, while the creation gate makes one trigger, so it
-/// fails closed. The aggregate head stays supported and triggers once; a
-/// singular tracked-set referent ("return it") still moves one object.
+/// CR 603.12a: a move whose target is handed over by an earlier instruction
+/// (an inherited parent target, "them") carries no cardinality the parser can
+/// prove: "Tap two target creatures. Exile them." moves both creatures, and
+/// "Tap target creature. Reveal the top two cards of your library. Exile them."
+/// moves both revealed cards. A single-occurrence head after such a move would
+/// trigger once per object while the creation gate makes one trigger, so it
+/// fails closed, conservatively including the singular "return it" form. The
+/// aggregate head stays supported and triggers once.
 #[test]
-fn single_occurrence_head_after_an_inherited_two_target_move_fails_closed() {
-    let single = spell_ability(
-        "Tap two target creatures. Exile them. When you exile a creature this way, you gain 1 life.",
-        "Probe",
-    );
-    let producer = single.sub_ability.as_deref().expect("the exile clause");
-    assert!(
-        matches!(
-            producer.effect.as_ref(),
-            Effect::ChangeZone {
-                target: TargetFilter::ParentTarget,
-                ..
+fn single_occurrence_head_after_an_inherited_target_move_fails_closed() {
+    for (text, earlier) in [
+        (
+            "Tap two target creatures. Exile them. When you exile a creature this way, you gain 1 life.",
+            "the two-target tap",
+        ),
+        (
+            "Tap target creature. Reveal the top two cards of your library. Exile them. When you exile a card this way, you gain 1 life.",
+            "the reveal of two cards",
+        ),
+        (
+            "Exile target creature, then return it to the battlefield under its owner's control. When a creature enters this way, you gain 1 life.",
+            "the single-target exile",
+        ),
+    ] {
+        let single = spell_ability(text, "Probe");
+        let mut node = Some(&single);
+        let mut producer = None;
+        while let Some(current) = node {
+            if matches!(current.effect.as_ref(), Effect::Unimplemented { .. }) {
+                break;
             }
-        ),
-        "reach guard: the producer moves the inherited targets: {producer:?}"
-    );
-    assert_eq!(
-        unimplemented_name(&single).as_deref(),
-        Some("zone_change_reflexive_occurrence"),
-        "{single:?}"
-    );
-
-    let singular = spell_ability(
-        "Exile target creature, then return it to the battlefield under its owner's control. When a creature enters this way, you gain 1 life.",
+            producer = Some(current);
+            node = current.sub_ability.as_deref();
+        }
+        let producer = producer.expect("a producer before the head");
+        assert!(
+            matches!(producer.effect.as_ref(), Effect::ChangeZone { .. }),
+            "reach guard: the head follows a move of what {earlier} handed over: {single:?}"
+        );
+        assert_eq!(
+            unimplemented_name(&single).as_deref(),
+            Some("zone_change_reflexive_occurrence"),
+            "{single:?}"
+        );
+    }
+    let reveal = spell_ability(
+        "Tap target creature. Reveal the top two cards of your library. Exile them. When you exile a card this way, you gain 1 life.",
         "Probe",
     );
     assert!(
         matches!(
-            singular
-                .sub_ability
-                .as_deref()
-                .map(|sub| sub.effect.as_ref()),
-            Some(Effect::ChangeZone {
-                target: TargetFilter::TrackedSet { .. },
-                ..
-            })
+            reveal.sub_ability.as_deref().map(|sub| sub.effect.as_ref()),
+            Some(Effect::RevealTop { .. } | Effect::Dig { .. })
         ),
-        "reach guard: the singular tracked-set move: {singular:?}"
+        "reach guard: the reveal-two instruction: {reveal:?}"
     );
-    assert_supported_zone_change_reflexive(&singular);
 
     let aggregate = "Tap two target creatures. Exile them. When you exile one or more creatures this way, you gain 1 life.";
     assert_supported_zone_change_reflexive(&spell_ability(aggregate, "Probe"));
@@ -1009,8 +1014,40 @@ fn single_occurrence_head_after_an_inherited_two_target_move_fails_closed() {
     );
     assert_eq!(out.triggers_on_stack, 1, "one reflexive on the stack");
     assert_eq!(r.life(P0), life + 1, "the aggregate head triggers once");
+
+    let revealed = "Tap target creature. Reveal the top two cards of your library. Exile them. When you exile one or more cards this way, you gain 1 life.";
+    assert_supported_zone_change_reflexive(&spell_ability(revealed, "Probe"));
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let spell = s
+        .add_spell_to_hand_from_oracle(P0, "Probe", false, revealed)
+        .id();
+    let top_one = s.add_card_to_library_top(P0, "Top One");
+    let top_two = s.add_card_to_library_top(P0, "Top Two");
+    let opp = s.add_creature(P1, "Opp Creature", 2, 2).id();
+    let mut r = s.build();
+    let life = r.life(P0);
+    cast(&mut r, spell);
+    let out = drive(&mut r, Plan::new(opp).target(vec![TargetRef::Object(opp)]));
+    assert!(r.state().objects[&opp].tapped, "reach: the tap resolved");
+    assert_eq!(
+        r.state().objects[&top_one].zone,
+        Zone::Exile,
+        "both revealed cards exiled"
+    );
+    assert_eq!(
+        r.state().objects[&top_two].zone,
+        Zone::Exile,
+        "both revealed cards exiled"
+    );
+    assert_eq!(out.triggers_on_stack, 1, "one reflexive on the stack");
+    assert_eq!(r.life(P0), life + 1, "the aggregate head triggers once");
 }
 
+/// Probe board 4 (CR 603.12a): "When you exile a card this way" counts one
+/// occurrence, so after an instruction that exiles two cards it would trigger
+/// twice, while the creation gate makes one trigger: fails closed. The
+/// aggregate head ("one or more cards") is one event and triggers once.
 #[test]
 fn single_occurrence_head_after_a_multi_card_producer_fails_closed() {
     let single = spell_ability(

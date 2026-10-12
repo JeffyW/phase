@@ -48,12 +48,17 @@ fn publishes_event(effect: &Effect, verb: ThisWayVerb) -> bool {
 
 /// CR 603.12a: a reflexive whose head counts ONE occurrence ("When you exile a
 /// card this way") triggers once for each card the instruction moved, but the
-/// creation gate creates one trigger. Supported only when the producer moves
-/// at most one object. `earlier` is every clause before the producer, read to
-/// prove the cardinality of a target the producer inherits.
-fn producer_moves_at_most_one(producer: &ClauseIr, earlier: &[ClauseIr]) -> bool {
+/// creation gate creates one trigger. Supported only when the producer itself
+/// moves at most one object: a fixed count of one, or a move whose own target
+/// names one object. A target handed over by an earlier instruction (an
+/// inherited parent target, "them", the cards exiled with this) carries no
+/// cardinality the parser can prove at this boundary, so it fails closed.
+fn producer_moves_at_most_one(producer: &ClauseIr) -> bool {
     let one = |count: &QuantityExpr| matches!(count, QuantityExpr::Fixed { value: 1 });
-    single_instruction(producer)
+    let single_instruction = producer.multi_target.is_none()
+        && producer.parsed.multi_target.is_none()
+        && producer.repeat_for.is_none();
+    single_instruction
         && match &producer.parsed.effect {
             Effect::Discard { count, .. }
             | Effect::ExileTop { count, .. }
@@ -69,72 +74,36 @@ fn producer_moves_at_most_one(producer: &ClauseIr, earlier: &[ClauseIr]) -> bool
                 Some(kept) => *kept == 1,
                 None => *destination != Some(Zone::Library),
             },
-            Effect::ChangeZone { target, .. } => match move_target_cardinality(target) {
-                MoveCardinality::One => true,
-                // "Exile target creature, then return it" moves the one object
-                // its parent announced; "Tap two target creatures. Exile them."
-                // moves both. Single only when the nearest earlier clause that
-                // announced a target is itself a single-target instruction.
-                MoveCardinality::ParentTargets => earlier
-                    .iter()
-                    .rev()
-                    .find(|clause| has_typed_target_widened(&clause.parsed.effect))
-                    .is_some_and(single_instruction),
-                MoveCardinality::Population => false,
-            },
+            Effect::ChangeZone { target, .. } => target_names_one_object(target),
             _ => false,
         }
 }
 
-/// One instruction, one selection: no multi-target slot and no repetition.
-fn single_instruction(clause: &ClauseIr) -> bool {
-    clause.multi_target.is_none()
-        && clause.parsed.multi_target.is_none()
-        && clause.repeat_for.is_none()
-}
-
-/// How many objects a move's target can name.
-enum MoveCardinality {
-    /// One object this instruction selects or names, a singular referent, or
-    /// no object population at all.
-    One,
-    /// The inherited parent target(s): as many as the parent announced.
-    ParentTargets,
-    /// A population an earlier instruction (or the source's history) handed
-    /// over, of any size.
-    Population,
-}
-
-/// CR 603.12a: how many objects a move's target names. A population handed
-/// over by an earlier instruction ("those cards", the cards exiled with this)
-/// carries no cardinality of its own: the resolver moves every member. Recurses
-/// through `And`/`Or` only; a filter property that merely mentions a referent
-/// (`DistinctFrom { ParentTarget }`) excludes an object, it doesn't move one.
-fn move_target_cardinality(target: &TargetFilter) -> MoveCardinality {
+/// CR 603.12a: whether a move's own target names one object. A referent handed
+/// over by an earlier instruction (an inherited parent target, "those cards",
+/// the cards exiled with this) or a pairing ("this creature and the creature
+/// it's paired with") carries no cardinality of its own: the resolver moves
+/// every member. Recurses through `And`/`Or` only; a filter property that
+/// merely mentions a referent (`DistinctFrom { ParentTarget }`) excludes an
+/// object, it doesn't move one.
+fn target_names_one_object(target: &TargetFilter) -> bool {
     match target {
-        TargetFilter::ParentTarget => MoveCardinality::ParentTargets,
-        TargetFilter::ParentTargetSlot { .. }
+        // Populations, of any size.
+        TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::SourceOrPaired
         | TargetFilter::LastZoneChanged
         | TargetFilter::LastRevealed
         | TargetFilter::LastCreated
         | TargetFilter::CostPaidObject
         | TargetFilter::ExiledBySource
         | TargetFilter::TrackedSetFiltered { .. }
-        | TargetFilter::ControllerAndControlledPermanents { .. } => MoveCardinality::Population,
+        | TargetFilter::ControllerAndControlledPermanents { .. } => false,
         TargetFilter::And { filters } | TargetFilter::Or { filters } => {
-            filters.iter().map(move_target_cardinality).fold(
-                MoveCardinality::One,
-                |widest, member| match (widest, member) {
-                    (MoveCardinality::Population, _) | (_, MoveCardinality::Population) => {
-                        MoveCardinality::Population
-                    }
-                    (MoveCardinality::ParentTargets, _) | (_, MoveCardinality::ParentTargets) => {
-                        MoveCardinality::ParentTargets
-                    }
-                    (MoveCardinality::One, MoveCardinality::One) => MoveCardinality::One,
-                },
-            )
+            filters.iter().all(target_names_one_object)
         }
+        // One object this instruction selects or names, a singular referent,
+        // or no object population at all.
         TargetFilter::Typed(_)
         | TargetFilter::Not { .. }
         | TargetFilter::TrackedSet { .. }
@@ -148,7 +117,6 @@ fn move_target_cardinality(target: &TargetFilter) -> MoveCardinality {
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
         | TargetFilter::GrantingObject { .. }
-        | TargetFilter::SourceOrPaired
         | TargetFilter::StackAbility { .. }
         | TargetFilter::StackSpell
         | TargetFilter::SpecificObject { .. }
@@ -181,7 +149,7 @@ fn move_target_cardinality(target: &TargetFilter) -> MoveCardinality {
         | TargetFilter::HasChosenName
         | TargetFilter::Named { .. }
         | TargetFilter::Owner
-        | TargetFilter::AllPlayers => MoveCardinality::One,
+        | TargetFilter::AllPlayers => true,
     }
 }
 
@@ -239,13 +207,7 @@ pub(super) fn unsupported_zone_change_reflexive(
     if producer.player_scope.is_some() || !publishes_event(&producer.parsed.effect, head.verb) {
         return Some("zone_change_reflexive_event_source");
     }
-    let earlier = clauses
-        .iter()
-        .position(|clause| std::ptr::eq(clause, producer))
-        .map_or(&clauses[..0], |at| &clauses[..at]);
-    if head.occurrence == ThisWayOccurrence::Single
-        && !producer_moves_at_most_one(producer, earlier)
-    {
+    if head.occurrence == ThisWayOccurrence::Single && !producer_moves_at_most_one(producer) {
         return Some("zone_change_reflexive_occurrence");
     }
     if body_player_scope.is_some() {
@@ -282,4 +244,36 @@ pub(super) fn unsupported_zone_change_reflexive(
         return Some("zone_change_reflexive_unbound_referent");
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_names_one_object;
+    use crate::types::ability::{TargetFilter, TypedFilter};
+    use crate::types::identifiers::TrackedSetId;
+
+    /// CR 603.12a: a move's target names one object only when it selects or
+    /// names one. Handed-over referents and a pairing ("this creature and the
+    /// creature it's paired with", which the resolver expands to the source
+    /// and its partner) are populations.
+    #[test]
+    fn handed_over_referents_and_pairings_are_populations() {
+        for population in [
+            TargetFilter::ParentTarget,
+            TargetFilter::SourceOrPaired,
+            TargetFilter::LastRevealed,
+            TargetFilter::LastZoneChanged,
+            TargetFilter::ExiledBySource,
+        ] {
+            assert!(!target_names_one_object(&population), "{population:?}");
+        }
+        let typed = TargetFilter::Typed(TypedFilter::default());
+        assert!(target_names_one_object(&typed));
+        assert!(target_names_one_object(&TargetFilter::TrackedSet {
+            id: TrackedSetId(0)
+        }));
+        assert!(!target_names_one_object(&TargetFilter::And {
+            filters: vec![typed, TargetFilter::ParentTarget],
+        }));
+    }
 }
