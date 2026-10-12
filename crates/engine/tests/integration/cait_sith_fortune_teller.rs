@@ -7,13 +7,15 @@
 //!
 //! Every test drives the printed combat trigger through production priority.
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::zones::move_to_zone;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{Effect, EffectKind, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{PersistedGameState, PersistedRestoreFinalization, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, PersistedGameState, PersistedRestoreFinalization, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -30,11 +32,14 @@ struct Fixture {
     cait: ObjectId,
     bear: ObjectId,
     top: Option<ObjectId>,
+    /// P1's free instants, cast in response to the reflexive.
+    bounce: ObjectId,
+    destroy: ObjectId,
 }
 
 /// Cait Sith and a Bear for P0 (two legal targets, so the prompt is
 /// observable); the top of P0's library is a mana value 3 card unless
-/// `empty_library`.
+/// `empty_library`. P1 holds a free bounce and a free destroy instant.
 fn fixture(empty_library: bool) -> Fixture {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
@@ -47,12 +52,55 @@ fn fixture(empty_library: bool) -> Fixture {
             .with_mana_cost(ManaCost::generic(3))
             .id()
     });
+    let bounce = s
+        .add_spell_to_hand_from_oracle(
+            P1,
+            "Free Bounce",
+            true,
+            "Return target creature to its owner's hand.",
+        )
+        .id();
+    let destroy = s
+        .add_spell_to_hand_from_oracle(P1, "Free Destroy", true, "Destroy target creature.")
+        .id();
     Fixture {
         runner: s.build(),
         cait,
         bear,
         top,
+        bounce,
+        destroy,
     }
+}
+
+/// With the reflexive on the stack, P0 passes priority and P1 casts `spell`
+/// targeting `target` in response; the response resolves through the
+/// production pipeline before the reflexive does.
+fn p1_responds(r: &mut GameRunner, spell: ObjectId, target: ObjectId) {
+    r.act(GameAction::PassPriority).expect("P0 passes");
+    assert!(
+        matches!(r.state().waiting_for, WaitingFor::Priority { player } if player == P1),
+        "reach: P1 has priority with the reflexive on the stack"
+    );
+    let card_id = r.state().objects[&spell].card_id;
+    r.act(GameAction::CastSpell {
+        object_id: spell,
+        card_id,
+        targets: vec![],
+        payment_mode: CastPaymentMode::Auto,
+    })
+    .expect("P1 casts the response");
+    if matches!(r.state().waiting_for, WaitingFor::TargetSelection { .. }) {
+        r.act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(target)],
+        })
+        .expect("P1 targets");
+    }
+    assert_eq!(
+        r.state().stack.len(),
+        2,
+        "reach: the response is above the reflexive"
+    );
 }
 
 /// Advance from precombat main into combat, keeping the scried card on top,
@@ -215,6 +263,7 @@ fn cait_sith_reflexive_fizzles_when_its_target_leaves() {
         mut runner,
         bear,
         top,
+        bounce,
         ..
     } = fixture(false);
     let (_, prompted) = advance_to_reflexive_prompt(&mut runner);
@@ -225,9 +274,14 @@ fn cait_sith_reflexive_fizzles_when_its_target_leaves() {
         1,
         "reach: the reflexive is on the stack"
     );
-    let mut events = Vec::new();
-    move_to_zone(runner.state_mut(), bear, Zone::Graveyard, &mut events);
+    // Hostile: P1 bounces the chosen creature in response.
+    p1_responds(&mut runner, bounce, bear);
     resolve_stack(&mut runner);
+    assert_eq!(
+        zone(&runner, bear),
+        Zone::Hand,
+        "reach: the bounce resolved"
+    );
     // CR 608.2b: its only target is illegal, so it does nothing.
     assert!(runner.state().stack.is_empty());
     assert_eq!(zone(&runner, top.unwrap()), Zone::Exile);
@@ -240,6 +294,8 @@ fn cait_sith_reflexive_reads_the_exiled_card_after_it_leaves_exile() {
         bear,
         top,
         cait,
+        destroy,
+        ..
     } = fixture(false);
     let top = top.unwrap();
     let (_, prompted) = advance_to_reflexive_prompt(&mut runner);
@@ -248,11 +304,19 @@ fn cait_sith_reflexive_reads_the_exiled_card_after_it_leaves_exile() {
     // Hostile: the exiled card and Cait Sith both leave before the reflexive
     // resolves. CR 608.2h: "that card's mana value" is the last known
     // information of the card exiled this way; the reflexive is independent of
-    // its source (CR 113.7a).
+    // its source (CR 113.7a). Cait Sith is destroyed by P1's response through
+    // the production pipeline. The exiled card's departure is a RAW-STATE
+    // mutation (`move_to_zone`), deliberately: it only has to stop being the
+    // object in exile, and no replacement or trigger is in play for it.
     let mut events = Vec::new();
     move_to_zone(runner.state_mut(), top, Zone::Hand, &mut events);
-    move_to_zone(runner.state_mut(), cait, Zone::Graveyard, &mut events);
+    p1_responds(&mut runner, destroy, cait);
     resolve_stack(&mut runner);
+    assert_eq!(
+        zone(&runner, cait),
+        Zone::Graveyard,
+        "reach: the destroy resolved"
+    );
     assert_eq!(runner.state().objects[&bear].power, Some(5));
 }
 

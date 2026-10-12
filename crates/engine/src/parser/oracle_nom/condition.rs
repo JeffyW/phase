@@ -10864,8 +10864,10 @@ pub enum ThisWayVerb {
 /// How many occurrences of the event a "… this way" head counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThisWayOccurrence {
-    /// "a"/"an"/"that"/"another" — one occurrence (CR 603.12a: a reflexive
-    /// triggers once for each time its event occurred).
+    /// "a"/"an" — one occurrence (CR 603.12a: a reflexive triggers once for
+    /// each time its event occurred). Passive subjects also take "that" and
+    /// "another"; active "you <verb>" heads don't (see
+    /// `parse_active_this_way_quantifier`).
     Single,
     /// "one or more"/"at least one"/"any number of" — the event as a whole.
     Aggregate,
@@ -10885,6 +10887,25 @@ fn parse_this_way_quantifier(input: &str) -> OracleResult<'_, ThisWayOccurrence>
             nom::combinator::peek(tag("another ")),
         ),
         value(ThisWayOccurrence::Single, tag("that ")),
+        value(ThisWayOccurrence::Single, parse_article),
+    ))
+    .parse(input)
+}
+
+/// The quantifier of an active-voice "you <verb> ... this way" head ("you
+/// discard a card", "you exile one or more cards"). Shared by every active head
+/// so its arms can't drift apart. Unlike the passive subject
+/// ([`parse_this_way_quantifier`]), active heads deliberately admit neither
+/// "that" nor "another": "you discard that card this way" and "you exile
+/// another card this way" don't occur on printed cards, so both stay
+/// unrecognized rather than guessed.
+fn parse_active_this_way_quantifier(input: &str) -> OracleResult<'_, ThisWayOccurrence> {
+    alt((
+        value(
+            ThisWayOccurrence::Aggregate,
+            tag::<_, _, OracleError<'_>>("at least one "),
+        ),
+        value(ThisWayOccurrence::Aggregate, tag("one or more ")),
         value(ThisWayOccurrence::Single, parse_article),
     ))
     .parse(input)
@@ -11349,15 +11370,7 @@ pub fn parse_you_put_onto_battlefield_this_way_head(
     input: &str,
 ) -> OracleResult<'_, (TargetFilter, bool, ThisWayHead)> {
     let (rest, _) = tag("you put ").parse(input)?;
-    let (rest, occurrence) = alt((
-        value(
-            ThisWayOccurrence::Aggregate,
-            tag::<_, _, OracleError<'_>>("at least one "),
-        ),
-        value(ThisWayOccurrence::Aggregate, tag("one or more ")),
-        value(ThisWayOccurrence::Single, parse_article),
-    ))
-    .parse(rest)?;
+    let (rest, occurrence) = parse_active_this_way_quantifier(rest)?;
     let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -11411,15 +11424,7 @@ pub fn parse_you_put_into_graveyard_this_way_head(
     input: &str,
 ) -> OracleResult<'_, (TargetFilter, bool, ThisWayHead)> {
     let (rest, _) = tag("you put ").parse(input)?;
-    let (rest, occurrence) = alt((
-        value(
-            ThisWayOccurrence::Aggregate,
-            tag::<_, _, OracleError<'_>>("at least one "),
-        ),
-        value(ThisWayOccurrence::Aggregate, tag("one or more ")),
-        value(ThisWayOccurrence::Single, parse_article),
-    ))
-    .parse(rest)?;
+    let (rest, occurrence) = parse_active_this_way_quantifier(rest)?;
     let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -11472,15 +11477,7 @@ pub fn parse_you_discard_this_way_head(
     input: &str,
 ) -> OracleResult<'_, (TargetFilter, bool, ThisWayHead)> {
     let (rest, _) = tag("you discard ").parse(input)?;
-    let (rest, occurrence) = alt((
-        value(
-            ThisWayOccurrence::Aggregate,
-            tag::<_, _, OracleError<'_>>("at least one "),
-        ),
-        value(ThisWayOccurrence::Aggregate, tag("one or more ")),
-        value(ThisWayOccurrence::Single, parse_article),
-    ))
-    .parse(rest)?;
+    let (rest, occurrence) = parse_active_this_way_quantifier(rest)?;
     let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -11526,14 +11523,14 @@ pub fn parse_you_sacrifice_this_way_head(
     input: &str,
 ) -> OracleResult<'_, (TargetFilter, bool, ThisWayHead)> {
     let (rest, _) = tag("you sacrifice ").parse(input)?;
+    // "you sacrifice any number of artifacts": the one active head whose
+    // producer ("Sacrifice any number of ...") also takes this quantifier.
     let (rest, occurrence) = alt((
         value(
             ThisWayOccurrence::Aggregate,
-            tag::<_, _, OracleError<'_>>("at least one "),
+            tag::<_, _, OracleError<'_>>("any number of "),
         ),
-        value(ThisWayOccurrence::Aggregate, tag("one or more ")),
-        value(ThisWayOccurrence::Aggregate, tag("any number of ")),
-        value(ThisWayOccurrence::Single, parse_article),
+        parse_active_this_way_quantifier,
     ))
     .parse(rest)?;
     let (filter, after_filter) = parse_type_phrase_folding(rest);
@@ -11584,15 +11581,7 @@ pub fn parse_you_exile_this_way_head(
     let (rest, _) = tag("you exile").parse(input)?;
     let (rest, _) = opt(tag("d")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, occurrence) = alt((
-        value(
-            ThisWayOccurrence::Aggregate,
-            tag::<_, _, OracleError<'_>>("at least one "),
-        ),
-        value(ThisWayOccurrence::Aggregate, tag("one or more ")),
-        value(ThisWayOccurrence::Single, parse_article),
-    ))
-    .parse(rest)?;
+    let (rest, occurrence) = parse_active_this_way_quantifier(rest)?;
     let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(

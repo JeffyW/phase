@@ -180,6 +180,11 @@ fn resolve_created_reflexive(runner: &mut GameRunner, target: TargetRef) -> (usi
             other => panic!("unexpected prompt {other:?}"),
         }
     }
+    assert!(
+        runner.state().stack.is_empty(),
+        "reflexive did not finish resolving: {:?}",
+        runner.state().waiting_for
+    );
     (prompts, reached_stack)
 }
 

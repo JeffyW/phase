@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use engine::game::combat::{has_cant_be_blocked_static, AttackTarget};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{AbilityDefinition, Effect, TargetRef};
+use engine::types::ability::{AbilityDefinition, Effect, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
@@ -937,6 +937,80 @@ fn spellbook_draft_entry_reflexives_fail_closed() {
 /// occurrence, so after an instruction that exiles two cards it would trigger
 /// twice, while the creation gate makes one trigger: fails closed. The
 /// aggregate head ("one or more cards") is one event and triggers once.
+/// CR 603.12a: a move whose target is inherited from an earlier clause
+/// ("Tap two target creatures. Exile them.") carries no cardinality of its own;
+/// it moves every inherited target. A single-occurrence head after it would
+/// trigger once per card, while the creation gate makes one trigger, so it
+/// fails closed. The aggregate head stays supported and triggers once; a
+/// singular tracked-set referent ("return it") still moves one object.
+#[test]
+fn single_occurrence_head_after_an_inherited_two_target_move_fails_closed() {
+    let single = spell_ability(
+        "Tap two target creatures. Exile them. When you exile a creature this way, you gain 1 life.",
+        "Probe",
+    );
+    let producer = single.sub_ability.as_deref().expect("the exile clause");
+    assert!(
+        matches!(
+            producer.effect.as_ref(),
+            Effect::ChangeZone {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "reach guard: the producer moves the inherited targets: {producer:?}"
+    );
+    assert_eq!(
+        unimplemented_name(&single).as_deref(),
+        Some("zone_change_reflexive_occurrence"),
+        "{single:?}"
+    );
+
+    let singular = spell_ability(
+        "Exile target creature, then return it to the battlefield under its owner's control. When a creature enters this way, you gain 1 life.",
+        "Probe",
+    );
+    assert!(
+        matches!(
+            singular
+                .sub_ability
+                .as_deref()
+                .map(|sub| sub.effect.as_ref()),
+            Some(Effect::ChangeZone {
+                target: TargetFilter::TrackedSet { .. },
+                ..
+            })
+        ),
+        "reach guard: the singular tracked-set move: {singular:?}"
+    );
+    assert_supported_zone_change_reflexive(&singular);
+
+    let aggregate = "Tap two target creatures. Exile them. When you exile one or more creatures this way, you gain 1 life.";
+    assert_supported_zone_change_reflexive(&spell_ability(aggregate, "Probe"));
+    let mut s = GameScenario::new();
+    s.at_phase(Phase::PreCombatMain);
+    let spell = s
+        .add_spell_to_hand_from_oracle(P0, "Probe", false, aggregate)
+        .id();
+    let first = s.add_creature(P1, "First", 2, 2).id();
+    let second = s.add_creature(P1, "Second", 2, 2).id();
+    let mut r = s.build();
+    let life = r.life(P0);
+    cast(&mut r, spell);
+    let out = drive(
+        &mut r,
+        Plan::new(first).target(vec![TargetRef::Object(first), TargetRef::Object(second)]),
+    );
+    assert_eq!(r.state().objects[&first].zone, Zone::Exile, "reach: exiled");
+    assert_eq!(
+        r.state().objects[&second].zone,
+        Zone::Exile,
+        "reach: exiled"
+    );
+    assert_eq!(out.triggers_on_stack, 1, "one reflexive on the stack");
+    assert_eq!(r.life(P0), life + 1, "the aggregate head triggers once");
+}
+
 #[test]
 fn single_occurrence_head_after_a_multi_card_producer_fails_closed() {
     let single = spell_ability(
@@ -1039,27 +1113,86 @@ fn reflexive_survives_save_and_restore_at_the_producers_discard_choice() {
 /// opponent).
 #[test]
 fn reflexive_with_an_object_the_stack_cannot_carry_fails_closed() {
-    for (name, expected_gap, text) in [
+    /// Every node of the body, through both branches.
+    fn nodes(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
+        let mut out = vec![def];
+        for child in [def.sub_ability.as_deref(), def.else_ability.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            out.extend(nodes(child));
+        }
+        out
+    }
+    fn enters_battlefield(e: &Effect) -> bool {
+        matches!(
+            e,
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                ..
+            }
+        )
+    }
+    fn sacrifices(e: &Effect) -> bool {
+        matches!(e, Effect::Sacrifice { .. })
+    }
+    fn mills(e: &Effect) -> bool {
+        matches!(e, Effect::Mill { .. })
+    }
+    /// (card name, expected gap, printed text, producer shape)
+    type Case = (
+        &'static str,
+        &'static str,
+        &'static str,
+        fn(&Effect) -> bool,
+    );
+    let cases: [Case; 3] = [
         (
             "Hans Eriksson",
             "zone_change_reflexive_event_source",
             "Whenever Hans Eriksson attacks, reveal the top card of your library. If it's a creature card, put it onto the battlefield tapped and attacking defending player or a planeswalker they control. Otherwise, put that card into your hand. When you put a creature card onto the battlefield this way, it fights Hans Eriksson.",
+            enters_battlefield,
         ),
         (
             "Three Dog, Galaxy News DJ",
             "zone_change_reflexive_unbound_referent",
             "Whenever you attack, you may pay {2} and sacrifice an Aura attached to Three Dog. When you sacrifice an Aura this way, for each other attacking creature you control, create a token that's a copy of that Aura attached to that creature.",
+            sacrifices,
         ),
         (
             "Saruman of Many Colors",
             "zone_change_reflexive_event_source",
             "Whenever you cast your second spell each turn, each opponent mills two cards. When one or more cards are milled this way, exile target enchantment, instant, or sorcery card with equal or lesser mana value than that spell from an opponent's graveyard. Copy the exiled card. You may cast the copy without paying its mana cost.",
+            mills,
         ),
-    ] {
+    ];
+    for (name, expected_gap, text, producer) in cases {
         let parsed = parse_oracle_text(text, name, &[], &["Creature".to_string()], &[]);
-        let json = serde_json::to_string(&parsed.triggers).unwrap();
-        assert!(json.contains(expected_gap), "{name}: {json}");
-        assert!(!json.contains("WhenYouDo"), "{name}: no reflexive gate is claimed: {json}");
+        let body = parsed
+            .triggers
+            .iter()
+            .find_map(|trigger| trigger.execute.as_deref())
+            .expect("trigger body");
+        let all = nodes(body);
+        assert!(
+            all.iter().any(|node| producer(node.effect.as_ref())),
+            "{name}: reach guard, the producer is in the trigger body: {body:?}"
+        );
+        assert!(
+            all.iter().any(|node| matches!(
+                node.effect.as_ref(),
+                Effect::Unimplemented { name: gap, description: Some(head) }
+                    if gap == expected_gap && head.contains("this way")
+            )),
+            "{name}: the head clause fails closed as {expected_gap}: {body:?}"
+        );
+        assert!(
+            all.iter().all(|node| !node
+                .condition
+                .as_ref()
+                .is_some_and(|condition| condition.has_when_you_do_marker())),
+            "{name}: no reflexive gate is claimed: {body:?}"
+        );
     }
 }
 

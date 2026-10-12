@@ -10,7 +10,7 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -1152,6 +1152,7 @@ fn gilgamesh_reflexive_offers_only_the_equipment_moved_this_way() {
 
     cast_for_free(&mut runner, gilgamesh);
     let mut dug = false;
+    let mut original_trigger = None;
     let mut reflexive_on_stack = false;
     let mut offered_equipment = None;
     for _ in 0..48 {
@@ -1160,9 +1161,29 @@ fn gilgamesh_reflexive_offers_only_the_equipment_moved_this_way() {
                 if runner.state().stack.is_empty() {
                     break;
                 }
+                let gilgamesh_triggers: Vec<_> = runner
+                    .state()
+                    .stack
+                    .iter()
+                    .filter(|entry| {
+                        entry.source_id == gilgamesh
+                            && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                    })
+                    .map(|entry| entry.id)
+                    .collect();
+                if !dug && original_trigger.is_none() {
+                    original_trigger = gilgamesh_triggers.first().copied();
+                }
                 // CR 603.12: after the Dig resolved, the reflexive waits on the
-                // stack as its own object.
-                reflexive_on_stack |= dug;
+                // stack as its own object, and the trigger that created it is
+                // gone.
+                if dug {
+                    reflexive_on_stack |= gilgamesh_triggers
+                        .iter()
+                        .any(|id| Some(*id) != original_trigger)
+                        && original_trigger
+                            .is_some_and(|original| !gilgamesh_triggers.contains(&original));
+                }
                 runner
                     .act(GameAction::PassPriority)
                     .expect("priority pass must be accepted");
@@ -1204,8 +1225,12 @@ fn gilgamesh_reflexive_offers_only_the_equipment_moved_this_way() {
         }
     }
     assert!(
+        original_trigger.is_some(),
+        "reach: Gilgamesh's enters trigger was on the stack"
+    );
+    assert!(
         reflexive_on_stack,
-        "reach: the reflexive resolved from the stack"
+        "reach: after the Dig, a separate Gilgamesh reflexive was on the stack"
     );
     let offered = offered_equipment.expect("reach: the Equipment choice opened");
     assert_eq!(

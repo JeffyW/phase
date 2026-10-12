@@ -49,13 +49,11 @@ fn publishes_event(effect: &Effect, verb: ThisWayVerb) -> bool {
 /// CR 603.12a: a reflexive whose head counts ONE occurrence ("When you exile a
 /// card this way") triggers once for each card the instruction moved, but the
 /// creation gate creates one trigger. Supported only when the producer moves
-/// at most one object.
-fn producer_moves_at_most_one(producer: &ClauseIr) -> bool {
+/// at most one object. `earlier` is every clause before the producer, read to
+/// prove the cardinality of a target the producer inherits.
+fn producer_moves_at_most_one(producer: &ClauseIr, earlier: &[ClauseIr]) -> bool {
     let one = |count: &QuantityExpr| matches!(count, QuantityExpr::Fixed { value: 1 });
-    let single_instruction = producer.multi_target.is_none()
-        && producer.parsed.multi_target.is_none()
-        && producer.repeat_for.is_none();
-    single_instruction
+    single_instruction(producer)
         && match &producer.parsed.effect {
             Effect::Discard { count, .. }
             | Effect::ExileTop { count, .. }
@@ -71,9 +69,120 @@ fn producer_moves_at_most_one(producer: &ClauseIr) -> bool {
                 Some(kept) => *kept == 1,
                 None => *destination != Some(Zone::Library),
             },
-            Effect::ChangeZone { .. } => true,
+            Effect::ChangeZone { target, .. } => match move_target_cardinality(target) {
+                MoveCardinality::One => true,
+                // "Exile target creature, then return it" moves the one object
+                // its parent announced; "Tap two target creatures. Exile them."
+                // moves both. Single only when the nearest earlier clause that
+                // announced a target is itself a single-target instruction.
+                MoveCardinality::ParentTargets => earlier
+                    .iter()
+                    .rev()
+                    .find(|clause| has_typed_target_widened(&clause.parsed.effect))
+                    .is_some_and(single_instruction),
+                MoveCardinality::Population => false,
+            },
             _ => false,
         }
+}
+
+/// One instruction, one selection: no multi-target slot and no repetition.
+fn single_instruction(clause: &ClauseIr) -> bool {
+    clause.multi_target.is_none()
+        && clause.parsed.multi_target.is_none()
+        && clause.repeat_for.is_none()
+}
+
+/// How many objects a move's target can name.
+enum MoveCardinality {
+    /// One object this instruction selects or names, a singular referent, or
+    /// no object population at all.
+    One,
+    /// The inherited parent target(s): as many as the parent announced.
+    ParentTargets,
+    /// A population an earlier instruction (or the source's history) handed
+    /// over, of any size.
+    Population,
+}
+
+/// CR 603.12a: how many objects a move's target names. A population handed
+/// over by an earlier instruction ("those cards", the cards exiled with this)
+/// carries no cardinality of its own: the resolver moves every member. Recurses
+/// through `And`/`Or` only; a filter property that merely mentions a referent
+/// (`DistinctFrom { ParentTarget }`) excludes an object, it doesn't move one.
+fn move_target_cardinality(target: &TargetFilter) -> MoveCardinality {
+    match target {
+        TargetFilter::ParentTarget => MoveCardinality::ParentTargets,
+        TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::LastZoneChanged
+        | TargetFilter::LastRevealed
+        | TargetFilter::LastCreated
+        | TargetFilter::CostPaidObject
+        | TargetFilter::ExiledBySource
+        | TargetFilter::TrackedSetFiltered { .. }
+        | TargetFilter::ControllerAndControlledPermanents { .. } => MoveCardinality::Population,
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().map(move_target_cardinality).fold(
+                MoveCardinality::One,
+                |widest, member| match (widest, member) {
+                    (MoveCardinality::Population, _) | (_, MoveCardinality::Population) => {
+                        MoveCardinality::Population
+                    }
+                    (MoveCardinality::ParentTargets, _) | (_, MoveCardinality::ParentTargets) => {
+                        MoveCardinality::ParentTargets
+                    }
+                    (MoveCardinality::One, MoveCardinality::One) => MoveCardinality::One,
+                },
+            )
+        }
+        TargetFilter::Typed(_)
+        | TargetFilter::Not { .. }
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::PlayerMatching { .. }
+        | TargetFilter::ChosenDamageSource { .. }
+        | TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SourceController
+        | TargetFilter::Opponent
+        | TargetFilter::SelfRef
+        | TargetFilter::GrantingObject { .. }
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::AmassedArmy
+        | TargetFilter::ChosenCard
+        | TargetFilter::ExiledCardByIndex { .. }
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
+        | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
+        | TargetFilter::DeclaredPlayer { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::OriginalSource
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => MoveCardinality::One,
+    }
 }
 
 /// CR 608.2c: a play permission over the moved cards ("You may play that card
@@ -130,7 +239,13 @@ pub(super) fn unsupported_zone_change_reflexive(
     if producer.player_scope.is_some() || !publishes_event(&producer.parsed.effect, head.verb) {
         return Some("zone_change_reflexive_event_source");
     }
-    if head.occurrence == ThisWayOccurrence::Single && !producer_moves_at_most_one(producer) {
+    let earlier = clauses
+        .iter()
+        .position(|clause| std::ptr::eq(clause, producer))
+        .map_or(&clauses[..0], |at| &clauses[..at]);
+    if head.occurrence == ThisWayOccurrence::Single
+        && !producer_moves_at_most_one(producer, earlier)
+    {
         return Some("zone_change_reflexive_occurrence");
     }
     if body_player_scope.is_some() {
