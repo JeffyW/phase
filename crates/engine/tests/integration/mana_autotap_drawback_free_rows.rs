@@ -10,8 +10,10 @@
 //! choose to have it not untap during your next untap step"); the automatic
 //! payer must not make that choice, or a sacrifice, when it isn't needed.
 
+use engine::game::mana_sources::activatable_mana_actions_for_player;
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::types::ability::{ContinuousModification, TargetFilter};
+use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
@@ -31,6 +33,8 @@ const OASIS_RITUALIST_ORACLE: &str = "{T}: Add one mana of any color.\n\
 (An exerted creature won't untap during your next untap step.)";
 const TWILIGHT_MIRE_ORACLE: &str = "{T}: Add {C}.\n{B/G}, {T}: Add {B}{B}, {B}{G}, or {G}{G}.";
 const AZORIUS_SIGNET_ORACLE: &str = "{1}, {T}: Add {W}{U}.";
+const GRAVEN_CAIRNS_ORACLE: &str = "{T}: Add {C}.\n{B/R}, {T}: Add {B}{B}, {B}{R}, or {R}{R}.";
+const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
 fn exert_markers(state: &GameState, id: ObjectId) -> usize {
@@ -337,4 +341,128 @@ fn drawback_free_plan_is_rejected_when_it_cannot_fund_a_mana_sub_cost() {
     let outcome = auto_pay_and_resolve(&mut runner, spell);
     assert_eq!(outcome.zone_of(ruins), Zone::Graveyard);
     assert!(outcome.state().objects[&signet].tapped && outcome.state().objects[&mountain].tapped);
+}
+
+// --- Two filter lands whose sub-costs must not be funded independently ---
+
+/// P0: Graven Cairns, Fetid Heath, Dwarven Ruins, Swamp (in that order), all
+/// untapped, and Hearthfire Hobgoblin ({R/W}{R/W}{R/W}) in hand.
+fn cairns_heath_board() -> (GameRunner, [ObjectId; 4], ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cairns = scenario
+        .add_land_from_oracle(P0, "Graven Cairns", GRAVEN_CAIRNS_ORACLE)
+        .id();
+    let heath = scenario
+        .add_land_from_oracle(P0, "Fetid Heath", FETID_HEATH_ORACLE)
+        .id();
+    let ruins = scenario
+        .add_land_from_oracle(P0, "Dwarven Ruins", DWARVEN_RUINS_ORACLE)
+        .id();
+    let swamp = scenario.add_basic_land(P0, ManaColor::Black);
+    let hobgoblin = scenario
+        .add_creature_to_hand_from_oracle(P0, "Hearthfire Hobgoblin", 2, 2, "Double strike")
+        .with_mana_cost(cost(
+            &[
+                ManaCostShard::RedWhite,
+                ManaCostShard::RedWhite,
+                ManaCostShard::RedWhite,
+            ],
+            0,
+        ))
+        .id();
+    let lands = [cairns, heath, ruins, swamp];
+    let runner = build_untapped(scenario, &lands);
+    for land in lands {
+        assert!(
+            !runner.state().objects[&land].tapped,
+            "reach: {land:?} starts untapped"
+        );
+    }
+    for (land, abilities) in [(cairns, 2), (heath, 2), (ruins, 2)] {
+        assert_eq!(
+            runner.state().objects[&land].abilities.len(),
+            abilities,
+            "reach: {land:?} has its plain and its costed mana ability"
+        );
+    }
+    (runner, lands, hobgoblin)
+}
+
+/// CR 601.2g + CR 605.3b: Cairns {R}{R} and Heath {W}{W} pay the Hobgoblin, and
+/// each filter ability's hybrid sub-cost needs its own funding source. Auto-pay
+/// must not fund Cairns' {B/R} with the Swamp that Heath's {W/B} needs: the
+/// cast is affordable and resolves through the default automatic payment.
+#[test]
+fn two_filter_land_sub_costs_are_funded_together() {
+    let (mut runner, [cairns, heath, _ruins, _swamp], hobgoblin) = cairns_heath_board();
+    assert!(
+        engine::ai_support::legal_actions(runner.state())
+            .iter()
+            .any(
+                |action| matches!(action, GameAction::CastSpell { object_id, .. }
+                if *object_id == hobgoblin)
+            ),
+        "Hearthfire Hobgoblin must be affordable under automatic payment"
+    );
+
+    let outcome = runner.cast(hobgoblin).resolve();
+    let filter_outputs: Vec<(ObjectId, ManaType)> = mana_added(outcome.events())
+        .into_iter()
+        .filter(|(source, _)| *source == cairns || *source == heath)
+        .collect();
+    assert_eq!(
+        filter_outputs,
+        vec![
+            (cairns, ManaType::Red),
+            (cairns, ManaType::Red),
+            (heath, ManaType::White),
+            (heath, ManaType::White),
+        ],
+        "reach: the selected filter outputs are Cairns {{R}}{{R}}, then Heath {{W}}{{W}}; all mana \
+         added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(
+        outcome.zone_of(hobgoblin),
+        Zone::Battlefield,
+        "mana added {:?}",
+        mana_added(outcome.events())
+    );
+}
+
+/// Manual control for the board above: Swamp funds Heath, Ruins' plain {R}
+/// funds Cairns, and the Hobgoblin resolves without sacrificing the Ruins.
+#[test]
+fn two_filter_land_sub_costs_manual_control() {
+    let (mut runner, [cairns, heath, ruins, swamp], hobgoblin) = cairns_heath_board();
+    let activate = |runner: &mut GameRunner, source: ObjectId, output: &[ManaType]| {
+        let action = activatable_mana_actions_for_player(runner.state(), P0)
+            .into_iter()
+            .find(|action| match action {
+                GameAction::TapLandForMana { selection } => {
+                    selection.source.object_id == source
+                        && match output {
+                            [single] => {
+                                selection.atomic_combination.is_none()
+                                    && selection.mana_type == *single
+                            }
+                            combination => {
+                                selection.atomic_combination.as_deref() == Some(combination)
+                            }
+                        }
+                }
+                _ => false,
+            })
+            .unwrap_or_else(|| panic!("{source:?} offers {output:?}"));
+        runner.act(action).expect("manual mana activation");
+    };
+    activate(&mut runner, swamp, &[ManaType::Black]);
+    activate(&mut runner, heath, &[ManaType::White, ManaType::White]);
+    activate(&mut runner, ruins, &[ManaType::Red]);
+    activate(&mut runner, cairns, &[ManaType::Red, ManaType::Red]);
+
+    let outcome = runner.cast(hobgoblin).resolve();
+    assert_eq!(outcome.zone_of(hobgoblin), Zone::Battlefield);
+    assert_eq!(outcome.zone_of(ruins), Zone::Battlefield);
 }

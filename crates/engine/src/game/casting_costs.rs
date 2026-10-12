@@ -13532,6 +13532,7 @@ pub(super) fn auto_tap_mana_sources_excluding(
         None,
         None,
         None,
+        AutoTapRowPolicy::Choose,
     );
 }
 
@@ -13607,6 +13608,7 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding_and_resume(
         None,
         resume,
         parent,
+        AutoTapRowPolicy::Choose,
     );
 }
 
@@ -13632,6 +13634,7 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding(
         None,
         None,
         None,
+        AutoTapRowPolicy::Choose,
     );
 }
 
@@ -13663,6 +13666,7 @@ pub(super) fn auto_tap_non_sacrificial_mana_sources(
         None,
         None,
         None,
+        AutoTapRowPolicy::Choose,
     );
 }
 
@@ -13827,6 +13831,7 @@ pub(super) fn auto_tap_mana_sources_with_context_excluding_cached(
         source_cache,
         None,
         None,
+        AutoTapRowPolicy::Choose,
     );
 }
 
@@ -14013,6 +14018,7 @@ fn auto_tap_mana_sources_inner(
     source_cache: Option<&AutoTapSourceCache>,
     resume: Option<&crate::types::game_state::ManaAbilityResume>,
     parent: Option<&ManaAbilityCostParent>,
+    row_policy: AutoTapRowPolicy,
 ) {
     use crate::types::mana::ManaCost;
 
@@ -14106,16 +14112,23 @@ fn auto_tap_mana_sources_inner(
     // Build the typed shard-requirements list first — used by both the
     // combination pre-pass and the main MCV/LCV loop.
     let (needs, deferred_generic) = auto_tap_needs(shards, mana_spend_permission);
-    let AutoTapPlan {
-        mut to_tap,
-        used_sources,
-        ..
-    } = choose_auto_tap_plan(
+    // The row policy is decided once for the whole payment and inherited by every
+    // nested mana sub-cost payment, so sibling sub-costs are funded under the plan
+    // that was verified for them together.
+    let (
+        AutoTapPlan {
+            mut to_tap,
+            used_sources,
+            ..
+        },
+        nested_row_policy,
+    ) = choose_auto_tap_plan(
         state,
         available,
         &needs,
         generic as usize + deferred_generic,
         effective_ctx,
+        row_policy,
     );
 
     // Phase 3: activate each selected mana source.
@@ -14220,6 +14233,7 @@ fn auto_tap_mana_sources_inner(
                         None,
                         resume,
                         parent,
+                        nested_row_policy,
                     );
                     if super::casting::mana_ability_cost_payment_is_paused(state) {
                         return;
@@ -14640,7 +14654,21 @@ fn plan_auto_tap_rows(
     }
 }
 
-/// CR 601.2g + CR 605.3b: Choose which mana-source rows auto-pay activates.
+/// CR 601.2g + CR 605.3b: Which mana-source rows an auto-tap plans with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoTapRowPolicy {
+    /// The outermost payment: decide for the whole payment, sub-costs included
+    /// (see [`choose_auto_tap_plan`]).
+    Choose,
+    /// Withhold avoidable drawback combination rows
+    /// ([`rows_without_avoidable_drawback_combinations`]).
+    WithoutAvoidableDrawbacks,
+    /// Every row: the planner without drawback avoidance.
+    AllRows,
+}
+
+/// CR 601.2g + CR 605.3b: Choose which mana-source rows auto-pay activates, and
+/// the policy every nested mana sub-cost payment of this payment inherits.
 ///
 /// A source may offer a drawback-free mana ability beside a multi-mana one that
 /// costs or does more (`mana_sources::mana_source_option_has_drawback`): Arena of
@@ -14653,10 +14681,14 @@ fn plan_auto_tap_rows(
 /// spends another source's mana, so none of them should be made when nothing
 /// needs them.
 ///
-/// The planner therefore first withholds the drawback combination rows of every
-/// source that also has a drawback-free row, and uses that plan when it pays the
-/// whole cost, sub-costs included. Otherwise it plans with every row, as before,
-/// so a cost only the drawback row can pay is still paid with it.
+/// For the outermost payment (`Choose`) the planner first withholds the drawback
+/// combination rows of every source that also has a drawback-free row. It uses
+/// that plan when it pays the whole cost and every mana sub-cost of the rows it
+/// selects, planned the way Phase 3 will pay them: under the same withholding,
+/// from the sources still unused. Otherwise the whole payment, nested sub-costs
+/// included, plans with every row, exactly as before drawback avoidance. Nested
+/// payments never re-decide: deciding per sub-cost could spend a source that a
+/// sibling sub-cost needs.
 ///
 /// Single-mana rows are never withheld: the source sort already ranks them by
 /// penalty, and withholding them would change choices between different sources
@@ -14668,21 +14700,54 @@ fn choose_auto_tap_plan(
     needs: &[AutoTapNeed],
     generic_units: usize,
     payment_context: Option<&PaymentContext<'_>>,
-) -> AutoTapPlan {
-    if let Some(drawback_free) = rows_without_avoidable_drawback_combinations(state, available) {
-        let plan = plan_auto_tap_rows(state, &drawback_free, needs, generic_units, payment_context);
-        if plan.covers_cost
-            && planned_mana_sub_costs_fundable(
+    policy: AutoTapRowPolicy,
+) -> (AutoTapPlan, AutoTapRowPolicy) {
+    let all_rows = || {
+        (
+            plan_auto_tap_rows(state, available, needs, generic_units, payment_context),
+            AutoTapRowPolicy::AllRows,
+        )
+    };
+    match policy {
+        AutoTapRowPolicy::AllRows => all_rows(),
+        AutoTapRowPolicy::Choose => {
+            let Some(rows) = rows_without_avoidable_drawback_combinations(state, available) else {
+                return all_rows();
+            };
+            let plan = plan_auto_tap_rows(state, &rows, needs, generic_units, payment_context);
+            if plan.covers_cost
+                && planned_mana_sub_costs_fundable(
+                    state,
+                    &rows,
+                    &plan,
+                    &mut plan.used_sources.clone(),
+                )
+            {
+                (plan, AutoTapRowPolicy::WithoutAvoidableDrawbacks)
+            } else {
+                all_rows()
+            }
+        }
+        // A nested payment of a verified plan. Its rows are the verified plan's
+        // rows minus the sources already used, so this replays the check. If it
+        // still falls short (mana the check did not count changed the residual),
+        // every row is the last resort rather than leaving the cost unpaid.
+        AutoTapRowPolicy::WithoutAvoidableDrawbacks => {
+            let rows = rows_without_avoidable_drawback_combinations(state, available);
+            let plan = plan_auto_tap_rows(
                 state,
-                available,
-                &plan,
-                &mut plan.used_sources.clone(),
-            )
-        {
-            return plan;
+                rows.as_deref().unwrap_or(available),
+                needs,
+                generic_units,
+                payment_context,
+            );
+            if plan.covers_cost {
+                (plan, AutoTapRowPolicy::WithoutAvoidableDrawbacks)
+            } else {
+                all_rows()
+            }
         }
     }
-    plan_auto_tap_rows(state, available, needs, generic_units, payment_context)
 }
 
 /// `available` without the drawback combination rows (`atomic_combination`) of
@@ -14728,20 +14793,20 @@ fn rows_without_avoidable_drawback_combinations(
 /// activates can be paid by sources the plan leaves unused, recursively.
 /// `consumed` starts as the plan's own sources and grows as sub-costs claim more.
 ///
-/// Phase 3 of [`auto_tap_mana_sources_inner`] pays each sub-cost with a nested
-/// auto-tap that excludes the outer plan's sources. This checks that payment the
-/// same way, with the same planner, but conservatively: mana already in the pool
-/// (including surplus from earlier activations) is not counted, and a sub-cost
-/// shape the planner cannot read counts as unfundable. A wrong `false` only makes
-/// [`choose_auto_tap_plan`] fall back to the plan with every row.
+/// Phase 3 of [`auto_tap_mana_sources_inner`] pays each selected sub-cost, in
+/// plan order, with a nested auto-tap that excludes the sources already used and
+/// inherits the outer row policy. This plans those payments the same way: the
+/// same planner over `rows` (the rows that policy allows) minus `consumed`. It is
+/// conservative: mana already in the pool (including surplus from earlier
+/// activations) is not counted, and a sub-cost shape the planner cannot read
+/// counts as unfundable. A wrong `false` only makes [`choose_auto_tap_plan`] use
+/// every row for the whole payment.
 fn planned_mana_sub_costs_fundable(
     state: &GameState,
-    available: &[ManaSourceOption],
+    rows: &[ManaSourceOption],
     plan: &AutoTapPlan,
     consumed: &mut HashSet<ObjectId>,
 ) -> bool {
-    use crate::types::mana::ManaCost;
-
     for option in &plan.to_tap {
         let Some(ability_index) = option.ability_index else {
             continue;
@@ -14762,7 +14827,7 @@ fn planned_mana_sub_costs_fundable(
             | ManaCost::SelfManaCostReduced { .. } => return false,
         };
         let (needs, deferred_generic) = auto_tap_needs(shards, None);
-        let remaining: Vec<ManaSourceOption> = available
+        let remaining: Vec<ManaSourceOption> = rows
             .iter()
             .filter(|row| !consumed.contains(&row.object_id))
             .cloned()
@@ -14784,7 +14849,7 @@ fn planned_mana_sub_costs_fundable(
             return false;
         }
         consumed.extend(nested.used_sources.iter().copied());
-        if !planned_mana_sub_costs_fundable(state, available, &nested, consumed) {
+        if !planned_mana_sub_costs_fundable(state, rows, &nested, consumed) {
             return false;
         }
     }
