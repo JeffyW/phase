@@ -3609,6 +3609,7 @@ pub(super) fn match_changes_controller(
 ///     the event's `old_controller` (the loser, by construction);
 ///   * the source's control didn't change anywhere in the buffer: its live
 ///     controller is its controller at every event in it.
+///
 /// Otherwise the source changed control in the same buffer as this event, and
 /// whether it did so before, with, or after this event isn't recorded (a
 /// player-scope fan-out publishes one simultaneous instruction as several
