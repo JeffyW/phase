@@ -33,6 +33,9 @@ const CLOAK_OF_THE_PHILOSOPHER: &str =
     "Equipped creature gets +1/+1.\n{2}: Untap equipped creature.\nEquip {2}";
 const PARALLAX_DEMENTIA_LEAVES: &str = "Enchant creature\nEnchanted creature gets +3/+2.\nWhen this Aura leaves the battlefield, destroy enchanted creature. That creature can't be regenerated.";
 const NURTURING_LICID: &str = "{G}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {G} to end this effect.\n{G}: Regenerate enchanted creature.";
+const FRENZIED_FUGUE: &str = "Enchant permanent\nWhen this Aura enters and at the beginning of your upkeep, gain control of enchanted permanent until end of turn. Untap that permanent. It gains haste until end of turn.";
+const MAROONED: &str = "Enchant artifact or creature\nWhen this Aura enters, you may pay {3}. If you do, tap enchanted permanent.\nEnchanted permanent doesn't untap during its controller's untap step and can't be beamed up.";
+const SWORD_OF_THE_PARUNS: &str = "As long as equipped creature is tapped, tapped creatures you control get +2/+0.\nAs long as equipped creature is untapped, untapped creatures you control get +0/+2.\n{3}: You may tap or untap equipped creature.\nEquip {3}";
 
 fn free_cost() -> ManaCost {
     ManaCost::Cost {
@@ -112,12 +115,19 @@ fn ability_index(runner: &GameRunner, source: ObjectId, pick: fn(&Effect) -> boo
 struct Drive {
     targeted_aura_spell: bool,
     ward_after_cast: usize,
-    /// One entry per ward "unless pays" prompt.
-    ward_prompts: usize,
+    /// Every distinct ward trigger the host put on the stack during the drive.
+    ward_triggers: std::collections::HashSet<ObjectId>,
+}
+
+impl Drive {
+    fn ward_triggers(&self) -> usize {
+        self.ward_triggers.len()
+    }
 }
 
 /// Cast the Aura spell at `host`, then resolve everything. Pays the first ward
-/// prompt and declines any later one (the live game had no mana left).
+/// trigger's cost and declines a second one (the live game had no mana left);
+/// accepts every "you may".
 fn cast_aura_and_resolve(
     runner: &mut GameRunner,
     aura: ObjectId,
@@ -137,6 +147,10 @@ fn cast_aura_and_resolve(
     let mut announcing = true;
     for _ in 0..64 {
         let wf = runner.state().waiting_for.clone();
+        d.ward_triggers.extend(runner.state().stack.iter().filter_map(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == host)
+                .then_some(e.id)
+        }));
         if announcing && matches!(wf, WaitingFor::Priority { .. }) {
             announcing = false;
             d.ward_after_cast = ward_triggers_on_stack(runner, host);
@@ -159,10 +173,11 @@ fn cast_aura_and_resolve(
                 }
             }
             WaitingFor::ManaPayment { .. } => GameAction::PassPriority,
-            WaitingFor::UnlessPayment { .. } => {
-                let pay = d.ward_prompts == 0;
-                d.ward_prompts += 1;
-                GameAction::PayUnlessCost { pay }
+            WaitingFor::UnlessPayment { .. } => GameAction::PayUnlessCost {
+                pay: d.ward_triggers() < 2,
+            },
+            WaitingFor::OptionalEffectChoice { .. } => {
+                GameAction::DecideOptionalEffect { accept: true }
             }
             WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
                 order: (0..triggers.len()).collect(),
@@ -209,8 +224,9 @@ fn ward_host_case(aura_name: &str, aura_text: &str, mode: CastPaymentMode) {
     // CR 115.10a: "tap enchanted permanent/creature" has no "target", so the ETB
     // never makes the host become the target and ward asks exactly once.
     assert_eq!(
-        d.ward_prompts, 1,
-        "({aura_name}, {mode:?}) ward asks for payment exactly once"
+        d.ward_triggers(),
+        1,
+        "({aura_name}, {mode:?}) ward triggers exactly once"
     );
     assert!(
         s.objects[&host].tapped,
@@ -254,7 +270,7 @@ fn fatal_attraction_etb_damage_does_not_retrigger_ward() {
         Some(AttachTarget::Object(host)),
         "reach: Fatal Attraction resolved and attached"
     );
-    assert_eq!(d.ward_prompts, 1, "ward asks for payment exactly once");
+    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
     assert_eq!(
         s.objects[&host].damage_marked, 2,
         "the ETB deals 2 damage to the enchanted creature"
@@ -292,6 +308,141 @@ fn bind_the_monster_taps_host_and_host_deals_its_power_to_you() {
         s.players[P0.0 as usize].life,
         life_before - 6,
         "the enchanted creature deals damage equal to its power to Bind the Monster's controller"
+    );
+}
+
+/// Control-change sibling with an anaphor chain: "gain control of enchanted
+/// permanent until end of turn. Untap that permanent. It gains haste until end of
+/// turn." Ward triggers only for the Aura spell, and "that permanent"/"It" follow
+/// the host the first instruction acted on.
+#[test]
+fn frenzied_fugue_steals_untaps_and_hastes_ward_host_with_one_ward_trigger() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P1, "Warded Brute", 4, 4)
+        .with_keyword(Keyword::Ward(WardCost::Mana(ManaCost::generic(2))))
+        .id();
+    let aura = aura_in_hand(&mut sc, P0, "Frenzied Fugue", FRENZIED_FUGUE);
+    sc.add_creature(P0, "Grizzly Bears", 2, 2);
+    sc.with_mana_pool(P0, pool(0, 2));
+    let mut runner = sc.build();
+    set_tapped(&mut runner, host, true);
+
+    let d = cast_aura_and_resolve(&mut runner, aura, host, CastPaymentMode::Auto);
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&aura].attached_to,
+        Some(AttachTarget::Object(host)),
+        "reach: Frenzied Fugue resolved and attached"
+    );
+    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
+    assert_eq!(
+        s.objects[&host].controller, P0,
+        "Fugue's controller gains control"
+    );
+    assert!(
+        !s.objects[&host].tapped,
+        "'Untap that permanent' untaps the host"
+    );
+    assert!(
+        s.objects[&host]
+            .keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Haste)),
+        "'It gains haste' grants haste to the host"
+    );
+}
+
+/// Conditional-sub sibling: "you may pay {3}. If you do, tap enchanted
+/// permanent." The host binding happens when the "if you do" instruction runs.
+#[test]
+fn marooned_paid_taps_ward_host_with_one_ward_trigger() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P1, "Patchwork Automaton", 1, 1)
+        .with_keyword(Keyword::Ward(WardCost::Mana(ManaCost::generic(2))))
+        .id();
+    let aura = aura_in_hand(&mut sc, P0, "Marooned", MAROONED);
+    sc.add_creature(P0, "Grizzly Bears", 2, 2);
+    sc.with_mana_pool(P0, pool(0, 5));
+    let mut runner = sc.build();
+
+    let d = cast_aura_and_resolve(&mut runner, aura, host, CastPaymentMode::Auto);
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&aura].attached_to,
+        Some(AttachTarget::Object(host)),
+        "reach: Marooned resolved and attached"
+    );
+    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
+    assert!(
+        s.objects[&host].tapped,
+        "the paid ETB taps the enchanted permanent"
+    );
+}
+
+/// Optional + modal sibling: "{3}: You may tap or untap equipped creature." The
+/// chosen tap/untap branch acts on the bound host (shrouded here).
+#[test]
+fn sword_of_the_paruns_untaps_a_shrouded_equipped_creature() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P0, "Shrouded Bear", 2, 2)
+        .with_keyword(Keyword::Shroud)
+        .id();
+    let sword = sc
+        .add_creature(P0, "Sword of the Paruns", 0, 0)
+        .as_artifact()
+        .with_subtypes(vec!["Equipment"])
+        .from_oracle_text(SWORD_OF_THE_PARUNS)
+        .id();
+    sc.with_mana_pool(P0, pool(0, 3));
+    let mut runner = sc.build();
+    attach(&mut runner, sword, host);
+    set_tapped(&mut runner, host, true);
+
+    let index = ability_index(&runner, sword, |e| matches!(e, Effect::TargetOnly { .. }));
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: sword,
+            ability_index: index,
+        })
+        .expect("CR 115.10a: 'tap or untap equipped creature' does not target");
+    let mut chose_branch = false;
+    for _ in 0..16 {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OptionalEffectChoice { .. } => {
+                GameAction::DecideOptionalEffect { accept: true }
+            }
+            WaitingFor::ChooseOneOfBranch { branches, .. } => {
+                chose_branch = true;
+                let untap = branches
+                    .iter()
+                    .position(|b| {
+                        matches!(
+                            &*b.effect,
+                            Effect::SetTapState {
+                                state: engine::types::ability::TapStateChange::Untap,
+                                ..
+                            }
+                        )
+                    })
+                    .expect("an untap branch");
+                GameAction::ChooseBranch { index: untap }
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        };
+        runner.act(action).expect("prompt accepts");
+    }
+    assert!(chose_branch, "reach: the tap-or-untap choice was offered");
+    assert!(
+        !runner.state().objects[&host].tapped,
+        "the shrouded equipped creature is untapped"
     );
 }
 
