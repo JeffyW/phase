@@ -9333,6 +9333,7 @@ fn parse_oracle_pipeline(
     demote_unbound_delayed_sweeps(&mut parsed);
     demote_unenforceable_replacement_lifetimes(&mut parsed);
     demote_unsupported_composite_counter_choice_costs(&mut parsed);
+    demote_crew_history_population_counts(&mut parsed);
     #[cfg(debug_assertions)]
     crate::parser::oracle_effect::debug_assert_exile_top_opponent_sentinel_lifted(
         &parsed, card_name,
@@ -9498,31 +9499,89 @@ fn demote_unreached_granter_references(parsed: &mut ParsedAbilities) {
     demote_granter_references(parsed, granter_reference_unreached);
 }
 
+/// CR 702.122c + CR 400.7: a population COUNT over a crew-history filter ("for
+/// each creature that crewed it this turn", Luxurious Locomotive) must include
+/// crewers that have since left the battlefield, but `ObjectCount` and its
+/// siblings evaluate live membership, and a departed crewer is a new object that
+/// matches no ledger record. No quantity reads the crew ledger's cardinality, so
+/// every definition holding such a count lowers to the unsupported residual
+/// rather than undercounting. Detected on the serialized tree so every nesting
+/// position (effect counts, conditions, sub-abilities) is covered by one walk.
+fn demote_crew_history_population_counts(parsed: &mut ParsedAbilities) {
+    demote_definitions(parsed, "crew_history_population_count", |node| {
+        let tree = match &node {
+            DefinitionNode::Ability(def) => serde_json::to_value(def),
+            DefinitionNode::Trigger(def) => serde_json::to_value(def),
+            DefinitionNode::Static(def) => serde_json::to_value(def),
+            DefinitionNode::Replacement(def) => serde_json::to_value(def),
+        };
+        tree.is_ok_and(|tree| holds_crew_history_population_count(&tree, false))
+    });
+}
+
+/// Whether `tree` holds a crew-history filter prop beneath a population-count
+/// quantity (`in_count` carries that ancestry down the walk).
+fn holds_crew_history_population_count(tree: &serde_json::Value, in_count: bool) -> bool {
+    match tree {
+        serde_json::Value::Object(map) => {
+            let tag = map.get("type").and_then(serde_json::Value::as_str);
+            if in_count && tag == Some("CrewedThisTurn") {
+                return true;
+            }
+            let in_count = in_count
+                || matches!(
+                    tag,
+                    Some("ObjectCount" | "ObjectCountDistinct" | "ObjectCountBySharedQuality")
+                );
+            map.values()
+                .any(|value| holds_crew_history_population_count(value, in_count))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|item| holds_crew_history_population_count(item, in_count)),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
+    }
+}
+
 /// Lowers each top-level definition `refuse` selects to the unsupported granter residual,
 /// visiting abilities, triggers, statics and replacements each in order.
 fn demote_granter_references(
     parsed: &mut ParsedAbilities,
+    refuse: impl FnMut(DefinitionNode<'_>) -> bool,
+) {
+    demote_definitions(parsed, "granter_reference_unreached", refuse);
+}
+
+/// Lowers each top-level definition `refuse` selects to an unsupported residual keyed
+/// `gap`, visiting abilities, triggers, statics and replacements each in order.
+fn demote_definitions(
+    parsed: &mut ParsedAbilities,
+    gap: &str,
     mut refuse: impl FnMut(DefinitionNode<'_>) -> bool,
 ) {
+    let residual = |description: &Option<String>| unsupported_residual(gap, description);
     for def in &mut parsed.abilities {
         if refuse(DefinitionNode::Ability(def)) {
-            *def = unreached_granter_residual(&def.description);
+            *def = residual(&def.description);
         }
     }
     let demoted: Vec<AbilityDefinition> = parsed
         .triggers
         .extract_if(.., |def| refuse(DefinitionNode::Trigger(def)))
-        .map(|def| unreached_granter_residual(&def.description))
+        .map(|def| residual(&def.description))
         .collect();
     let demoted_statics: Vec<AbilityDefinition> = parsed
         .statics
         .extract_if(.., |def| refuse(DefinitionNode::Static(def)))
-        .map(|def| unreached_granter_residual(&def.description))
+        .map(|def| residual(&def.description))
         .collect();
     let demoted_replacements: Vec<AbilityDefinition> = parsed
         .replacements
         .extract_if(.., |def| refuse(DefinitionNode::Replacement(def)))
-        .map(|def| unreached_granter_residual(&def.description))
+        .map(|def| residual(&def.description))
         .collect();
     parsed.abilities.extend(
         demoted
@@ -9655,13 +9714,11 @@ fn granter_reference_count(tree: &serde_json::Value) -> usize {
     }
 }
 
-fn unreached_granter_residual(description: &Option<String>) -> AbilityDefinition {
+/// The unsupported residual a demoted top-level definition lowers to, keyed `gap`.
+fn unsupported_residual(gap: &str, description: &Option<String>) -> AbilityDefinition {
     let fragment = description.clone().unwrap_or_default();
-    AbilityDefinition::new(
-        AbilityKind::Spell,
-        Effect::unimplemented("granter_reference_unreached", &fragment),
-    )
-    .description(fragment)
+    AbilityDefinition::new(AbilityKind::Spell, Effect::unimplemented(gap, &fragment))
+        .description(fragment)
 }
 
 /// The decision node: `duration` and `effect` sit on the SAME

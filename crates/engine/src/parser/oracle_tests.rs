@@ -3923,17 +3923,20 @@ fn turtle_van_attack_trigger_conditional_double_counters() {
         );
     let trigger = r.triggers.first().expect("attack trigger");
     let execute = trigger.execute.as_deref().expect("execute ability");
-    // CR 115.1 + CR 601.2c: "that crewed it this turn" restricts which creature
-    // is a legal target. No filter expresses the crewer set yet, so the head is
-    // an explicit counter-tail gap instead of a placement onto ANY creature.
-    assert!(
-        matches!(
-            &*execute.effect,
-            Effect::Unimplemented { name, description: Some(fragment) }
-                if name == "put_counter_tail" && fragment.contains("that crewed it")
+    // CR 115.1 + CR 601.2c + CR 702.122c: "that crewed it this turn" restricts
+    // which creature is a legal target — the crewer side of the per-turn crew
+    // relation.
+    let Effect::PutCounter { target, .. } = &*execute.effect else {
+        panic!("expected a PutCounter head, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::CrewedThisTurn {
+                relation: crate::types::ability::CrewRelation::CrewedSource,
+            }])
         ),
-        "head clause must surface the crewer restriction as a gap, got {:?}",
-        execute.effect
+        "the counter's target must be a creature that crewed the Vehicle this turn"
     );
     let sub = execute
         .sub_ability

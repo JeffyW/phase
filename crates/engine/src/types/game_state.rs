@@ -22213,6 +22213,17 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub crew_resolved_this_turn: HashSet<ObjectIncarnationRef>,
+    /// CR 702.122b + CR 702.122c: every (Vehicle, crewer) pair this turn — a
+    /// creature "crews" a Vehicle when it is tapped to pay that Vehicle's crew
+    /// cost, and the Vehicle is then "crewed by" it. Recorded at COST PAYMENT
+    /// (`crate::game::engine::record_crew_payment`), so a crew ability that is
+    /// later countered still counts. Both ends are pinned to their exact
+    /// incarnation (CR 400.7): a Vehicle or creature that left and returned is a
+    /// new object and matches none of its predecessor's records. Read by
+    /// `FilterProp::CrewedThisTurn`. Cleared at turn start.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub crew_history_this_turn: HashSet<crate::game::crew_payment::CrewHistoryPair>,
     /// CR 606.1 + CR 606.3 + CR 603.4: Per-player count of loyalty-ability
     /// activations this turn. Incremented in
     /// `planeswalker::finalize_loyalty_activation` whenever any loyalty ability
@@ -29218,6 +29229,7 @@ impl GameState {
             activated_abilities_this_game: HashMap::new(),
             crew_activated_this_turn: HashSet::new(),
             crew_resolved_this_turn: HashSet::new(),
+            crew_history_this_turn: HashSet::new(),
             loyalty_abilities_activated_this_turn: HashMap::new(),
             extra_loyalty_activations_this_turn: HashMap::new(),
             exerted_this_turn: std::collections::HashSet::new(),
@@ -32244,6 +32256,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         activated_abilities_this_game: _,
         crew_activated_this_turn: _,
         crew_resolved_this_turn: _,
+        crew_history_this_turn: _,
         loyalty_abilities_activated_this_turn: _,
         extra_loyalty_activations_this_turn: _,
         exerted_this_turn: _,
@@ -32600,6 +32613,7 @@ impl PartialEq for GameState {
             && self.activated_abilities_this_game == other.activated_abilities_this_game
             && self.crew_activated_this_turn == other.crew_activated_this_turn
             && self.crew_resolved_this_turn == other.crew_resolved_this_turn
+            && self.crew_history_this_turn == other.crew_history_this_turn
             && self.loyalty_abilities_activated_this_turn
                 == other.loyalty_abilities_activated_this_turn
             && self.extra_loyalty_activations_this_turn == other.extra_loyalty_activations_this_turn
