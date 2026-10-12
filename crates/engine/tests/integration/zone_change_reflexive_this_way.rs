@@ -346,6 +346,32 @@ fn agatha_body_reflexive_targets_after_a_creature_card_is_exiled() {
     }
 }
 
+/// Augusta, Order Returned (fail closed): "each player exiles a card from their
+/// graveyard" resolves its gated clause once per player, so the single CR
+/// 603.12 event "one or more nonland cards are exiled this way" would create
+/// one reflexive per player. Measured on the spell form: the first reflexive's
+/// target prompt opened while the opponent's card was still in the graveyard.
+#[test]
+fn augusta_reflexive_over_a_player_iteration_fails_closed() {
+    let parsed = parse_oracle_text(
+        "Whenever Augusta attacks, each player exiles a card from their graveyard. When one or more nonland cards are exiled this way, put that many +1/+1 counters on target attacking creature.",
+        "Augusta, Order Returned",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let execute = parsed.triggers[0].execute.as_deref().expect("trigger body");
+    assert!(
+        execute.player_scope.is_some(),
+        "reach guard: the producer iterates players"
+    );
+    assert_eq!(
+        unimplemented_name(execute).as_deref(),
+        Some("zone_change_reflexive_event_source"),
+        "{execute:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Sacrifice heads ("that many")
 // ---------------------------------------------------------------------------
@@ -491,11 +517,12 @@ fn entered_equipment_attaches_to_the_reflexive_target() {
     );
 }
 
-/// CR 603.12 + CR 603.3d (fail closed): printed class members whose reflexive
-/// body cannot be carried by the reflexive stack object — Hans Eriksson's
-/// "it fights" (its event is put onto the battlefield by a branch of the
-/// reveal, and its subject was left as the parent's target), Three Dog's "a copy of that Aura" (no copy source), and
-/// Saruman of Many Colors' "than that spell" (read as the target being chosen).
+/// CR 603.12 + CR 603.3d (fail closed): printed class members the reflexive
+/// stack object cannot carry — Hans Eriksson (its event is put onto the
+/// battlefield by a branch of the reveal, and "it fights" was left as the
+/// parent's target), Three Dog ("a copy of that Aura" has no copy source), and
+/// Saruman of Many Colors ("each opponent mills" resolves its gate once per
+/// opponent).
 #[test]
 fn reflexive_with_an_object_the_stack_cannot_carry_fails_closed() {
     for (name, expected_gap, text) in [
@@ -511,7 +538,7 @@ fn reflexive_with_an_object_the_stack_cannot_carry_fails_closed() {
         ),
         (
             "Saruman of Many Colors",
-            "zone_change_reflexive_unbound_referent",
+            "zone_change_reflexive_event_source",
             "Whenever you cast your second spell each turn, each opponent mills two cards. When one or more cards are milled this way, exile target enchantment, instant, or sorcery card with equal or lesser mana value than that spell from an opponent's graveyard. Copy the exiled card. You may cast the copy without paying its mana cost.",
         ),
     ] {

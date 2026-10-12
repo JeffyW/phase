@@ -18,9 +18,7 @@ use nom::Parser;
 use super::super::oracle_nom::error::OracleError;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::{has_typed_target_widened, ClauseDisposition, ClauseIr};
-use crate::types::ability::{
-    AbilityCondition, Effect, FilterProp, ObjectScope, QuantityExpr, QuantityRef, TargetFilter,
-};
+use crate::types::ability::{AbilityCondition, Effect, TargetFilter};
 
 /// The zone-change event a "When … this way" head names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,13 +119,13 @@ fn grants_play_permission(effect: &Effect) -> bool {
 ///   permission) is not one that performs the head's zone change: a later
 ///   moving instruction ("Discard a card, then draw a card") or a structural
 ///   mismatch ("sacrifice … unless you discard", a delayed sacrifice) would
-///   make the gate read the wrong cards.
+///   make the gate read the wrong cards; a producer iterated over players
+///   ("each player exiles a card") would create one reflexive per player.
 /// * `zone_change_reflexive_unbound_referent` — the body names an object the
 ///   reflexive stack object cannot carry: a bare `ParentTarget` operand (its
 ///   target, or a fight's subject) while no earlier instruction announced a
-///   target for it to inherit or while the body itself says "target"; a copy
-///   with no copy source; or a target filter compared against the ability's
-///   own target while that target is being chosen.
+///   target for it to inherit or while the body itself says "target"; or a
+///   copy with no copy source.
 pub(super) fn unsupported_zone_change_reflexive(
     condition: Option<&AbilityCondition>,
     effect: &Effect,
@@ -146,7 +144,12 @@ pub(super) fn unsupported_zone_change_reflexive(
         .filter(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }))
         .find(|clause| !grants_play_permission(&clause.parsed.effect));
     let event_published = match (producer, this_way_event(chunk_lower)) {
-        (Some(producer), Some(event)) => publishes_event(&producer.parsed.effect, event),
+        // CR 603.12: a producer iterated over players ("each player exiles a
+        // card") resolves the gated clause once per player, so the one event
+        // the head names would create one reflexive per iteration.
+        (Some(producer), Some(event)) => {
+            producer.player_scope.is_none() && publishes_event(&producer.parsed.effect, event)
+        }
         _ => false,
     };
     if !event_published {
@@ -173,10 +176,7 @@ pub(super) fn unsupported_zone_change_reflexive(
         return Some("zone_change_reflexive_unbound_referent");
     }
     // A copy whose source lost its referent ("a token that's a copy of that
-    // Aura" parsed with no source), or a target filter that compares a
-    // candidate against the ability's own target while that target is being
-    // chosen ("with equal or lesser mana value than that spell" read as the
-    // target), names no object the stack object can carry.
+    // Aura" parsed with no source) names no object the stack object can carry.
     let copies_nothing = matches!(
         effect,
         Effect::CopyTokenOf {
@@ -184,38 +184,10 @@ pub(super) fn unsupported_zone_change_reflexive(
             ..
         }
     );
-    let filter_reads_own_target = effect
-        .target_filter()
-        .is_some_and(filter_compares_against_own_target);
-    if copies_nothing || filter_reads_own_target {
+    if copies_nothing {
         return Some("zone_change_reflexive_unbound_referent");
     }
     None
-}
-
-/// Whether a mana-value comparison inside `filter` reads `ObjectScope::Target`
-/// — the ability's own target, which does not exist while that target is the
-/// one being chosen.
-fn filter_compares_against_own_target(filter: &TargetFilter) -> bool {
-    match filter {
-        TargetFilter::Typed(typed) => typed.properties.iter().any(|property| {
-            matches!(
-                property,
-                FilterProp::Cmc {
-                    value: QuantityExpr::Ref {
-                        qty: QuantityRef::ObjectManaValue {
-                            scope: ObjectScope::Target,
-                        },
-                    },
-                    ..
-                }
-            )
-        }),
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-            filters.iter().any(filter_compares_against_own_target)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
