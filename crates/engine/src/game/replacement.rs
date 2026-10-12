@@ -10512,6 +10512,12 @@ pub(crate) fn replacement_last_applied_decides(
     candidates: &[ReplacementId],
     proposed: &ProposedEvent,
 ) -> bool {
+    // CR 614.12 + CR 616.1e: an unanswered pre-entry choice that can change a
+    // competitor's applicability has no "last write" — the earlier effect may
+    // stop the later one from applying at all.
+    if as_enters_choice_changes_applicability(state, candidates, proposed) {
+        return false;
+    }
     let mut saw_overwrite = false;
     for rid in candidates {
         match candidate_materiality(state, *rid, proposed) {
@@ -10534,6 +10540,11 @@ pub(crate) fn replacement_ordering_is_material(
     candidates: &[ReplacementId],
     proposed: &ProposedEvent,
 ) -> bool {
+    // CR 614.12 + CR 616.1e: a pre-entry choice that can change what a
+    // competitor reads makes the order the affected player's choice.
+    if as_enters_choice_changes_applicability(state, candidates, proposed) {
+        return true;
+    }
     let mut seen_writes: Vec<(EventField, CommuteClass)> = Vec::new();
     for rid in candidates {
         match candidate_materiality(state, *rid, proposed) {
@@ -10664,7 +10675,7 @@ enum CandidateMateriality {
         commute: CommuteClass,
     },
     /// Touches no event field that another candidate could also touch
-    /// (`Effect::Choose` post-effect, null/no-op pass-through with no side field).
+    /// (`Effect::Choose`, null/no-op pass-through with no side field).
     Disjoint,
 }
 
@@ -10980,11 +10991,13 @@ fn candidate_materiality(
             }
             // ETB-counter replacements (`PutCounter`) only *append* to
             // `enter_with_counters`, so they never conflict. `Effect::Choose`
-            // (the as-enters color choice) and `Effect::ChoosePermanent` (the
-            // as-enters object choice — Metamorphic Alteration) run after the
-            // ZoneChange and touch no shared event field. Both are explicitly
-            // recognized as order-independent so they do NOT fall through to
-            // the conservative material default below.
+            // (the as-enters colour/type choice) and `Effect::ChoosePermanent`
+            // (the as-enters object choice — Metamorphic Alteration) write no
+            // field another candidate overwrites: a pre-entry choice appends to
+            // `enter_with_choices` (CR 614.12a). Whether a pre-entry choice can
+            // change another candidate's APPLICABILITY is a set-level question
+            // answered by `as_enters_choice_changes_applicability`, which the
+            // shared authorities consult before this per-candidate walk.
             Effect::PutCounter { .. } | Effect::Choose { .. } | Effect::ChoosePermanent { .. } => {}
             // CR 614.1a + CR 111.1: Full token substitution on a CreateToken
             // event rewrites `CreateToken::spec` in the applier. Two different
@@ -11426,10 +11439,12 @@ pub(crate) fn pending_entry_named_choice_is_live(state: &GameState) -> bool {
 /// competing candidate reads. The choice writes the entrant's characteristics
 /// as it would exist (its own statics that read the choice — the CR 614.12
 /// projection), and a competitor whose applicability reads the entrant (a
-/// non-self `valid_card`, or a condition) may stop or start applying. When both
-/// are present, the order is the affected player's choice (Metallic Mimic
-/// choosing Phyrexian with Phyrexian Censor out).
-fn as_enters_choice_order_is_material(
+/// non-self `valid_card`, or a condition) may stop or start applying. Folded
+/// into the shared CR 616.1 authorities (`replacement_ordering_is_material`,
+/// `replacement_last_applied_decides`) so every consumer — the pipeline, the
+/// prompt-cause probe and the display — agrees (Metallic Mimic choosing
+/// Phyrexian with Phyrexian Censor out).
+fn as_enters_choice_changes_applicability(
     state: &GameState,
     candidates: &[ReplacementId],
     proposed: &ProposedEvent,
@@ -11984,7 +11999,6 @@ fn pipeline_loop(
             }
         } else if state.replacement_auto_choice_tail.is_some()
             || replacement_ordering_is_material(state, &candidates, &proposed)
-            || as_enters_choice_order_is_material(state, &candidates, &proposed)
         {
             // CR 616.1: If multiple replacement effects apply, the affected player
             // or controller of the affected object chooses which one to apply first,

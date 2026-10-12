@@ -69,18 +69,7 @@ pub(crate) fn eval_chosen_label_is(state: &GameState, source_id: ObjectId, label
     state
         .objects
         .get(&source_id)
-        .is_some_and(|obj| object_chosen_label_is(obj, label))
-}
-
-/// CR 614.12c + CR 607.2d: whether `obj`'s persisted chosen label is `label`
-/// (case-insensitive). The object-level read shared by the live condition above
-/// and the CR 614.12 entry projection, which evaluates it on the entrant as it
-/// would exist.
-pub(crate) fn object_chosen_label_is(
-    obj: &crate::game::game_object::GameObject,
-    label: &str,
-) -> bool {
-    obj.chosen_label()
+        .and_then(|obj| obj.chosen_label())
         .is_some_and(|chosen| chosen.eq_ignore_ascii_case(label))
 }
 

@@ -947,7 +947,7 @@ fn abandon_pending_zone_change_member_for_player_left(
         if state
             .pending_replacement
             .as_ref()
-            .is_some_and(|pending| pending.proposed == expected_event)
+            .is_some_and(|pending| pending.parks_delivery(&expected_event))
         {
             state.pending_replacement = None;
             state.replacement_may_cost_paused = false;

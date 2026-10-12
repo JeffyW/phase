@@ -25305,9 +25305,50 @@ pub struct PendingReplacement {
     /// `proposed`, and a CR 616.1f re-park replaces it, but the owner's paused
     /// delivery is keyed on the exact event it first parked on
     /// (`PendingZoneChangeDelivery::captures`). `None` means `proposed` is that
-    /// boundary.
+    /// boundary. Read and written only through the `PendingReplacement`
+    /// boundary methods below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_boundary: Option<Box<ProposedEvent>>,
+}
+
+impl PendingReplacement {
+    /// The event the logical owner of this paused zone-change delivery parked
+    /// on. The single authority every owner match reads — capture
+    /// (`GameState::pending_zone_change_delivery_from_replacement`),
+    /// settlement, and CR 800.4a abandonment — so none of them compares the
+    /// mutable `proposed` directly.
+    pub fn delivery_boundary_event(&self) -> &ProposedEvent {
+        self.delivery_boundary.as_deref().unwrap_or(&self.proposed)
+    }
+
+    /// Whether this record is the paused delivery its owner parked on as
+    /// `expected_event`.
+    pub fn parks_delivery(&self, expected_event: &ProposedEvent) -> bool {
+        self.delivery_boundary_event() == expected_event
+    }
+
+    /// Pin the current boundary before an answer changes `proposed` (CR
+    /// 614.12a pre-entry choice, CR 616.1b entry-controller choice).
+    pub fn pin_delivery_boundary(&mut self) {
+        if self.delivery_boundary.is_none() {
+            self.delivery_boundary = Some(Box::new(self.proposed.clone()));
+        }
+    }
+
+    /// CR 616.1f: a fresh record re-parked for the SAME zone change keeps the
+    /// boundary its predecessor answered to.
+    pub fn inherit_delivery_boundary(&mut self, predecessor: &ProposedEvent) {
+        let same_zone_change = matches!(
+            (&self.proposed, predecessor),
+            (
+                ProposedEvent::ZoneChange { object_id: now, .. },
+                ProposedEvent::ZoneChange { object_id: was, .. },
+            ) if now == was
+        );
+        if self.delivery_boundary.is_none() && same_zone_change && self.proposed != *predecessor {
+            self.delivery_boundary = Some(Box::new(predecessor.clone()));
+        }
+    }
 }
 
 /// CR 701.21a: The subject and controller of a sacrifice whose inner zone
@@ -27776,13 +27817,9 @@ impl GameState {
         &self,
     ) -> Option<PendingZoneChangeDelivery> {
         let pending = self.pending_replacement.as_ref()?;
-        // The owner parked on `delivery_boundary` when an answered pre-entry
-        // choice or a CR 616.1f re-park has since changed `proposed`.
-        let expected_event = pending
-            .delivery_boundary
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| pending.proposed.clone());
+        // The owner parked on the record's boundary, which an answered
+        // pre-entry choice or a CR 616.1f re-park may have left behind `proposed`.
+        let expected_event = pending.delivery_boundary_event().clone();
         let object_id = match &expected_event {
             ProposedEvent::ZoneChange { object_id, .. } => *object_id,
             _ => return None,

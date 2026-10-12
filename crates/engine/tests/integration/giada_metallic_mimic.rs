@@ -194,20 +194,11 @@ remain in graveyards.)";
 const REANIMATE: &str = "Put target creature card from a graveyard onto the battlefield \
 under your control. You lose life equal to that card's mana value.";
 
-const PRIMAL_CLAY: &str = "As this creature enters, it becomes your choice of a 3/3 \
-artifact creature, a 2/2 artifact creature with flying, or a 1/6 Wall artifact creature \
-with defender in addition to its other types. (A creature with defender can't attack.)";
-
 const RECKLESS_FIREWEAVER: &str = "Whenever an artifact you control enters, this creature \
 deals 1 damage to each opponent.";
 
 const THRIVING_GROVE: &str = "This land enters tapped. As it enters, choose a color other \
 than green.\n{T}: Add {G} or one mana of the chosen color.";
-
-/// A test permanent whose entry consumer reads the Wall subtype (no printed card pairs a
-/// Wall-reading entry replacement with Primal Clay; the consumer shape is Giada's).
-const WALL_PATRON: &str = "Each other Wall you control enters with an additional +1/+1 \
-counter on it.";
 
 /// A test permanent with the Thunderous Velocipede `EntersWithAdditionalCounters` static
 /// shape, narrowed to Angels, so the static (non-replacement) entry path reads the
@@ -867,36 +858,28 @@ fn save_without_entry_choices_restores_and_continues() {
     assert!(!restored.state().objects[&mimic].tapped);
 }
 
-/// CR 614.12 + CR 614.12c (Main ruling): Primal Clay's label-gated type static applies to
-/// itself as it would exist with its label chosen. The 1/6 option makes it a Wall.
+/// CR 614.12 completeness contract, failed closed: a face whose as-enters choice is
+/// made before entry but whose own type static depends on a condition the entry
+/// projection doesn't evaluate (the Primal Clay class: label-gated types) is marked
+/// unsupported by coverage; the Metallic Mimic and Painter's Servant shapes are not.
 #[test]
-fn primal_clay_wall_label_is_seen_by_a_wall_entry_replacement() {
-    for (label, expected) in [("1/6 Artifact Wall Defender", 1), ("3/3 Artifact", 0)] {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        let patron = scenario
-            .add_creature_from_oracle(P0, "Wall Patron", 1, 1, WALL_PATRON)
-            .id();
-        let clay = scenario
-            .add_creature_to_hand_from_oracle(P0, "Primal Clay", 0, 0, PRIMAL_CLAY)
-            .as_artifact_creature()
-            .with_subtypes(vec!["Shapeshifter"])
-            .id();
-        let mut runner = scenario.build();
-        set_creature_types(&mut runner);
-        assert!(
-            runner.state().objects[&patron]
-                .replacement_definitions
-                .iter_unchecked()
-                .any(|def| format!("{:?}", def.valid_card).contains("Wall")),
-            "reach: the Wall entry replacement parsed"
-        );
-
-        cast(&mut runner, clay);
-        let prompts = drive(&mut runner, &[label], None);
-
-        assert!(prompts.iter().any(is_named), "{prompts:?}");
-        assert_eq!(p1p1(&runner, clay), expected, "label {label}");
+fn label_gated_type_statics_are_marked_unsupported_for_the_entry_projection() {
+    let Some(db) = crate::support::shared_card_db() else {
+        return;
+    };
+    let gap_of = |name: &str| {
+        let face = db
+            .get_face_by_name(name)
+            .unwrap_or_else(|| panic!("{name} is in the card database"));
+        engine::game::coverage::card_face_gaps(face)
+            .iter()
+            .any(|gap| gap == engine::game::coverage::ENTRY_PROJECTION_GAP)
+    };
+    for name in ["Primal Clay", "Primal Plasma", "Corrupted Shapeshifter"] {
+        assert!(gap_of(name), "{name} must be marked unsupported");
+    }
+    for name in ["Metallic Mimic", "Painter's Servant", "Adaptive Automaton"] {
+        assert!(!gap_of(name), "{name} is fully projected");
     }
 }
 
@@ -948,4 +931,161 @@ fn open_the_vaults_under_censor_reparks_each_choice_on_its_owner() {
         2,
         "both deliveries settled on their owner"
     );
+}
+
+/// F1 board — CR 800.4a: P2's Phyrexian Censor, P1's Metallic Mimic in P1's graveyard,
+/// P0 casting Reanimate on it. Returns the runner parked at P0's pre-entry choice and
+/// the Mimic. With `censor`, Censor was applied first, so the parked proposal no longer
+/// equals the event the Reanimate owner parked on.
+fn reanimate_opponents_mimic_to_its_choice(censor: bool) -> (GameRunner, ObjectId) {
+    const P2: PlayerId = PlayerId(2);
+    let mut scenario = GameScenario::new_n_player(3, 9783);
+    scenario.at_phase(Phase::PreCombatMain);
+    if censor {
+        scenario
+            .add_creature_from_oracle(P2, "Phyrexian Censor", 3, 3, PHYREXIAN_CENSOR)
+            .with_subtypes(vec!["Phyrexian", "Wizard"]);
+    }
+    let mimic = mimic_in_graveyard(&mut scenario, P1);
+    let reanimate = scenario
+        .add_spell_to_hand_from_oracle(P0, "Reanimate", false, REANIMATE)
+        .id();
+    let mut runner = scenario.build();
+    set_creature_types(&mut runner);
+
+    runner.cast(reanimate).target_object(mimic).commit();
+    runner.advance_until_stack_empty();
+    if censor {
+        let WaitingFor::ReplacementChoice { candidates, .. } = runner.state().waiting_for.clone()
+        else {
+            panic!(
+                "reach: Censor is ordered against the choice, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        let sources: Vec<&str> = candidates.iter().map(|c| c.source_name.as_str()).collect();
+        assert!(
+            sources.contains(&"Phyrexian Censor") && sources.contains(&"Metallic Mimic"),
+            "reach: both ordering sources, got {sources:?}"
+        );
+        let index = sources
+            .iter()
+            .position(|s| *s == "Phyrexian Censor")
+            .unwrap();
+        runner
+            .act(GameAction::ChooseReplacement { index })
+            .expect("apply Censor first");
+    }
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::NamedChoice { player: P0, source: Some(source), .. }
+                if source.binding == NamedChoiceSourceBinding::PendingEntry
+        ),
+        "reach: the surviving controller P0 holds the pre-entry choice, got {:?}",
+        runner.state().waiting_for
+    );
+    let pending = runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .expect("the parked entry");
+    assert_eq!(
+        pending.proposed != *pending.delivery_boundary_event(),
+        censor,
+        "reach: the parked proposal differs from the owner's boundary exactly when Censor applied"
+    );
+    (runner, mimic)
+}
+
+fn assert_owner_departure_retires_the_entry(mut runner: GameRunner, mimic: ObjectId) {
+    runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("the Mimic's owner concedes");
+
+    assert!(
+        runner.state().pending_replacement.is_none(),
+        "CR 800.4a: the parked entry of the departed card is retired"
+    );
+    assert!(
+        runner
+            .state()
+            .objects
+            .get(&mimic)
+            .is_none_or(|obj| obj.zone != Zone::Battlefield),
+        "the departed owner's card never enters"
+    );
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty() && runner.state().pending_replacement.is_none(),
+        "P0's Reanimate finishes resolving, stack={:?}",
+        runner.state().stack
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "the game continues, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// F1 — CR 800.4a: the Mimic's owner leaves while P0 makes the pre-entry choice for a
+/// proposal Censor already changed. The owner's paused delivery is matched through
+/// the record's boundary, so the record is retired and Reanimate finishes.
+#[test]
+fn owner_leaving_during_a_reparked_choice_retires_the_entry() {
+    let (runner, mimic) = reanimate_opponents_mimic_to_its_choice(true);
+    assert_owner_departure_retires_the_entry(runner, mimic);
+}
+
+/// F1 control — the same departure when the proposal is unchanged.
+#[test]
+fn owner_leaving_during_an_unmodified_choice_retires_the_entry() {
+    let (runner, mimic) = reanimate_opponents_mimic_to_its_choice(false);
+    assert_owner_departure_retires_the_entry(runner, mimic);
+}
+
+/// Q3 — CR 613.1: a choice-reading static with no affected set affects every object
+/// (the layer pass's reading), so the projection applies it to the entrant exactly as an
+/// explicit "every object" static: the entrant chooses Blue first and Curator Beastie no
+/// longer applies.
+#[test]
+fn absent_affected_static_projects_like_an_explicit_every_object_static() {
+    use engine::types::ability::{
+        ColorChangeMode, ContinuousModification, StaticDefinition, TargetFilter,
+    };
+    for affected in [None, Some(TargetFilter::Any)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario
+            .add_creature_from_oracle(P0, "Curator Beastie", 6, 6, CURATOR_BEASTIE)
+            .with_subtypes(vec!["Beast"])
+            .with_color(vec![ManaColor::Green]);
+        let mut paint = StaticDefinition::continuous().modifications(vec![
+            ContinuousModification::AddChosenColor {
+                mode: ColorChangeMode::Add,
+            },
+        ]);
+        paint.affected = affected.clone();
+        let servant = scenario
+            .add_creature_to_hand_from_oracle(
+                P0,
+                "Painter's Servant",
+                1,
+                3,
+                "As this creature enters, choose a color.",
+            )
+            .as_artifact_creature()
+            .with_subtypes(vec!["Scarecrow"])
+            .with_color(vec![])
+            .with_static_definition(paint)
+            .id();
+        let mut runner = scenario.build();
+        set_creature_types(&mut runner);
+
+        cast(&mut runner, servant);
+        let prompts = drive(&mut runner, &["Blue"], Some("Painter's Servant"));
+
+        assert_painter_and_beastie_ordered(&prompts);
+        assert_eq!(p1p1(&runner, servant), 0, "affected {affected:?}");
+    }
 }

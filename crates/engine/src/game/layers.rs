@@ -7014,7 +7014,7 @@ fn active_continuous_effects_from_static_definitions(
 
         let retained_condition = def.condition.clone();
 
-        let affected_filter = def.affected.clone().unwrap_or(TargetFilter::Any);
+        let affected_filter = static_affected_filter(def).into_owned();
         for (mod_index, modification) in def.modifications.iter().enumerate() {
             // CR 701.15b: Goaded is a designation, not an ability granted
             // to the affected permanent. Combat reads this functioning source.
@@ -8572,7 +8572,7 @@ fn active_combat_assignment_rule_effects_from_static_definitions(
 
         let retained_condition = def.condition.clone();
 
-        let affected_filter = def.affected.clone().unwrap_or(TargetFilter::Any);
+        let affected_filter = static_affected_filter(def).into_owned();
         effects.extend(
             def.modifications
                 .iter()
@@ -11336,6 +11336,16 @@ fn apply_continuous_effect_filtered(
         }
     }
     None
+}
+
+/// CR 613.1: the set of objects a continuous static affects. An absent
+/// `affected` filter is every object. The single reading shared by the layer
+/// pass and the CR 614.12 entry projection (`filter::EntryProjection`).
+pub(crate) fn static_affected_filter(def: &StaticDefinition) -> std::borrow::Cow<'_, TargetFilter> {
+    def.affected.as_ref().map_or(
+        std::borrow::Cow::Owned(TargetFilter::Any),
+        std::borrow::Cow::Borrowed,
+    )
 }
 
 /// What [`apply_type_or_color_modification`] did with one modification.

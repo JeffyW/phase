@@ -1458,20 +1458,8 @@ fn handle_replacement_choice_inner(
                 // the event its logical owner parked on, so the eventual resume
                 // settles that owner's paused delivery even though an answered
                 // choice or applied replacement has changed the proposal since.
-                if pending.delivery_boundary.is_none() {
-                    if let Some(paused) = parked_zone_change_delivery.as_ref() {
-                        let same_zone_change = matches!(
-                            (&pending.proposed, &paused.expected_event),
-                            (
-                                ProposedEvent::ZoneChange { object_id: now, .. },
-                                ProposedEvent::ZoneChange { object_id: was, .. },
-                            ) if now == was
-                        );
-                        if same_zone_change && pending.proposed != paused.expected_event {
-                            pending.delivery_boundary =
-                                Some(Box::new(paused.expected_event.clone()));
-                        }
-                    }
+                if let Some(paused) = parked_zone_change_delivery.as_ref() {
+                    pending.inherit_delivery_boundary(&paused.expected_event);
                 }
             }
             Ok(super::replacement::replacement_choice_waiting_for(
@@ -1768,9 +1756,7 @@ pub(super) fn handle_entry_controller_choice(
     }
     // The logical owner parked on the unanswered event; keep that boundary
     // before the answer changes the proposal.
-    if pending.delivery_boundary.is_none() {
-        pending.delivery_boundary = Some(Box::new(pending.proposed.clone()));
-    }
+    pending.pin_delivery_boundary();
     let ProposedEvent::ZoneChange {
         controller_override,
         to: Zone::Battlefield,
@@ -1818,9 +1804,7 @@ pub(super) fn handle_entry_named_choice(
         .pending_replacement
         .as_mut()
         .expect("a live pre-entry choice owns the pending replacement");
-    if pending.delivery_boundary.is_none() {
-        pending.delivery_boundary = Some(Box::new(pending.proposed.clone()));
-    }
+    pending.pin_delivery_boundary();
     let rid = pending.candidates[0];
     let ProposedEvent::ZoneChange {
         enter_with_choices, ..

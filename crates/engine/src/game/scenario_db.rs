@@ -39,9 +39,7 @@ fn abandon_as_enters_choice_for_scenario_setup(
             .pending_replacement
             .as_mut()
             .expect("a live pre-entry choice owns the pending replacement");
-        if pending.delivery_boundary.is_none() {
-            pending.delivery_boundary = Some(Box::new(pending.proposed.clone()));
-        }
+        pending.pin_delivery_boundary();
         let rid = pending.candidates[0];
         pending.proposed.mark_applied(rid);
         let mut events = Vec::new();
