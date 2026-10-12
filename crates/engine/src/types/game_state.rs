@@ -21075,8 +21075,9 @@ declare_game_state! {
     pub active_spend_only_on_x_count: Option<(ObjectId, u32)>,
     /// CR 601.2g + CR 605.3b: the row policy of the automatic mana payment that
     /// is executing (see `casting_costs::AutoTapRowPolicy`). Set while a
-    /// payment activates its selected sources, and while a paused payment
-    /// resumes, so every auto-tap inside that payment plans under one policy.
+    /// payment activates its selected sources, and to `AllRows` while a
+    /// suspended payment resumes, so every auto-tap inside that payment plans
+    /// under one policy.
     /// `None` outside those synchronous windows; never serialized and never part
     /// of state equality.
     #[serde(skip)]

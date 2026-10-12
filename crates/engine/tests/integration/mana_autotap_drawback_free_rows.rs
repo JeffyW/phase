@@ -174,7 +174,7 @@ fn arena_of_glory_auto_pay_for_two_red_does_not_exert() {
     assert_arena_not_exerted(&[ManaCostShard::Red, ManaCostShard::Red], 0, 1);
 }
 
-/// X costs: X is announced before payment (CR 601.2f), so {X}{R} with X = 1
+/// X costs: X is announced before payment (CR 601.2b), so {X}{R} with X = 1
 /// pays exactly like {1}{R}.
 #[test]
 fn arena_of_glory_auto_pay_for_x_spell_does_not_exert() {
@@ -478,9 +478,9 @@ fn two_filter_land_sub_costs_manual_control() {
 /// with a sacrifice row, so the payment plans with every row (two sacrifices,
 /// as before drawback avoidance). Rest in Peace and Leyline of the Void both
 /// replace the first Ruins' trip to the graveyard, so the payment pauses for
-/// P0's replacement choice. The resumed payment must keep the policy the
-/// payment decided rather than re-deciding from what is left: the second Ruins
-/// is sacrificed too.
+/// P0's replacement choice. Drawback avoidance applies only to a payment that
+/// completes without suspending: the resumed remainder plans with every row, so
+/// the second Ruins is sacrificed too, exactly as before drawback avoidance.
 #[test]
 fn resumed_payment_keeps_its_row_policy() {
     let mut scenario = GameScenario::new();

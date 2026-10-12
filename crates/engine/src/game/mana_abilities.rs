@@ -3743,6 +3743,29 @@ pub(crate) fn resume_mana_ability_root(
     resume: ManaAbilityResume,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    // CR 601.2g + CR 605.3b: the single authority for the row policy of a
+    // resumed automatic payment. A synchronous auto-tap never reaches this
+    // root (its direct resolver resumes to `Priority`; the payment root is
+    // promoted only when a cost move pauses), so whatever this resumes is the
+    // remainder of a payment that suspended, however it got here (a cost-move
+    // replacement, a triggered-mana prompt, a colour choice). The policy the
+    // payment decided lived only in its call frames and is not persisted, so
+    // every auto-tap below plans with every row: drawback avoidance applies
+    // only to a payment that completes without suspending.
+    let enclosing_row_policy = state
+        .active_auto_tap_row_policy
+        .replace(super::casting_costs::AutoTapRowPolicy::AllRows);
+    let resumed = resume_mana_ability_root_payment(state, mana_source_controller, resume, events);
+    state.active_auto_tap_row_policy = enclosing_row_policy;
+    resumed
+}
+
+fn resume_mana_ability_root_payment(
+    state: &mut GameState,
+    mana_source_controller: PlayerId,
+    resume: ManaAbilityResume,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
     match resume {
         ManaAbilityResume::EffectPayCost {
             payer,
@@ -4054,17 +4077,7 @@ pub(crate) fn resume_mana_ability_cost_move(
     else {
         unreachable!("mana ability cost-move resume requires its typed continuation")
     };
-    // CR 601.2g + CR 605.3b: the row policy the paused automatic payment decided
-    // lived only in its call frames. Everything this resume runs (the suspended
-    // parents' sub-costs and the root's finalizer) is the rest of that payment,
-    // so it plans with every row, the planner without drawback avoidance, rather
-    // than re-deciding from the sources that are left.
-    let enclosing_row_policy = state
-        .active_auto_tap_row_policy
-        .replace(super::casting_costs::AutoTapRowPolicy::AllRows);
-    let resumed = continue_mana_ability_cost_payment(state, *pending, cursor, events, 0);
-    state.active_auto_tap_row_policy = enclosing_row_policy;
-    resumed
+    continue_mana_ability_cost_payment(state, *pending, cursor, events, 0)
 }
 
 /// CR 605.3b + CR 605.1a: Run a mana ability's `sub_ability` chain inline.
@@ -4896,6 +4909,17 @@ fn pay_mana_sub_cost(
         // chain, or a self-loop terminate instead of recursing infinitely.
         let mut excluded_sources = excluded_sources.clone();
         excluded_sources.insert(source_id);
+        // CR 601.2g + CR 605.3b: a sub-cost that funds an outer automatic
+        // payment (`sub_cost_demand` is that payment's reserved colours, kept on
+        // the cursor across a pause) never chooses its rows on its own: deciding
+        // per sub-cost could spend a source a sibling still needs. Inside the
+        // live payment it takes the policy that payment published; with no live
+        // payment (its parent resumed after a pause) it plans with every row.
+        let enclosing_row_policy = state.active_auto_tap_row_policy;
+        if sub_cost_demand.is_some() && enclosing_row_policy.is_none() {
+            state.active_auto_tap_row_policy =
+                Some(super::casting_costs::AutoTapRowPolicy::AllRows);
+        }
         let payment = super::casting::pay_ability_mana_cost_excluding_with_parent(
             state,
             player,
@@ -4906,7 +4930,9 @@ fn pay_mana_sub_cost(
             &excluded_sources,
             sub_cost_demand,
             parent,
-        )?;
+        );
+        state.active_auto_tap_row_policy = enclosing_row_policy;
+        let payment = payment?;
         let choice_player = state
             .pending_replacement
             .is_some()
@@ -5647,8 +5673,95 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::game::casting_costs::AutoTapRowPolicy;
+    use crate::game::scenario::{GameScenario, P0};
 
     use crate::game::test_fixtures::mana_fixture_roles;
+
+    /// CR 601.2g + CR 605.3b: a mana ability's own sub-cost that funds an outer
+    /// automatic payment (`sub_cost_demand` present) never chooses its rows on
+    /// its own. With no live payment (its parent resumed after a pause) it plans
+    /// with every row; inside a live payment it takes that payment's policy; a
+    /// standalone sub-cost (no outer demand) decides. Board: Arena of Glory and a
+    /// Mountain fund a `{R}` sub-cost. Every row exerts Arena (its `{R}{R}` row,
+    /// funded by the Mountain); deciding taps one land and leaves Arena unexerted.
+    #[test]
+    fn outer_payment_sub_cost_never_decides_its_rows_alone() {
+        let exerted = |demand: Option<mana_payment::ColorDemand>,
+                       active: Option<AutoTapRowPolicy>| {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+            let arena = scenario
+                .add_land_from_oracle(
+                    P0,
+                    "Arena of Glory",
+                    "{T}: Add {R}.\n{R}, {T}, Exert this land: Add {R}{R}.",
+                )
+                .id();
+            scenario.add_basic_land(P0, ManaColor::Red);
+            let funded = scenario
+                .add_artifact_from_oracle(P0, "Sub-cost Witness", "{R}, {T}: Add {C}{C}.")
+                .id();
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            state.active_auto_tap_row_policy = active;
+            let sub_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            };
+            let progress = pay_mana_sub_cost(
+                state,
+                funded,
+                P0,
+                Some(0),
+                &sub_cost,
+                None,
+                &mut Vec::new(),
+                &HashSet::new(),
+                demand.as_ref(),
+                None,
+            )
+            .expect("reach: the {R} sub-cost is paid");
+            assert!(matches!(
+                progress,
+                ManaAbilityCostComponentProgress::Complete
+            ));
+            assert_eq!(
+                state.active_auto_tap_row_policy, active,
+                "the sub-cost payment restores the enclosing window"
+            );
+            state
+                .transient_continuous_effects
+                .iter()
+                .filter(|effect| effect.affected == TargetFilter::SpecificObject { id: arena })
+                .any(|effect| {
+                    effect.modifications.iter().any(|modification| {
+                        matches!(
+                            modification,
+                            ContinuousModification::AddStaticMode {
+                                mode: StaticMode::CantUntap
+                            }
+                        )
+                    })
+                })
+        };
+
+        assert!(
+            !exerted(None, None),
+            "a standalone sub-cost decides and avoids the exert"
+        );
+        assert!(
+            exerted(Some([0; 5]), None),
+            "reach: an outer payment's sub-cost with no live payment plans with every row"
+        );
+        assert!(
+            !exerted(
+                Some([0; 5]),
+                Some(AutoTapRowPolicy::WithoutAvoidableDrawbacks)
+            ),
+            "inside a live payment the sub-cost takes that payment's policy"
+        );
+    }
 
     /// **CR 605.4a — the acceptance decision is THREADED, not re-derived.**
     ///

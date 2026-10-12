@@ -14680,9 +14680,11 @@ fn plan_auto_tap_rows(
 /// its last nested mana sub-cost. It is passed explicitly to Phase 3's nested
 /// auto-taps and published in `GameState::active_auto_tap_row_policy` while that
 /// payment activates its sources, so a resolver re-entry that starts a new
-/// auto-tap with `Choose` inherits it. It is never persisted: a payment resumed
-/// after a pause plans its remainder with `AllRows`
-/// (`mana_abilities::resume_mana_ability_cost_move`).
+/// auto-tap with `Choose` inherits it. It is never persisted. Drawback avoidance
+/// applies only to a payment that completes without suspending: a resumed
+/// payment plans its remainder with `AllRows`
+/// (`mana_abilities::resume_mana_ability_root`), and a resumed outer payment's
+/// mana sub-cost never decides on its own (`mana_abilities::pay_mana_sub_cost`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutoTapRowPolicy {
     /// The outermost payment: decide for the whole payment, sub-costs included
@@ -17178,6 +17180,8 @@ mod tests {
     use rand::RngCore;
 
     use super::*;
+    use crate::game::scenario::P0;
+    use crate::types::ability::ContinuousModification;
 
     /// CR 601.2g + CR 605.3b: a `Choose` auto-tap made while an automatic payment
     /// is executing takes that payment's published row policy instead of
@@ -17189,11 +17193,6 @@ mod tests {
     /// avoidance and exerts Arena, funded by the Mountain.
     #[test]
     fn choose_auto_tap_inherits_the_active_payment_row_policy() {
-        use crate::game::scenario::{GameScenario, P0};
-        use crate::types::ability::{ContinuousModification, TargetFilter};
-        use crate::types::mana::ManaColor;
-        use crate::types::statics::StaticMode;
-
         let exerted = |active: Option<AutoTapRowPolicy>| {
             let mut scenario = GameScenario::new();
             scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
