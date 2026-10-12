@@ -10622,14 +10622,21 @@ fn trigger_opponent_gains_control_from_you_maps_to_changes_controller() {
 }
 
 /// Fail-closed boundaries of the control-change trigger class: a subject with
-/// its own controller (read after the change, not looked back on) and the
-/// gain side "you gain control of ~ from another player" (Risky Move — not a
-/// CR 603.10d look-back trigger) both stay `Unknown`.
+/// its own controller or a post-change property (read after the change, not
+/// looked back on) and the gain side "you gain control of ~ from another
+/// player" (Risky Move — not a CR 603.10d look-back trigger) all stay
+/// `Unknown`. Positive guard: the same frame with a controller-free subject
+/// (and with an ownership property, judged with the look-back "you") is
+/// claimed.
 #[test]
 fn trigger_control_change_unsupported_shapes_stay_unknown() {
     for (text, name) in [
         (
             "Whenever an opponent gains control of a creature you control from you, draw a card.",
+            "Probe",
+        ),
+        (
+            "Whenever an opponent gains control of an attacking creature from you, draw a card.",
             "Probe",
         ),
         (
@@ -10642,6 +10649,26 @@ fn trigger_control_change_unsupported_shapes_stay_unknown() {
             matches!(def.mode, TriggerMode::Unknown(_)),
             "{text:?} must fail closed, got {:?}",
             def.mode
+        );
+    }
+    for (text, subject) in [
+        (
+            "Whenever an opponent gains control of a creature from you, draw a card.",
+            TypedFilter::creature(),
+        ),
+        (
+            "Whenever an opponent gains control of a permanent you own from you, draw a card.",
+            TypedFilter::permanent().properties(vec![FilterProp::Owned {
+                controller: ControllerRef::You,
+            }]),
+        ),
+    ] {
+        let def = parse_trigger_line(text, "Probe");
+        assert_eq!(def.mode, TriggerMode::ChangesController, "reach: {text:?}");
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(subject)),
+            "{text:?}"
         );
     }
 }

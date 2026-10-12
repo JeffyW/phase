@@ -7,7 +7,7 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::format::FormatConfig;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::ManaCost;
+use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 
@@ -19,8 +19,10 @@ const ZIDANE: &str = "When Zidane enters, gain control of target creature an opp
     Whenever an opponent gains control of a permanent from you, you create a Treasure token.";
 const ACT_OF_TREASON: &str = "Gain control of target creature until end of turn. Untap that \
     creature. It gains haste until end of turn. (It can attack and {T} this turn.)";
-const SUBJUGATE_THE_HOBBITS: &str =
-    "Gain control of each noncommander creature with mana value 3 or less.";
+const MOB_RULE: &str = "Choose one \u{2014}\n\u{2022} Gain control of all creatures with power \
+    4 or greater until end of turn. Untap those creatures. They gain haste until end of turn.\n\
+    \u{2022} Gain control of all creatures with power 3 or less until end of turn. Untap those \
+    creatures. They gain haste until end of turn.";
 const SWITCHEROO: &str = "Exchange control of two target creatures.";
 const PERPLEXING_CHIMERA: &str = "Whenever an opponent casts a spell, you may exchange control \
     of this creature and that spell. If you do, you may choose new targets for the spell. (If \
@@ -49,9 +51,18 @@ fn give_priority(runner: &mut GameRunner, player: PlayerId) {
     state.waiting_for = WaitingFor::Priority { player };
 }
 
+/// Zidane with its printed mana cost, {3}{R}{W} (mana value 5).
+fn zidane_cost() -> ManaCost {
+    ManaCost::Cost {
+        shards: vec![ManaCostShard::Red, ManaCostShard::White],
+        generic: 3,
+    }
+}
+
 fn add_zidane(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
     scenario
         .add_creature_from_oracle(player, "Zidane, Tantalus Thief", 3, 3, ZIDANE)
+        .with_mana_cost(zidane_cost())
         .id()
 }
 
@@ -172,22 +183,24 @@ fn stealing_zidane_itself_fires_for_its_previous_controller() {
 }
 
 /// CR 603.2c: a mass steal is one occurrence per permanent, Zidane included.
+/// Mob Rule's second mode takes every creature with power 3 or less: Zidane
+/// (3/3, printed mana value 5) and the bear.
 #[test]
 fn mass_steal_fires_once_per_permanent_including_zidane() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
     let bear = scenario.add_vanilla(P0, 2, 2);
-    let subjugate = add_free_spell(
-        &mut scenario,
-        P1,
-        "Subjugate the Hobbits",
-        SUBJUGATE_THE_HOBBITS,
-    );
+    let mob_rule = add_free_spell(&mut scenario, P1, "Mob Rule", MOB_RULE);
     let mut runner = scenario.build();
     give_priority(&mut runner, P1);
+    assert_eq!(
+        runner.state().objects[&zidane].mana_cost.mana_value(),
+        5,
+        "REACH: Zidane keeps its printed mana value"
+    );
 
-    runner.cast(subjugate).resolve();
+    runner.cast(mob_rule).modes(&[1]).resolve();
     runner.advance_until_stack_empty();
     assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane stolen");
     assert_eq!(controller(&runner, bear), P1, "REACH: bear stolen");
@@ -384,5 +397,132 @@ fn self_subject_fires_only_for_the_source() {
             "steal_source {steal_source}: only the source changing hands fires"
         );
         assert_eq!(treasures(&runner, P1), 0);
+    }
+}
+
+/// Labelled synthetic two-instruction spell: two exchanges in one resolution,
+/// one after the other (CR 608.2c).
+const DOUBLE_SWITCHEROO: &str =
+    "Exchange control of two target creatures. Exchange control of two target creatures.";
+
+/// CR 603.10d + CR 608.2c: within one resolution, the second exchange happens
+/// after the first. Zidane leaves P0 in the first (Treasure for P0); P1
+/// controls Zidane when P1 then loses a creature to P2 in the second
+/// (Treasure for P1).
+#[test]
+fn sequential_instructions_read_zidanes_controller_at_each_event() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P0);
+    let bear_a = scenario.add_vanilla(P1, 2, 2);
+    let bear_b = scenario.add_vanilla(P1, 2, 2);
+    let bear_c = scenario.add_vanilla(P2, 2, 2);
+    let spell = add_free_spell(&mut scenario, P0, "Double Switcheroo", DOUBLE_SWITCHEROO);
+    let mut runner = scenario.build();
+
+    runner
+        .cast(spell)
+        .target_objects(&[zidane, bear_a, bear_b, bear_c])
+        .resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane went to P1");
+    assert_eq!(controller(&runner, bear_a), P0, "REACH: bear A came to P0");
+    assert_eq!(controller(&runner, bear_b), P2, "REACH: bear B went to P2");
+    assert_eq!(controller(&runner, bear_c), P1, "REACH: bear C came to P1");
+    assert_eq!(treasures(&runner, P0), 1, "P0 lost Zidane to an opponent");
+    assert_eq!(
+        treasures(&runner, P1),
+        1,
+        "P1 controlled Zidane when P1 lost bear B to an opponent"
+    );
+    assert_eq!(treasures(&runner, P2), 0);
+}
+
+const OWNED_WATCHER: &str = "Whenever an opponent gains control of a permanent you own from \
+    you, you create a Treasure token.";
+
+/// CR 603.10d: "you own" is judged with the look-back "you" — the watcher's
+/// controller before it was stolen — not with its new controller.
+#[test]
+fn owned_subject_reads_the_look_back_controller() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let watcher = scenario
+        .add_creature_from_oracle(P0, "Owned Watcher", 1, 1, OWNED_WATCHER)
+        .id();
+    let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P1);
+
+    runner.cast(steal).target_object(watcher).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, watcher),
+        P1,
+        "REACH: P1 stole the watcher"
+    );
+    assert_eq!(treasures(&runner, P0), 1);
+    assert_eq!(treasures(&runner, P1), 0);
+}
+
+/// Verbatim Oracle text (Scryfall).
+const GRAB_THE_REINS: &str = "Choose one \u{2014}\n\u{2022} Until end of turn, you gain control \
+    of target creature and it gains haste.\n\u{2022} Sacrifice a creature. Grab the Reins deals \
+    damage equal to that creature's power to any target.\nEntwine {2}{R} (Choose both if you \
+    pay the entwine cost.)";
+
+/// CR 110.1 + CR 603.10d: a permanent stolen and then sacrificed by the same
+/// resolution was a permanent when it changed control. `p1_has_other` adds a
+/// second creature for P1, so the sacrifice pauses for P1's choice instead of
+/// taking the only candidate.
+#[test]
+fn steal_then_sacrifice_in_one_resolution_still_fires() {
+    for p1_has_other in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P0);
+        let bear = scenario.add_vanilla(P0, 2, 2);
+        let other = p1_has_other.then(|| scenario.add_vanilla(P1, 1, 1));
+        let reins = scenario
+            .add_spell_to_hand_from_oracle(P1, "Grab the Reins", true, GRAB_THE_REINS)
+            .from_oracle_text_with_keywords(&["Entwine"], GRAB_THE_REINS)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 3,
+            })
+            .id();
+        scenario.with_mana_pool(
+            P1,
+            (0..7)
+                .map(|_| ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]))
+                .collect(),
+        );
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+
+        runner
+            .cast(reins)
+            .modes(&[0, 1])
+            .target_object(bear)
+            .target_player(P0)
+            .sacrifice_with(&[bear])
+            .resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&bear].zone,
+            engine::types::zones::Zone::Graveyard,
+            "REACH (p1_has_other {p1_has_other}): the stolen bear was sacrificed"
+        );
+        if let Some(other) = other {
+            assert!(
+                runner.state().battlefield.contains(&other),
+                "REACH: P1 chose the stolen bear over its own creature"
+            );
+        }
+        assert_eq!(
+            treasures(&runner, P0),
+            1,
+            "p1_has_other {p1_has_other}: the bear left P0's control as a permanent"
+        );
     }
 }
