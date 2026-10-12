@@ -9499,14 +9499,19 @@ fn demote_unreached_granter_references(parsed: &mut ParsedAbilities) {
     demote_granter_references(parsed, granter_reference_unreached);
 }
 
-/// CR 702.122c + CR 400.7: a population COUNT over a crew-history filter ("for
-/// each creature that crewed it this turn", Luxurious Locomotive) must include
-/// crewers that have since left the battlefield, but `ObjectCount` and its
-/// siblings evaluate live membership, and a departed crewer is a new object that
-/// matches no ledger record. No quantity reads the crew ledger's cardinality, so
-/// every definition holding such a count lowers to the unsupported residual
-/// rather than undercounting. Detected on the serialized tree so every nesting
-/// position (effect counts, conditions, sub-abilities) is covered by one walk.
+/// CR 702.122c + CR 400.7: a quantity over a crew-history filter ("for each
+/// creature that crewed it this turn", Luxurious Locomotive) must include
+/// crewers that have since left the battlefield, but every filter-bearing
+/// `QuantityRef` evaluates live membership, and a departed crewer is a new
+/// object that matches no ledger record. No quantity reads the crew ledger's
+/// cardinality, so every definition holding such a quantity lowers to the
+/// unsupported residual rather than undercounting.
+///
+/// Reached on the serialized tree so every nesting position (effect counts,
+/// conditions, sub-abilities, granted statics) is covered by one walk; each
+/// node is judged TYPED — it must decode as a `QuantityRef`, and the shared
+/// `quantity_ref_uses_filter_prop` authority (exhaustive over `QuantityRef`)
+/// decides whether any filter it carries reads the crew relation.
 fn demote_crew_history_population_counts(parsed: &mut ParsedAbilities) {
     demote_definitions(parsed, "crew_history_population_count", |node| {
         let tree = match &node {
@@ -9515,30 +9520,39 @@ fn demote_crew_history_population_counts(parsed: &mut ParsedAbilities) {
             DefinitionNode::Static(def) => serde_json::to_value(def),
             DefinitionNode::Replacement(def) => serde_json::to_value(def),
         };
-        tree.is_ok_and(|tree| holds_crew_history_population_count(&tree, false))
+        tree.is_ok_and(|tree| mentions_crew_history(&tree) && holds_crew_history_quantity(&tree))
     });
 }
 
-/// Whether `tree` holds a crew-history filter prop beneath a population-count
-/// quantity (`in_count` carries that ancestry down the walk).
-fn holds_crew_history_population_count(tree: &serde_json::Value, in_count: bool) -> bool {
+/// Cheap prefilter: does the serialized tree name the crew-history prop at all?
+/// Correctness rests on the typed walk below; this only skips trees that cannot
+/// match.
+fn mentions_crew_history(tree: &serde_json::Value) -> bool {
     match tree {
         serde_json::Value::Object(map) => {
-            let tag = map.get("type").and_then(serde_json::Value::as_str);
-            if in_count && tag == Some("CrewedThisTurn") {
-                return true;
-            }
-            let in_count = in_count
-                || matches!(
-                    tag,
-                    Some("ObjectCount" | "ObjectCountDistinct" | "ObjectCountBySharedQuality")
-                );
-            map.values()
-                .any(|value| holds_crew_history_population_count(value, in_count))
+            map.get("type").is_some_and(|tag| tag == "CrewedThisTurn")
+                || map.values().any(mentions_crew_history)
         }
-        serde_json::Value::Array(items) => items
-            .iter()
-            .any(|item| holds_crew_history_population_count(item, in_count)),
+        serde_json::Value::Array(items) => items.iter().any(mentions_crew_history),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
+    }
+}
+
+/// Whether any node of `tree` is a `QuantityRef` whose filters read
+/// `FilterProp::CrewedThisTurn`.
+fn holds_crew_history_quantity(tree: &serde_json::Value) -> bool {
+    let reads_crew_history = |prop: &FilterProp| matches!(prop, FilterProp::CrewedThisTurn { .. });
+    match tree {
+        serde_json::Value::Object(map) => {
+            let is_crew_quantity = map.contains_key("type")
+                && <QuantityRef as serde::Deserialize>::deserialize(tree)
+                    .is_ok_and(|qty| quantity_ref_uses_filter_prop(&qty, &reads_crew_history));
+            is_crew_quantity || map.values().any(holds_crew_history_quantity)
+        }
+        serde_json::Value::Array(items) => items.iter().any(holds_crew_history_quantity),
         serde_json::Value::Null
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)

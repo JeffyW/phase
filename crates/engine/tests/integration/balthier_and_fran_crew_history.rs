@@ -787,8 +787,8 @@ fn subterranean_schooner_crewer_explores() {
         P0,
         "Subterranean Schooner",
         SUBTERRANEAN_SCHOONER,
-        4,
         3,
+        4,
     );
     let crewer = s.add_creature(P0, "Crewer", 1, 1).id();
     let second_crewer = s.add_creature(P0, "Second Crewer", 1, 1).id();
@@ -826,7 +826,7 @@ fn subterranean_schooner_crewer_explores() {
 fn turtle_van_counters_a_turtle_crewer_and_doubles_them() {
     let mut s = GameScenario::new();
     s.at_phase(Phase::PreCombatMain);
-    let van = add_vehicle(&mut s, P0, "Turtle Van", TURTLE_VAN, 3, 3);
+    let van = add_vehicle(&mut s, P0, "Turtle Van", TURTLE_VAN, 4, 4);
     let turtle = s
         .add_creature(P0, "Turtle", 1, 1)
         .with_subtypes(vec!["Turtle"])
