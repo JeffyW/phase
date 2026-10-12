@@ -4721,15 +4721,84 @@ fn static_has_type_or_color_effect(def: &crate::types::ability::StaticDefinition
     })
 }
 
+/// Whether a static is within the entry projection's scope: a continuous
+/// type/colour static that can apply to the entrant itself.
+fn static_in_entry_projection_scope(def: &crate::types::ability::StaticDefinition) -> bool {
+    def.mode == StaticMode::Continuous
+        && static_has_type_or_color_effect(def)
+        && !static_affects_only_attachment_host(def)
+}
+
+/// CR 614.12 + CR 613.3 + CR 613.6 + CR 613.8: the projection's set-level
+/// contract for the static at `index` among the entrant's statics. The
+/// projection decides every static's affected-set membership once, up front,
+/// and applies the statics in written order within a layer. That is exact only
+/// when no other in-scope static of the entrant can change what this one's
+/// affected filter reads (CR 613.6 / CR 613.8 dependency) and no
+/// characteristic-defining static must jump the written order (CR 613.3).
+/// Anything else is unproven and fails closed: the runtime skips it and
+/// coverage marks the face (`ENTRY_PROJECTION_GAP`).
+pub(crate) fn entry_projection_proves_static(
+    statics: &[crate::types::ability::StaticDefinition],
+    index: usize,
+) -> bool {
+    let def = &statics[index];
+    if !static_in_entry_projection_scope(def) {
+        return true;
+    }
+    if !entry_projection_supports_static(def) {
+        return false;
+    }
+    let others = || {
+        statics
+            .iter()
+            .enumerate()
+            .filter(move |(other, candidate)| {
+                *other != index && static_in_entry_projection_scope(candidate)
+            })
+            .map(|(_, candidate)| candidate)
+    };
+    // CR 613.3: a characteristic-defining ability applies before the other
+    // effects in its layer, which written order doesn't prove.
+    if (def.characteristic_defining && others().next().is_some())
+        || others().any(|other| other.characteristic_defining)
+    {
+        return false;
+    }
+    let reads = match crate::game::layers::static_affected_filter(def).as_ref() {
+        TargetFilter::SelfRef | TargetFilter::Any => CharacteristicKinds::EMPTY,
+        filter => target_filter_characteristic_reads(filter),
+    };
+    let writes = others().flat_map(|other| other.modifications.iter()).fold(
+        CharacteristicKinds::EMPTY,
+        |writes, modification| {
+            writes.union(crate::game::layers::modification_characteristic_writes(
+                modification,
+            ))
+        },
+    );
+    !reads.intersects(writes)
+}
+
+/// CR 614.12: whether the projection proves every static of a face or object
+/// — the face-level form of [`entry_projection_proves_static`] that coverage
+/// reads.
+pub(crate) fn entry_projection_supports_statics(
+    statics: &[crate::types::ability::StaticDefinition],
+) -> bool {
+    (0..statics.len()).all(|index| entry_projection_proves_static(statics, index))
+}
+
 /// CR 614.12 + CR 616.1e: whether the entrant's projection depends on its
 /// as-enters choices — an own static the projection applies that reads the
 /// chosen subtype or colour.
 pub(crate) fn entry_projection_reads_choices(
     entrant: &crate::game::game_object::GameObject,
 ) -> bool {
-    entrant.static_definitions.iter_all().any(|def| {
-        def.mode == StaticMode::Continuous
-            && entry_projection_supports_static(def)
+    let statics = entrant.static_definitions.as_slice();
+    statics.iter().enumerate().any(|(index, def)| {
+        static_in_entry_projection_scope(def)
+            && entry_projection_proves_static(statics, index)
             && def.modifications.iter().any(|modification| {
                 matches!(
                     modification,
@@ -4789,9 +4858,9 @@ fn static_affects_only_attachment_host(def: &crate::types::ability::StaticDefini
 /// such as Painter's Servant's; an absent affected set is every object, as the
 /// layer pass reads it) — in layer order: types (CR 613.1d) before colours
 /// (CR 613.1e); within a layer the statics share the entrant's timestamp and
-/// apply in written order (CR 613.7a). Statics outside the completeness
-/// contract (`entry_projection_supports_static`) are skipped; coverage marks
-/// such a face unsupported (`ENTRY_PROJECTION_GAP`).
+/// apply in written order (CR 613.7a). Statics the projection can't prove
+/// (`entry_projection_proves_static`) are skipped; coverage marks such a face
+/// unsupported (`ENTRY_PROJECTION_GAP`).
 fn apply_entrant_own_statics(
     state: &GameState,
     entrant: &mut crate::game::game_object::GameObject,
@@ -4799,11 +4868,12 @@ fn apply_entrant_own_statics(
     // `Definitions` is reference-counted: this clone is a refcount bump that
     // lets the walk read the statics while the entrant is modified.
     let statics = entrant.static_definitions.clone();
+    let statics = statics.as_slice();
     let mut applicable = Vec::new();
-    for def in statics.iter_all() {
+    for (index, def) in statics.iter().enumerate() {
         if def.mode != StaticMode::Continuous
             || !def.modifications.iter().any(is_type_or_color_modification)
-            || !entry_projection_supports_static(def)
+            || !entry_projection_proves_static(statics, index)
             || !crate::game::functioning_abilities::static_functions_in_zone(entrant, def)
         {
             continue;
@@ -22069,12 +22139,20 @@ mod entry_projection_tests {
     use crate::game::coverage::{card_face_gaps, ENTRY_PROJECTION_GAP};
     use crate::game::layers::{apply_type_or_color_modification, TypeColorModification};
     use crate::game::replacement::as_enters_choice_type;
+    use crate::game::replacement::{
+        proposed_event_prompt_cause, replacement_last_applied_decides,
+        replacement_ordering_is_material, replacement_registry, ReplacementPromptCause,
+    };
+    use crate::game::scenario::{GameScenario, P0, P1};
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ChoiceType, ChosenSubtypeKind, ColorChangeMode, Effect,
         ReplacementDefinition, ReplacementMode, StaticCondition, StaticDefinition,
         TargetSelectionMode,
     };
+    use crate::types::actions::GameAction;
     use crate::types::card::CardFace;
+    use crate::types::game_state::{CastPaymentMode, PendingReplacement, WaitingFor};
+    use crate::types::proposed_event::ProposedEvent;
     use crate::types::replacements::ReplacementEvent;
 
     fn choose(persist: bool, selection: TargetSelectionMode) -> AbilityDefinition {
@@ -22145,10 +22223,10 @@ mod entry_projection_tests {
             .modifications(vec![modification])
     }
 
-    /// CR 614.12 completeness contract: unconditional and chosen-label-gated
-    /// type/colour statics are projected; any other condition and the
-    /// ability-removing land-subtype sets are not, unless the static can only
-    /// affect an attachment host.
+    /// CR 614.12 completeness contract: unconditional type/colour statics are
+    /// projected; any condition (the chosen label included), the
+    /// ability-removing land-subtype sets and granted type/colour statics are
+    /// not, unless the static can only affect an attachment host.
     #[test]
     fn projection_static_support_contract() {
         let chosen = ContinuousModification::AddChosenSubtype {
@@ -22192,6 +22270,46 @@ mod entry_projection_tests {
             &self_static(ContinuousModification::AddPower { value: 1 })
                 .condition(StaticCondition::SourceIsAttacking)
         ));
+    }
+
+    /// CR 613.3 + CR 613.6 + CR 613.8: the set-level contract. A static whose
+    /// affected filter reads a characteristic another own static writes, or a
+    /// characteristic-defining static beside another own static, is unproven;
+    /// independent statics (Mimic's own subtype + an unrelated self colour) are
+    /// proven.
+    #[test]
+    fn projection_set_contract_rejects_unproven_dependencies() {
+        let chosen = self_static(ContinuousModification::AddChosenSubtype {
+            kind: ChosenSubtypeKind::CreatureType,
+        });
+        let self_blue = self_static(ContinuousModification::AddColor {
+            color: ManaColor::Blue,
+        });
+        assert!(entry_projection_supports_statics(&[
+            chosen.clone(),
+            self_blue.clone()
+        ]));
+        let angels_blue = StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().subtype("Angel".to_string()),
+            ))
+            .modifications(vec![ContinuousModification::AddColor {
+                color: ManaColor::Blue,
+            }]);
+        let set = [chosen.clone(), angels_blue.clone()];
+        assert!(entry_projection_proves_static(&set, 0));
+        assert!(
+            !entry_projection_proves_static(&set, 1),
+            "Angel membership depends on the chosen subtype"
+        );
+        assert!(!entry_projection_supports_statics(&set));
+        assert!(
+            entry_projection_supports_statics(&[angels_blue]),
+            "alone, nothing it reads is rewritten by an own static"
+        );
+        let mut cda = self_blue;
+        cda.characteristic_defining = true;
+        assert!(!entry_projection_supports_statics(&[chosen, cda]));
     }
 
     /// CR 613.1: an absent affected set is every object — the layer pass's
@@ -22309,9 +22427,6 @@ mod entry_projection_tests {
     /// Board: P1's Phyrexian Censor, P0 casting Metallic Mimic; parked at the
     /// CR 616.1 prompt that orders Censor against Mimic's pre-entry choice.
     fn censor_mimic_prompt() -> crate::game::scenario::GameRunner {
-        use crate::game::scenario::{GameScenario, P0, P1};
-        use crate::types::actions::GameAction;
-        use crate::types::game_state::CastPaymentMode;
         let mut scenario = GameScenario::new();
         scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
         scenario
@@ -22346,11 +22461,6 @@ mod entry_projection_tests {
     /// Phyrexian leaves Mimic tapped, so no last write wins.
     #[test]
     fn pre_entry_choice_dependency_is_in_the_shared_ordering_authority() {
-        use crate::game::replacement::{
-            proposed_event_prompt_cause, replacement_last_applied_decides,
-            replacement_ordering_is_material, replacement_registry, ReplacementPromptCause,
-        };
-        use crate::types::game_state::WaitingFor;
         let runner = censor_mimic_prompt();
         let state = runner.state();
         let WaitingFor::ReplacementChoice {
@@ -22388,8 +22498,6 @@ mod entry_projection_tests {
     /// change, and a re-park of a different event (no inheritance).
     #[test]
     fn delivery_boundary_is_the_single_owner_key() {
-        use crate::types::game_state::PendingReplacement;
-        use crate::types::proposed_event::ProposedEvent;
         let mut state = GameState::new_two_player(9783);
         let entrant = crate::game::zones::create_object(
             &mut state,

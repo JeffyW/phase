@@ -11449,25 +11449,31 @@ fn as_enters_choice_changes_applicability(
     candidates: &[ReplacementId],
     proposed: &ProposedEvent,
 ) -> bool {
+    // Only a battlefield entry can carry a pre-entry choice; every other event
+    // class leaves here without touching a candidate.
+    let ProposedEvent::ZoneChange {
+        object_id,
+        to: Zone::Battlefield,
+        ..
+    } = proposed
+    else {
+        return false;
+    };
     if candidates.len() < 2 {
         return false;
     }
-    let (choices, competitors): (Vec<ReplacementId>, Vec<ReplacementId>) = candidates
-        .iter()
-        .partition(|rid| as_enters_choice_for_entry(state, proposed, **rid).is_some());
-    if choices.is_empty() || competitors.is_empty() {
+    let is_choice =
+        |rid: &ReplacementId| as_enters_choice_for_entry(state, proposed, *rid).is_some();
+    if !candidates.iter().any(is_choice) {
         return false;
     }
-    let ProposedEvent::ZoneChange { object_id, .. } = proposed else {
-        return false;
-    };
     let Some(entrant) = state.entering_or_live_object(*object_id) else {
         return false;
     };
     if !crate::game::filter::entry_projection_reads_choices(entrant) {
         return false;
     }
-    competitors.iter().any(|rid| {
+    candidates.iter().filter(|rid| !is_choice(rid)).any(|rid| {
         // Virtual candidates carry no definition to prove independence from.
         replacement_definition_for_id(state, *rid).is_none_or(|def| {
             def.condition.is_some() || !matches!(def.valid_card, None | Some(TargetFilter::SelfRef))

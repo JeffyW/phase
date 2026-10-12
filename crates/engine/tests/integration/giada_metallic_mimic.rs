@@ -16,8 +16,11 @@
 //! CR 614.12a (an as-enters choice is made before the permanent enters).
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::ChosenAttribute;
+use engine::types::ability::{
+    ChosenAttribute, ContinuousModification, Effect, StaticDefinition, TargetFilter, TypedFilter,
+};
 use engine::types::actions::GameAction;
+use engine::types::card::CardFace;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
     CastPaymentMode, NamedChoiceSourceBinding, PersistedGameState, PersistedRestoreFinalization,
@@ -28,6 +31,7 @@ use engine::types::keywords::Keyword;
 use engine::types::mana::ManaColor;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::replacements::ReplacementEvent;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
@@ -878,7 +882,32 @@ fn label_gated_type_statics_are_marked_unsupported_for_the_entry_projection() {
     for name in ["Primal Clay", "Primal Plasma", "Corrupted Shapeshifter"] {
         assert!(gap_of(name), "{name} must be marked unsupported");
     }
-    for name in ["Metallic Mimic", "Painter's Servant", "Adaptive Automaton"] {
+    // Reach guards for the negatives: each face still carries its persisting
+    // as-enters choice and the static that reads it, so "no gap" can't pass
+    // because a parse lost either.
+    for (name, reads_choice) in [
+        ("Metallic Mimic", "AddChosenSubtype"),
+        ("Painter's Servant", "AddChosenColor"),
+        ("Adaptive Automaton", "AddChosenSubtype"),
+    ] {
+        let face = db.get_face_by_name(name).expect("in the card database");
+        assert!(
+            face.replacements.iter().any(|def| {
+                def.event == ReplacementEvent::Moved
+                    && def.valid_card == Some(TargetFilter::SelfRef)
+                    && def.execute.as_deref().is_some_and(|execute| {
+                        matches!(*execute.effect, Effect::Choose { persist: true, .. })
+                    })
+            }),
+            "reach: {name} keeps its persisting as-enters choice"
+        );
+        assert!(
+            face.static_abilities.iter().any(|def| def
+                .modifications
+                .iter()
+                .any(|modification| format!("{modification:?}").starts_with(reads_choice))),
+            "reach: {name} keeps its {reads_choice} static"
+        );
         assert!(!gap_of(name), "{name} is fully projected");
     }
 }
@@ -1088,4 +1117,106 @@ fn absent_affected_static_projects_like_an_explicit_every_object_static() {
         assert_painter_and_beastie_ordered(&prompts);
         assert_eq!(p1p1(&runner, servant), 0, "affected {affected:?}");
     }
+}
+
+/// N1 — CR 613.6 + CR 613.8: an own static whose affected set ("Angel creatures") is
+/// decided by another own static (the chosen subtype) is a dependency the entry
+/// projection doesn't prove. Contract fixture, not a printed interaction: Metallic
+/// Mimic with an added "Angel creatures are blue in addition" static, Curator Beastie
+/// out, the choice ordered first, Angel chosen. The face is marked unsupported; the
+/// unproven entry counter outcome is not asserted.
+#[test]
+fn dependent_own_static_is_marked_unsupported_for_the_entry_projection() {
+    let mimic_board = |extra: Option<StaticDefinition>| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario
+            .add_creature_from_oracle(P0, "Curator Beastie", 6, 6, CURATOR_BEASTIE)
+            .with_subtypes(vec!["Beast"])
+            .with_color(vec![ManaColor::Green]);
+        let mut mimic =
+            scenario.add_creature_to_hand_from_oracle(P0, "Metallic Mimic", 2, 1, METALLIC_MIMIC);
+        mimic
+            .as_artifact_creature()
+            .with_subtypes(vec!["Shapeshifter"])
+            .with_color(vec![]);
+        if let Some(extra) = extra {
+            mimic.with_static_definition(extra);
+        }
+        let mimic = mimic.id();
+        let mut runner = scenario.build();
+        set_creature_types(&mut runner);
+        (runner, mimic)
+    };
+    let blue = || ContinuousModification::AddColor {
+        color: ManaColor::Blue,
+    };
+    let face_of = |runner: &GameRunner, id: ObjectId| {
+        let object = &runner.state().objects[&id];
+        CardFace {
+            replacements: object
+                .replacement_definitions
+                .iter_unchecked()
+                .cloned()
+                .collect(),
+            static_abilities: object
+                .static_definitions
+                .iter_unchecked()
+                .cloned()
+                .collect(),
+            ..CardFace::default()
+        }
+    };
+    let has_gap = |face: &CardFace| {
+        engine::game::coverage::card_face_gaps(face)
+            .iter()
+            .any(|gap| gap == engine::game::coverage::ENTRY_PROJECTION_GAP)
+    };
+
+    // The dependent shape: an honest gap marker.
+    let angels_blue = StaticDefinition::continuous()
+        .affected(TargetFilter::Typed(
+            TypedFilter::creature().subtype("Angel".to_string()),
+        ))
+        .modifications(vec![blue()]);
+    let (mut runner, mimic) = mimic_board(Some(angels_blue));
+    assert!(
+        has_gap(&face_of(&runner, mimic)),
+        "the unproven dependency is marked unsupported"
+    );
+    cast(&mut runner, mimic);
+    let prompts = drive(&mut runner, &["Angel"], Some("Metallic Mimic"));
+    let Some(Prompt::Order { sources }) = prompts.first() else {
+        panic!("reach: both replacements apply, got {prompts:?}");
+    };
+    assert!(sources.iter().any(|s| s == "Curator Beastie"));
+    let obj = &runner.state().objects[&mimic];
+    assert!(
+        obj.card_types.subtypes.iter().any(|s| s == "Angel")
+            && obj.color.contains(&ManaColor::Blue),
+        "reach: on the battlefield it is an Angel and therefore blue"
+    );
+
+    // Control: an invariant self colour is proven, so the choice-first order makes it
+    // blue as it enters and Beastie doesn't apply.
+    let (mut runner, mimic) = mimic_board(Some(
+        StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![blue()]),
+    ));
+    assert!(!has_gap(&face_of(&runner, mimic)));
+    cast(&mut runner, mimic);
+    drive(&mut runner, &["Angel"], Some("Metallic Mimic"));
+    assert_eq!(p1p1(&runner, mimic), 0, "a blue entrant isn't colorless");
+
+    // Control: no colour static leaves it colorless, so Beastie applies.
+    let (mut runner, mimic) = mimic_board(None);
+    assert!(!has_gap(&face_of(&runner, mimic)));
+    cast(&mut runner, mimic);
+    drive(&mut runner, &["Angel"], None);
+    assert_eq!(
+        p1p1(&runner, mimic),
+        2,
+        "a colorless entrant gets Beastie's counters"
+    );
 }

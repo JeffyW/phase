@@ -5440,7 +5440,9 @@ fn population_probe_blinded_by_entrant_characteristic_change(
 /// [`population_probe_blinded_by_entrant_characteristic_change`]. A variant that
 /// writes several kinds returns their union; a variant whose effect cannot be
 /// bounded returns [`CharacteristicKinds::ALL`].
-fn modification_characteristic_writes(m: &ContinuousModification) -> CharacteristicKinds {
+pub(crate) fn modification_characteristic_writes(
+    m: &ContinuousModification,
+) -> CharacteristicKinds {
     modification_characteristic_writes_at(m, GRANTED_STATIC_WRITE_DEPTH)
 }
 
