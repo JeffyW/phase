@@ -10839,25 +10839,28 @@ pub struct ThisWayHead {
 /// The zone-change verb a "… this way" head names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThisWayVerb {
-    /// CR 701.13a
+    /// CR 701.13a: exile moves an object to the exile zone from wherever it is.
     Exile,
-    /// CR 701.9a
+    /// CR 701.9a: discard moves a card from its owner's hand to their graveyard.
     Discard,
-    /// CR 701.21a
+    /// CR 701.21a: sacrifice moves a permanent from the battlefield to its
+    /// owner's graveyard.
     Sacrifice,
-    /// CR 701.17a
+    /// CR 701.17a: mill puts cards from the top of a library into the graveyard.
     Mill,
     /// "put onto the battlefield" / "enters"
     EnterBattlefield,
-    /// "put into your graveyard" (CR 701.25a surveil)
+    /// "put into your graveyard" (CR 701.25a: surveil puts any number of the
+    /// looked-at cards into the graveyard).
     PutIntoGraveyard,
-    /// CR 701.8a
+    /// CR 701.8a: destroy moves a permanent from the battlefield to its owner's
+    /// graveyard.
     Destroy,
     /// "returned"
     Return,
-    /// CR 701.6a
+    /// CR 701.6a: counter removes a spell or ability from the stack.
     Counter,
-    /// CR 700.4 "dies" / "put into a graveyard"
+    /// CR 700.4: "dies" means put into a graveyard from the battlefield.
     Die,
 }
 
