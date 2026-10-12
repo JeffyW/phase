@@ -295,24 +295,94 @@ fn teammate_steal_does_not_fire() {
     }
 }
 
-/// A steal between two other players is not "from you".
+/// A steal between two other players is not "from you"; the same steal of
+/// your creature in the same three-player game is.
 #[test]
 fn steal_between_other_players_does_not_fire() {
-    let mut scenario = GameScenario::new_n_player(3, 42);
-    scenario.at_phase(Phase::PreCombatMain);
-    add_zidane(&mut scenario, P0);
-    let victim = scenario.add_vanilla(P2, 2, 2);
-    let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
-    let mut runner = scenario.build();
-    give_priority(&mut runner, P1);
+    for (victim_controller, expected) in [(P2, 0), (P0, 1)] {
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P0);
+        let victim = scenario.add_vanilla(victim_controller, 2, 2);
+        let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
 
-    runner.cast(steal).target_object(victim).resolve();
-    runner.advance_until_stack_empty();
-    assert_eq!(
-        controller(&runner, victim),
-        P1,
-        "REACH: P1 stole P2's creature"
-    );
-    assert_eq!(treasures(&runner, P0), 0);
-    assert_eq!(treasures(&runner, P2), 0);
+        runner.cast(steal).target_object(victim).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, victim),
+            P1,
+            "REACH: P1 stole {victim_controller:?}'s creature"
+        );
+        assert_eq!(
+            treasures(&runner, P0),
+            expected,
+            "victim controller {victim_controller:?}: only a steal from you fires"
+        );
+        assert_eq!(treasures(&runner, P2), 0);
+    }
+}
+
+/// Synthetic subjects through the same parser arm: `valid_card` scopes the
+/// changing permanent by type ("an artifact"), and "~" scopes it to the
+/// source itself.
+const ARTIFACT_WATCHER: &str =
+    "Whenever an opponent gains control of an artifact from you, you create a Treasure token.";
+const SELF_WATCHER: &str =
+    "Whenever an opponent gains control of ~ from you, you create a Treasure token.";
+const STEAL_ARTIFACT: &str = "Gain control of target artifact until end of turn.";
+
+#[test]
+fn typed_subject_fires_only_for_matching_permanents() {
+    for (steal_artifact, expected) in [(false, 0), (true, 1)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature_from_oracle(P0, "Artifact Watcher", 1, 1, ARTIFACT_WATCHER);
+        let artifact = scenario.add_artifact_from_oracle(P0, "Loot", "").id();
+        let creature = scenario.add_vanilla(P0, 2, 2);
+        let (name, text, victim) = if steal_artifact {
+            ("Steal Artifact", STEAL_ARTIFACT, artifact)
+        } else {
+            ("Act of Treason", ACT_OF_TREASON, creature)
+        };
+        let steal = add_free_spell(&mut scenario, P1, name, text);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+
+        runner.cast(steal).target_object(victim).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, victim), P1, "REACH: {name} resolved");
+        assert_eq!(
+            treasures(&runner, P0),
+            expected,
+            "{name}: only an artifact changing hands fires"
+        );
+    }
+}
+
+#[test]
+fn self_subject_fires_only_for_the_source() {
+    for (steal_source, expected) in [(false, 0), (true, 1)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let watcher = scenario
+            .add_creature_from_oracle(P0, "Self Watcher", 1, 1, SELF_WATCHER)
+            .id();
+        let other = scenario.add_vanilla(P0, 2, 2);
+        let victim = if steal_source { watcher } else { other };
+        let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+
+        runner.cast(steal).target_object(victim).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, victim), P1, "REACH: P1 stole it");
+        assert_eq!(
+            treasures(&runner, P0),
+            expected,
+            "steal_source {steal_source}: only the source changing hands fires"
+        );
+        assert_eq!(treasures(&runner, P1), 0);
+    }
 }
