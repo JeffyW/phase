@@ -844,7 +844,7 @@ pub(crate) fn reduce_cost_by_pool(
                     spend_any_for_required_colors(&mut scratch, &[color], spell, None, &[])
                         .is_some()
                 } else {
-                    spend_eligible_outside_demand(&mut scratch, color, spell, demand).is_some()
+                    spend_eligible(&mut scratch, color, spell, &[]).is_some()
                 }
             }
             // CR 107.4e/f: Hybrid pays either half.
@@ -852,8 +852,8 @@ pub(crate) fn reduce_cost_by_pool(
                 if any_color {
                     spend_any_for_required_colors(&mut scratch, &[a, b], spell, None, &[]).is_some()
                 } else {
-                    spend_eligible_outside_demand(&mut scratch, a, spell, demand).is_some()
-                        || spend_eligible_outside_demand(&mut scratch, b, spell, demand).is_some()
+                    spend_eligible(&mut scratch, a, spell, &[]).is_some()
+                        || spend_eligible(&mut scratch, b, spell, &[]).is_some()
                 }
             }
             // CR 107.4e: {C/color} — prefer colorless, else the colored half.
@@ -869,8 +869,7 @@ pub(crate) fn reduce_cost_by_pool(
                     .is_some()
                 } else {
                     spend_eligible(&mut scratch, ManaType::Colorless, spell, &[]).is_some()
-                        || spend_eligible_outside_demand(&mut scratch, color, spell, demand)
-                            .is_some()
+                        || spend_eligible(&mut scratch, color, spell, &[]).is_some()
                 }
             }
             // CR 107.4e: {2/color} — 1 colored is cheaper than 2 generic; try colored first.
@@ -880,9 +879,7 @@ pub(crate) fn reduce_cost_by_pool(
                 if any_color {
                     spend_any_for_required_colors(&mut scratch, &[color], spell, None, &[])
                         .is_some()
-                } else if spend_eligible_outside_demand(&mut scratch, color, spell, demand)
-                    .is_some()
-                {
+                } else if spend_eligible(&mut scratch, color, spell, &[]).is_some() {
                     true
                 } else {
                     let mut backup = scratch.clone();
@@ -914,9 +911,7 @@ pub(crate) fn reduce_cost_by_pool(
                 if any_color {
                     spend_any_for_required_colors(&mut scratch, &[color], spell, None, &[])
                         .is_some()
-                } else if spend_eligible_outside_demand(&mut scratch, color, spell, demand)
-                    .is_some()
-                {
+                } else if spend_eligible(&mut scratch, color, spell, &[]).is_some() {
                     true
                 } else {
                     let mut backup = scratch.clone();
@@ -2335,28 +2330,6 @@ fn spend_restricted_x_generic_eligible(
 /// `spend_generic_eligible` — it never falls through to the least-available
 /// ordering when reserved units are all that is left (WATCH-ITEM #1: the planner
 /// must leave the residual, not coincidentally pay from a reserved unit).
-/// CR 118.10 + CR 601.2h: Dry-run spend of one `color` unit for a colored shard
-/// of a nested mana sub-cost. With an outer `demand`, a unit of a demanded color
-/// counts only when the pool holds it in SURPLUS (live eligible count above the
-/// demanded count), the same rule `spend_generic_non_demanded` applies to
-/// generic pips. Mana the outer cost still needs stays reserved, so the
-/// sub-cost's colored shard stays in the residual and auto-tap funds it from
-/// another source instead of stranding the outer cost. Without a demand this is
-/// `spend_eligible`.
-fn spend_eligible_outside_demand(
-    pool: &mut ManaPool,
-    color: ManaType,
-    spell: Option<&PaymentContext<'_>>,
-    demand: Option<&ColorDemand>,
-) -> Option<ManaUnit> {
-    if let (Some(demand), Some(index)) = (demand, mana_type_to_demand_index(color)) {
-        if demand[index] > 0 && eligible_color_count(pool, color, spell) <= demand[index] as usize {
-            return None;
-        }
-    }
-    spend_eligible(pool, color, spell, &[])
-}
-
 fn spend_generic_non_demanded(
     pool: &mut ManaPool,
     spell: Option<&PaymentContext<'_>>,

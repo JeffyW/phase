@@ -14146,17 +14146,24 @@ fn auto_tap_mana_sources_inner(
     //
     // CR 601.2g permits mana-ability activation; CR 605.3b resolves it
     // immediately; CR 605.3c prevents reactivation. Those rules do not prescribe
-    // this ordering. Engine scheduling policy: selected sources without a mana
-    // sub-cost resolve first, stably, so their mana is available to pay a later cost.
+    // this ordering. Engine scheduling policy: with every row, selected sources
+    // without a mana sub-cost resolve first, stably, so their mana is available to
+    // pay a later cost. A drawback-free plan was accepted only because each
+    // selected sub-cost is payable from sources the plan leaves unused
+    // (`planned_mana_sub_costs_fundable`), so its sub-cost rows resolve first:
+    // their sub-costs are then paid that way, before the outer plan's own mana
+    // floats where a colored sub-cost shard could take it from the outer cost.
     // This preserves the plan and `used_sources` reservation; it changes only order.
+    let sub_cost_rows_first = nested_row_policy == AutoTapRowPolicy::WithoutAvoidableDrawbacks;
     to_tap.sort_by_key(|option| {
-        option.ability_index.is_some_and(|ability_index| {
+        let has_sub_cost = option.ability_index.is_some_and(|ability_index| {
             state
                 .objects
                 .get(&option.object_id)
                 .and_then(|object| object.abilities.get(ability_index))
                 .is_some_and(|ability| mana_abilities::mana_sub_cost_of(&ability.cost).is_some())
-        })
+        });
+        has_sub_cost != sub_cost_rows_first
     });
 
     // Publish this payment's policy for the activations below: a selected mana
@@ -14824,8 +14831,9 @@ fn rows_without_avoidable_drawback_combinations(
 /// `consumed` starts as the plan's own sources and grows as sub-costs claim more.
 ///
 /// Phase 3 of [`auto_tap_mana_sources_inner`] pays each selected sub-cost, in
-/// plan order, with a nested auto-tap that excludes the sources already used and
-/// inherits the outer row policy. This plans those payments the same way: the
+/// plan order and before any other selected source resolves, with a nested
+/// auto-tap that excludes the sources already used and inherits the outer row
+/// policy. This plans those payments the same way: the
 /// same planner over `rows` (the rows that policy allows) minus `consumed`. It is
 /// conservative: mana already in the pool (including surplus from earlier
 /// activations) is not counted, and a sub-cost shape the planner cannot read

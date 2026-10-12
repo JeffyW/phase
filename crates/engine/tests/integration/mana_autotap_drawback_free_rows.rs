@@ -50,6 +50,7 @@ const CETA_DISCIPLE_ORACLE: &str = "{R}, {T}: Target creature gets +2/+0 until e
 {G}, {T}: Add one mana of any color.";
 const HAVENWOOD_BATTLEGROUND_ORACLE: &str =
     "This land enters tapped.\n{T}: Add {G}.\n{T}, Sacrifice this land: Add {G}{G}.";
+const BLACK_KNIGHT_ORACLE: &str = "First strike\nProtection from white";
 const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
@@ -864,4 +865,63 @@ fn colored_sub_cost_keeps_the_payment_row_policy() {
         Zone::Battlefield,
         "Havenwood was not sacrificed"
     );
+}
+
+/// CR 106.4 + CR 118.10 + CR 107.4e: P0 floats {B} from a Swamp, then casts
+/// Black Knight ({B}{B}) with Twilight Mire and Havenwood Battleground untapped.
+/// Only Mire's filter pair makes the second {B}, so the payment plans with
+/// every row and selects Mire's {B}{B}. Its `{B/G}` sub-cost may use the
+/// floating {B}: Mire's own {B}{B} then covers the whole outer demand. Holding
+/// that {B} back for the outer cost would make the sub-cost sacrifice Havenwood
+/// for {G}{G} instead.
+#[test]
+fn floating_mana_replaced_by_the_funded_output_is_not_reserved() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let swamp = scenario.add_basic_land(P0, ManaColor::Black);
+    let mire = scenario
+        .add_land_from_oracle(P0, "Twilight Mire", TWILIGHT_MIRE_ORACLE)
+        .id();
+    let havenwood = scenario
+        .add_land_from_oracle(P0, "Havenwood Battleground", HAVENWOOD_BATTLEGROUND_ORACLE)
+        .id();
+    let knight = scenario
+        .add_creature_to_hand_from_oracle(P0, "Black Knight", 2, 2, BLACK_KNIGHT_ORACLE)
+        .with_mana_cost(cost(&[ManaCostShard::Black, ManaCostShard::Black], 0))
+        .id();
+    let mut runner = build_untapped(scenario, &[swamp, mire, havenwood]);
+
+    let tap_swamp = activatable_mana_actions_for_player(runner.state(), P0)
+        .into_iter()
+        .find(|action| {
+            matches!(action, GameAction::TapLandForMana { selection }
+                if selection.source.object_id == swamp)
+        })
+        .expect("the Swamp offers {B}");
+    runner.act(tap_swamp).expect("P0 floats {B} from the Swamp");
+    let pool = &runner.state().players[0].mana_pool;
+    assert!(
+        pool.total() == 1 && pool.count_color(ManaType::Black) == 1,
+        "reach: exactly one floating {{B}}"
+    );
+
+    let outcome = runner.cast(knight).resolve();
+    assert_eq!(
+        outcome.zone_of(knight),
+        Zone::Battlefield,
+        "reach: Black Knight was paid and resolved; mana added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(
+        mana_added_by(outcome.events(), &[mire]),
+        vec![(mire, ManaType::Black), (mire, ManaType::Black)],
+        "reach: Twilight Mire's {{B}}{{B}} pair paid the second {{B}}"
+    );
+    assert!(
+        mana_added_by(outcome.events(), &[havenwood]).is_empty(),
+        "Havenwood made no mana; mana added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(outcome.zone_of(havenwood), Zone::Battlefield);
+    assert!(!outcome.state().objects[&havenwood].tapped);
 }
