@@ -11,11 +11,11 @@
 //! payer must not make that choice, or a sacrifice, when it isn't needed.
 
 use engine::game::mana_sources::activatable_mana_actions_for_player;
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{ContinuousModification, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::GameState;
+use engine::types::game_state::{CastPaymentMode, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
 use engine::types::phase::Phase;
@@ -34,6 +34,11 @@ const OASIS_RITUALIST_ORACLE: &str = "{T}: Add one mana of any color.\n\
 const TWILIGHT_MIRE_ORACLE: &str = "{T}: Add {C}.\n{B/G}, {T}: Add {B}{B}, {B}{G}, or {G}{G}.";
 const AZORIUS_SIGNET_ORACLE: &str = "{1}, {T}: Add {W}{U}.";
 const GRAVEN_CAIRNS_ORACLE: &str = "{T}: Add {C}.\n{B/R}, {T}: Add {B}{B}, {B}{R}, or {R}{R}.";
+const REST_IN_PEACE_ORACLE: &str = "When this enchantment enters, exile all graveyards.\n\
+If a card or token would be put into a graveyard from anywhere, exile it instead.";
+const LEYLINE_OF_THE_VOID_ORACLE: &str = "If this card is in your opening hand, you may begin the \
+game with it on the battlefield.\n\
+If a card would be put into an opponent's graveyard from anywhere, exile it instead.";
 const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
@@ -465,4 +470,109 @@ fn two_filter_land_sub_costs_manual_control() {
     let outcome = runner.cast(hobgoblin).resolve();
     assert_eq!(outcome.zone_of(hobgoblin), Zone::Battlefield);
     assert_eq!(outcome.zone_of(ruins), Zone::Battlefield);
+}
+
+// --- A payment that pauses keeps the payment's row policy when it resumes ---
+
+/// CR 601.2g + CR 605.3b + CR 616.1: two Dwarven Ruins pay {R/W}{R/W}{R/W} only
+/// with a sacrifice row, so the payment plans with every row (two sacrifices,
+/// as before drawback avoidance). Rest in Peace and Leyline of the Void both
+/// replace the first Ruins' trip to the graveyard, so the payment pauses for
+/// P0's replacement choice. The resumed payment must keep the policy the
+/// payment decided rather than re-deciding from what is left: the second Ruins
+/// is sacrificed too.
+#[test]
+fn resumed_payment_keeps_its_row_policy() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let first_ruins = scenario
+        .add_land_from_oracle(P0, "Dwarven Ruins", DWARVEN_RUINS_ORACLE)
+        .id();
+    let second_ruins = scenario
+        .add_land_from_oracle(P0, "Dwarven Ruins", DWARVEN_RUINS_ORACLE)
+        .id();
+    scenario.add_enchantment_from_oracle(P1, "Rest in Peace", REST_IN_PEACE_ORACLE);
+    scenario.add_enchantment_from_oracle(P1, "Leyline of the Void", LEYLINE_OF_THE_VOID_ORACLE);
+    let hobgoblin = scenario
+        .add_creature_to_hand_from_oracle(P0, "Hearthfire Hobgoblin", 2, 2, "Double strike")
+        .with_mana_cost(cost(
+            &[
+                ManaCostShard::RedWhite,
+                ManaCostShard::RedWhite,
+                ManaCostShard::RedWhite,
+            ],
+            0,
+        ))
+        .id();
+    let mut runner = build_untapped(scenario, &[first_ruins, second_ruins]);
+    let card_id = runner.state().objects[&hobgoblin].card_id;
+
+    runner
+        .act(GameAction::CastSpell {
+            object_id: hobgoblin,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the automatic cast starts paying");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "reach: the first Ruins' sacrifice pauses for a replacement choice, got {:?}",
+        runner.state().waiting_for
+    );
+    let tapped_before_choice = [first_ruins, second_ruins]
+        .into_iter()
+        .filter(|ruins| runner.state().objects[ruins].tapped)
+        .count();
+    assert_eq!(
+        tapped_before_choice, 1,
+        "reach: one Ruins has paid {{T}} and waits on its sacrifice; the other is untouched"
+    );
+
+    // Each sacrificed Ruins asks P0 to order Rest in Peace and Leyline of the
+    // Void (CR 616.1). Answer every prompt the payment raises.
+    let mut replacement_choices = 0;
+    while matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ) {
+        runner
+            .act(GameAction::ChooseReplacement { index: 0 })
+            .expect("the replacement choice resumes the payment");
+        replacement_choices += 1;
+        assert!(replacement_choices <= 2, "at most one choice per Ruins");
+    }
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "the resumed payment completes the cast; waiting for {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        replacement_choices, 2,
+        "the resumed payment keeps the every-row plan and sacrifices the second Ruins too"
+    );
+    for ruins in [first_ruins, second_ruins] {
+        assert!(
+            !runner.state().battlefield.contains(&ruins),
+            "{ruins:?} was sacrificed"
+        );
+    }
+    let exiled_ruins = runner
+        .state()
+        .exile
+        .iter()
+        .filter(|id| runner.state().objects[id].name == "Dwarven Ruins")
+        .count();
+    assert_eq!(
+        exiled_ruins, 2,
+        "reach: both sacrificed Ruins were exiled by the chosen replacement"
+    );
+    runner.resolve_top();
+    assert!(
+        runner.state().battlefield.contains(&hobgoblin),
+        "reach: the paid Hobgoblin resolves"
+    );
 }

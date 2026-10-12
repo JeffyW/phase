@@ -14022,6 +14022,17 @@ fn auto_tap_mana_sources_inner(
 ) {
     use crate::types::mana::ManaCost;
 
+    // An explicit nested policy wins. A `Choose` call made while an automatic
+    // payment is executing (a mana ability's own sub-cost payment re-entering
+    // auto-tap, or a payment resumed after a pause) is part of that payment and
+    // takes its policy rather than deciding again.
+    let row_policy = match row_policy {
+        AutoTapRowPolicy::Choose => state
+            .active_auto_tap_row_policy
+            .unwrap_or(AutoTapRowPolicy::Choose),
+        AutoTapRowPolicy::WithoutAvoidableDrawbacks | AutoTapRowPolicy::AllRows => row_policy,
+    };
+
     // CR 601.2g: A player may spend mana from their mana pool to pay costs.
     // Plan against the *residual* cost (what the pool can't already cover) so
     // pre-floated mana isn't shadowed by redundant taps — e.g. Sol Ring + an
@@ -14148,6 +14159,12 @@ fn auto_tap_mana_sources_inner(
         })
     });
 
+    // Publish this payment's policy for the activations below: a selected mana
+    // ability's own sub-cost payment re-enters auto-tap through the resolver
+    // with `Choose`, and must not decide independently of its siblings. Every
+    // exit below restores the enclosing value.
+    let enclosing_row_policy = state.active_auto_tap_row_policy.replace(nested_row_policy);
+
     // Sources with an explicit ability delegate to resolve_mana_ability (the single
     // authority for cost payment — handles tap, sacrifice, and future cost types).
     // The basic-land-subtype fallback (ability_index: None) uses inline tap + produce.
@@ -14236,6 +14253,7 @@ fn auto_tap_mana_sources_inner(
                         nested_row_policy,
                     );
                     if super::casting::mana_ability_cost_payment_is_paused(state) {
+                        state.active_auto_tap_row_policy = enclosing_row_policy;
                         return;
                     }
                 }
@@ -14266,6 +14284,7 @@ fn auto_tap_mana_sources_inner(
                     parent,
                 );
                 if super::casting::mana_ability_cost_payment_is_paused(state) {
+                    state.active_auto_tap_row_policy = enclosing_row_policy;
                     return;
                 }
             }
@@ -14328,6 +14347,7 @@ fn auto_tap_mana_sources_inner(
             });
         }
     }
+    state.active_auto_tap_row_policy = enclosing_row_policy;
 }
 
 /// One colored-shard requirement of an auto-tap plan: the acceptable mana
@@ -14655,8 +14675,16 @@ fn plan_auto_tap_rows(
 }
 
 /// CR 601.2g + CR 605.3b: Which mana-source rows an auto-tap plans with.
+///
+/// The policy belongs to one automatic payment, from its outermost auto-tap to
+/// its last nested mana sub-cost. It is passed explicitly to Phase 3's nested
+/// auto-taps and published in `GameState::active_auto_tap_row_policy` while that
+/// payment activates its sources, so a resolver re-entry that starts a new
+/// auto-tap with `Choose` inherits it. It is never persisted: a payment resumed
+/// after a pause plans its remainder with `AllRows`
+/// (`mana_abilities::resume_mana_ability_cost_move`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutoTapRowPolicy {
+pub(crate) enum AutoTapRowPolicy {
     /// The outermost payment: decide for the whole payment, sub-costs included
     /// (see [`choose_auto_tap_plan`]).
     Choose,
@@ -17150,6 +17178,71 @@ mod tests {
     use rand::RngCore;
 
     use super::*;
+
+    /// CR 601.2g + CR 605.3b: a `Choose` auto-tap made while an automatic payment
+    /// is executing takes that payment's published row policy instead of
+    /// deciding again. This is the single seam both a mana ability's resolver
+    /// re-entry (Phase 3's window) and a resumed payment
+    /// (`resume_mana_ability_cost_move`) rely on. Arena of Glory + Mountain
+    /// paying {R}: deciding afresh taps one land without exerting Arena; under an
+    /// inherited `AllRows` window the payment plans as before drawback
+    /// avoidance and exerts Arena, funded by the Mountain.
+    #[test]
+    fn choose_auto_tap_inherits_the_active_payment_row_policy() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::ability::{ContinuousModification, TargetFilter};
+        use crate::types::mana::ManaColor;
+        use crate::types::statics::StaticMode;
+
+        let exerted = |active: Option<AutoTapRowPolicy>| {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+            let arena = scenario
+                .add_land_from_oracle(
+                    P0,
+                    "Arena of Glory",
+                    "{T}: Add {R}.\n{R}, {T}, Exert this land: Add {R}{R}.",
+                )
+                .id();
+            scenario.add_basic_land(P0, ManaColor::Red);
+            let mut runner = scenario.build();
+            let state = runner.state_mut();
+            state.active_auto_tap_row_policy = active;
+            let cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            };
+            auto_tap_mana_sources(state, P0, &cost, &mut Vec::new(), None);
+            assert_eq!(
+                state.active_auto_tap_row_policy, active,
+                "auto-tap restores the enclosing window"
+            );
+            state
+                .transient_continuous_effects
+                .iter()
+                .filter(|effect| effect.affected == TargetFilter::SpecificObject { id: arena })
+                .any(|effect| {
+                    effect.modifications.iter().any(|modification| {
+                        matches!(
+                            modification,
+                            ContinuousModification::AddStaticMode {
+                                mode: StaticMode::CantUntap
+                            }
+                        )
+                    })
+                })
+        };
+
+        assert!(
+            !exerted(None),
+            "a fresh payment decides and avoids the exert"
+        );
+        assert!(
+            exerted(Some(AutoTapRowPolicy::AllRows)),
+            "reach + inheritance: an AllRows window plans as before drawback avoidance"
+        );
+        assert!(!exerted(Some(AutoTapRowPolicy::WithoutAvoidableDrawbacks)));
+    }
 
     // CR 107.3a + CR 107.3k: bind this activation's bare X, without replacing
     // fixed, other-variable, source-derived, or compound life quantities.

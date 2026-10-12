@@ -4054,7 +4054,17 @@ pub(crate) fn resume_mana_ability_cost_move(
     else {
         unreachable!("mana ability cost-move resume requires its typed continuation")
     };
-    continue_mana_ability_cost_payment(state, *pending, cursor, events, 0)
+    // CR 601.2g + CR 605.3b: the row policy the paused automatic payment decided
+    // lived only in its call frames. Everything this resume runs (the suspended
+    // parents' sub-costs and the root's finalizer) is the rest of that payment,
+    // so it plans with every row, the planner without drawback avoidance, rather
+    // than re-deciding from the sources that are left.
+    let enclosing_row_policy = state
+        .active_auto_tap_row_policy
+        .replace(super::casting_costs::AutoTapRowPolicy::AllRows);
+    let resumed = continue_mana_ability_cost_payment(state, *pending, cursor, events, 0);
+    state.active_auto_tap_row_policy = enclosing_row_policy;
+    resumed
 }
 
 /// CR 605.3b + CR 605.1a: Run a mana ability's `sub_ability` chain inline.
