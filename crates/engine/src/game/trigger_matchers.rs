@@ -877,19 +877,6 @@ pub(super) fn target_filter_matches_object(
     filter: &TargetFilter,
     source_context: &TriggerSourceContext,
 ) -> bool {
-    target_filter_matches_object_as(state, object_id, filter, source_context, None)
-}
-
-/// [`target_filter_matches_object`] with an explicit "you" (CR 109.5) for
-/// look-back triggers (CR 603.10d); `None` reads the source's latched
-/// controller.
-fn target_filter_matches_object_as(
-    state: &GameState,
-    object_id: ObjectId,
-    filter: &TargetFilter,
-    source_context: &TriggerSourceContext,
-    controller: Option<PlayerId>,
-) -> bool {
     match filter {
         TargetFilter::None => false,
         TargetFilter::Player => false,
@@ -962,15 +949,7 @@ fn target_filter_matches_object_as(
             state,
             object_id,
             filter,
-            &match controller {
-                Some(controller) => {
-                    super::filter::FilterContext::from_trigger_source_with_controller(
-                        source_context,
-                        controller,
-                    )
-                }
-                None => super::filter::FilterContext::from_trigger_source(source_context),
-            },
+            &super::filter::FilterContext::from_trigger_source(source_context),
         ),
     }
 }
@@ -3576,7 +3555,7 @@ pub(super) fn match_taps_for_mana(
 /// lose control of ~" (Khârn the Betrayer, Duplicity, Gustha's Scepter), the S25
 /// Stolen Uniform reflexive, and "Whenever an opponent gains control of a
 /// permanent from you" (Zidane, Tantalus Thief — `valid_target` names the
-/// gaining player). Three guards keep it from over-firing:
+/// gaining player). Four guards keep it from over-firing:
 ///   * `valid_card` scopes the event to the tracked object (SelfRef for "~";
 ///     the bound Equipment for Stolen Uniform's `ParentTarget`). Without this
 ///     the trigger fired on *any* object's control change (the Portent trap).
@@ -3597,6 +3576,9 @@ pub(super) fn match_taps_for_mana(
 ///       (old == owner != caster).
 ///   * CR 110.1: the changing object must be a permanent (on the battlefield);
 ///     a spell changing control on the stack never matches.
+///   * Conservative fallback: when collection can't establish the event-time
+///     facts (the changing object has left the battlefield, or the source
+///     changed control elsewhere in the same buffer), it doesn't fire.
 ///
 /// Registry entry point: with no wider buffer, the event is its own buffer.
 /// The printed-trigger collector calls [`match_changes_controller_in_batch`]
@@ -3616,105 +3598,52 @@ pub(super) fn match_changes_controller(
     )
 }
 
-/// CR 603.10d + CR 608.2c: event-time facts about one `ControllerChanged`
-/// inside the trigger-collection buffer.
+/// CR 603.10d + CR 603.3a: the "you" of a look-back control-change trigger —
+/// its source's controller immediately before the control change — when the
+/// collection buffer proves it; `None` when it doesn't.
 ///
 /// Every trigger scan runs after `flush_layers`, over a buffer that holds a
-/// whole resolved chain (`collect_pending_triggers`), so live state is the
-/// END of that chain. Look-back control-change triggers need the state AT the
-/// event instead. Each resolver publishes its instruction's events and then
-/// its `EffectResolved`, so the events between two `EffectResolved` markers
-/// are one instruction's simultaneous events (an exchange, a mass steal, the
-/// cleanup reversion); events in earlier instructions happened before them.
-struct ControlChangeEventTime<'a> {
-    batch: &'a [GameEvent],
-    index: usize,
-    /// First buffer index of the instruction `index` belongs to.
-    instruction_start: usize,
-}
-
-impl<'a> ControlChangeEventTime<'a> {
-    /// Locates `event` in `event_batch` by identity. An event that isn't an
-    /// element of the batch (a registry caller with no wider buffer) is its own
-    /// one-event batch.
-    fn locate(event: &'a GameEvent, event_batch: &'a [GameEvent]) -> Self {
-        let (batch, index) = event_batch
-            .iter()
-            .position(|candidate| std::ptr::eq(candidate, event))
-            .map_or((std::slice::from_ref(event), 0), |index| {
-                (event_batch, index)
-            });
-        let instruction_start = batch[..index]
-            .iter()
-            .rposition(|candidate| matches!(candidate, GameEvent::EffectResolved { .. }))
-            .map_or(0, |marker| marker + 1);
-        Self {
-            batch,
-            index,
-            instruction_start,
-        }
-    }
-
-    /// `object_id`'s controller immediately before this event's instruction:
-    /// the new controller of its last control change in an earlier instruction,
-    /// else the old controller of its first change from this instruction on,
-    /// else (its control never changed in the buffer) `live`.
-    fn controller_before(&self, object_id: ObjectId, live: PlayerId) -> PlayerId {
-        let change_of = |candidate: &GameEvent| match candidate {
-            GameEvent::ControllerChanged {
-                object_id: changed,
-                old_controller,
-                new_controller,
-            } if *changed == object_id && old_controller != new_controller => {
-                Some((*old_controller, *new_controller))
-            }
-            _ => None,
-        };
-        let (earlier, from_here) = self.batch.split_at(self.instruction_start);
-        earlier
-            .iter()
-            .rev()
-            .find_map(change_of)
-            .map(|(_, new)| new)
-            .or_else(|| from_here.iter().find_map(change_of).map(|(old, _)| old))
-            .unwrap_or(live)
-    }
-
-    /// The zone `object_id` was in when this event happened: the origin of its
-    /// next zone change later in the buffer, else its live zone.
-    fn zone_at_event(&self, object_id: ObjectId, state: &GameState) -> Option<Zone> {
-        self.batch[self.index + 1..]
-            .iter()
-            .find_map(|candidate| match candidate {
-                GameEvent::ZoneChanged {
-                    object_id: moved,
-                    from,
-                    ..
-                } if *moved == object_id => Some(*from),
-                _ => None,
-            })
-            .unwrap_or_else(|| state.objects.get(&object_id).map(|obj| obj.zone))
-    }
-}
-
-/// CR 603.10d + CR 603.3a: the "you" of a look-back control-change trigger —
-/// its source's controller immediately before the control change, read from
-/// the event-time authority. The source's live controller is the answer only
-/// when its control didn't change in the buffer.
+/// whole resolved chain (`collect_pending_triggers`), so live state is the END
+/// of that chain. Two facts are unambiguous there:
+///   * the source IS the changing object: its controller before this change is
+///     the event's `old_controller` (the loser, by construction);
+///   * the source's control didn't change anywhere in the buffer: its live
+///     controller is its controller at every event in it.
+/// Otherwise the source changed control in the same buffer as this event, and
+/// whether it did so before, with, or after this event isn't recorded (a
+/// player-scope fan-out publishes one simultaneous instruction as several
+/// resolver calls). That case is the conservative fallback: no "you", so the
+/// trigger doesn't fire rather than fire for a guessed player.
 pub(crate) fn changes_controller_look_back_you(
     event: &GameEvent,
     event_batch: &[GameEvent],
     source_context: &TriggerSourceContext,
     state: &GameState,
-) -> PlayerId {
-    ControlChangeEventTime::locate(event, event_batch).controller_before(
-        source_event_subject_id(source_context),
-        source_context.source_read(state).controller(),
-    )
+) -> Option<PlayerId> {
+    let source_id = source_event_subject_id(source_context);
+    let source_change = |candidate: &GameEvent| match candidate {
+        GameEvent::ControllerChanged {
+            object_id,
+            old_controller,
+            new_controller,
+        } if *object_id == source_id && old_controller != new_controller => Some(*old_controller),
+        _ => None,
+    };
+    match source_change(event) {
+        Some(old_controller) => Some(old_controller),
+        None if event_batch
+            .iter()
+            .any(|candidate| source_change(candidate).is_some()) =>
+        {
+            None
+        }
+        None => Some(source_context.source_read(state).controller()),
+    }
 }
 
 /// [`match_changes_controller`] with the collection buffer `event` belongs to,
-/// so "you" and the changing object's zone are read at event time.
+/// so a source that changed control elsewhere in the buffer is recognised as
+/// ambiguous (see [`changes_controller_look_back_you`]).
 pub(crate) fn match_changes_controller_in_batch(
     event: &GameEvent,
     event_batch: &[GameEvent],
@@ -3733,36 +3662,30 @@ pub(crate) fn match_changes_controller_in_batch(
     if old_controller == new_controller {
         return false;
     }
-    let event_time = ControlChangeEventTime::locate(event, event_batch);
     // CR 110.1: every ChangesController subject is a permanent. A
     // `ControllerChanged` on a stack object (CR 109.4 — e.g. Perplexing
     // Chimera exchanging control of a spell) is not a permanent changing
     // control, even when a type-only subject ("a permanent") would match the
-    // spell's card types. Judged where the object was when it changed
-    // control, so a permanent stolen and then sacrificed by the same
-    // resolution still counts.
-    if event_time.zone_at_event(*object_id, state) != Some(Zone::Battlefield) {
+    // spell's card types. Collection runs at the end of the resolved chain, so
+    // an object that has since left the battlefield can't be told apart from a
+    // spell that changed control on the stack: it doesn't fire (conservative
+    // fallback, e.g. a permanent stolen and then sacrificed by one spell).
+    if !state.battlefield.contains(object_id) {
+        return false;
+    }
+    if !valid_card_matches(trigger, state, *object_id, source_context) {
         return false;
     }
     // CR 603.10d: "you lose control of …" and "an opponent gains control of …
     // from you" look back in time, so "you" is the trigger source's controller
-    // immediately before the change. When the source IS the changing object
-    // that is `old_controller` — the loser, by construction. For the
-    // delayed/`SpecificObject` case (Stolen Uniform) the source is the
-    // graveyard spell whose controller is the player who temporarily held the
-    // object, so the loss fires and the initial gain (old == owner != caster)
-    // does not.
-    let you = event_time.controller_before(
-        source_event_subject_id(source_context),
-        source_context.source_read(state).controller(),
-    );
-    // CR 603.10d: the subject is judged with the same look-back "you" ("a
-    // permanent you own").
-    if !trigger.valid_card.as_ref().is_none_or(|filter| {
-        target_filter_matches_object_as(state, *object_id, filter, source_context, Some(you))
-    }) {
+    // immediately before the change. For the delayed/`SpecificObject` case
+    // (Stolen Uniform) the source is the graveyard spell whose controller is
+    // the player who temporarily held the object, so the loss fires and the
+    // initial gain (old == owner != caster) does not.
+    let Some(you) = changes_controller_look_back_you(event, event_batch, source_context, state)
+    else {
         return false;
-    }
+    };
     // CR 603.2: the lose side — the object left "your" control.
     if *old_controller != you {
         return false;

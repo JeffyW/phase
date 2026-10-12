@@ -19235,22 +19235,18 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
     }
     if let Ok((_, subject_text)) = parse_opponent_gains_control_from_you(lower) {
         let (subject, sub_rem) = parse_trigger_subject(subject_text, &mut ParseContext::default());
-        // "from you" fixes the losing controller. A subject that carries its own
-        // controller, or a property read from the permanent's post-change
-        // state (combat status, how long it has been controlled, …), would not
-        // be looked back on (CR 603.10d), so it fails closed (stays Unknown).
-        // Ownership and token-ness don't change with control, and "you" in
-        // `Owned` is judged with the look-back "you".
+        // "from you" fixes the losing controller. Collection runs after the
+        // change, so only subjects whose match can't depend on the permanent's
+        // post-change state are claimed (CR 603.10d look-back): "~", and "a
+        // permanent", which every object on the battlefield is (CR 110.1).
+        // Any other type, a controller, or a property fails closed (stays
+        // Unknown).
         let subject_is_event_time_safe = match &subject {
             TargetFilter::SelfRef => true,
             TargetFilter::Typed(typed) => {
                 typed.controller.is_none()
-                    && typed.properties.iter().all(|prop| {
-                        matches!(
-                            prop,
-                            FilterProp::Owned { .. } | FilterProp::Token | FilterProp::NonToken
-                        )
-                    })
+                    && typed.properties.is_empty()
+                    && typed.type_filters.as_slice() == [TypeFilter::Permanent]
             }
             _ => false,
         };

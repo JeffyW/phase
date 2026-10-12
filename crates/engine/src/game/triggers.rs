@@ -3087,9 +3087,10 @@ fn collect_matching_triggers_inner(
             // flushes layers before this scan runs. The same authority the
             // matcher used for "you" (`changes_controller_look_back_you`)
             // answers here, so the matched "you" and the controller agree by
-            // construction. A source untouched by the batch keeps `controller`;
-            // so does the delayed / `SpecificObject` shape (Stolen Uniform),
-            // whose source is a different object (CR 113.8).
+            // construction (an admitted trigger always has one). A source
+            // untouched by the batch keeps `controller`; so does the delayed /
+            // `SpecificObject` shape (Stolen Uniform), whose source is a
+            // different object (CR 113.8).
             let controller = if trig_def.mode == TriggerMode::ChangesController {
                 super::trigger_matchers::changes_controller_look_back_you(
                     event,
@@ -3097,6 +3098,7 @@ fn collect_matching_triggers_inner(
                     &source_context,
                     state,
                 )
+                .unwrap_or(controller)
             } else {
                 controller
             };

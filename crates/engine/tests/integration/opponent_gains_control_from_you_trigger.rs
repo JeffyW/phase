@@ -10,6 +10,7 @@ use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::zones::Zone;
 
 const P2: PlayerId = PlayerId(2);
 
@@ -182,11 +183,52 @@ fn stealing_zidane_itself_fires_for_its_previous_controller() {
     assert_eq!(treasures(&runner, P1), 0, "the new controller gets nothing");
 }
 
-/// CR 603.2c: a mass steal is one occurrence per permanent, Zidane included.
-/// Mob Rule's second mode takes every creature with power 3 or less: Zidane
-/// (3/3, printed mana value 5) and the bear.
+/// CR 603.2c: a mass steal is one occurrence per permanent. Mob Rule's first
+/// mode takes every creature with power 4 or greater: both 4/4s, not Zidane
+/// (3/3).
 #[test]
-fn mass_steal_fires_once_per_permanent_including_zidane() {
+fn mass_steal_fires_once_per_permanent() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P0);
+    let giants = [
+        scenario.add_vanilla(P0, 4, 4),
+        scenario.add_vanilla(P0, 4, 4),
+    ];
+    let mob_rule = add_free_spell(&mut scenario, P1, "Mob Rule", MOB_RULE);
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P1);
+
+    runner.cast(mob_rule).modes(&[0]).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: Zidane stayed with P0"
+    );
+    for giant in giants {
+        assert_eq!(controller(&runner, giant), P1, "REACH: each 4/4 stolen");
+    }
+    assert_eq!(
+        treasures(&runner, P0),
+        2,
+        "one Treasure per stolen permanent"
+    );
+    assert_eq!(treasures(&runner, P1), 0);
+}
+
+/// FAIL-CLOSED LIMIT, documented: a simultaneous mass steal that also takes
+/// Zidane. The ruling ("If an opponent gains control of Zidane and one or more
+/// other permanents from you simultaneously, Zidane's last ability will
+/// trigger for each of those permanents, including itself.") gives P0 two
+/// Treasures here. Collection can't tell when Zidane changed hands relative
+/// to the bear, so the bear's trigger doesn't fire. This pins only that
+/// nothing fires for the wrong player: Zidane's own trigger fires for P0, and
+/// P1 (Zidane's new controller) gets nothing. Mob Rule's second mode takes
+/// every creature with power 3 or less: Zidane (3/3, printed mana value 5) and
+/// the bear.
+#[test]
+fn limit_mass_steal_taking_zidane_never_fires_for_the_wrong_player() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
@@ -204,10 +246,14 @@ fn mass_steal_fires_once_per_permanent_including_zidane() {
     runner.advance_until_stack_empty();
     assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane stolen");
     assert_eq!(controller(&runner, bear), P1, "REACH: bear stolen");
+    assert!(
+        treasures(&runner, P0) >= 1,
+        "Zidane's own trigger fires for the player who lost it"
+    );
     assert_eq!(
-        treasures(&runner, P0),
-        2,
-        "one Treasure per stolen permanent"
+        treasures(&runner, P1),
+        0,
+        "nothing fires for Zidane's new controller"
     );
 }
 
@@ -337,42 +383,10 @@ fn steal_between_other_players_does_not_fire() {
     }
 }
 
-/// Synthetic subjects through the same parser arm: `valid_card` scopes the
-/// changing permanent by type ("an artifact"), and "~" scopes it to the
-/// source itself.
-const ARTIFACT_WATCHER: &str =
-    "Whenever an opponent gains control of an artifact from you, you create a Treasure token.";
+/// Synthetic "~" subject through the same parser arm: `valid_card` scopes the
+/// changing permanent to the source itself.
 const SELF_WATCHER: &str =
     "Whenever an opponent gains control of ~ from you, you create a Treasure token.";
-const STEAL_ARTIFACT: &str = "Gain control of target artifact until end of turn.";
-
-#[test]
-fn typed_subject_fires_only_for_matching_permanents() {
-    for (steal_artifact, expected) in [(false, 0), (true, 1)] {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        scenario.add_creature_from_oracle(P0, "Artifact Watcher", 1, 1, ARTIFACT_WATCHER);
-        let artifact = scenario.add_artifact_from_oracle(P0, "Loot", "").id();
-        let creature = scenario.add_vanilla(P0, 2, 2);
-        let (name, text, victim) = if steal_artifact {
-            ("Steal Artifact", STEAL_ARTIFACT, artifact)
-        } else {
-            ("Act of Treason", ACT_OF_TREASON, creature)
-        };
-        let steal = add_free_spell(&mut scenario, P1, name, text);
-        let mut runner = scenario.build();
-        give_priority(&mut runner, P1);
-
-        runner.cast(steal).target_object(victim).resolve();
-        runner.advance_until_stack_empty();
-        assert_eq!(controller(&runner, victim), P1, "REACH: {name} resolved");
-        assert_eq!(
-            treasures(&runner, P0),
-            expected,
-            "{name}: only an artifact changing hands fires"
-        );
-    }
-}
 
 #[test]
 fn self_subject_fires_only_for_the_source() {
@@ -400,17 +414,73 @@ fn self_subject_fires_only_for_the_source() {
     }
 }
 
+/// Verbatim Oracle text (Scryfall).
+const HOMEWARD_PATH: &str =
+    "{T}: Add {C}.\n{T}: Each player gains control of all creatures they own.";
+
+/// CR 101.4 + CR 608.2e: Homeward Path returns every creature to its owner at
+/// once. After Switcheroo gave P1 Zidane and P0 P1's bear, Homeward Path moves
+/// Zidane back from P1 (an opponent of P1 gains control of it from P1:
+/// Treasure for P1) and the bear back from P0 (P0 didn't control Zidane then:
+/// nothing for P0).
+#[test]
+fn homeward_path_returns_fire_for_zidanes_controller_before_the_return() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P0);
+    let bear = scenario.add_vanilla(P1, 2, 2);
+    let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
+    let path = scenario
+        .add_land_from_oracle(P0, "Homeward Path", HOMEWARD_PATH)
+        .id();
+    let mut runner = scenario.build();
+
+    runner
+        .cast(switcheroo)
+        .target_objects(&[zidane, bear])
+        .resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane went to P1");
+    assert_eq!(controller(&runner, bear), P0, "REACH: the bear came to P0");
+    let (p0_before, p1_before) = (treasures(&runner, P0), treasures(&runner, P1));
+
+    runner.activate(path, 1).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: Zidane returned to P0"
+    );
+    assert_eq!(
+        controller(&runner, bear),
+        P1,
+        "REACH: the bear returned to P1"
+    );
+    assert_eq!(
+        treasures(&runner, P1),
+        p1_before + 1,
+        "P1 lost Zidane to an opponent"
+    );
+    assert_eq!(
+        treasures(&runner, P0),
+        p0_before,
+        "P0 didn't control Zidane when it lost the bear"
+    );
+}
+
 /// Labelled synthetic two-instruction spell: two exchanges in one resolution,
 /// one after the other (CR 608.2c).
 const DOUBLE_SWITCHEROO: &str =
     "Exchange control of two target creatures. Exchange control of two target creatures.";
 
-/// CR 603.10d + CR 608.2c: within one resolution, the second exchange happens
-/// after the first. Zidane leaves P0 in the first (Treasure for P0); P1
-/// controls Zidane when P1 then loses a creature to P2 in the second
-/// (Treasure for P1).
+/// FAIL-CLOSED LIMIT, documented: a later instruction after Zidane moved.
+/// The first exchange gives Zidane to P1 (Treasure for P0); the second moves
+/// bear B from P1 to P2 while P1 controls Zidane, which by the rules is a
+/// Treasure for P1. Collection can't order Zidane's change against the
+/// second exchange, so that trigger doesn't fire. This pins only that nothing
+/// fires for the wrong player: P0 gets exactly its own Treasure, and P2 none.
 #[test]
-fn sequential_instructions_read_zidanes_controller_at_each_event() {
+fn limit_later_instruction_after_zidane_moved_never_fires_for_the_wrong_player() {
     let mut scenario = GameScenario::new_n_player(3, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
@@ -429,40 +499,12 @@ fn sequential_instructions_read_zidanes_controller_at_each_event() {
     assert_eq!(controller(&runner, bear_a), P0, "REACH: bear A came to P0");
     assert_eq!(controller(&runner, bear_b), P2, "REACH: bear B went to P2");
     assert_eq!(controller(&runner, bear_c), P1, "REACH: bear C came to P1");
-    assert_eq!(treasures(&runner, P0), 1, "P0 lost Zidane to an opponent");
     assert_eq!(
-        treasures(&runner, P1),
+        treasures(&runner, P0),
         1,
-        "P1 controlled Zidane when P1 lost bear B to an opponent"
+        "P0 gets its Treasure for Zidane and nothing for bear B"
     );
     assert_eq!(treasures(&runner, P2), 0);
-}
-
-const OWNED_WATCHER: &str = "Whenever an opponent gains control of a permanent you own from \
-    you, you create a Treasure token.";
-
-/// CR 603.10d: "you own" is judged with the look-back "you" — the watcher's
-/// controller before it was stolen — not with its new controller.
-#[test]
-fn owned_subject_reads_the_look_back_controller() {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    let watcher = scenario
-        .add_creature_from_oracle(P0, "Owned Watcher", 1, 1, OWNED_WATCHER)
-        .id();
-    let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
-    let mut runner = scenario.build();
-    give_priority(&mut runner, P1);
-
-    runner.cast(steal).target_object(watcher).resolve();
-    runner.advance_until_stack_empty();
-    assert_eq!(
-        controller(&runner, watcher),
-        P1,
-        "REACH: P1 stole the watcher"
-    );
-    assert_eq!(treasures(&runner, P0), 1);
-    assert_eq!(treasures(&runner, P1), 0);
 }
 
 /// Verbatim Oracle text (Scryfall).
@@ -471,12 +513,15 @@ const GRAB_THE_REINS: &str = "Choose one \u{2014}\n\u{2022} Until end of turn, y
     damage equal to that creature's power to any target.\nEntwine {2}{R} (Choose both if you \
     pay the entwine cost.)";
 
-/// CR 110.1 + CR 603.10d: a permanent stolen and then sacrificed by the same
-/// resolution was a permanent when it changed control. `p1_has_other` adds a
-/// second creature for P1, so the sacrifice pauses for P1's choice instead of
-/// taking the only candidate.
+/// FAIL-CLOSED LIMIT, documented: a permanent stolen and then sacrificed by
+/// the same resolution. It was a permanent when it changed hands, so by the
+/// rules P0 gets a Treasure; collection runs after it left, when it can't be
+/// told apart from a spell that changed control on the stack, so it doesn't
+/// fire. This pins only that nothing fires for the wrong player.
+/// `p1_has_other` adds a second creature for P1, so the sacrifice pauses for
+/// P1's choice instead of taking the only candidate.
 #[test]
-fn steal_then_sacrifice_in_one_resolution_still_fires() {
+fn limit_steal_then_sacrifice_never_fires_for_the_wrong_player() {
     for p1_has_other in [false, true] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -510,7 +555,7 @@ fn steal_then_sacrifice_in_one_resolution_still_fires() {
         runner.advance_until_stack_empty();
         assert_eq!(
             runner.state().objects[&bear].zone,
-            engine::types::zones::Zone::Graveyard,
+            Zone::Graveyard,
             "REACH (p1_has_other {p1_has_other}): the stolen bear was sacrificed"
         );
         if let Some(other) = other {
@@ -520,9 +565,67 @@ fn steal_then_sacrifice_in_one_resolution_still_fires() {
             );
         }
         assert_eq!(
-            treasures(&runner, P0),
-            1,
-            "p1_has_other {p1_has_other}: the bear left P0's control as a permanent"
+            treasures(&runner, P1),
+            0,
+            "p1_has_other {p1_has_other}: nothing fires for the thief"
+        );
+    }
+}
+
+/// Verbatim Oracle text (Scryfall).
+const THRAGTUSK: &str = "When this creature enters, you gain 5 life.\nWhen this creature \
+    leaves the battlefield, create a 3/3 green Beast creature token.";
+/// Labelled synthetic steal-then-exile spell.
+const STEAL_THEN_EXILE: &str = "Gain control of target creature until end of turn. Exile it.";
+
+/// FAIL-CLOSED LIMIT, documented: steal-then-exile of a permanent with its own
+/// leaves-the-battlefield trigger, so the exile's zone event is collected
+/// separately from the control change. As in the sacrifice case, P0's
+/// Treasure doesn't fire; this pins only that Thragtusk's trigger still
+/// creates P1's Beast and nothing fires for the wrong player. `thragtusk`
+/// false is the same steal-then-exile of a vanilla creature.
+#[test]
+fn limit_steal_then_exile_never_fires_for_the_wrong_player() {
+    for thragtusk in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P0);
+        let victim = if thragtusk {
+            scenario
+                .add_creature_from_oracle(P0, "Thragtusk", 5, 3, THRAGTUSK)
+                .id()
+        } else {
+            scenario.add_vanilla(P0, 5, 3)
+        };
+        let spell = add_free_spell(&mut scenario, P1, "Steal Then Exile", STEAL_THEN_EXILE);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+
+        runner.cast(spell).target_object(victim).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&victim].zone,
+            Zone::Exile,
+            "REACH (thragtusk {thragtusk}): the stolen creature was exiled"
+        );
+        let p1_beasts = runner
+            .state()
+            .battlefield
+            .iter()
+            .filter(|id| {
+                let obj = &runner.state().objects[*id];
+                obj.name.contains("Beast") && obj.controller == P1
+            })
+            .count();
+        assert_eq!(
+            p1_beasts,
+            usize::from(thragtusk),
+            "REACH: Thragtusk's leaves trigger is controlled by its last controller, P1"
+        );
+        assert_eq!(
+            treasures(&runner, P1),
+            0,
+            "thragtusk {thragtusk}: nothing fires for the thief"
         );
     }
 }
