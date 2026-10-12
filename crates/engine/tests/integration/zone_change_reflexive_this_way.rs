@@ -15,7 +15,7 @@ use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{AbilityDefinition, Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -28,6 +28,8 @@ struct Drive {
     target_prompts: Vec<Zone>,
     /// Cards offered at each `EffectZoneChoice`, in order.
     zone_choices: Vec<Vec<ObjectId>>,
+    /// Priority windows with a triggered ability on top of the stack.
+    triggers_on_stack: usize,
 }
 
 struct Plan {
@@ -103,7 +105,15 @@ fn drive(r: &mut GameRunner, mut plan: Plan) -> Drive {
                 accept: plan.accept_optional,
             }),
             WaitingFor::Priority { .. } if r.state().stack.is_empty() => break,
-            WaitingFor::Priority { .. } => r.act(GameAction::PassPriority),
+            WaitingFor::Priority { .. } => {
+                if matches!(
+                    r.state().stack.back().map(|entry| &entry.kind),
+                    Some(StackEntryKind::TriggeredAbility { .. })
+                ) {
+                    out.triggers_on_stack += 1;
+                }
+                r.act(GameAction::PassPriority)
+            }
             other => panic!("unexpected prompt {other:?}"),
         };
         result.expect("action accepted");
@@ -463,6 +473,10 @@ fn nyssa_body_that_many_bounds_targets_and_draw() {
         out.target_prompts,
         vec![Zone::Graveyard],
         "targets after the sacrifice"
+    );
+    assert!(
+        out.triggers_on_stack >= 1,
+        "the reflexive went on the stack"
     );
     assert!(r.state().objects[&o1].tapped && r.state().objects[&o2].tapped);
     assert_eq!(
