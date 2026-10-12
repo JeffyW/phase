@@ -4049,12 +4049,14 @@ fn gendered_past_type_condition_does_not_hoist_outside_leading_dies_position() {
     assert_eq!(trailing.origin, Some(Zone::Battlefield));
     assert_eq!(trailing.destination, Some(Zone::Graveyard));
     assert_eq!(trailing.condition, None);
+    // The draw count position reads "a card" only; the trailing "if she was a
+    // land" it cannot read makes the clause an honest gap (CR 603.4).
     assert!(matches!(
         trailing
             .execute
             .as_deref()
             .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Draw { .. })
+        Some(Effect::Unimplemented { .. })
     ));
     assert_eq!(
         trailing
@@ -4072,18 +4074,12 @@ fn gendered_past_type_condition_does_not_hoist_outside_leading_dies_position() {
         &[],
     );
     assert!(
-        trailing_card.parse_warnings.iter().any(|warning| matches!(
-            warning,
-            OracleDiagnostic::SwallowedClause {
-                detector,
-                description,
-                line_index: 0,
-                ..
-            } if detector == "Condition_If"
-                && description == "When this creature dies, draw a card if she was a land."
-        )),
-        "the trailing predicate must remain an exact honest deferral: {:?}",
-        trailing_card.parse_warnings
+        trailing_card.triggers.iter().any(|trigger| trigger
+            .execute
+            .as_deref()
+            .is_some_and(|ability| matches!(&*ability.effect, Effect::Unimplemented { .. }))),
+        "the trailing predicate must remain an honest deferral: a clause gap, not an \
+         unconditional draw"
     );
 
     let leading_card = parse_oracle_text(
@@ -30804,7 +30800,7 @@ fn attack_one_or_more_opponents_uses_defending_player_controller() {
 /// cards) — distinct from the "attack a player ... that player controls"
 /// anaphor path covered above. Drives the full trigger→effect→target
 /// pipeline on the real Oracle text; the assertion flips to `None` if the
-/// `parse_zone_controller` arm is reverted.
+/// "defending player" arm of `nom_target::parse_controller_phrase` is reverted.
 #[test]
 fn attack_trigger_destroy_or_target_defending_player_controls() {
     use crate::types::ability::Effect;
