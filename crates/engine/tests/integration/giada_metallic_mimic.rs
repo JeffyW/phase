@@ -1196,9 +1196,15 @@ fn renamed_entrant_is_marked_unsupported_for_the_entry_projection() {
     let (mut runner, mimic) = beastie_mimic_board(vec![named_blue]);
     cast(&mut runner, mimic);
     drive(&mut runner, &["Angel"], None);
-    assert!(!runner.state().objects[&mimic]
-        .color
-        .contains(&ManaColor::Blue));
+    let obj = &runner.state().objects[&mimic];
+    assert_eq!(obj.zone, Zone::Battlefield, "reach: the control entered");
+    assert_eq!(
+        obj.chosen_creature_type(),
+        Some("Angel"),
+        "reach: it chose Angel"
+    );
+    assert_eq!(obj.name, "Metallic Mimic", "reach: no rename");
+    assert!(!obj.color.contains(&ManaColor::Blue));
 }
 
 /// CR 614.12 over the whole export (self-skips when it isn't generated): no printed

@@ -543,11 +543,13 @@ pub(crate) fn target_filter_characteristic_reads_at(
         TargetFilter::TrackedSetFiltered { filter: inner, .. } => {
             target_filter_characteristic_reads_at(inner, depth)
         }
-        TargetFilter::ChosenDamageSource { filter: inner, .. } => {
-            inner.as_ref().map_or(CharacteristicKinds::EMPTY, |f| {
-                target_filter_characteristic_reads_at(f, depth)
-            })
-        }
+        // CR 609.7a + CR 609.7b: the evaluator rechecks the recorded choice's
+        // own `source_filter` (`state.last_chosen_damage_source`), which this
+        // AST doesn't carry and which can read anything.
+        TargetFilter::ChosenDamageSource { .. } => CharacteristicKinds::ALL,
+        // CR 201.2: compares the live `name` field against the chosen name,
+        // which layer 3 writes.
+        TargetFilter::HasChosenName => CharacteristicKinds::NAME_TEXT,
         // CR 613.1b: stack-ability reference scoped by controller.
         TargetFilter::StackAbility { .. } => CharacteristicKinds::CONTROLLER,
         // CR 613.1b + CR 613.1d: parse-layer sugar for "that player and the
@@ -607,7 +609,6 @@ pub(crate) fn target_filter_characteristic_reads_at(
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner
         | TargetFilter::DefendingPlayer
-        | TargetFilter::HasChosenName
         | TargetFilter::Owner
         | TargetFilter::GrantingObject { .. }
         | TargetFilter::AllPlayers => CharacteristicKinds::EMPTY,
@@ -4806,8 +4807,11 @@ fn is_color_modification(modification: &ContinuousModification) -> bool {
 
 /// CR 614.12: apply the entrant's allowlisted own statics
 /// ([`entry_projection_allowlisted`]) that function on the battlefield, types
-/// (CR 613.1d) before colours (CR 613.1e). They only add, so their order within
-/// a layer doesn't change the result.
+/// (CR 613.1d) before colours (CR 613.1e), then derive the intrinsic mana
+/// abilities of its basic land types (CR 305.6) as the layer pass does. Each
+/// writes only the chosen subtype, the chosen colour or every creature type and
+/// reads no characteristic, so their order within a layer doesn't change the
+/// result.
 fn apply_entrant_own_statics(
     state: &GameState,
     entrant: &mut crate::game::game_object::GameObject,
@@ -4844,6 +4848,9 @@ fn apply_entrant_own_statics(
                     &state.all_creature_types,
                 );
             }
+        }
+        if !color_layer {
+            crate::game::layers::derive_intrinsic_basic_land_mana_abilities(entrant);
         }
     }
 }
@@ -22072,8 +22079,8 @@ mod entry_projection_tests {
     };
     use crate::game::scenario::{GameScenario, P0, P1};
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, ChoiceType, ChosenSubtypeKind, ColorChangeMode, Effect,
-        ReplacementDefinition, ReplacementMode, StaticCondition, StaticDefinition,
+        AbilityDefinition, AbilityKind, ChoiceType, ChosenSubtypeKind, ColorChangeMode, Comparator,
+        Effect, ReplacementDefinition, ReplacementMode, StaticCondition, StaticDefinition,
         TargetSelectionMode,
     };
     use crate::types::actions::GameAction;
@@ -22290,7 +22297,6 @@ mod entry_projection_tests {
     /// whole allowlisted projection.
     #[test]
     fn runtime_projection_is_all_or_nothing_per_consumer() {
-        use crate::types::ability::Comparator;
         let state = GameState::new_two_player(9783);
         let entrant = |statics: Vec<StaticDefinition>| {
             let mut obj = GameObject::new(
@@ -22435,26 +22441,167 @@ mod entry_projection_tests {
             assert!(has(&gapped, ENTRY_PROJECTION_GAP));
         }
 
-        let consumer = |valid_card: TargetFilter| {
-            let mut consumer = CardFace::default();
-            consumer.replacements.push(
-                ReplacementDefinition::new(ReplacementEvent::ChangeZone)
-                    .valid_card(valid_card)
-                    .destination_zone(Zone::Battlefield),
+        // F6: every replacement spelling that can consume a battlefield entry.
+        for (event, destination) in [
+            (ReplacementEvent::ChangeZone, Some(Zone::Battlefield)),
+            (ReplacementEvent::ChangeZone, None),
+            (ReplacementEvent::Moved, Some(Zone::Battlefield)),
+            (ReplacementEvent::Moved, None),
+        ] {
+            let consumer = |valid_card: TargetFilter| {
+                let mut def = ReplacementDefinition::new(event.clone()).valid_card(valid_card);
+                def.destination_zone = destination;
+                let mut consumer = CardFace::default();
+                consumer.replacements.push(def);
+                consumer
+            };
+            let spelling = format!("{event:?} to {destination:?}");
+            assert!(
+                has(
+                    &consumer(TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::PowerGTSource]),
+                    )),
+                    ENTRY_CONSUMER_GAP
+                ),
+                "{spelling}"
             );
-            consumer
-        };
-        assert!(has(
-            &consumer(TargetFilter::Typed(
-                TypedFilter::creature().properties(vec![FilterProp::PowerGTSource]),
-            )),
-            ENTRY_CONSUMER_GAP
+            assert!(
+                !has(
+                    &consumer(TargetFilter::Typed(
+                        TypedFilter::creature().subtype("Angel".to_string()),
+                    )),
+                    ENTRY_CONSUMER_GAP
+                ),
+                "{spelling}"
+            );
+            // F5: a chosen-name reader reads names; a chosen damage source can
+            // read anything.
+            for reader in [
+                TargetFilter::HasChosenName,
+                TargetFilter::ChosenDamageSource { filter: None },
+            ] {
+                assert!(
+                    has(&consumer(reader.clone()), ENTRY_CONSUMER_GAP),
+                    "{spelling} {reader:?}"
+                );
+            }
+        }
+        // A replacement that can't see a battlefield entry isn't a consumer.
+        let mut to_graveyard = CardFace::default();
+        to_graveyard.replacements.push(
+            ReplacementDefinition::new(ReplacementEvent::Moved)
+                .valid_card(TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::PowerGTSource]),
+                ))
+                .destination_zone(Zone::Graveyard),
+        );
+        assert!(!has(&to_graveyard, ENTRY_CONSUMER_GAP));
+    }
+
+    /// F5: the two classifier arms the per-query proof relies on. A chosen-name
+    /// reader reads the name (CR 201.2), so an own rename is unproven for it; a
+    /// chosen damage source rechecks the recorded choice's own filter
+    /// (CR 609.7b), which can read anything.
+    #[test]
+    fn chosen_name_and_damage_source_reads_feed_the_proof() {
+        assert_eq!(
+            target_filter_characteristic_reads(&TargetFilter::HasChosenName),
+            CharacteristicKinds::NAME_TEXT
+        );
+        assert!(
+            target_filter_characteristic_reads(&TargetFilter::ChosenDamageSource { filter: None })
+                .is_all()
+        );
+        let rename = [self_static(ContinuousModification::SetTextName {
+            name: "Projected".to_string(),
+        })];
+        assert!(!entry_projection_proven_for(
+            &rename,
+            target_filter_characteristic_reads(&TargetFilter::HasChosenName)
         ));
-        assert!(!has(
-            &consumer(TargetFilter::Typed(
-                TypedFilter::creature().subtype("Angel".to_string()),
-            )),
-            ENTRY_CONSUMER_GAP
+        assert!(!entry_projection_proven_for(
+            &[self_static(ContinuousModification::AddPower { value: 1 })],
+            target_filter_characteristic_reads(&TargetFilter::ChosenDamageSource { filter: None })
+        ));
+        assert!(entry_projection_proven_for(
+            &[chosen_subtype()],
+            target_filter_characteristic_reads(&TargetFilter::ChosenDamageSource { filter: None })
+        ));
+    }
+
+    /// F7 — CR 305.6 + CR 614.12: an ability-less land entrant whose allowlisted
+    /// own static adds the chosen basic land type. Choosing Island gives it the
+    /// Island's intrinsic mana ability in the projection, as the layer pass
+    /// would, so a mana-ability reader matches it exactly. Control: with no
+    /// type chosen it has no mana ability. The classifier counts an off-list
+    /// basic-land-type write as an ability write too.
+    #[test]
+    fn chosen_basic_land_type_projects_its_intrinsic_mana_ability() {
+        use crate::types::ability::BasicLandType;
+        let state = GameState::new_two_player(9783);
+        let mut land = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Chosen Land".to_string(),
+            Zone::Hand,
+        );
+        land.card_types.core_types = vec![CoreType::Land];
+        land.replacement_definitions = vec![as_enters(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Choose {
+                choice_type: ChoiceType::BasicLandType,
+                persist: true,
+                selection: TargetSelectionMode::Chosen,
+            },
+        ))]
+        .into();
+        let land_type = self_static(ContinuousModification::AddChosenSubtype {
+            kind: ChosenSubtypeKind::BasicLandType,
+        });
+        land.static_definitions = vec![land_type.clone()].into();
+        let mana_reader =
+            TargetFilter::Typed(TypedFilter::land().properties(vec![FilterProp::HasManaAbility]));
+        let ctx = FilterContext::from_source(&state, ObjectId(1));
+
+        let island = EntryProjection::proposed(
+            &state,
+            land.clone(),
+            &[ChosenAttribute::BasicLandType(BasicLandType::Island)],
+            None,
+            &mana_reader,
+        )
+        .expect("the allowlisted land-type static is proven for a mana-ability reader");
+        assert!(island.card_types.subtypes.iter().any(|s| s == "Island"));
+        assert!(matches_target_filter_on_object(
+            &state,
+            &island,
+            &mana_reader,
+            &ctx
+        ));
+
+        let unchosen =
+            EntryProjection::proposed(&state, land, &[], None, &mana_reader).expect("still proven");
+        assert!(!matches_target_filter_on_object(
+            &state,
+            &unchosen,
+            &mana_reader,
+            &ctx
+        ));
+
+        let off_list = StaticDefinition::continuous().modifications(land_type.modifications);
+        let abilities_only = TargetFilter::Typed(TypedFilter {
+            type_filters: Vec::new(),
+            controller: None,
+            properties: vec![FilterProp::HasManaAbility],
+        });
+        assert_eq!(
+            target_filter_characteristic_reads(&abilities_only),
+            CharacteristicKinds::ABILITIES
+        );
+        assert!(!entry_projection_proven_for(
+            &[off_list],
+            target_filter_characteristic_reads(&abilities_only)
         ));
     }
 

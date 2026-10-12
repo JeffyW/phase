@@ -7340,6 +7340,19 @@ pub const ENTRY_PROJECTION_GAP: &str = "Replacement:as_enters_projection";
 /// projected (CR 614.12), so the face is unsupported and fails closed.
 pub const ENTRY_CONSUMER_GAP: &str = "Replacement:entry_consumer_reads_unprojected";
 
+/// CR 614.12: whether a replacement can apply to an object entering the
+/// battlefield — a `ChangeZone` replacement (its matcher proposes only
+/// battlefield entries) or a `Moved` replacement (any zone change), with no
+/// destination or the battlefield as its destination.
+fn replacement_can_consume_battlefield_entry(
+    def: &crate::types::ability::ReplacementDefinition,
+) -> bool {
+    matches!(
+        def.event,
+        ReplacementEvent::ChangeZone | ReplacementEvent::Moved
+    ) && matches!(def.destination_zone, None | Some(Zone::Battlefield))
+}
+
 fn check_entry_projection(face: &CardFace, missing: &mut Vec<String>) {
     let mut push = |label: &str| {
         if !missing.iter().any(|existing| existing == label) {
@@ -7361,10 +7374,7 @@ fn check_entry_projection(face: &CardFace, missing: &mut Vec<String>) {
     let entry_replacement_filters = face
         .replacements
         .iter()
-        .filter(|def| {
-            def.event == ReplacementEvent::ChangeZone
-                && def.destination_zone == Some(Zone::Battlefield)
-        })
+        .filter(|def| replacement_can_consume_battlefield_entry(def))
         .filter_map(|def| def.valid_card.as_ref());
     let entry_static_filters = face
         .static_abilities

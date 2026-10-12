@@ -5461,16 +5461,27 @@ fn modification_characteristic_writes_at(
     };
     match m {
         // ---- CR 613.1d (layer 4): typeline. ----
-        ContinuousModification::AddType { .. }
-        | ContinuousModification::RemoveType { .. }
-        | ContinuousModification::SetCardTypes { .. }
-        | ContinuousModification::AddSubtype { .. }
-        | ContinuousModification::RemoveSubtype { .. }
-        | ContinuousModification::RemoveAllSubtypes { .. }
-        | ContinuousModification::AddAllCreatureTypes
+        // CR 305.6: a land has the intrinsic mana ability of each basic land type
+        // it has, so a type write that can change whether an object is a land or
+        // which basic land types it has also writes its abilities.
+        ContinuousModification::AddType { core_type }
+        | ContinuousModification::RemoveType { core_type } => {
+            land_type_line_writes(*core_type == CoreType::Land)
+        }
+        ContinuousModification::AddSubtype { subtype }
+        | ContinuousModification::RemoveSubtype { subtype } => {
+            land_type_line_writes(subtype.parse::<BasicLandType>().is_ok())
+        }
+        ContinuousModification::RemoveAllSubtypes { set } => {
+            land_type_line_writes(*set == SubtypeSet::Land)
+        }
+        ContinuousModification::AddChosenSubtype { kind } => {
+            land_type_line_writes(*kind == ChosenSubtypeKind::BasicLandType)
+        }
+        ContinuousModification::SetCardTypes { .. }
         | ContinuousModification::AddAllBasicLandTypes
-        | ContinuousModification::AddAllLandTypes
-        | ContinuousModification::AddChosenSubtype { .. }
+        | ContinuousModification::AddAllLandTypes => land_type_line_writes(true),
+        ContinuousModification::AddAllCreatureTypes
         | ContinuousModification::AddSupertype { .. }
         | ContinuousModification::RemoveSupertype { .. } => CharacteristicKinds::CARD_TYPES,
         // CR 305.7: setting a basic land type replaces the land's subtypes AND
@@ -5578,6 +5589,16 @@ fn modification_characteristic_writes_at(
         // CR 306.5b: loyalty is read from the copiable values, not written as a
         // layer effect; the apply site asserts unreachable.
         | ContinuousModification::SetStartingLoyalty { .. } => CharacteristicKinds::EMPTY,
+    }
+}
+
+/// CR 613.1d + CR 305.6: a typeline write; one that can change a land's basic
+/// land types also writes the intrinsic mana abilities they give it.
+fn land_type_line_writes(can_change_basic_land_types: bool) -> CharacteristicKinds {
+    if can_change_basic_land_types {
+        CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
+    } else {
+        CharacteristicKinds::CARD_TYPES
     }
 }
 
@@ -11552,22 +11573,29 @@ fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, su
 /// intrinsic basic-land mana abilities before layer 6 ability effects apply.
 fn apply_intrinsic_basic_land_mana_abilities(state: &mut GameState, battlefield_ids: &[ObjectId]) {
     for &id in battlefield_ids {
-        let Some(obj) = state.objects.get_mut(&id) else {
-            continue;
-        };
-        if !obj.card_types.core_types.contains(&CoreType::Land) {
-            continue;
+        if let Some(obj) = state.objects.get_mut(&id) {
+            derive_intrinsic_basic_land_mana_abilities(obj);
         }
+    }
+}
 
-        let land_types: Vec<BasicLandType> = obj
-            .card_types
-            .subtypes
-            .iter()
-            .filter_map(|subtype| subtype.parse().ok())
-            .collect();
-        for land_type in land_types {
-            add_basic_land_mana_ability(obj, land_type);
-        }
+/// CR 305.6: give a land the intrinsic mana ability of each basic land type it
+/// has. The single authority shared by the layer pass and the CR 614.12 entry
+/// projection.
+pub(crate) fn derive_intrinsic_basic_land_mana_abilities(
+    obj: &mut crate::game::game_object::GameObject,
+) {
+    if !obj.card_types.core_types.contains(&CoreType::Land) {
+        return;
+    }
+    let land_types: Vec<BasicLandType> = obj
+        .card_types
+        .subtypes
+        .iter()
+        .filter_map(|subtype| subtype.parse().ok())
+        .collect();
+    for land_type in land_types {
+        add_basic_land_mana_ability(obj, land_type);
     }
 }
 
