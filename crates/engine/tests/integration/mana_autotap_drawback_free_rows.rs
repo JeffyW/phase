@@ -51,6 +51,10 @@ const CETA_DISCIPLE_ORACLE: &str = "{R}, {T}: Target creature gets +2/+0 until e
 const HAVENWOOD_BATTLEGROUND_ORACLE: &str =
     "This land enters tapped.\n{T}: Add {G}.\n{T}, Sacrifice this land: Add {G}{G}.";
 const BLACK_KNIGHT_ORACLE: &str = "First strike\nProtection from white";
+const SUNGRASS_PRAIRIE_ORACLE: &str = "{1}, {T}: Add {G}{W}.";
+const TATYOVA_ORACLE: &str = "Land creatures you control have flying.\n\
+Whenever a land you control enters, if you control seven or more lands, up to one target land \
+you control becomes a 3/3 Elemental creature with haste. It's still a land.";
 const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
@@ -924,4 +928,115 @@ fn floating_mana_replaced_by_the_funded_output_is_not_reserved() {
     );
     assert_eq!(outcome.zone_of(havenwood), Zone::Battlefield);
     assert!(!outcome.state().objects[&havenwood].tapped);
+}
+
+/// CR 601.2g + CR 605.3b + CR 106.4: two selected sources with their own mana
+/// costs. P0 has an empty pool and, created in this order, Sungrass Prairie
+/// (`{1}, {T}: Add {G}{W}`), Ceta Disciple (`{G}, {T}`: any color), Havenwood
+/// Battleground, a Forest and a Plains, and casts Tatyova, Steward of Tides
+/// ({G}{G}{U}). A plan funding each sub-cost from an unused source would pay the
+/// Sungrass `{1}` from the Plains and Ceta's `{G}` from Havenwood's plain row.
+/// Executed one source at a time, Ceta's `{G}` could instead take the {G}
+/// Sungrass already added, leaving the cast one {G} short. Auto-pay must still
+/// cast and resolve Tatyova.
+#[test]
+fn two_selected_sub_costs_still_pay_the_cast() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let sungrass = scenario
+        .add_land_from_oracle(P0, "Sungrass Prairie", SUNGRASS_PRAIRIE_ORACLE)
+        .id();
+    let disciple = scenario
+        .add_creature_from_oracle(P0, "Ceta Disciple", 1, 1, CETA_DISCIPLE_ORACLE)
+        .id();
+    let havenwood = scenario
+        .add_land_from_oracle(P0, "Havenwood Battleground", HAVENWOOD_BATTLEGROUND_ORACLE)
+        .id();
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let plains = scenario.add_basic_land(P0, ManaColor::White);
+    let tatyova = scenario
+        .add_creature_to_hand_from_oracle(P0, "Tatyova, Steward of Tides", 3, 3, TATYOVA_ORACLE)
+        .with_mana_cost(cost(
+            &[
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+                ManaCostShard::Blue,
+            ],
+            0,
+        ))
+        .id();
+    let mut runner = build_untapped(scenario, &[sungrass, disciple, havenwood, forest, plains]);
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "reach: empty pool"
+    );
+
+    let outcome = runner.cast(tatyova).resolve();
+    assert_eq!(
+        outcome.zone_of(tatyova),
+        Zone::Battlefield,
+        "Tatyova was paid and resolved; mana added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(
+        mana_added_by(outcome.events(), &[disciple]),
+        vec![(disciple, ManaType::Blue)],
+        "reach: Ceta Disciple's costed row paid the {{U}}; mana added {:?}",
+        mana_added(outcome.events()),
+    );
+}
+
+/// CR 601.2g + CR 605.3b + CR 106.4: a drawback-free plan with a selected
+/// sub-cost is only used when the pool is empty. P0 floats {G} from a Forest,
+/// then casts a {U}{G}{G} witness with Ceta Disciple, Havenwood Battleground and
+/// another Forest. The drawback-free plan (Ceta for {U}, the Forest for {G},
+/// Havenwood's plain {G} for Ceta's sub-cost) would let Ceta's `{G}` take the
+/// floating {G} and leave the cast one {G} short, so the payment plans with
+/// every row instead and the cast is paid.
+#[test]
+fn selected_sub_cost_with_floating_mana_still_pays_the_cast() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let disciple = scenario
+        .add_creature_from_oracle(P0, "Ceta Disciple", 1, 1, CETA_DISCIPLE_ORACLE)
+        .id();
+    let havenwood = scenario
+        .add_land_from_oracle(P0, "Havenwood Battleground", HAVENWOOD_BATTLEGROUND_ORACLE)
+        .id();
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let floated_forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let spell = witness_spell(
+        &mut scenario,
+        cost(
+            &[
+                ManaCostShard::Blue,
+                ManaCostShard::Green,
+                ManaCostShard::Green,
+            ],
+            0,
+        ),
+    );
+    let mut runner = build_untapped(scenario, &[disciple, havenwood, forest, floated_forest]);
+    let tap_forest = activatable_mana_actions_for_player(runner.state(), P0)
+        .into_iter()
+        .find(|action| {
+            matches!(action, GameAction::TapLandForMana { selection }
+                if selection.source.object_id == floated_forest)
+        })
+        .expect("the Forest offers {G}");
+    runner.act(tap_forest).expect("P0 floats {G}");
+    let pool = &runner.state().players[0].mana_pool;
+    assert!(
+        pool.total() == 1 && pool.count_color(ManaType::Green) == 1,
+        "reach: exactly one floating {{G}}"
+    );
+
+    let outcome = auto_pay_and_resolve(&mut runner, spell);
+    assert_eq!(
+        mana_added_by(outcome.events(), &[disciple]),
+        vec![(disciple, ManaType::Blue)],
+        "reach: Ceta Disciple's costed row paid the {{U}}; mana added {:?}",
+        mana_added(outcome.events()),
+    );
 }

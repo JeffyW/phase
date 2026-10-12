@@ -14126,6 +14126,11 @@ fn auto_tap_mana_sources_inner(
     // The row policy is decided once for the whole payment and inherited by every
     // nested mana sub-cost payment, so sibling sub-costs are funded under the plan
     // that was verified for them together.
+    let floating_mana = state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .is_some_and(|p| p.mana_pool.total() > 0);
     let (
         AutoTapPlan {
             mut to_tap,
@@ -14140,6 +14145,7 @@ fn auto_tap_mana_sources_inner(
         generic as usize + deferred_generic,
         effective_ctx,
         row_policy,
+        floating_mana,
     );
 
     // Phase 3: activate each selected mana source.
@@ -14148,11 +14154,11 @@ fn auto_tap_mana_sources_inner(
     // immediately; CR 605.3c prevents reactivation. Those rules do not prescribe
     // this ordering. Engine scheduling policy: with every row, selected sources
     // without a mana sub-cost resolve first, stably, so their mana is available to
-    // pay a later cost. A drawback-free plan was accepted only because each
-    // selected sub-cost is payable from sources the plan leaves unused
-    // (`planned_mana_sub_costs_fundable`), so its sub-cost rows resolve first:
-    // their sub-costs are then paid that way, before the outer plan's own mana
-    // floats where a colored sub-cost shard could take it from the outer cost.
+    // pay a later cost. A drawback-free plan selects at most one row with a mana
+    // sub-cost at each payment level, and only when the pool was empty
+    // (`planned_mana_sub_costs_fundable`); that row resolves first, so its
+    // sub-cost is planned against the same empty pool and unused sources the
+    // check planned it against, before any of this plan's mana floats.
     // This preserves the plan and `used_sources` reservation; it changes only order.
     let sub_cost_rows_first = nested_row_policy == AutoTapRowPolicy::WithoutAvoidableDrawbacks;
     to_tap.sort_by_key(|option| {
@@ -14722,8 +14728,10 @@ pub(crate) enum AutoTapRowPolicy {
 /// combination rows of every source that also has a drawback-free row. It uses
 /// that plan when it pays the whole cost and every mana sub-cost of the rows it
 /// selects, planned the way Phase 3 will pay them: under the same withholding,
-/// from the sources still unused. Otherwise the whole payment, nested sub-costs
-/// included, plans with every row, exactly as before drawback avoidance. Nested
+/// from the sources still unused, against an empty pool. That last condition is
+/// enforced, not assumed (`planned_mana_sub_costs_fundable`). Otherwise the whole
+/// payment, nested sub-costs included, plans with every row, exactly as before
+/// drawback avoidance. Nested
 /// payments never re-decide: deciding per sub-cost could spend a source that a
 /// sibling sub-cost needs.
 ///
@@ -14738,6 +14746,7 @@ fn choose_auto_tap_plan(
     generic_units: usize,
     payment_context: Option<&PaymentContext<'_>>,
     policy: AutoTapRowPolicy,
+    floating_mana: bool,
 ) -> (AutoTapPlan, AutoTapRowPolicy) {
     let all_rows = || {
         (
@@ -14758,6 +14767,7 @@ fn choose_auto_tap_plan(
                     &rows,
                     &plan,
                     &mut plan.used_sources.clone(),
+                    floating_mana,
                 )
             {
                 (plan, AutoTapRowPolicy::WithoutAvoidableDrawbacks)
@@ -14826,25 +14836,55 @@ fn rows_without_avoidable_drawback_combinations(
     (rows.len() < available.len()).then_some(rows)
 }
 
-/// CR 605.3b + CR 118.3: True when every mana sub-cost of the rows `plan`
-/// activates can be paid by sources the plan leaves unused, recursively.
-/// `consumed` starts as the plan's own sources and grows as sub-costs claim more.
+/// CR 605.3b + CR 118.3 + CR 106.4: True when every mana sub-cost of the rows
+/// `plan` activates can be paid by sources the plan leaves unused, recursively,
+/// and Phase 3 will pay it exactly as planned here. `consumed` starts as the
+/// plan's own sources and grows as sub-costs claim more.
 ///
-/// Phase 3 of [`auto_tap_mana_sources_inner`] pays each selected sub-cost, in
-/// plan order and before any other selected source resolves, with a nested
-/// auto-tap that excludes the sources already used and inherits the outer row
-/// policy. This plans those payments the same way: the
-/// same planner over `rows` (the rows that policy allows) minus `consumed`. It is
-/// conservative: mana already in the pool (including surplus from earlier
-/// activations) is not counted, and a sub-cost shape the planner cannot read
-/// counts as unfundable. A wrong `false` only makes [`choose_auto_tap_plan`] use
-/// every row for the whole payment.
+/// Phase 3 of [`auto_tap_mana_sources_inner`] pays a selected sub-cost with a
+/// nested auto-tap that reduces it against the live pool, excludes the sources
+/// already used and inherits the outer row policy. This plans that payment with
+/// the same planner over `rows` (the rows that policy allows) minus `consumed`,
+/// against an empty pool. The two agree only if the pool is empty when the
+/// nested payment runs, so that is enforced, not assumed:
+///
+/// - at most one selected row has a mana sub-cost at each payment level, so no
+///   sub-cost can take mana an earlier selected row added (CR 106.4: produced
+///   mana goes to the pool);
+/// - when one does, `floating_mana` (the pool held mana when this plan was
+///   made) rejects the plan, so no sub-cost can take mana that was floating;
+/// - Phase 3 resolves that one row first under this policy, before any other
+///   selected source adds mana, and its own nested payment meets the same
+///   empty pool, so the rule recurses with `floating_mana = false`.
+///
+/// A sub-cost shape the planner cannot read counts as unfundable. A wrong
+/// `false` only makes [`choose_auto_tap_plan`] use every row for the whole
+/// payment.
 fn planned_mana_sub_costs_fundable(
     state: &GameState,
     rows: &[ManaSourceOption],
     plan: &AutoTapPlan,
     consumed: &mut HashSet<ObjectId>,
+    floating_mana: bool,
 ) -> bool {
+    let sub_cost_rows = plan
+        .to_tap
+        .iter()
+        .filter(|option| {
+            option.ability_index.is_some_and(|ability_index| {
+                state
+                    .objects
+                    .get(&option.object_id)
+                    .and_then(|object| object.abilities.get(ability_index))
+                    .is_some_and(|ability| {
+                        mana_abilities::mana_sub_cost_of(&ability.cost).is_some()
+                    })
+            })
+        })
+        .count();
+    if sub_cost_rows > 1 || (sub_cost_rows == 1 && floating_mana) {
+        return false;
+    }
     for option in &plan.to_tap {
         let Some(ability_index) = option.ability_index else {
             continue;
@@ -14887,7 +14927,7 @@ fn planned_mana_sub_costs_fundable(
             return false;
         }
         consumed.extend(nested.used_sources.iter().copied());
-        if !planned_mana_sub_costs_fundable(state, rows, &nested, consumed) {
+        if !planned_mana_sub_costs_fundable(state, rows, &nested, consumed, false) {
             return false;
         }
     }
