@@ -7322,7 +7322,76 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
         &mut missing,
     );
     check_shared_source_graveyard_slot(face, &mut missing);
+    check_entry_projection(face, &mut missing);
     missing
+}
+
+/// The coverage label for a face whose as-enters choice is made before it
+/// enters (CR 614.12a) but whose own statics write a characteristic that entry
+/// consumers read and the CR 614.12 entry projection doesn't apply
+/// (`filter::entry_projection_proven_for` against `filter::ENTRY_CONSUMER_READS`).
+/// Entry replacements would see the permanent without that write, so the face
+/// is unsupported and fails closed.
+pub const ENTRY_PROJECTION_GAP: &str = "Replacement:as_enters_projection";
+
+/// The coverage label for a face whose battlefield-entry replacement or "enters
+/// with an additional counter" static reads an entrant characteristic outside
+/// `filter::ENTRY_CONSUMER_READS`: an entrant's own write of that kind isn't
+/// projected (CR 614.12), so the face is unsupported and fails closed.
+pub const ENTRY_CONSUMER_GAP: &str = "Replacement:entry_consumer_reads_unprojected";
+
+/// CR 614.12: whether a replacement can apply to an object entering the
+/// battlefield — a `ChangeZone` replacement (its matcher proposes only
+/// battlefield entries) or a `Moved` replacement (any zone change), with no
+/// destination or the battlefield as its destination.
+fn replacement_can_consume_battlefield_entry(
+    def: &crate::types::ability::ReplacementDefinition,
+) -> bool {
+    matches!(
+        def.event,
+        ReplacementEvent::ChangeZone | ReplacementEvent::Moved
+    ) && matches!(def.destination_zone, None | Some(Zone::Battlefield))
+}
+
+fn check_entry_projection(face: &CardFace, missing: &mut Vec<String>) {
+    let mut push = |label: &str| {
+        if !missing.iter().any(|existing| existing == label) {
+            missing.push(label.to_string());
+        }
+    };
+    let has_pre_entry_choice = face
+        .replacements
+        .iter()
+        .any(|def| crate::game::replacement::as_enters_choice_type(def).is_some());
+    if has_pre_entry_choice
+        && !crate::game::filter::entry_projection_proven_for(
+            &face.static_abilities,
+            crate::game::filter::ENTRY_CONSUMER_READS,
+        )
+    {
+        push(ENTRY_PROJECTION_GAP);
+    }
+    let entry_replacement_filters = face
+        .replacements
+        .iter()
+        .filter(|def| replacement_can_consume_battlefield_entry(def))
+        .filter_map(|def| def.valid_card.as_ref());
+    let entry_static_filters = face
+        .static_abilities
+        .iter()
+        .filter(|def| matches!(def.mode, StaticMode::EntersWithAdditionalCounters { .. }))
+        .filter_map(|def| def.affected.as_ref());
+    if entry_replacement_filters
+        .chain(entry_static_filters)
+        .any(|filter| {
+            !matches!(filter, TargetFilter::SelfRef)
+                && !crate::game::filter::ENTRY_CONSUMER_READS.contains(
+                    crate::game::filter::target_filter_characteristic_reads(filter),
+                )
+        })
+    {
+        push(ENTRY_CONSUMER_GAP);
+    }
 }
 
 /// The coverage label for a graveyard-cast permission whose extra cost

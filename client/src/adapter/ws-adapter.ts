@@ -210,6 +210,15 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 133 — CR 614.12a pre-entry as-enters choices: NamedChoiceSourceBinding gains
+ *      PendingEntry (WaitingFor.NamedChoice.source.binding), and the parked
+ *      entry event / PendingReplacement carry the answers and the paused
+ *      delivery's boundary — see PROTOCOL_VERSION's own `/// 133` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v132 peer cannot parse the new
+ *      binding tag. Wire 115 moves with it.
+ * 132 — `GameObject::exile_from_stack_linked_source` carries the stamping
+ *      incarnation (`ObjectIncarnationRef`, CR 400.7); a v131 peer cannot
+ *      decode a set rider. Wire 114 moves with it; no lobby frame names it.
  * 131 — PlayerFilter gains AnyOf (the union of player sets) and TargetPlayer
  *      (the first declared player target), carried in an ability's
  *      player_scope inside GameState — see PROTOCOL_VERSION's own `/// 131`
@@ -828,7 +837,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 131;
+export const PROTOCOL_VERSION = 133;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

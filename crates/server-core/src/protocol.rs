@@ -3346,7 +3346,18 @@ mod tests {
         }
     }
 
-    /// The bump this number is at: `PlayerFilter` gains `AnyOf { filters }` and
+    /// The bump this number is at: CR 614.12a pre-entry as-enters choices —
+    /// `NamedChoiceSourceBinding::PendingEntry`, `ProposedEvent::ZoneChange`'s
+    /// `enter_with_choices` and `PendingReplacement::delivery_boundary`, all
+    /// inside `GameState`; a v132 peer cannot parse the new binding tag, so it
+    /// must be refused before it receives v133 state.
+    ///
+    /// v132: `GameObject::exile_from_stack_linked_source`
+    /// carries the stamping incarnation (`ObjectIncarnationRef`, CR 400.7); a
+    /// v131 peer cannot decode a set rider, so it must be refused before it
+    /// receives v132 state.
+    ///
+    /// v131: `PlayerFilter` gains `AnyOf { filters }` and
     /// `TargetPlayer`, carried in a resolving or pending ability's `player_scope`
     /// inside `GameState`; a v130 peer cannot parse either tag, so it must be
     /// refused before it receives v131 state.
@@ -3517,8 +3528,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_131_for_coordinated_player_set() {
-        assert_eq!(PROTOCOL_VERSION, 131);
+    fn protocol_version_is_133_for_pre_entry_choices() {
+        assert_eq!(PROTOCOL_VERSION, 133);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3529,7 +3540,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_131_for_coordinated_player_set` stays
+    /// `protocol_version_is_133_for_pre_entry_choices` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
