@@ -2601,10 +2601,10 @@ fn mana_ability_cost_cursor(
     resolution_mode: ManaAbilityCostResolutionMode,
     parent: Option<&ManaAbilityCostParent>,
 ) -> ManaAbilityCostCursor {
-    let mut remaining = Vec::new();
-    if let Some(cost) = cost {
-        append_mana_ability_cost_components(cost, &mut remaining);
-    }
+    let remaining = cost
+        .as_ref()
+        .map(mana_ability_cost_components)
+        .unwrap_or_default();
     let mut excluded_sources: Vec<_> = excluded_sources.iter().copied().collect();
     excluded_sources.sort_unstable_by_key(|source_id| source_id.0);
     ManaAbilityCostCursor {
@@ -2627,6 +2627,18 @@ fn mana_ability_cost_cursor(
         current_action_deferred_start: 0,
         parent: parent.cloned().map(Box::new),
     }
+}
+
+/// CR 601.2h + CR 602.2b: The leaf components of a mana ability's cost, in the
+/// order its cost cursor pays them, with every `Composite` (at any depth)
+/// flattened. The single authority for that shape: the cursor pays exactly these
+/// components, and auto-tap planning inspects the same list
+/// (`casting_costs::planned_mana_sub_costs_fundable`), so the two cannot disagree
+/// about how many mana payments an activation makes.
+pub(crate) fn mana_ability_cost_components(cost: &AbilityCost) -> Vec<AbilityCost> {
+    let mut remaining = Vec::new();
+    append_mana_ability_cost_components(cost, &mut remaining);
+    remaining
 }
 
 fn append_mana_ability_cost_components(cost: &AbilityCost, remaining: &mut Vec<AbilityCost>) {

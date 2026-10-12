@@ -12,7 +12,7 @@
 
 use engine::game::mana_sources::activatable_mana_actions_for_player;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{ContinuousModification, TargetFilter};
+use engine::types::ability::{AbilityCost, ContinuousModification, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, GameState, ManaChoice, WaitingFor};
@@ -55,6 +55,7 @@ const SUNGRASS_PRAIRIE_ORACLE: &str = "{1}, {T}: Add {G}{W}.";
 const TATYOVA_ORACLE: &str = "Land creatures you control have flying.\n\
 Whenever a land you control enters, if you control seven or more lands, up to one target land \
 you control becomes a 3/3 Elemental creature with haste. It's still a land.";
+const AZORIUS_FIRST_WING_ORACLE: &str = "Flying, protection from enchantments";
 const FETID_HEATH_ORACLE: &str = "{T}: Add {C}.\n{W/B}, {T}: Add {W}{W}, {W}{B}, or {B}{B}.";
 
 /// Transient `CantUntap` effects aimed at `id` (the shape an exert cost installs).
@@ -1038,5 +1039,138 @@ fn selected_sub_cost_with_floating_mana_still_pays_the_cast() {
         vec![(disciple, ManaType::Blue)],
         "reach: Ceta Disciple's costed row paid the {{U}}; mana added {:?}",
         mana_added(outcome.events()),
+    );
+}
+
+// --- Cost shapes the plan check does not model fall back to every row ---
+
+fn mana_component(shards: &[ManaCostShard]) -> AbilityCost {
+    AbilityCost::Mana {
+        cost: cost(shards, 0),
+    }
+}
+
+/// Azorius Signet with its `{1}, {T}` cost replaced by the typed `signet_cost`,
+/// Dwarven Ruins, and (when `with_mountain`) a Mountain, all untapped with an
+/// empty pool, and Azorius First-Wing ({W}{U}) in hand. Casts First-Wing
+/// through the default automatic payment and returns the outcome.
+fn signet_with_cost_casts_first_wing(
+    signet_cost: AbilityCost,
+    with_mountain: bool,
+) -> (CastOutcome, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let signet = scenario
+        .add_artifact_from_oracle(P0, "Azorius Signet", AZORIUS_SIGNET_ORACLE)
+        .id();
+    let ruins = scenario
+        .add_land_from_oracle(P0, "Dwarven Ruins", DWARVEN_RUINS_ORACLE)
+        .id();
+    let mut lands = vec![signet, ruins];
+    if with_mountain {
+        lands.push(scenario.add_basic_land(P0, ManaColor::Red));
+    }
+    let first_wing = scenario
+        .add_creature_to_hand_from_oracle(P0, "Azorius First-Wing", 2, 2, AZORIUS_FIRST_WING_ORACLE)
+        .with_mana_cost(cost(&[ManaCostShard::White, ManaCostShard::Blue], 0))
+        .id();
+    let mut runner = build_untapped(scenario, &lands);
+    {
+        let object = runner.state_mut().objects.get_mut(&signet).unwrap();
+        for abilities in [&mut object.abilities, &mut object.base_abilities] {
+            std::sync::Arc::make_mut(abilities)[0].cost = Some(signet_cost.clone());
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&signet].abilities[0].cost,
+        Some(signet_cost),
+        "reach: the typed cost survived construction"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        0,
+        "reach: empty pool"
+    );
+    let outcome = runner.cast(first_wing).resolve();
+    assert_eq!(
+        outcome.zone_of(first_wing),
+        Zone::Battlefield,
+        "Azorius First-Wing was paid and resolved; mana added {:?}",
+        mana_added(outcome.events()),
+    );
+    assert_eq!(
+        mana_added_by(outcome.events(), &[signet]),
+        vec![(signet, ManaType::White), (signet, ManaType::Blue)],
+        "reach: the Signet's costed row paid {{W}}{{U}}"
+    );
+    (outcome, signet, ruins)
+}
+
+/// CR 601.2h + CR 602.2b: a costed row whose cost makes two separate mana
+/// payments (`Composite[Mana {R}, Mana {R}, Tap]`). The drawback-free plan's
+/// check models one mana payment per row, so the plan is not used and the
+/// payment plans with every row: Dwarven Ruins is sacrificed for {R}{R}, which
+/// pays both components, and the cast resolves.
+#[test]
+fn two_mana_components_fall_back_to_every_row() {
+    let (outcome, _signet, ruins) = signet_with_cost_casts_first_wing(
+        AbilityCost::Composite {
+            costs: vec![
+                mana_component(&[ManaCostShard::Red]),
+                mana_component(&[ManaCostShard::Red]),
+                AbilityCost::Tap,
+            ],
+        },
+        false,
+    );
+    assert_eq!(
+        outcome.zone_of(ruins),
+        Zone::Graveyard,
+        "the every-row fallback sacrificed the Ruins for {{R}}{{R}}"
+    );
+}
+
+/// CR 601.2h + CR 602.2b: a costed row whose only mana payment sits inside a
+/// nested `Composite`, which the planner's pre-funding does not see. The plan
+/// is not used and the payment plans with every row, and the cast resolves.
+#[test]
+fn nested_mana_component_falls_back_to_every_row() {
+    let (outcome, _signet, ruins) = signet_with_cost_casts_first_wing(
+        AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Composite {
+                    costs: vec![mana_component(&[ManaCostShard::Red])],
+                },
+                AbilityCost::Tap,
+            ],
+        },
+        true,
+    );
+    assert_eq!(
+        outcome.zone_of(ruins),
+        Zone::Graveyard,
+        "the every-row fallback sacrificed the Ruins for the nested {{R}}"
+    );
+}
+
+/// Positive control: one mana payment of {R}{R} (`Composite[Mana {R}{R}, Tap]`)
+/// is the shape the check models, so the drawback-free plan is used: the Ruins'
+/// plain {R} and the Mountain fund it, and the Ruins survive.
+#[test]
+fn single_mana_component_keeps_the_drawback_free_plan() {
+    let (outcome, _signet, ruins) = signet_with_cost_casts_first_wing(
+        AbilityCost::Composite {
+            costs: vec![
+                mana_component(&[ManaCostShard::Red, ManaCostShard::Red]),
+                AbilityCost::Tap,
+            ],
+        },
+        true,
+    );
+    assert_eq!(outcome.zone_of(ruins), Zone::Battlefield);
+    assert_eq!(
+        mana_added_by(outcome.events(), &[ruins]),
+        vec![(ruins, ManaType::Red)],
+        "the Ruins' plain row funded one {{R}}"
     );
 }

@@ -14848,6 +14848,11 @@ fn rows_without_avoidable_drawback_combinations(
 /// against an empty pool. The two agree only if the pool is empty when the
 /// nested payment runs, so that is enforced, not assumed:
 ///
+/// - each selected row makes at most one mana payment, counted over its whole
+///   cost tree with the flattener the cost cursor pays from
+///   (`mana_abilities::mana_ability_cost_components`), and that payment is the
+///   one Phase 3 pre-funds (`mana_sub_cost_of`); any other cost shape is not
+///   checked here, so the plan is not used;
 /// - at most one selected row has a mana sub-cost at each payment level, so no
 ///   sub-cost can take mana an earlier selected row added (CR 106.4: produced
 ///   mana goes to the pool);
@@ -14867,21 +14872,32 @@ fn planned_mana_sub_costs_fundable(
     consumed: &mut HashSet<ObjectId>,
     floating_mana: bool,
 ) -> bool {
-    let sub_cost_rows = plan
-        .to_tap
-        .iter()
-        .filter(|option| {
-            option.ability_index.is_some_and(|ability_index| {
-                state
-                    .objects
-                    .get(&option.object_id)
-                    .and_then(|object| object.abilities.get(ability_index))
-                    .is_some_and(|ability| {
-                        mana_abilities::mana_sub_cost_of(&ability.cost).is_some()
-                    })
-            })
-        })
-        .count();
+    let mut sub_cost_rows = 0usize;
+    for option in &plan.to_tap {
+        let Some(ability) = option.ability_index.and_then(|ability_index| {
+            state
+                .objects
+                .get(&option.object_id)
+                .and_then(|object| object.abilities.get(ability_index))
+        }) else {
+            continue;
+        };
+        // The components the cost cursor will actually pay, from the same
+        // flattener it uses: a row must make exactly one mana payment, and it must
+        // be the one Phase 3 pre-funds (`mana_sub_cost_of`), or the check below
+        // does not describe the execution and the plan is not used.
+        let mana_components = ability.cost.as_ref().map_or(0, |cost| {
+            mana_abilities::mana_ability_cost_components(cost)
+                .iter()
+                .filter(|component| matches!(component, AbilityCost::Mana { .. }))
+                .count()
+        });
+        match mana_components {
+            0 => {}
+            1 if mana_abilities::mana_sub_cost_of(&ability.cost).is_some() => sub_cost_rows += 1,
+            _ => return false,
+        }
+    }
     if sub_cost_rows > 1 || (sub_cost_rows == 1 && floating_mana) {
         return false;
     }
