@@ -21933,7 +21933,7 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
 
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
-    let (shards_covered, shard_consumed) =
+    let (shards_covered, shard_charge) =
         super::mana_sources::can_cover_shards_with_activatable_mana(
             state,
             player,
@@ -21954,9 +21954,11 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
     // controller could currently activate (covering Sacrifice / Discard /
     // PayLife costs that auto-tap cannot simulate).
     //
-    // Subtract mana already allocated to shard coverage so one activation is
-    // not counted twice (issue #583 review: power-2 Vivi must not cover {1}
-    // generic after paying {U}{R}).
+    // Subtract the capacity shard coverage used up, so one activation is not
+    // counted twice (issue #583 review: power-2 Vivi must not cover {1}
+    // generic after paying {U}{R}), and an activation is credited only with
+    // the color it was planned to make (blue from Nyx Lotus adds its blue
+    // amount, not its larger green amount).
     //
     // The per-permanent sum over-counts in chain-sacrifice configurations
     // (e.g. 2× KCI + 1 fodder reports cap=4 when the actual reachable yield
@@ -21973,7 +21975,7 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
             super::mana_sources::feasible_mana_capacity(state, id, player, spell_ctx.as_ref())
         })
         .sum::<u32>()
-        .saturating_sub(shard_consumed);
+        .saturating_sub(shard_charge);
 
     capacity >= residual_generic
 }
@@ -28474,9 +28476,10 @@ enum TargetRead {
     /// Every read: the question "must this wait for the committed targets?".
     Any,
     /// Only reads target settlement can't bind: a player filter anchored on a
-    /// parent target (`PlayerFilter::ParentObjectTarget*`), which the filter
-    /// matcher resolves without the ability's targets. A rider that reads its
-    /// target this way can't be priced, so it is refused, never priced wrong.
+    /// parent target (`PlayerFilter::ParentObjectTarget*`) or on the declared
+    /// player target (`PlayerFilter::TargetPlayer`), which the filter matcher
+    /// resolves without the ability's targets. A rider that reads its target
+    /// this way can't be priced, so it is refused, never priced wrong.
     Unbindable,
 }
 
@@ -28800,9 +28803,15 @@ fn player_filter_reads_chosen_target(filter: &PlayerFilter, read: TargetRead) ->
     match filter {
         // CR 109.4: a player filter anchored on a parent target. The filter
         // matcher binds no targets for it (see `effects::matches_player_scope`),
-        // so it is the one read settlement can't price.
-        PlayerFilter::ParentObjectTargetController | PlayerFilter::ParentObjectTargetOwner => true,
+        // so it is the one read settlement can't price. CR 115.1: the
+        // declared-player-target anchor has the same property.
+        PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::TargetPlayer => true,
         PlayerFilter::AllExcept { exclude } => player_filter_reads_chosen_target(exclude, read),
+        PlayerFilter::AnyOf { filters } => filters
+            .iter()
+            .any(|f| player_filter_reads_chosen_target(f, read)),
         PlayerFilter::OpponentDealtDamage { source, .. } => source
             .as_deref()
             .is_some_and(|x| target_filter_reads_chosen_target(x, read)),
