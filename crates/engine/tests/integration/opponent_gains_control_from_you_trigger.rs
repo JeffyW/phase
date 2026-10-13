@@ -1692,3 +1692,174 @@ fn shifting_population_scoped_producer_fails_closed() {
         );
     }
 }
+
+/// R5-1 probe (CR 611.2c + CR 608.2e), hand-built typed AST (labelled
+/// synthetic, no printed producer): "Choose target creature. Each opponent
+/// may gain control of all nontoken permanents owned by that creature's
+/// controller." The ownership reference reads the target's live controller.
+fn r5_1_probe_spell(scenario: &mut GameScenario, owner: PlayerId) -> ObjectId {
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, ControllerRef, Effect, FilterProp, PlayerFilter,
+        TargetFilter, TypedFilter,
+    };
+    let steal = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainControlAll {
+            target: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                FilterProp::NonToken,
+                FilterProp::Owned {
+                    controller: ControllerRef::ParentTargetController,
+                },
+            ])),
+        },
+    )
+    .player_scope(PlayerFilter::Opponent)
+    .optional();
+    let root = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::TargetOnly {
+            target: TargetFilter::Typed(TypedFilter::creature()),
+        },
+    )
+    .sub_ability(steal);
+    let mut builder = scenario.add_spell_to_hand(owner, "R5-1 Probe", true);
+    builder.with_ability_definition(root);
+    builder.with_mana_cost(ManaCost::zero()).id()
+}
+
+/// DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. Probed at
+/// 151bf7c05 (before the class failed closed): P1 +3, because P2's seat
+/// re-read `ParentTargetController` as P0 after P0 took Anchor and also took
+/// the bear; the rules give P1 +2. `Owned` by a player reference that can read
+/// a live controller isn't control-invariant, so the producer is unsupported
+/// and Zidane fires for no player.
+#[test]
+fn r5_1_owned_by_a_live_reference_fails_closed() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P1);
+    let anchor = scenario.add_vanilla(P1, 2, 2);
+    let bear = scenario.add_vanilla(P0, 2, 2);
+    let steal_bear = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let probe = r5_1_probe_spell(&mut scenario, P1);
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P1);
+    runner.cast(steal_bear).target_object(bear).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, bear),
+        P1,
+        "REACH: P1 controls P0's bear"
+    );
+    let before = treasures(&runner, P1);
+
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    runner.cast(probe).target_object(anchor).commit();
+    for _ in 0..3 {
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+            && !runner.state().stack.is_empty()
+        {
+            let _ = runner.act(GameAction::PassPriority);
+        }
+    }
+    for _ in 0..2 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ) {
+            answer_optional(&mut runner);
+        }
+    }
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, anchor),
+        P0,
+        "REACH: P0's seat took Anchor"
+    );
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: P0's seat took Zidane"
+    );
+    assert_eq!(
+        treasures(&runner, P1) - before,
+        0,
+        "the class fires for no player"
+    );
+}
+
+/// R5-2 probe: a retained continuation that removes a later seat's member.
+const RETURN_AND_DESTROY: &str = "Each player may gain control of all nontoken permanents they \
+    own and destroy target creature.";
+
+/// DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. Probed at
+/// 151bf7c05: P1 +1, because P0's seat ran the retained destroy on B before
+/// P2's seat could take B back; CR 608.2e processes the return for every player
+/// first (P1 +2). A retained continuation outside the typed whitelist makes the
+/// producer unsupported, and Zidane fires for no player.
+#[test]
+fn r5_2_retained_destroy_fails_closed() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P1);
+    let a = scenario.add_vanilla(P0, 2, 2);
+    let b = scenario.add_vanilla(P2, 2, 2);
+    let steal_a = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let steal_b = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Return and Destroy", true, RETURN_AND_DESTROY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P1);
+    runner.cast(steal_a).target_object(a).resolve();
+    runner.advance_until_stack_empty();
+    runner.cast(steal_b).target_object(b).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        (controller(&runner, a), controller(&runner, b)),
+        (P1, P1),
+        "REACH"
+    );
+    let before = treasures(&runner, P1);
+
+    give_priority(&mut runner, P0);
+    runner.cast(spell).target_object(b).commit();
+    for _ in 0..3 {
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+            && !runner.state().stack.is_empty()
+        {
+            let _ = runner.act(GameAction::PassPriority);
+        }
+    }
+    for _ in 0..3 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ) {
+            answer_optional(&mut runner);
+        }
+    }
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, a), P0, "REACH: P0's seat took A back");
+    assert_eq!(
+        runner.state().objects[&b].zone,
+        Zone::Graveyard,
+        "REACH: the retained destroy killed B"
+    );
+    assert_eq!(
+        controller(&runner, zidane),
+        P1,
+        "REACH: Zidane stayed with P1"
+    );
+    assert_eq!(
+        treasures(&runner, P1) - before,
+        0,
+        "the class fires for no player"
+    );
+}

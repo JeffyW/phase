@@ -13868,6 +13868,92 @@ mod tests {
             );
         }
     }
+    /// CR 611.2c: ownership is fixed, but the player it's tested against must be
+    /// too. `Owned` by the seat's own player is control-invariant; `Owned` by a
+    /// reference that reads a live controller (`ParentTargetController`) isn't,
+    /// so a settling (optional) scoped head over it is unsupported (R5-1).
+    #[test]
+    fn owned_by_a_live_player_reference_is_not_control_invariant() {
+        use crate::game::effects::FanOutControlBoundary;
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, ControllerRef, Effect, FilterProp, PlayerFilter,
+            TargetFilter, TypedFilter,
+        };
+        let scoped = |owner: ControllerRef| {
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainControlAll {
+                    target: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                        FilterProp::NonToken,
+                        FilterProp::Owned { controller: owner },
+                    ])),
+                },
+            )
+            .player_scope(PlayerFilter::All)
+            .optional()
+        };
+        let boundary = |def: &AbilityDefinition| {
+            crate::game::effects::player_scope_control_boundary(
+                &crate::game::ability_utils::build_resolved_from_def(
+                    def,
+                    crate::types::identifiers::ObjectId(1),
+                    crate::types::player::PlayerId(0),
+                ),
+            )
+        };
+        assert_eq!(
+            boundary(&scoped(ControllerRef::ScopedPlayer)),
+            Some(FanOutControlBoundary::Head),
+            "REACH: the seat's own ownership is invariant"
+        );
+        let live = scoped(ControllerRef::ParentTargetController);
+        assert_eq!(boundary(&live), Some(FanOutControlBoundary::Unobservable));
+        assert!(super::fan_out_control_boundary_is_unobservable(&live));
+    }
+
+    /// CR 608.2e: a node retained in the seat template after the head can
+    /// remove a later seat's member before that seat's head runs, so only a
+    /// typed whitelist (changing tapped state) is admitted (R5-2). The parsed
+    /// synthetic retains its destroy inside the seat template and is
+    /// unsupported; Scrambleverse's retained untap stays exact (see the
+    /// printed-producer receipt).
+    #[test]
+    fn a_retained_mutating_continuation_is_unsupported() {
+        use crate::game::effects::FanOutControlBoundary;
+        let text = "Each player may gain control of all nontoken permanents they own and \
+                    destroy target creature.";
+        let parsed = crate::parser::parse_oracle_text(
+            text,
+            "Return and Destroy",
+            &[],
+            &["Instant".into()],
+            &[],
+        );
+        let mut scoped = Vec::new();
+        for def in parsed.abilities.iter() {
+            scoped_nodes(def, &mut scoped);
+        }
+        let def = scoped.first().expect("REACH: a scoped clause parses");
+        let resolved = crate::game::ability_utils::build_resolved_from_def(
+            def,
+            crate::types::identifiers::ObjectId(1),
+            crate::types::player::PlayerId(0),
+        );
+        let scope = resolved.player_scope.clone().expect("scoped");
+        let (template, _) = crate::game::effects::split_player_scope_chain(&resolved, &scope);
+        assert!(
+            template.sub_ability.as_deref().is_some_and(|sub| matches!(
+                sub.effect,
+                crate::types::ability::Effect::Destroy { .. }
+            )),
+            "REACH: the destroy is retained inside the seat template"
+        );
+        assert_eq!(
+            crate::game::effects::player_scope_control_boundary(&resolved),
+            Some(FanOutControlBoundary::Unobservable)
+        );
+        assert!(super::fan_out_control_boundary_is_unobservable(def));
+    }
     /// CR 608.2e + CR 603.10d: a control action retained behind a scoped prefix
     /// ("each player may <X> and gain control of …": the optional clause keeps
     /// its continuation in the seat) has no single pre-seat boundary, so the

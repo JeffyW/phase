@@ -7445,7 +7445,7 @@ fn detach_after_player_scope_local_chain(
     }
 }
 
-fn split_player_scope_chain(
+pub(crate) fn split_player_scope_chain(
     ability: &ResolvedAbility,
     scope: &PlayerFilter,
 ) -> (ResolvedAbility, Option<Box<ResolvedAbility>>) {
@@ -7491,7 +7491,9 @@ pub(crate) enum FanOutControlBoundary {
     /// every seat performs, so the board before the first seat is its
     /// immediately-before board, and its population is the one fixed when the
     /// action began (CR 611.2c): either no settle can happen between seats, or
-    /// the population reads only control-invariant facts.
+    /// the population reads only control-invariant facts; and every node the
+    /// template retains after the head is proven safe for later seats
+    /// (`retained_continuation_is_safe`).
     Head,
     /// More than one control-change action, one behind a retained prefix that
     /// can mutate first, or a head whose later seats can settle and then read a
@@ -7509,8 +7511,9 @@ pub(crate) fn fan_out_control_boundary(template: &ResolvedAbility) -> FanOutCont
     ) {
         (_, 0) => FanOutControlBoundary::NoControl,
         (true, 1)
-            if !(seats_can_settle_between(template)
-                && !control_population_is_control_invariant(&template.effect)) =>
+            if retained_continuation_is_safe(template)
+                && !(seats_can_settle_between(template)
+                    && !control_population_is_control_invariant(&template.effect)) =>
         {
             FanOutControlBoundary::Head
         }
@@ -7545,16 +7548,26 @@ fn seats_can_settle_between(template: &ResolvedAbility) -> bool {
 /// earlier seat's control change can alter, so a later seat that reads it after
 /// a settle still finds the population fixed when the action began: a context
 /// or chosen reference, or a typed population of permanents bounded only by
-/// ownership, token status and "another". Card types, power and toughness,
-/// controllers and every other property can move with control (an anthem, a
-/// controller-relative type change), so they are not invariant (fail closed).
+/// token status, "another", and ownership by the seat's own player or the
+/// ability's controller. Card types, power and toughness, controllers,
+/// ownership by any other player reference (which can read a live controller,
+/// e.g. `ParentTargetController`) and every other shape can move with control,
+/// so they are not proven invariant (fail closed).
 fn control_population_is_control_invariant(effect: &Effect) -> bool {
-    let target = match effect {
-        Effect::GainControl { target }
-        | Effect::GainControlAll { target }
-        | Effect::GiveControl { target, .. } => target,
-        _ => return false,
+    // Only a control-change head reaches here (`fan_out_control_boundary`).
+    // ExchangeControl's subjects are per-seat declared targets, not a fixed
+    // population: not proven invariant.
+    let (Effect::GainControl { target }
+    | Effect::GainControlAll { target }
+    | Effect::GiveControl { target, .. }) = effect
+    else {
+        return false;
     };
+    target_population_is_control_invariant(target)
+}
+
+fn target_population_is_control_invariant(target: &TargetFilter) -> bool {
+    use crate::types::ability::{ControllerRef, FilterProp, TypeFilter};
     match target {
         TargetFilter::Any
         | TargetFilter::ParentTarget
@@ -7563,23 +7576,93 @@ fn control_population_is_control_invariant(effect: &Effect) -> bool {
         | TargetFilter::TrackedSet { .. } => true,
         TargetFilter::Typed(typed) => {
             typed.controller.is_none()
-                && typed.type_filters.iter().all(|type_filter| {
-                    matches!(type_filter, crate::types::ability::TypeFilter::Permanent)
-                })
-                && typed.properties.iter().all(|property| {
-                    matches!(
-                        property,
-                        crate::types::ability::FilterProp::Owned { .. }
-                            | crate::types::ability::FilterProp::NonToken
-                            | crate::types::ability::FilterProp::Token
-                            | crate::types::ability::FilterProp::Another
-                    )
+                && typed
+                    .type_filters
+                    .iter()
+                    .all(|type_filter| matches!(type_filter, TypeFilter::Permanent))
+                && typed.properties.iter().all(|property| match property {
+                    FilterProp::Owned { controller } => {
+                        matches!(controller, ControllerRef::ScopedPlayer | ControllerRef::You)
+                    }
+                    other => matches!(
+                        other,
+                        FilterProp::NonToken | FilterProp::Token | FilterProp::Another
+                    ),
                 })
         }
-        _ => false,
+        // Not proven invariant: player selectors, composite shapes, and every
+        // reference that reads a live characteristic, controller, relation or
+        // event fact a control change can move.
+        TargetFilter::None
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SourceController
+        | TargetFilter::ControllerAndControlledPermanents { .. }
+        | TargetFilter::Opponent
+        | TargetFilter::GrantingObject { .. }
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::Not { .. }
+        | TargetFilter::Or { .. }
+        | TargetFilter::And { .. }
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::PlayerMatching { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::LastZoneChanged
+        | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
+        | TargetFilter::ChosenCard
+        | TargetFilter::TrackedSetFiltered { .. }
+        | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
+        | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::OriginalSource
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageSource
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::ChosenDamageSource { .. }
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => false,
     }
 }
 
+/// CR 608.2e + CR 611.2c: whether every node a template retains after its
+/// head is proven unable to remove, move or rebind a later seat's member
+/// before that seat's head runs (the engine runs each seat's whole template
+/// before the next seat's head). Exhaustive typed whitelist: changing tapped
+/// state only (Scrambleverse's "Untap those permanents"). A template with no
+/// retained node is trivially safe.
+fn retained_continuation_is_safe(template: &ResolvedAbility) -> bool {
+    fn node_is_safe(node: &ResolvedAbility) -> bool {
+        matches!(node.effect, Effect::SetTapState { .. })
+            && node.sub_ability.as_deref().is_none_or(node_is_safe)
+            && node.else_ability.as_deref().is_none_or(node_is_safe)
+    }
+    template.sub_ability.as_deref().is_none_or(node_is_safe)
+        && template.else_ability.as_deref().is_none_or(node_is_safe)
+}
 /// The boundary of a `player_scope` link: classified on the exact template the
 /// driver resolves per seat (`split_player_scope_chain`), so coverage and the
 /// runtime share one authority. `None` when `ability` isn't a scoped link.
