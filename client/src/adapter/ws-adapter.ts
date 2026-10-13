@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 140 — CR 603.10d control-change provenance: GameObject gains
+ *      controller_changed_turn — see PROTOCOL_VERSION's own `/// 140` entry in
+ *      crates/lobby-broker/src/protocol.rs. Look-back control-change triggers
+ *      read it, so a v139 peer resolves them differently. Wire 122 moves with it.
  * 139 — CR 702.122c per-turn crew relation: GameState gains
  *      crew_history_this_turn and FilterProp gains CrewedThisTurn — see
  *      PROTOCOL_VERSION's own `/// 139` entry in crates/lobby-broker/src/protocol.rs.
@@ -848,7 +852,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 139;
+export const PROTOCOL_VERSION = 140;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -3440,10 +3440,15 @@ fn finish_layer_evaluation(
     // the sole responsibility of `turns::start_next_turn` for the active
     // player's permanents.
     let mut controller_changed: Vec<ObjectId> = Vec::new();
+    let turn_number = state.turn_number;
     for (id, prev) in prev_controllers {
         if let Some(obj) = state.objects.get_mut(&id) {
             if obj.controller != prev {
                 obj.summoning_sick = true;
+                // CR 603.10d: the single writer of the control-change provenance
+                // look-back control-change triggers read (`trigger_matchers::
+                // changes_controller_look_back_you`).
+                obj.controller_changed_turn = Some(turn_number);
                 controller_changed.push(id);
             }
         }

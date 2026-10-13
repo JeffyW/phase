@@ -1023,7 +1023,15 @@ pub struct GameObject {
     // filters — NOT for summoning-sickness (see `summoning_sick`).
     pub entered_battlefield_turn: Option<u32>,
 
-    // CR 702.187b: Global turn on which this card was put into a graveyard as a
+    /// CR 613.1b + CR 603.10d: the last global turn on which this permanent's
+    /// controller changed, by any layer-2 change (an effect starting or
+    /// ending, a static ability starting or stopping to apply). Written only
+    /// by `layers::finish_layer_evaluation`'s controller diff. Look-back
+    /// control-change triggers read it as provenance: a source whose stamp
+    /// isn't the current turn has had the same controller for the whole turn.
+    /// Never cleared: a stale stamp only makes that proof unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_changed_turn: Option<u32>,
     // result of a discard. Used by the Mayhem keyword's "as long as you
     // discarded this card this turn" gate. Compared against the current turn
     // number at query time, so it auto-expires when the turn advances; reset to
@@ -1784,6 +1792,10 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         timestamp: _,
         incarnation: _,
         entered_battlefield_turn: _,
+        // OMITTED, SAFE BY WRITE SITE: written only by the layer-2 controller
+        // diff, i.e. exactly when the compared `controller` changes, so it is
+        // trigger provenance, not a per-iteration accumulator.
+        controller_changed_turn: _,
         discarded_turn: _,
         summoning_sick: _,
         echo_due: _,
@@ -3012,6 +3024,7 @@ impl GameObject {
             timestamp: 0,
             incarnation: 0,
             entered_battlefield_turn: None,
+            controller_changed_turn: None,
             discarded_turn: None,
             summoning_sick: false,
             echo_due: false,

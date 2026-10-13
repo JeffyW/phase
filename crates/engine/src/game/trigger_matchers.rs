@@ -3607,8 +3607,10 @@ pub(super) fn match_changes_controller(
 /// of that chain. Two facts are unambiguous there:
 ///   * the source IS the changing object: its controller before this change is
 ///     the event's `old_controller` (the loser, by construction);
-///   * the source's control didn't change anywhere in the buffer: its live
-///     controller is its controller at every event in it.
+///   * the source's control didn't change this turn (no `ControllerChanged`
+///     for it in the buffer, and no layer-2 control change stamped on it this
+///     turn — see [`source_controller_stable_this_turn`]): its live controller
+///     is its controller at every event in it.
 ///
 /// Otherwise the source changed control in the same buffer as this event, and
 /// whether it did so before, with, or after this event isn't recorded (a
@@ -3638,7 +3640,31 @@ pub(crate) fn changes_controller_look_back_you(
         {
             None
         }
-        None => Some(source_context.source_read(state).controller()),
+        None => source_controller_stable_this_turn(source_context, state),
+    }
+}
+
+/// CR 603.10d + CR 613.1b: the source's controller, when it provably held for
+/// the whole turn so far. A battlefield source's control can change through
+/// layer 2 without any `ControllerChanged` being published (an Aura's static
+/// ability starting or stopping to apply), so a missing event isn't proof; the
+/// proof is `controller_changed_turn`, stamped by the layer-2 controller diff
+/// that every control change of a permanent passes through. A stamp from this
+/// turn makes "you" unprovable: `None`, the trigger doesn't fire. A source that
+/// isn't a live battlefield object (a delayed trigger's graveyard spell, or a
+/// latched snapshot) has a controller layer 2 can't move.
+fn source_controller_stable_this_turn(
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> Option<PlayerId> {
+    match source_context.source_read(state) {
+        crate::types::game_state::TriggerSourceRead::ExactLive(object)
+            if object.zone == Zone::Battlefield
+                && object.controller_changed_turn == Some(state.turn_number) =>
+        {
+            None
+        }
+        read => Some(read.controller()),
     }
 }
 

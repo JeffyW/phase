@@ -4,9 +4,13 @@
 //! spells and the cleanup reversion.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::ability::{TargetFilter, TypedFilter};
+use engine::types::card_type::CoreType;
+use engine::types::events::GameEvent;
 use engine::types::format::FormatConfig;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -522,6 +526,29 @@ const GRAB_THE_REINS: &str = "Choose one \u{2014}\n\u{2022} Until end of turn, y
 /// P1's choice instead of taking the only candidate.
 #[test]
 fn limit_steal_then_sacrifice_never_fires_for_the_wrong_player() {
+    // Trigger reach guard: Grab the Reins' steal mode alone, with the stolen
+    // bear staying on the battlefield, does fire for P0.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P0);
+        let bear = scenario.add_vanilla(P0, 2, 2);
+        let reins = add_free_spell(&mut scenario, P1, "Grab the Reins", GRAB_THE_REINS);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+        runner.cast(reins).modes(&[0]).target_object(bear).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, bear),
+            P1,
+            "REACH: the steal mode resolved"
+        );
+        assert_eq!(
+            treasures(&runner, P0),
+            1,
+            "REACH: Zidane's trigger fires on this board when the bear stays"
+        );
+    }
     for p1_has_other in [false, true] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -586,6 +613,26 @@ const STEAL_THEN_EXILE: &str = "Gain control of target creature until end of tur
 /// false is the same steal-then-exile of a vanilla creature.
 #[test]
 fn limit_steal_then_exile_never_fires_for_the_wrong_player() {
+    // Trigger reach guard: the same steal without the exile fires for P0.
+    {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P0);
+        let victim = scenario
+            .add_creature_from_oracle(P0, "Thragtusk", 5, 3, THRAGTUSK)
+            .id();
+        let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+        runner.cast(steal).target_object(victim).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, victim), P1, "REACH: the steal resolved");
+        assert_eq!(
+            treasures(&runner, P0),
+            1,
+            "REACH: Zidane's trigger fires on this board when Thragtusk stays"
+        );
+    }
     for thragtusk in [true, false] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
@@ -628,4 +675,191 @@ fn limit_steal_then_exile_never_fires_for_the_wrong_player() {
             "thragtusk {thragtusk}: nothing fires for the thief"
         );
     }
+}
+
+/// Verbatim Oracle text (Scryfall).
+const CONTROL_MAGIC: &str = "Enchant creature\nYou control enchanted creature.";
+/// Labelled synthetic two-instruction spell.
+const STEAL_AND_DESTROY_ENCHANTMENT: &str =
+    "Gain control of target creature until end of turn. Destroy target enchantment.";
+
+/// An Aura in P1's hand: Control Magic as an enchantment card with its Enchant
+/// keyword, so it is cast and attached through the production pipeline.
+fn add_control_magic(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+    scenario
+        .add_artifact_to_hand_from_oracle(player, "Control Magic", CONTROL_MAGIC)
+        .with_subtypes(vec!["Aura"])
+        .with_mana_cost(ManaCost::zero())
+        .id()
+}
+
+fn make_enchantment_aura(runner: &mut GameRunner, aura: ObjectId) {
+    let obj = runner.state_mut().objects.get_mut(&aura).unwrap();
+    obj.card_types.core_types = vec![CoreType::Enchantment];
+    obj.base_card_types = obj.card_types.clone();
+    let enchant = Keyword::Enchant(TargetFilter::Typed(TypedFilter::creature()));
+    obj.keywords.push(enchant.clone());
+    obj.base_keywords.push(enchant);
+}
+
+/// CR 603.10d + CR 613.1b: a layer-2 control change publishes no
+/// `ControllerChanged` (Control Magic leaving), so "no event for Zidane" is no
+/// proof that its controller held. P1's Control Magic gives P1 Zidane (owned by
+/// P0). P1 then steals P0's bear and destroys Control Magic in one resolution:
+/// when the bear changed hands P1 controlled Zidane, so nothing fires for P0,
+/// although Zidane is back with P0 when triggers are collected. Paired control:
+/// Control Magic on another P0 creature, Zidane with P0 throughout → 1.
+#[test]
+fn silent_layer_two_return_of_zidane_never_fires_for_the_wrong_player() {
+    for magic_on_zidane in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P0);
+        let bear = scenario.add_vanilla(P0, 2, 2);
+        let decoy = scenario.add_vanilla(P0, 1, 1);
+        let magic = add_control_magic(&mut scenario, P1);
+        let spell = add_free_spell(
+            &mut scenario,
+            P1,
+            "Steal and Destroy Enchantment",
+            STEAL_AND_DESTROY_ENCHANTMENT,
+        );
+        let mut runner = scenario.build();
+        make_enchantment_aura(&mut runner, magic);
+        give_priority(&mut runner, P1);
+
+        let enchanted = if magic_on_zidane { zidane } else { decoy };
+        runner.cast(magic).target_object(enchanted).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, enchanted),
+            P1,
+            "REACH: Control Magic took its creature"
+        );
+        let p0_before = treasures(&runner, P0);
+
+        let outcome = runner.cast(spell).target_objects(&[bear, magic]).resolve();
+        let zidane_events = outcome
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GameEvent::ControllerChanged { object_id, .. } if *object_id == zidane
+                )
+            })
+            .count();
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, bear), P1, "REACH: the bear went to P1");
+        assert_eq!(
+            runner.state().objects[&magic].zone,
+            Zone::Graveyard,
+            "REACH: Control Magic was destroyed"
+        );
+        assert_eq!(controller(&runner, zidane), P0, "REACH: Zidane is with P0");
+        assert_eq!(
+            zidane_events, 0,
+            "REACH: Zidane's return published no ControllerChanged"
+        );
+        let expected = if magic_on_zidane { 0 } else { 1 };
+        assert_eq!(
+            treasures(&runner, P0) - p0_before,
+            expected,
+            "magic_on_zidane {magic_on_zidane}: Zidane's controller when the bear moved decides"
+        );
+        assert_eq!(treasures(&runner, P1), 0);
+    }
+}
+
+/// CR 613.1b + CR 603.10d: the control-change provenance is written by the
+/// layer-2 controller diff on every path that changes a permanent's
+/// controller: a targeted steal, an exchange, an Aura starting and stopping
+/// to apply, and the cleanup reversion.
+#[test]
+fn every_control_change_path_stamps_the_provenance() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PostCombatMain);
+    let bear = scenario.add_vanilla(P0, 2, 2);
+    let theirs = scenario.add_vanilla(P1, 2, 2);
+    let ours = scenario.add_vanilla(P0, 2, 2);
+    let magic = add_control_magic(&mut scenario, P1);
+    let treason = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let switcheroo = add_free_spell(&mut scenario, P1, "Switcheroo", SWITCHEROO);
+    let disenchant = add_free_spell(
+        &mut scenario,
+        P1,
+        "Steal and Destroy Enchantment",
+        STEAL_AND_DESTROY_ENCHANTMENT,
+    );
+    let mut runner = scenario.build();
+    make_enchantment_aura(&mut runner, magic);
+    give_priority(&mut runner, P1);
+    let turn = runner.state().turn_number;
+    let clear = |runner: &mut GameRunner, ids: &[ObjectId]| {
+        for id in ids {
+            runner
+                .state_mut()
+                .objects
+                .get_mut(id)
+                .unwrap()
+                .controller_changed_turn = None;
+        }
+    };
+    let stamp =
+        |runner: &GameRunner, id: ObjectId| runner.state().objects[&id].controller_changed_turn;
+
+    runner.cast(treason).target_object(bear).resolve();
+    assert_eq!(controller(&runner, bear), P1, "REACH: targeted steal");
+    assert_eq!(stamp(&runner, bear), Some(turn), "targeted steal stamps");
+
+    clear(&mut runner, &[theirs, ours]);
+    runner
+        .cast(switcheroo)
+        .target_objects(&[theirs, ours])
+        .resolve();
+    assert_eq!(controller(&runner, ours), P1, "REACH: exchange");
+    assert_eq!(stamp(&runner, ours), Some(turn), "exchange stamps one side");
+    assert_eq!(
+        stamp(&runner, theirs),
+        Some(turn),
+        "exchange stamps the other"
+    );
+
+    let to_enchant = theirs;
+    clear(&mut runner, &[to_enchant]);
+    runner.cast(magic).target_object(to_enchant).resolve();
+    assert_eq!(
+        controller(&runner, to_enchant),
+        P1,
+        "REACH: Aura starts to apply"
+    );
+    assert_eq!(
+        stamp(&runner, to_enchant),
+        Some(turn),
+        "Aura starting stamps"
+    );
+
+    // `ours` is only the steal half's target here (P1 already controls it).
+    clear(&mut runner, &[to_enchant]);
+    runner
+        .cast(disenchant)
+        .target_objects(&[ours, magic])
+        .resolve();
+    assert_eq!(
+        runner.state().objects[&magic].zone,
+        Zone::Graveyard,
+        "REACH: Aura destroyed"
+    );
+    assert_eq!(
+        controller(&runner, to_enchant),
+        P0,
+        "REACH: Aura stops applying"
+    );
+    assert_eq!(stamp(&runner, to_enchant), Some(turn), "Aura ending stamps");
+
+    clear(&mut runner, &[bear]);
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, bear), P0, "REACH: cleanup reversion");
+    assert_eq!(stamp(&runner, bear), Some(turn), "cleanup reversion stamps");
 }

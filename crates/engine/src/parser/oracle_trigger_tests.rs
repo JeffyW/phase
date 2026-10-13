@@ -10648,6 +10648,14 @@ fn trigger_control_change_unsupported_shapes_stay_unknown() {
             "Probe",
         ),
         (
+            "Whenever an opponent gains control of one or more permanents from you, draw a card.",
+            "Probe",
+        ),
+        (
+            "Whenever an opponent gains control of permanents from you, draw a card.",
+            "Probe",
+        ),
+        (
             "When you gain control of this enchantment from another player, draw a card.",
             "Risky Move",
         ),
