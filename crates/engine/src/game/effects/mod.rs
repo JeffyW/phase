@@ -15509,7 +15509,7 @@ fn resolve_chain_body(
     let host_effect_impossible = match &host_binding {
         crate::game::targeting::ResolutionHostBinding::Absent => true,
         crate::game::targeting::ResolutionHostBinding::Departed(bound) => {
-            !crate::game::effects::token_copy::reads_copiable_values_of_target(&bound.effect)
+            bound.effect.departed_operand_use() == crate::types::ability::DepartedOperandUse::Acts
         }
         crate::game::targeting::ResolutionHostBinding::NotApplicable
         | crate::game::targeting::ResolutionHostBinding::Bound(_) => false,

@@ -15,8 +15,10 @@
 use engine::game::combat::AttackTarget;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{Effect, TargetChoiceTiming};
+use engine::types::ability::{Effect, TargetChoiceTiming, TargetRef};
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, GameState, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, WardCost};
@@ -49,6 +51,7 @@ const OBSERVED_STASIS: &str = "Flash\nEnchant creature an opponent controls\nWhe
 const LAST_VOYAGE: &str = "When this enchantment enters, you may put a name sticker on it, then it becomes an Aura with enchant creature. Return a creature card from your graveyard to the battlefield and attach this Aura to it.\nEnchanted creature gets +2/+0 for each name sticker on this Aura with seven or fewer letters.\nWhen this Aura leaves the battlefield, sacrifice enchanted creature.";
 const PENUMBRA_UMBRA: &str = "Enchant creature you control\nWhen Penumbra Umbra is put into a graveyard from the battlefield, create a token that's a copy of enchanted creature, except the token is black.\nUmbra armor (If enchanted creature would be destroyed, instead remove all damage from it and destroy this Aura.)";
 const CAPTIVATING_GLANCE: &str = "Enchant creature\nAt the beginning of your end step, clash with an opponent. If you win, gain control of enchanted creature. Otherwise, that player gains control of enchanted creature. (Each clashing player reveals the top card of their library, then puts that card on their choice of the top or bottom. A player wins if their card had a greater mana value.)";
+const STAMINA: &str = "Enchant creature\nEnchanted creature has vigilance.\nSacrifice this Aura: Regenerate enchanted creature.";
 
 fn free_cost() -> ManaCost {
     ManaCost::Cost {
@@ -839,6 +842,188 @@ fn penumbra_umbra_copies_its_exiled_host_from_last_known_values() {
     );
 }
 
+/// Review probe F1 (CR 602.2 + CR 113.7a + CR 608.2h): Stamina, "Sacrifice this
+/// Aura: Regenerate enchanted creature." The cost moves the Aura to the
+/// graveyard before the ability is put on the stack; "enchanted creature" is
+/// still the creature it was attached to as it was sacrificed.
+#[test]
+fn stamina_sacrificed_as_cost_regenerates_its_last_known_host() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let aura = aura_on_battlefield(&mut sc, P0, "Stamina", STAMINA);
+    let mut runner = sc.build();
+    attach(&mut runner, aura, host);
+    let index = ability_index(&runner, aura, |e| matches!(e, Effect::Regenerate { .. }));
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: aura,
+            ability_index: index,
+        })
+        .expect("Stamina's ability is activated");
+    if let WaitingFor::PayCost { choices, .. } = runner.state().waiting_for.clone() {
+        runner
+            .act(GameAction::SelectCards { cards: choices })
+            .expect("the Aura is sacrificed");
+    }
+    assert_eq!(
+        runner.state().objects[&aura].zone,
+        Zone::Graveyard,
+        "reach: the cost sacrificed the Aura"
+    );
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "reach: the regeneration ability is on the stack"
+    );
+    runner.advance_until_stack_empty();
+    assert!(
+        has_regeneration_shield(&runner, host),
+        "the creature Stamina enchanted as it was sacrificed gets the shield"
+    );
+}
+
+/// Equips Cloak of the Philosopher to `bears` through its Equip ability.
+fn equip(runner: &mut GameRunner, cloak: ObjectId, bears: ObjectId) {
+    let index = ability_index(runner, cloak, |e| matches!(e, Effect::Attach { .. }));
+    runner.activate(cloak, index).target_object(bears).resolve();
+    assert_eq!(
+        runner.state().objects[&cloak].attached_to,
+        Some(AttachTarget::Object(bears)),
+        "reach: Cloak is equipped to the creature"
+    );
+}
+
+/// Review probe F2 (CR 400.7 + CR 613.7e): Cloak of the Philosopher's "{2}:
+/// Untap equipped creature." is activated, and the Cloak is destroyed in
+/// response. `blink_first`: earlier in the turn the creature was blinked (a new
+/// object) and the Cloak re-equipped to it — that earlier departure must not
+/// override the later attachment.
+fn cloak_destroyed_in_response(blink_first: bool) -> bool {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let bears = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let cloak = sc
+        .add_creature(P0, "Cloak of the Philosopher", 0, 0)
+        .as_artifact()
+        .with_subtypes(vec!["Equipment"])
+        .from_oracle_text(CLOAK_OF_THE_PHILOSOPHER)
+        .id();
+    sc.with_mana_pool(P0, pool(0, 6));
+    let mut runner = sc.build();
+    equip(&mut runner, cloak, bears);
+    if blink_first {
+        blink(&mut runner, bears);
+        let mut events = Vec::new();
+        engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
+        equip(&mut runner, cloak, bears);
+    }
+    set_tapped(&mut runner, bears, true);
+    let index = ability_index(&runner, cloak, |e| matches!(e, Effect::SetTapState { .. }));
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cloak,
+            ability_index: index,
+        })
+        .expect("the untap ability is activated");
+    // Disenchant on the Cloak, in response.
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), cloak, Zone::Graveyard, &mut events);
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "reach: the ability is still on the stack"
+    );
+    runner.advance_until_stack_empty();
+    !runner.state().objects[&bears].tapped
+}
+
+#[test]
+fn cloak_destroyed_in_response_still_untaps_its_equipped_creature() {
+    assert!(cloak_destroyed_in_response(false));
+}
+
+#[test]
+fn cloak_reequipped_after_a_blink_then_destroyed_untaps_the_returned_creature() {
+    assert!(cloak_destroyed_in_response(true));
+}
+
+/// Review probe F3 (CR 400.7 + CR 608.2h): Bind the Monster's ETB is pending on
+/// P1's 2/2 grown to 5/5, and P1 blinks the creature (a new 2/2). The tap can't
+/// happen to the departed creature and the returned one stays untapped, but "It
+/// deals damage to you equal to its power" uses the departed creature's last
+/// known power, 5.
+#[test]
+fn bind_the_monster_host_blinked_deals_its_last_known_power() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    sc.with_counter(host, CounterType::Plus1Plus1, 3);
+    let aura = aura_in_hand(&mut sc, P0, "Bind the Monster", BIND_THE_MONSTER);
+    let mut runner = sc.build();
+    runner.cast(aura).target_object(host).commit();
+    runner.act(GameAction::PassPriority).expect("pass");
+    for _ in 0..8 {
+        if runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }) {
+            break;
+        }
+        runner.act(GameAction::PassPriority).expect("pass");
+    }
+    assert!(
+        runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }),
+        "reach: the ETB trigger is on the stack"
+    );
+    assert_eq!(
+        runner.state().objects[&host].power,
+        Some(5),
+        "reach: the host is 5/5 as the trigger waits"
+    );
+    let life_before = runner.state().players[P0.0 as usize].life;
+    let departed_incarnation = runner.state().objects[&host].incarnation;
+    blink(&mut runner, host);
+    let mut events = Vec::new();
+    while !runner.state().stack.is_empty() {
+        events.extend(
+            runner
+                .act(GameAction::PassPriority)
+                .expect("priority passes")
+                .events,
+        );
+    }
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&host].power,
+        Some(2),
+        "reach: the returned creature is a new 2/2"
+    );
+    assert!(
+        !s.objects[&host].tapped,
+        "the returned creature is not tapped"
+    );
+    assert_eq!(
+        s.players[P0.0 as usize].life,
+        life_before - 5,
+        "the departed creature deals damage equal to its last known power"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            GameEvent::DamageDealt {
+                source_id,
+                target: TargetRef::Player(P0),
+                amount: 5,
+                source_incarnation: Some(incarnation),
+                ..
+            } if *source_id == host && *incarnation == departed_incarnation
+        )),
+        "CR 608.2h: the damage is dealt by the creature as it last existed, not by the returned one"
+    );
+}
+
 /// HOSTILE: the Aura leaves the battlefield while its ETB is on the stack. The
 /// instruction uses the Aura's last known information (CR 608.2h), so the
 /// creature it was attached to is still tapped.
@@ -1215,7 +1400,7 @@ fn observed_stasis_removes_attacking_host_from_combat_and_counts_its_controller(
             .expect("P1 passes priority");
     }
     let hand_before = runner.state().players[P0.0 as usize].hand.len();
-    // CR 500.4: the pool emptied as the steps changed; float ward's {2} now.
+    // CR 500.5: the pool emptied as the steps changed; float ward's {2} now.
     for unit in pool(0, 2) {
         let _ = runner.state_mut().add_mana_to_pool(P0, unit);
     }
@@ -1244,22 +1429,22 @@ fn observed_stasis_removes_attacking_host_from_combat_and_counts_its_controller(
     );
 }
 
-/// Captivating Glance at its controller's end step, with each library's top
-/// card fixed so the clash is decided: `p0_wins` puts the greater mana value on
-/// P0's library. Returns the runner after the trigger resolved.
-fn captivating_glance_clash(host_controller: PlayerId, p0_wins: bool) -> (GameRunner, ObjectId) {
+/// GainControl branch: Captivating Glance at P0's end step, enchanting P1's
+/// shrouded creature, with P0's library top card of greater mana value so P0
+/// wins the clash and gains control of the enchanted creature.
+#[test]
+fn captivating_glance_won_clash_gains_control_of_enchanted_creature() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PostCombatMain);
     let host = sc
-        .add_creature(host_controller, "Shrouded Bear", 2, 2)
+        .add_creature(P1, "Shrouded Bear", 2, 2)
         .with_keyword(Keyword::Shroud)
         .id();
     let aura = aura_on_battlefield(&mut sc, P0, "Captivating Glance", CAPTIVATING_GLANCE);
-    let (p0_mv, p1_mv) = if p0_wins { (5, 1) } else { (1, 5) };
     sc.add_spell_to_library_top(P0, "P0 Top", false)
-        .with_mana_cost(ManaCost::generic(p0_mv));
+        .with_mana_cost(ManaCost::generic(5));
     sc.add_spell_to_library_top(P1, "P1 Top", false)
-        .with_mana_cost(ManaCost::generic(p1_mv));
+        .with_mana_cost(ManaCost::generic(1));
     let mut runner = sc.build();
     attach(&mut runner, aura, host);
     runner.advance_to_phase(Phase::End);
@@ -1287,14 +1472,6 @@ fn captivating_glance_clash(host_controller: PlayerId, p0_wins: bool) -> (GameRu
         runner.state().stack.is_empty(),
         "reach: the trigger resolved"
     );
-    (runner, host)
-}
-
-/// GainControl branch: P0 wins the clash and gains control of the enchanted
-/// (shrouded) creature.
-#[test]
-fn captivating_glance_won_clash_gains_control_of_enchanted_creature() {
-    let (runner, host) = captivating_glance_clash(P1, true);
     assert_eq!(runner.state().objects[&host].controller, P0);
 }
 

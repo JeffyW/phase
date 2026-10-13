@@ -112,7 +112,8 @@ pub fn resolve(
         copy_source(state, ability, CopySourceReferent::OwnSource)
             .into_iter()
             .collect()
-    } else if reads_copiable_values_of_target(&ability.effect)
+    } else if ability.effect.departed_operand_use()
+        == crate::types::ability::DepartedOperandUse::ReadsCopiableValues
         && target_filter.contains_source_attachment_host()
     {
         // CR 303.4b + CR 301.5f + CR 608.2h + CR 707.2: "a copy of enchanted /
@@ -420,23 +421,6 @@ pub(crate) fn copies_own_source(effect: &Effect) -> bool {
             ..
         } | Effect::Myriad
             | Effect::Encore
-    )
-}
-
-/// CR 400.7 + CR 608.2h + CR 707.2: whether `effect` only READS its object
-/// operand — a token copy of it reads its copiable values — rather than acting
-/// on it. Such an operand that has since left the battlefield is still read,
-/// through its last known copiable values; every other instruction on a
-/// departed operand does nothing (CR 609.3). Deliberately narrow: an effect
-/// answers `true` here only once its handler reads a pinned departed
-/// incarnation exactly (the host branch of [`resolve`]).
-pub(crate) fn reads_copiable_values_of_target(effect: &Effect) -> bool {
-    matches!(
-        effect,
-        Effect::CopyTokenOf {
-            source_filter: None,
-            ..
-        }
     )
 }
 

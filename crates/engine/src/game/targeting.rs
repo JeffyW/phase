@@ -1767,12 +1767,17 @@ fn captured_source_ref(
 ///
 /// While the captured source incarnation is on the battlefield, its current
 /// attachment is used; once it has left, the attachment its departure record
-/// carries (last known information). Either way the host is pinned to the
-/// incarnation the source was attached to: a host that left the battlefield
-/// while the source was attached to it — recorded in the host's own departure,
-/// which lists the source's exact incarnation among its attachments — or that
-/// left after the source did, is `Departed`, never the new object that now
-/// reuses its storage id. A source attached to nothing names nothing.
+/// carries (last known information) — for an activated ability whose own cost
+/// moved its source, the departure that cost made ([`cost_moved_source_departure`]).
+/// Either way the host is pinned to the incarnation the source was attached to:
+/// a host that left the battlefield while the source was attached to it —
+/// recorded in the host's own departure, which lists the source's exact
+/// incarnation among its attachments — or that left after the source did, is
+/// `Departed`, never the new object that now reuses its storage id. A source
+/// that outlived such a departure and was attached again to the host's new
+/// incarnation (an Equipment re-equipped) names that incarnation, which its
+/// newer attachment timestamp proves (CR 613.7e). A source attached to nothing
+/// names nothing.
 pub(crate) fn source_attachment_host(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -1787,8 +1792,8 @@ pub(crate) fn source_attachment_host(
             .trigger_source_context()
             .map(|context| context.identity.reference)
     };
-    // The host's departure while this exact source incarnation was attached.
-    let host_left_with_source = |host: Option<ObjectId>| {
+    // The host's departure while the battlefield incarnation `source` was attached.
+    let host_left_with = |source: ObjectIncarnationRef, host: Option<ObjectId>| {
         records.iter().rev().find(|record| {
             left_battlefield(record)
                 && host.is_none_or(|host| record.object_id == host)
@@ -1807,7 +1812,7 @@ pub(crate) fn source_attachment_host(
         Some(object) => {
             let host = object.attached_to.and_then(|target| target.as_object())?;
             let host_object = state.objects.get(&host)?;
-            let left_while_attached = host_left_with_source(Some(host));
+            let left_while_attached = host_left_with(source, Some(host));
             // Still the object the source is attached to: it never left while
             // attached, or the source was re-attached to its new incarnation.
             if host_object.zone == Zone::Battlefield
@@ -1823,13 +1828,23 @@ pub(crate) fn source_attachment_host(
                 .map(AttachmentHost::Departed)
         }
         None => {
-            let departure_index = records.iter().rposition(|record| {
-                record.object_id == source.object_id
-                    && left_battlefield(record)
-                    && departed_ref(record) == Some(source)
-            });
-            let host = departure_index
-                .and_then(|index| records[index].attached_to)
+            // The source's battlefield departure: the record that moved the
+            // captured incarnation off the battlefield, or — when an activated
+            // ability's cost moved its source before the incarnation was
+            // captured — the departure that produced the captured incarnation.
+            let departure_index = records
+                .iter()
+                .rposition(|record| {
+                    record.object_id == source.object_id
+                        && left_battlefield(record)
+                        && departed_ref(record) == Some(source)
+                })
+                .or_else(|| cost_moved_source_departure(records, ability, source));
+            let departure = departure_index.map(|index| &records[index]);
+            // The source as it was on the battlefield, attached to its host.
+            let battlefield_source = departure.and_then(departed_ref).unwrap_or(source);
+            let host = departure
+                .and_then(|record| record.attached_to)
                 .and_then(|target| target.as_object())
                 .or_else(|| {
                     ability
@@ -1838,12 +1853,8 @@ pub(crate) fn source_attachment_host(
                         .and_then(|context| context.attached_to)
                         .and_then(|target| target.as_object())
                 });
-            if let Some(record) = host_left_with_source(host) {
-                return departed_ref(record).map(AttachmentHost::Departed);
-            }
-            let host = host?;
             // A host that left after the source did is a new object now.
-            if let Some(record) = departure_index.and_then(|index| {
+            if let Some(record) = departure_index.zip(host).and_then(|(index, host)| {
                 records
                     .iter()
                     .skip(index + 1)
@@ -1851,6 +1862,23 @@ pub(crate) fn source_attachment_host(
             }) {
                 return departed_ref(record).map(AttachmentHost::Departed);
             }
+            if let Some(record) = host_left_with(battlefield_source, host) {
+                // CR 613.7e: attaching draws a new timestamp. A source that
+                // survived its host's departure (Equipment) and was attached
+                // again to the host's new incarnation carries a timestamp newer
+                // than that incarnation's; otherwise its last attachment was to
+                // the departed incarnation.
+                let reattached_to_current = departure
+                    .and_then(|record| record.trigger_source_context())
+                    .zip(host.and_then(|host| state.objects.get(&host)))
+                    .is_some_and(|(context, host)| {
+                        host.zone == Zone::Battlefield && context.timestamp > host.timestamp
+                    });
+                if !reattached_to_current {
+                    return departed_ref(record).map(AttachmentHost::Departed);
+                }
+            }
+            let host = host?;
             state
                 .objects
                 .get(&host)
@@ -1858,6 +1886,42 @@ pub(crate) fn source_attachment_host(
                 .map(|object| AttachmentHost::Live(ObjectIncarnationRef::from_object(object)))
         }
     }
+}
+
+/// CR 602.2 + CR 113.6 + CR 113.7a + CR 400.7: an activated ability of an Aura
+/// or Equipment is activated while its source is on the battlefield (CR 113.6)
+/// and put on the stack after its cost is paid, so when that cost moved its
+/// own source ("Sacrifice this Aura:"), the incarnation it captured is the
+/// moved object's. The source it was activated from is the incarnation that
+/// move took off the battlefield: the source's last zone change before the
+/// captured incarnation itself moved, when that change left the battlefield.
+fn cost_moved_source_departure(
+    records: &im::Vector<crate::types::game_state::ZoneChangeRecord>,
+    ability: &ResolvedAbility,
+    captured: ObjectIncarnationRef,
+) -> Option<usize> {
+    if ability.trigger_source.is_some()
+        || ability.kind != crate::types::ability::AbilityKind::Activated
+    {
+        return None;
+    }
+    let captured_moved_at = records
+        .iter()
+        .position(|record| {
+            record.object_id == captured.object_id
+                && record
+                    .trigger_source_context()
+                    .is_some_and(|context| context.identity.reference == captured)
+        })
+        .unwrap_or(records.len());
+    let index = records
+        .iter()
+        .take(captured_moved_at)
+        .enumerate()
+        .filter(|(_, record)| record.object_id == captured.object_id)
+        .map(|(index, _)| index)
+        .last()?;
+    (records[index].from_zone == Some(Zone::Battlefield)).then_some(index)
 }
 
 /// CR 301.5a + CR 301.5f + CR 303.4b + CR 115.10a: an untargeted "equipped
