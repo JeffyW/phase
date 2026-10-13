@@ -7489,12 +7489,14 @@ pub(crate) enum FanOutControlBoundary {
     NoControl,
     /// The template's only control-change action is its head, the first action
     /// every seat performs, so the board before the first seat is its
-    /// immediately-before board. Selections it makes (targets, choices) are
-    /// made against that board; nothing mutates before it.
+    /// immediately-before board, and its population is the one fixed when the
+    /// action began (CR 611.2c): either no settle can happen between seats, or
+    /// the population reads only control-invariant facts.
     Head,
-    /// More than one control-change action, or one behind a retained prefix
-    /// that can mutate first: no single pre-seat capture is the boundary of
-    /// every seat's action. Fails closed: `Unrecorded` evidence at runtime, and
+    /// More than one control-change action, one behind a retained prefix that
+    /// can mutate first, or a head whose later seats can settle and then read a
+    /// population an earlier seat's control change altered: no single pre-seat
+    /// capture is the boundary of every seat's action. Fails closed: `Unrecorded` evidence at runtime, and
     /// coverage marks the producer unsupported
     /// (`coverage::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP`).
     Unobservable,
@@ -7506,8 +7508,75 @@ pub(crate) fn fan_out_control_boundary(template: &ResolvedAbility) -> FanOutCont
         control_change_node_count(template),
     ) {
         (_, 0) => FanOutControlBoundary::NoControl,
-        (true, 1) => FanOutControlBoundary::Head,
+        (true, 1)
+            if !(seats_can_settle_between(template)
+                && !control_population_is_control_invariant(&template.effect)) =>
+        {
+            FanOutControlBoundary::Head
+        }
         _ => FanOutControlBoundary::Unobservable,
+    }
+}
+
+/// CR 608.2e: whether layers can settle between one seat's application of the
+/// template and the next seat's. The engine applies the simultaneous action
+/// seat by seat; an earlier seat's control change only reaches the board a
+/// later seat reads (characteristics, controllers) once layers are settled,
+/// which happens at a pause (an optional seat, a per-seat target choice), at a
+/// retained following node (the chain-link settle), or when a "for as long as"
+/// duration begins.
+fn seats_can_settle_between(template: &ResolvedAbility) -> bool {
+    template.optional
+        || template.sub_ability.is_some()
+        || template.else_ability.is_some()
+        || template
+            .duration
+            .as_ref()
+            .is_some_and(crate::types::ability::Duration::is_for_as_long_as)
+        || matches!(
+            template.effect,
+            Effect::GainControl { .. }
+                | Effect::GiveControl { .. }
+                | Effect::ExchangeControl { .. }
+        )
+}
+
+/// CR 611.2c: whether the control action's affected set reads only facts no
+/// earlier seat's control change can alter, so a later seat that reads it after
+/// a settle still finds the population fixed when the action began: a context
+/// or chosen reference, or a typed population of permanents bounded only by
+/// ownership, token status and "another". Card types, power and toughness,
+/// controllers and every other property can move with control (an anthem, a
+/// controller-relative type change), so they are not invariant (fail closed).
+fn control_population_is_control_invariant(effect: &Effect) -> bool {
+    let target = match effect {
+        Effect::GainControl { target }
+        | Effect::GainControlAll { target }
+        | Effect::GiveControl { target, .. } => target,
+        _ => return false,
+    };
+    match target {
+        TargetFilter::Any
+        | TargetFilter::ParentTarget
+        | TargetFilter::SelfRef
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::TrackedSet { .. } => true,
+        TargetFilter::Typed(typed) => {
+            typed.controller.is_none()
+                && typed.type_filters.iter().all(|type_filter| {
+                    matches!(type_filter, crate::types::ability::TypeFilter::Permanent)
+                })
+                && typed.properties.iter().all(|property| {
+                    matches!(
+                        property,
+                        crate::types::ability::FilterProp::Owned { .. }
+                            | crate::types::ability::FilterProp::NonToken
+                            | crate::types::ability::FilterProp::Token
+                            | crate::types::ability::FilterProp::Another
+                    )
+                })
+        }
+        _ => false,
     }
 }
 

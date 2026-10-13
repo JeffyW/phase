@@ -7341,9 +7341,12 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
 /// The coverage label for an ability whose per-player fan-out ("each player
 /// …", "each target player …") performs a control-change action that can't
 /// share one immediately-before boundary across its seats: more than one
-/// control-change action in the per-seat template, or one behind a retained
-/// prefix. CR 608.2e processes each action simultaneously for every player,
-/// and CR 603.10d look-back control-change triggers need that action's
+/// control-change action in the per-seat template, one behind a retained
+/// prefix, or one whose later seats can settle (a pause, a per-seat choice, a
+/// retained following node) and then read a population an earlier seat's
+/// control change altered (CR 611.2c: the affected set is fixed when the
+/// action begins). CR 608.2e processes each action simultaneously for every
+/// player, and CR 603.10d look-back control-change triggers need that action's
 /// immediately-before board; the runtime publishes such changes with
 /// `Unrecorded` evidence, so the producer is unsupported and fails closed.
 /// Classified by `effects::player_scope_control_boundary` /
@@ -13743,14 +13746,6 @@ mod tests {
                  control of each permanent for which they were chosen. Untap those permanents.",
             ),
             (
-                "Inniaz, the Gale Force",
-                "Creature",
-                "Flying\n{2}{W/U}: Attacking creatures with flying get +1/+1 until end of turn. \
-                 ({W/U} can be paid with either {W} or {U}.)\nWhenever three or more creatures \
-                 you control with flying attack, each player gains control of a nonland \
-                 permanent of your choice controlled by the player to their right.",
-            ),
-            (
                 "Dack Fayden, Helping Hand",
                 "Creature",
                 "When Dack Fayden enters, reveal cards from the top of your library until you \
@@ -13759,14 +13754,6 @@ mod tests {
                  the rest of the game. For each of those permanents, choose a different \
                  opponent. Each opponent gains control of the permanent for which they were \
                  chosen.",
-            ),
-            (
-                "Seize the Spotlight",
-                "Sorcery",
-                "Each opponent chooses fame or fortune. For each player who chose fame, gain \
-                 control of a creature that player controls until end of turn. Untap those \
-                 creatures and they gain haste until end of turn. For each player who chose \
-                 fortune, you draw a card and create a Treasure token.",
             ),
             (
                 "Optional Homeward (synthetic, the probe fixture)",
@@ -13831,6 +13818,56 @@ mod tests {
         }
     }
 
+    /// CR 611.2c + CR 608.2e: the printed scoped producers whose later seats can
+    /// settle (a per-seat choice, a retained following node) and then read a
+    /// population an earlier seat's control change can alter (card types,
+    /// controllers) fail closed: coverage marks them unsupported, and Zidane
+    /// doesn't trigger on their changes.
+    #[test]
+    fn printed_scoped_producers_with_a_shifting_population_are_unsupported() {
+        for (name, types, text) in [
+            (
+                "Inniaz, the Gale Force",
+                "Creature",
+                "Flying\n{2}{W/U}: Attacking creatures with flying get +1/+1 until end of turn. \
+                 ({W/U} can be paid with either {W} or {U}.)\nWhenever three or more creatures \
+                 you control with flying attack, each player gains control of a nonland \
+                 permanent of your choice controlled by the player to their right.",
+            ),
+            (
+                "Seize the Spotlight",
+                "Sorcery",
+                "Each opponent chooses fame or fortune. For each player who chose fame, gain \
+                 control of a creature that player controls until end of turn. Untap those \
+                 creatures and they gain haste until end of turn. For each player who chose \
+                 fortune, you draw a card and create a Treasure token.",
+            ),
+        ] {
+            let parsed =
+                crate::parser::parse_oracle_text(text, name, &[], &[types.to_string()], &[]);
+            let mut missing = Vec::new();
+            super::check_abilities(
+                &parsed.abilities,
+                &super::build_trigger_registry(),
+                &super::build_static_registry(),
+                super::TokenStaticTraversal::Include,
+                &mut missing,
+            );
+            super::check_triggers(
+                &parsed.triggers,
+                &super::build_trigger_registry(),
+                &super::build_static_registry(),
+                super::TokenStaticTraversal::Include,
+                &mut missing,
+            );
+            assert!(
+                missing
+                    .iter()
+                    .any(|label| label == super::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP),
+                "{name}: the production coverage walk marks it: {missing:?}"
+            );
+        }
+    }
     /// CR 608.2e + CR 603.10d: a control action retained behind a scoped prefix
     /// ("each player may <X> and gain control of …": the optional clause keeps
     /// its continuation in the seat) has no single pre-seat boundary, so the

@@ -547,7 +547,7 @@ fn homeward_after_switcheroo_is_simultaneous_in_both_apnap_orders() {
 /// fan-out pauses on each seat's choice and resumes from a parked
 /// continuation (CR 608.2e: the choices are made in APNAP order, then the
 /// action is processed for every player at once).
-const OPTIONAL_HOMEWARD: &str = "Each player may gain control of all creatures they own.";
+const OPTIONAL_HOMEWARD: &str = "Each player may gain control of all nontoken permanents they own.";
 
 /// C2: a parked seat publishes against the link's pre-seat capture. Same board
 /// and expectation as Homeward Path: P1 lost Zidane (P1 +1); P0 didn't control
@@ -1567,4 +1567,128 @@ fn head_capture_two_losses_in_one_scoped_action() {
         "P1 lost the Aura and the creature in one action"
     );
     assert_eq!((treasures(&runner, P0), treasures(&runner, P2)), (0, 0));
+}
+
+/// Verbatim Oracle text (Scryfall), Trostani Discordant (1/4).
+const TROSTANI: &str = "Other creatures you control get +1/+1.\nWhen Trostani enters, create \
+    two 1/1 white Soldier creature tokens with lifelink.\nAt the beginning of your end step, \
+    each player gains control of all creatures they own.";
+/// Labelled synthetic for the R4-1 probe: a power-bounded "each player may".
+const RETURN_SMALL_CREATURES: &str =
+    "Each player may gain control of all creatures they own with power 3 or less.";
+
+fn power(runner: &GameRunner, id: ObjectId) -> i32 {
+    runner.state().objects[&id].power.unwrap_or_default()
+}
+
+/// R4-1 (CR 611.2c + CR 608.2e): DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not
+/// rules-correct counts. The affected set of "each player may gain control of
+/// all creatures they own with power 3 or less" is fixed when the action
+/// begins, but the engine applies it seat by seat and settles between seats
+/// (each seat's "may" pauses), so a later seat reads a population an earlier
+/// seat's control change altered: P1 controls P0's Trostani and P2's creature;
+/// P0's seat takes Trostani back, the anthem leaves, and P2's seat then finds
+/// its creature at power 3. Probed at 0376d8d75 (before this class failed
+/// closed): `base_power` 3 gave P1 +2 and moved the creature to P2, where the
+/// rules give P1 +1 and leave it with P1.
+///
+/// Such a producer (a pausing or settling head whose population reads more
+/// than control-invariant facts) is unsupported in coverage, and its changes
+/// publish `Unrecorded`, so Zidane never fires for them, for any player. This
+/// pins that, with reach guards; the creature's own move is the engine's
+/// pre-existing seat-by-seat population (reported separately).
+#[test]
+fn shifting_population_scoped_producer_fails_closed() {
+    for base_power in [3, 2] {
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P1);
+        let trostani = scenario
+            .add_creature_from_oracle(P0, "Trostani Discordant", 1, 4, TROSTANI)
+            .id();
+        let p2_creature = scenario.add_vanilla(P2, base_power, base_power);
+        let steal_trostani = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let steal_creature = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let returns = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Return Small Creatures",
+                true,
+                RETURN_SMALL_CREATURES,
+            )
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+
+        give_priority(&mut runner, P1);
+        runner
+            .cast(steal_trostani)
+            .target_object(trostani)
+            .resolve();
+        runner.advance_until_stack_empty();
+        runner
+            .cast(steal_creature)
+            .target_object(p2_creature)
+            .resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, trostani),
+            P1,
+            "REACH: P1 controls Trostani"
+        );
+        assert_eq!(power(&runner, trostani), 1, "REACH: Trostani has power 1");
+        assert_eq!(
+            controller(&runner, p2_creature),
+            P1,
+            "REACH: P1 controls P2's creature"
+        );
+        assert_eq!(
+            power(&runner, p2_creature),
+            base_power + 1,
+            "REACH: P1's anthem pumps P2's creature"
+        );
+        assert_eq!(power(&runner, zidane), 4, "REACH: P1's anthem pumps Zidane");
+        let before = (
+            treasures(&runner, P0),
+            treasures(&runner, P1),
+            treasures(&runner, P2),
+        );
+
+        give_priority(&mut runner, P0);
+        cast_and_pass(&mut runner, returns);
+        assert!(
+            runner.state().control_change_captures.is_empty(),
+            "the class takes no pre-seat capture: it fails closed"
+        );
+        answer_optional(&mut runner); // P0's seat: Trostani returns.
+        assert_eq!(
+            controller(&runner, trostani),
+            P0,
+            "REACH: P0 took Trostani back"
+        );
+        assert_eq!(
+            power(&runner, p2_creature),
+            base_power,
+            "REACH: the anthem left P1 before P2's seat"
+        );
+        for _ in 0..2 {
+            if matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { .. }
+            ) {
+                answer_optional(&mut runner);
+            }
+        }
+        runner.advance_until_stack_empty();
+        let after = (
+            treasures(&runner, P0),
+            treasures(&runner, P1),
+            treasures(&runner, P2),
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (0, 0, 0),
+            "base_power {base_power}: the class fires for no player"
+        );
+    }
 }
