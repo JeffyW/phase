@@ -1980,6 +1980,75 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
     )
 }
 
+/// Whether an ability's printed clauses say "target" anywhere: a host reference
+/// written as "target enchanted creature" stays targeted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrintedTargetWord {
+    Present,
+    Absent,
+}
+
+impl PrintedTargetWord {
+    pub(crate) fn from_clauses(clauses: &[ClauseIr]) -> Self {
+        let present = clauses.iter().any(|clause| {
+            nom_primitives::scan_contains(
+                &clause
+                    .source
+                    .fragment()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                "target ",
+            )
+        });
+        if present {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+/// CR 115.10a + CR 115.1b + CR 303.4b + CR 303.4m + CR 301.5f: "enchanted
+/// creature" / "equipped creature" in an Aura's or Equipment's own instruction
+/// names whatever the source is attached to. Unless the text says "target", the
+/// host is affected, not targeted: it claims no announcement slot, so it never
+/// "becomes the target" (ward, CR 702.21a) and shroud/hexproof can't stop the
+/// instruction. The runtime binds the host as the instruction resolves
+/// (`targeting::bind_resolution_attachment_hosts`).
+///
+/// Applied to the card's own fully composed ability (after every document
+/// relation), and only when the host instruction is the whole ability — one
+/// node, nothing before or after it (a later sentence that only modifies it,
+/// "That creature can't be regenerated.", folds into the same node). Without a
+/// provable host it then does nothing, exactly as the targeted form did when its
+/// only target was illegal (CR 608.2b). Instructions that precede or follow it
+/// read or depend on that host in ways the targeted form settled by fizzling
+/// the whole ability, so such chains keep their stack-time target (the
+/// followers of a host reference are follow-up work). Donor shapes ("becomes a
+/// copy of", "gains all activated abilities of" the host) also keep theirs.
+pub(crate) fn convert_terminal_attachment_host_reference(
+    def: &mut AbilityDefinition,
+    printed: PrintedTargetWord,
+) {
+    if def.sub_ability.is_some()
+        || def.else_ability.is_some()
+        || def.modal.is_some()
+        || !def.mode_abilities.is_empty()
+        || def.target_choice_timing != TargetChoiceTiming::Stack
+        || def.effect.attachment_host_slot() != crate::types::ability::AttachmentHostSlot::Operand
+    {
+        return;
+    }
+    if printed == PrintedTargetWord::Absent
+        && def
+            .effect
+            .target_filter()
+            .is_some_and(TargetFilter::contains_source_attachment_host)
+    {
+        def.target_choice_timing = TargetChoiceTiming::Resolution;
+    }
+}
+
 /// The clause's target-choice timing from its parsed effect and printed fragment; the
 /// compound splitter's continuation has no `ClauseIr` of its own.
 pub(super) fn target_choice_timing_for_parsed(
