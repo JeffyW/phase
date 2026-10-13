@@ -3175,6 +3175,54 @@ struct ProofSource {
     /// Each admitted ability's shared-resource legs; any one may be the one
     /// activated, so the proof budgets for the most demanding.
     ability_legs: Vec<Vec<mana_abilities::ManaCostResourceLeg>>,
+    /// Some admitted ability's output is sized or colored by the board.
+    board_sized: bool,
+    /// Some admitted ability's cost moves or taps an object.
+    moves_objects: bool,
+}
+
+/// CR 106.1 + CR 605.1a: What an activation's mana output depends on, for a
+/// payment proof (whose plan is an unordered set of activations).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProofOutput {
+    /// The same mana whenever it's activated: a literal output, or a fixed
+    /// count of fixed color options.
+    Constant,
+    /// Fixed at activation from the board (Nyx Lotus's devotion; colors among
+    /// permanents). Reliable only while no other activation in the plan moves
+    /// an object it may count.
+    BoardSized,
+    /// Sized by X or by the object its own cost chose (Soldevi Adnate's
+    /// "equal to the sacrificed creature's mana value"), or by a trigger
+    /// event: never proven.
+    Variable,
+}
+
+fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOutput {
+    let by_count = |count: &QuantityExpr, fixed_colors: bool| match count {
+        QuantityExpr::Fixed { .. } if fixed_colors => ProofOutput::Constant,
+        QuantityExpr::Fixed { .. } => ProofOutput::BoardSized,
+        _ if count.contains_x() || cost_moves_objects => ProofOutput::Variable,
+        _ => ProofOutput::BoardSized,
+    };
+    match produced {
+        ManaProduction::Fixed { .. }
+        | ManaProduction::Mixed { .. }
+        | ManaProduction::ChoiceAmongCombinations { .. } => ProofOutput::Constant,
+        ManaProduction::Colorless { count }
+        | ManaProduction::AnyOneColor { count, .. }
+        | ManaProduction::AnyCombination { count, .. }
+        | ManaProduction::ChosenColor { count, .. }
+        | ManaProduction::AnyInCommandersColorIdentity { count, .. } => by_count(count, true),
+        ManaProduction::NotedType { count }
+        | ManaProduction::OpponentLandColors { count }
+        | ManaProduction::AnyCombinationOfObjectColors { count, .. }
+        | ManaProduction::AnyTypeProduceableBy { count, .. }
+        | ManaProduction::AnyOneColorAmongPermanents { count, .. } => by_count(count, false),
+        ManaProduction::ChoiceAmongExiledColors { .. }
+        | ManaProduction::DistinctColorsAmongPermanents { .. } => ProofOutput::BoardSized,
+        ManaProduction::TriggerEventManaType => ProofOutput::Variable,
+    }
 }
 
 impl ProofSource {
@@ -3213,8 +3261,12 @@ impl ProofSource {
             .unwrap_or(0)
     }
 
-    fn spends_shared_resources(&self) -> bool {
+    /// Whether a plan may want to leave this source out: it spends a shared
+    /// resource, or its output and another source's cost can't share a plan.
+    fn contends(&self) -> bool {
         self.ability_legs.iter().any(|legs| !legs.is_empty())
+            || self.board_sized
+            || self.moves_objects
     }
 }
 
@@ -3237,6 +3289,14 @@ const MAX_PROOF_SETS: usize = 4096;
 /// fit the life total. Sufficient, not necessary: each source is budgeted for
 /// its most demanding admitted ability.
 fn proof_plan_is_affordable(plan: &[&ProofSource], life: u32) -> bool {
+    // A board-sized output (Nyx Lotus's devotion) is fixed at activation, but
+    // an unordered plan can't show it activates before another planned cost
+    // sacrifices, exiles, bounces or taps an object it counts.
+    if plan.iter().any(|source| source.board_sized)
+        && plan.iter().any(|source| source.moves_objects)
+    {
+        return false;
+    }
     if plan.iter().map(|source| source.life_demand()).sum::<u32>() > life {
         return false;
     }
@@ -3303,17 +3363,30 @@ pub(crate) fn manual_mana_payment_is_proven(
             if object.controller != player {
                 return None;
             }
-            let ability_legs: Vec<Option<Vec<mana_abilities::ManaCostResourceLeg>>> = object
+            // Each payment mana ability the proof admits: its cost modelled
+            // exactly, and its output fixed (Constant), or board-sized with a
+            // cost that moves nothing (an unordered plan can't show it is read
+            // before its own cost changes the board).
+            let admitted: Vec<Option<(mana_abilities::ManaCostProofShape, ProofOutput)>> = object
                 .abilities
                 .iter()
                 .map(|ability| {
-                    is_payment_mana_ability(ability)
-                        .then(|| {
-                            mana_abilities::mana_ability_cost_resource_legs(
-                                state, player, id, ability,
-                            )
-                        })
-                        .flatten()
+                    let Effect::Mana { produced, .. } = &*ability.effect else {
+                        return None;
+                    };
+                    if !is_payment_mana_ability(ability) {
+                        return None;
+                    }
+                    let shape = mana_abilities::mana_ability_cost_resource_legs(
+                        state, player, id, ability,
+                    )?;
+                    match proof_output(produced, shape.moves_objects) {
+                        ProofOutput::Variable => None,
+                        ProofOutput::BoardSized if shape.moves_objects => None,
+                        output @ (ProofOutput::Constant | ProofOutput::BoardSized) => {
+                            Some((shape, output))
+                        }
+                    }
                 })
                 .collect();
             let profiles = activatable_mana_profiles_for_object_with(
@@ -3321,20 +3394,24 @@ pub(crate) fn manual_mana_payment_is_proven(
                 id,
                 player,
                 payment_context,
-                |index, _| ability_legs.get(index).is_some_and(Option::is_some),
+                |index, _| admitted.get(index).is_some_and(Option::is_some),
             );
             let capacity = profiles.first()?.capacity;
+            let admitted: Vec<_> = admitted.into_iter().flatten().collect();
             Some(ProofSource {
                 object_id: id,
                 capacity,
                 kinds: profiles.into_iter().map(|profile| profile.kind).collect(),
-                ability_legs: ability_legs.into_iter().flatten().collect(),
+                board_sized: admitted
+                    .iter()
+                    .any(|(_, output)| *output == ProofOutput::BoardSized),
+                moves_objects: admitted.iter().any(|(shape, _)| shape.moves_objects),
+                ability_legs: admitted.into_iter().map(|(shape, _)| shape.legs).collect(),
             })
         })
         .collect();
-    let (contenders, free): (Vec<&ProofSource>, Vec<&ProofSource>) = sources
-        .iter()
-        .partition(|source| source.spends_shared_resources());
+    let (contenders, free): (Vec<&ProofSource>, Vec<&ProofSource>) =
+        sources.iter().partition(|source| source.contends());
 
     let covers = |plan: &[&ProofSource]| -> bool {
         let grouped: Vec<(ObjectId, u32, Vec<ActivatableManaProfileKind>)> = plan

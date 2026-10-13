@@ -5516,6 +5516,9 @@ struct SharedLegKinds {
     sacrifice: usize,
     tap: usize,
     life: u32,
+    /// The source itself leaves the battlefield (sacrificed, exiled or
+    /// returned) as part of the cost.
+    moves_source: bool,
 }
 
 /// Whether every component of `cost` is one a payment proof models exactly:
@@ -5529,7 +5532,10 @@ fn cost_components_are_modelled(cost: &AbilityCost, kinds: &mut SharedLegKinds) 
         AbilityCost::Sacrifice(SacrificeCost {
             target: TargetFilter::SelfRef,
             ..
-        }) => true,
+        }) => {
+            kinds.moves_source = true;
+            true
+        }
         AbilityCost::Sacrifice(SacrificeCost {
             requirement: SacrificeRequirement::Count { .. },
             ..
@@ -5555,7 +5561,10 @@ fn cost_components_are_modelled(cost: &AbilityCost, kinds: &mut SharedLegKinds) 
         AbilityCost::Exile {
             filter: Some(TargetFilter::SelfRef),
             ..
-        } => true,
+        } => {
+            kinds.moves_source = true;
+            true
+        }
         AbilityCost::Exile { zone, filter, .. } => {
             kinds.exile += 1;
             matches!(
@@ -5573,7 +5582,10 @@ fn cost_components_are_modelled(cost: &AbilityCost, kinds: &mut SharedLegKinds) 
         AbilityCost::ReturnToHand {
             filter: Some(TargetFilter::SelfRef),
             ..
-        } => true,
+        } => {
+            kinds.moves_source = true;
+            true
+        }
         AbilityCost::Composite { costs } => costs
             .iter()
             .all(|cost| cost_components_are_modelled(cost, kinds)),
@@ -5612,6 +5624,18 @@ fn cost_components_are_modelled(cost: &AbilityCost, kinds: &mut SharedLegKinds) 
     }
 }
 
+/// A mana ability's cost as a payment proof models it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManaCostProofShape {
+    /// The shared-resource legs, each with the objects its prompt offers.
+    pub(crate) legs: Vec<ManaCostResourceLeg>,
+    /// Paying the cost changes some object's place or state: an object leg's
+    /// choice (discarded, exiled, sacrificed, tapped) or the source leaving
+    /// the battlefield. An output that counts objects can't be relied on beside
+    /// such a cost.
+    pub(crate) moves_objects: bool,
+}
+
 /// CR 118.3 + CR 601.2h + CR 605.3a: The shared-resource legs of a mana
 /// ability's cost, each with the exact objects its payment prompt would offer
 /// now, for a payment proof that must not spend one object or point of life
@@ -5623,7 +5647,7 @@ pub(crate) fn mana_ability_cost_resource_legs(
     player: PlayerId,
     source_id: ObjectId,
     ability: &AbilityDefinition,
-) -> Option<Vec<ManaCostResourceLeg>> {
+) -> Option<ManaCostProofShape> {
     let mut kinds = SharedLegKinds::default();
     if let Some(cost) = &ability.cost {
         if !cost_components_are_modelled(cost, &mut kinds) {
@@ -5692,7 +5716,12 @@ pub(crate) fn mana_ability_cost_resource_legs(
     if kinds.life > 0 {
         legs.push(ManaCostResourceLeg::Life { amount: kinds.life });
     }
-    Some(legs)
+    let moves_objects =
+        kinds.moves_source || kinds.discard + kinds.exile + kinds.sacrifice > 0 || kinds.tap > 0;
+    Some(ManaCostProofShape {
+        legs,
+        moves_objects,
+    })
 }
 
 /// CR 118.3 + CR 608.2h: The objects a mana ability's exile or sacrifice cost

@@ -21972,6 +21972,37 @@ fn spell_cost_residual_after_pool(
     ))
 }
 
+/// CR 601.2b + CR 601.2f-h: Whether casting `spell` still owes a cost beyond
+/// its mana on any carrier of the cast (the live `pending_cast`, or one parked
+/// in a prompt): a deferred random discard or sacrifice, a required additional
+/// cost or additional-cost step not yet processed, or a printed additional cost
+/// on the spell itself or granted to it (which a carrier built before
+/// additional-cost processing doesn't show yet).
+fn cast_has_outstanding_cost_obligation(
+    state: &GameState,
+    player: PlayerId,
+    spell: ObjectId,
+) -> bool {
+    let carrier_owes = |pending: &PendingCast| {
+        pending.object_id == spell
+            && (pending.deferred_random_discard_cost.is_some()
+                || !pending.deferred_sacrificed_permanents.is_empty()
+                || pending.deferred_required_additional_cost.is_some()
+                || pending.additional_cost_flow.is_some()
+                || !pending.additional_cost_queue.is_empty())
+    };
+    state.pending_cast.as_deref().is_some_and(carrier_owes)
+        || state
+            .waiting_for
+            .pending_cast_ref()
+            .is_some_and(carrier_owes)
+        || state
+            .objects
+            .get(&spell)
+            .is_some_and(|object| object.additional_cost.is_some())
+        || !casting_costs::build_effective_additional_cost_queue(state, player, spell).is_empty()
+}
+
 /// How far [`manual_mana_payment_route`] goes. The castability gate needs only
 /// whether the route is `Infeasible`, so it skips the proof search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22055,16 +22086,22 @@ fn manual_mana_payment_route(
         RouteDepth::Feasibility => ManualPaymentRoute::Plausible,
         // CR 118.3 + CR 119.4: the optimistic planner lets two activations
         // spend the same card, permanent or life; only an affordable,
-        // exactly modelled activation set proves the payment.
+        // exactly modelled activation set proves the payment. CR 601.2b +
+        // CR 601.2h: a cast that still owes another cost (an additional cost
+        // not yet processed, or a deferred discard or sacrifice) may need the
+        // same cards or permanents, so its payment is never proven.
         RouteDepth::Proof => {
-            if super::mana_sources::manual_mana_payment_is_proven(
-                state,
-                player,
-                source_id,
-                spell_ctx.as_ref(),
-                residual_shards,
-                residual_generic,
-            ) {
+            if !source_id
+                .is_some_and(|spell| cast_has_outstanding_cost_obligation(state, player, spell))
+                && super::mana_sources::manual_mana_payment_is_proven(
+                    state,
+                    player,
+                    source_id,
+                    spell_ctx.as_ref(),
+                    residual_shards,
+                    residual_generic,
+                )
+            {
                 ManualPaymentRoute::Proven
             } else {
                 ManualPaymentRoute::Plausible

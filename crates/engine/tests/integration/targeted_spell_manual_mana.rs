@@ -1237,3 +1237,140 @@ fn many_discard_sources_do_not_hide_a_cast_one_of_them_pays() {
         );
     }
 }
+
+/// Probe R6 board: "Exile a card from your hand: Add {B}" (labelled
+/// infrastructure fixture), a targeted {B} spell with "As an additional cost
+/// to cast this spell, discard a card at random.", and `other_cards` other
+/// cards in hand. With `swamp`, a Swamp instead of the exile source.
+fn random_discard_spell_board(other_cards: usize, swamp: bool) -> (GameRunner, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    if swamp {
+        sc.add_basic_land(P0, ManaColor::Black);
+    } else {
+        sc.add_creature(P0, "Hand-Exile Mana Source", 0, 3)
+            .with_ability_definition(exile_from_hand_mana());
+    }
+    sc.add_creature(P1, "Grizzly Bears", 2, 2);
+    let spell = sc
+        .add_spell_to_hand_from_oracle(
+            P0,
+            "Random Discard Removal",
+            true,
+            "As an additional cost to cast this spell, discard a card at random.\nDestroy target creature.",
+        )
+        .with_mana_cost(cost(vec![ManaCostShard::Black], 0))
+        .id();
+    for i in 0..other_cards {
+        sc.add_spell_to_hand_from_oracle(P0, &format!("Other Card {i}"), true, "Draw a card.")
+            .with_mana_cost(cost(vec![ManaCostShard::Red, ManaCostShard::Red], 5));
+    }
+    (sc.build(), spell)
+}
+
+/// Probe R6 (CR 601.2b + CR 601.2h): a cast that still owes another cost (here
+/// a random discard from the same hand the exile source draws on) never has a
+/// proven manual payment, so it isn't offered with one other card or with two.
+/// Reach guards: the spell carries the additional cost, and the broad gate
+/// generates the cast. Base control: with a Swamp the Auto payer pays it and
+/// the cast is offered.
+#[test]
+fn outstanding_additional_cost_is_not_a_proven_payment() {
+    for other_cards in [1, 2] {
+        let (runner, spell) = random_discard_spell_board(other_cards, false);
+        assert!(
+            runner.state().objects[&spell].additional_cost.is_some(),
+            "reach: the spell carries its random-discard additional cost"
+        );
+        let action = auto_cast(&runner, spell);
+        assert!(
+            candidate_actions(runner.state())
+                .iter()
+                .any(|candidate| candidate.action == action),
+            "reach ({other_cards} other cards): the broad gate generates the cast"
+        );
+        assert!(
+            !legal_actions(runner.state()).contains(&action),
+            "{other_cards} other cards: the outstanding discard keeps the payment unproven"
+        );
+    }
+    let (control, control_spell) = random_discard_spell_board(1, true);
+    assert!(legal_actions(control.state()).contains(&auto_cast(&control, control_spell)));
+}
+
+const SOLDEVI_ADNATE: &str =
+    "{T}, Sacrifice a black or artifact creature: Add an amount of {B} equal to the sacrificed creature's mana value.";
+
+/// Variable-yield infrastructure fixture: Soldevi Adnate's parsed output ("an
+/// amount of {B} equal to the ... mana value" of the cost-paid object) behind
+/// "{T}, Exile a card from your graveyard" instead of its sacrifice, so the
+/// cast is generated with plain Auto payment and the offer consults the
+/// payment proof. Two such sources; the graveyard holds a mana value 4 card
+/// and `second` (mana value 4 or 0).
+fn exile_sized_board(second_mana_value: u32) -> (GameRunner, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let sources: Vec<ObjectId> = (0..2)
+        .map(|_| {
+            sc.add_creature(P0, "Graveyard Adnate", 1, 2)
+                .from_oracle_text(SOLDEVI_ADNATE)
+                .id()
+        })
+        .collect();
+    sc.add_creature_to_graveyard(P0, "Graveyard Card A", 2, 2)
+        .with_mana_cost(ManaCost::generic(4));
+    sc.add_creature_to_graveyard(P0, "Graveyard Card B", 2, 2)
+        .with_mana_cost(ManaCost::generic(second_mana_value));
+    sc.add_creature(P1, "Grizzly Bears", 2, 2);
+    let spell = sc
+        .add_spell_to_hand_from_oracle(P0, "Eight Black Removal", true, "Destroy target creature.")
+        .with_mana_cost(cost(vec![ManaCostShard::Black; 8], 0))
+        .id();
+    let mut runner = sc.build();
+    let exile_cost = AbilityCost::Composite {
+        costs: vec![
+            AbilityCost::Tap,
+            AbilityCost::Exile {
+                count: 1,
+                zone: Some(Zone::Graveyard),
+                filter: Some(TargetFilter::Typed(
+                    TypedFilter::card()
+                        .controller(ControllerRef::You)
+                        .properties(vec![FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        }]),
+                )),
+            },
+        ],
+    };
+    for source in sources {
+        let object = runner.state_mut().objects.get_mut(&source).unwrap();
+        std::sync::Arc::make_mut(&mut object.abilities)[0].cost = Some(exile_cost.clone());
+        std::sync::Arc::make_mut(&mut object.base_abilities)[0].cost = Some(exile_cost.clone());
+    }
+    (runner, spell)
+}
+
+/// Probe R5, offer level (CR 106.1 + CR 601.2h): an output sized by the
+/// object its own cost chose is never part of a proven payment. With cards of
+/// mana value 4 and 0 the two sources can make at most 4, yet the optimistic
+/// planner credits each with 4, so the cast is generated; it is not offered.
+/// With two mana value 4 cards it is payable but still unproven (the accepted
+/// limit: not offered, though casting it by hand works).
+#[test]
+fn cost_sized_yield_is_not_a_proven_payment() {
+    for second in [0, 4] {
+        let (runner, spell) = exile_sized_board(second);
+        let action = auto_cast(&runner, spell);
+        assert!(
+            candidate_actions(runner.state())
+                .iter()
+                .any(|candidate| candidate.action == action),
+            "reach (second card mana value {second}): generated with plain Auto payment"
+        );
+        assert!(
+            !legal_actions(runner.state()).contains(&action),
+            "second card mana value {second}: a cost-sized yield proves nothing"
+        );
+    }
+}

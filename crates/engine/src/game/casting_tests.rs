@@ -61027,3 +61027,231 @@ fn quantity_vs_each_opponent_skips_a_player_who_left_the_game() {
         "P2 left the game, so only P1's one card is compared"
     );
 }
+
+/// CR 601.2g-h + CR 605.3a: `spell_payment_manual_route` on the issue's boards
+/// and on the shapes a payment proof must not admit. The route is read as the
+/// spell is announced; only its `Proven` verdict lets a targeted Auto cast be
+/// offered after targets are chosen.
+mod manual_payment_route_proofs {
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
+
+    const NYX_LOTUS: &str = "Nyx Lotus enters tapped.\n{T}: Choose a color. Add an amount of mana of that color equal to your devotion to that color.";
+    const TREASONOUS_OGRE: &str = "Dethrone\nPay 3 life: Add {R}.";
+    const SKIRGE_FAMILIAR: &str = "Flying\nDiscard a card: Add {B}.";
+    const SOLDEVI_ADNATE: &str = "{T}, Sacrifice a black or artifact creature: Add an amount of {B} equal to the sacrificed creature's mana value.";
+    const ASHNODS_ALTAR: &str = "Sacrifice a creature: Add {C}{C}.";
+
+    fn cost(shards: Vec<ManaCostShard>, generic: u32) -> ManaCost {
+        ManaCost::Cost { shards, generic }
+    }
+
+    fn targeted_spell(sc: &mut GameScenario, mana_cost: ManaCost) -> ObjectId {
+        sc.add_spell_to_hand_from_oracle(P0, "Targeted Spell", true, "Destroy target creature.")
+            .with_mana_cost(mana_cost)
+            .id()
+    }
+
+    fn route(runner: &GameRunner, spell: ObjectId) -> ManualPaymentRoute {
+        let state = runner.state();
+        spell_payment_manual_route(state, P0, spell, &state.objects[&spell].mana_cost)
+    }
+
+    fn add_ogre(sc: &mut GameScenario) {
+        sc.add_creature(P0, "Treasonous Ogre", 2, 3)
+            .from_oracle_text_with_keywords(&["Dethrone"], TREASONOUS_OGRE)
+            .with_mana_cost(cost(vec![ManaCostShard::Red], 3));
+    }
+
+    fn add_merfolk(sc: &mut GameScenario) {
+        sc.add_creature(P0, "Merfolk of the Pearl Trident", 1, 1)
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 0));
+    }
+
+    fn add_nyx_lotus(sc: &mut GameScenario) {
+        let mut lotus = sc.add_artifact_from_oracle(P0, "Nyx Lotus", NYX_LOTUS);
+        lotus.as_legendary().with_mana_cost(cost(vec![], 4));
+    }
+
+    /// The issue's boards: Island or Nyx Lotus (blue devotion 1) for {U}, and
+    /// Treasonous Ogre's "Pay 3 life: Add {R}" for the generic. The Ogre's
+    /// cost pays life and moves no object, so the Lotus's devotion, fixed when
+    /// it activates (CR 700.5), can't change within the plan.
+    #[test]
+    fn issue_boards_are_proven() {
+        for lotus in [false, true] {
+            let mut sc = GameScenario::new();
+            sc.at_phase(Phase::PreCombatMain);
+            if lotus {
+                add_nyx_lotus(&mut sc);
+            } else {
+                sc.add_basic_land(P0, ManaColor::Blue);
+            }
+            add_merfolk(&mut sc);
+            add_ogre(&mut sc);
+            sc.add_creature(P1, "Grizzly Bears", 2, 2);
+            let spell = targeted_spell(&mut sc, cost(vec![ManaCostShard::Blue], 1));
+            let runner = sc.build();
+            assert_eq!(
+                route(&runner, spell),
+                ManualPaymentRoute::Proven,
+                "lotus={lotus}"
+            );
+        }
+    }
+
+    /// Skirge Familiar discarding another card pays a {B} spell: proven.
+    #[test]
+    fn skirge_familiar_board_is_proven() {
+        let mut sc = GameScenario::new();
+        sc.at_phase(Phase::PreCombatMain);
+        sc.add_creature(P0, "Skirge Familiar", 3, 2)
+            .from_oracle_text_with_keywords(&["Flying"], SKIRGE_FAMILIAR)
+            .with_mana_cost(cost(vec![ManaCostShard::Black], 4));
+        sc.add_spell_to_hand_from_oracle(P0, "Other Card", true, "Draw a card.");
+        sc.add_creature(P1, "Grizzly Bears", 2, 2);
+        let spell = targeted_spell(&mut sc, cost(vec![ManaCostShard::Black], 0));
+        let runner = sc.build();
+        assert_eq!(route(&runner, spell), ManualPaymentRoute::Proven);
+    }
+
+    /// Probe R5 (CR 106.1): Soldevi Adnate's yield is sized by the creature its
+    /// own cost sacrifices, so two Adnates can't each claim Gravedigger's 4.
+    /// The optimistic planner admits {B}x8 (not Infeasible); it is never
+    /// proven (Plausible). With two Gravediggers it is still only Plausible:
+    /// under-offering a cost-sized yield is the accepted limit.
+    #[test]
+    fn cost_sized_yield_is_plausible() {
+        for second_gravedigger in [false, true] {
+            let mut sc = GameScenario::new();
+            sc.at_phase(Phase::PreCombatMain);
+            for _ in 0..2 {
+                sc.add_creature(P0, "Soldevi Adnate", 1, 2)
+                    .from_oracle_text(SOLDEVI_ADNATE)
+                    .with_mana_cost(cost(vec![ManaCostShard::Black], 1))
+                    .with_color(vec![ManaColor::Black]);
+            }
+            sc.add_creature(P0, "Gravedigger", 2, 2)
+                .with_mana_cost(cost(vec![ManaCostShard::Black], 3))
+                .with_color(vec![ManaColor::Black]);
+            if second_gravedigger {
+                sc.add_creature(P0, "Gravedigger", 2, 2)
+                    .with_mana_cost(cost(vec![ManaCostShard::Black], 3))
+                    .with_color(vec![ManaColor::Black]);
+            } else {
+                sc.add_creature(P0, "Ornithopter", 0, 2)
+                    .as_artifact()
+                    .with_mana_cost(cost(vec![], 0));
+            }
+            sc.add_creature(P1, "Grizzly Bears", 2, 2);
+            let spell = targeted_spell(&mut sc, cost(vec![ManaCostShard::Black; 8], 0));
+            let runner = sc.build();
+            assert_eq!(
+                route(&runner, spell),
+                ManualPaymentRoute::Plausible,
+                "second Gravedigger={second_gravedigger}"
+            );
+        }
+    }
+
+    /// Main's ordering case (CR 700.5): Nyx Lotus's devotion counts Merfolk of
+    /// the Pearl Trident, which Ashnod's Altar could sacrifice in the same plan.
+    /// An unordered plan can't show the Lotus activates first: Plausible.
+    /// Control: an Island (a fixed output) beside the same Altar is proven.
+    #[test]
+    fn board_sized_output_beside_a_sacrifice_is_plausible() {
+        for lotus in [true, false] {
+            let mut sc = GameScenario::new();
+            sc.at_phase(Phase::PreCombatMain);
+            if lotus {
+                add_nyx_lotus(&mut sc);
+            } else {
+                sc.add_basic_land(P0, ManaColor::Blue);
+            }
+            add_merfolk(&mut sc);
+            sc.add_artifact_from_oracle(P0, "Ashnod's Altar", ASHNODS_ALTAR)
+                .with_mana_cost(cost(vec![], 3));
+            sc.add_creature(P1, "Grizzly Bears", 2, 2);
+            let spell = targeted_spell(&mut sc, cost(vec![ManaCostShard::Blue], 2));
+            let runner = sc.build();
+            assert_eq!(
+                route(&runner, spell),
+                if lotus {
+                    ManualPaymentRoute::Plausible
+                } else {
+                    ManualPaymentRoute::Proven
+                },
+                "lotus={lotus}"
+            );
+        }
+    }
+
+    /// Probe R6 (CR 601.2b + CR 601.2h): a spell that still owes "discard a
+    /// card at random" draws on the same hand as a hand-exile mana source, so
+    /// its payment is never proven, however many cards are in hand. Control:
+    /// the same board and spell without the additional cost is proven.
+    #[test]
+    fn outstanding_additional_cost_is_plausible() {
+        for (random_discard, expected) in [
+            (true, ManualPaymentRoute::Plausible),
+            (false, ManualPaymentRoute::Proven),
+        ] {
+            let mut sc = GameScenario::new();
+            sc.at_phase(Phase::PreCombatMain);
+            sc.add_creature(P0, "Hand-Exile Mana Source", 0, 3)
+                .with_ability_definition(
+                    AbilityDefinition::new(
+                        AbilityKind::Activated,
+                        Effect::Mana {
+                            produced: ManaProduction::Fixed {
+                                colors: vec![ManaColor::Black],
+                                contribution: ManaContribution::Base,
+                            },
+                            restrictions: vec![],
+                            grants: vec![],
+                            expiry: None,
+                            target: None,
+                        },
+                    )
+                    .cost(AbilityCost::Exile {
+                        count: 1,
+                        zone: Some(Zone::Hand),
+                        filter: Some(TargetFilter::Typed(
+                            TypedFilter::card()
+                                .controller(ControllerRef::You)
+                                .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+                        )),
+                    }),
+                );
+            sc.add_creature(P1, "Grizzly Bears", 2, 2);
+            let text = if random_discard {
+                "As an additional cost to cast this spell, discard a card at random.\nDestroy target creature."
+            } else {
+                "Destroy target creature."
+            };
+            let spell = sc
+                .add_spell_to_hand_from_oracle(P0, "Removal", true, text)
+                .with_mana_cost(cost(vec![ManaCostShard::Black], 0))
+                .id();
+            for i in 0..2 {
+                sc.add_spell_to_hand_from_oracle(
+                    P0,
+                    &format!("Other Card {i}"),
+                    true,
+                    "Draw a card.",
+                );
+            }
+            let runner = sc.build();
+            assert_eq!(
+                runner.state().objects[&spell].additional_cost.is_some(),
+                random_discard,
+                "reach: the additional cost is parsed"
+            );
+            assert_eq!(
+                route(&runner, spell),
+                expected,
+                "random_discard={random_discard}"
+            );
+        }
+    }
+}
