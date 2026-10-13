@@ -1767,18 +1767,17 @@ fn host_reference_timings(runner: &GameRunner, source: ObjectId) -> Vec<TargetCh
             .filter_map(|entry| entry.definition.execute.as_deref()),
     );
     let mut timings = Vec::new();
-    for definition in definitions {
-        let mut node = Some(definition);
-        while let Some(current) = node {
-            if current
-                .effect
-                .target_filter()
-                .is_some_and(|filter| filter.contains_source_attachment_host())
-            {
-                timings.push(current.target_choice_timing);
-            }
-            node = current.sub_ability.as_deref();
+    let mut pending = definitions;
+    while let Some(current) = pending.pop() {
+        if current
+            .effect
+            .target_filter()
+            .is_some_and(|filter| filter.contains_source_attachment_host())
+        {
+            timings.push(current.target_choice_timing);
         }
+        pending.extend(current.sub_ability.as_deref());
+        pending.extend(current.else_ability.as_deref());
     }
     timings
 }

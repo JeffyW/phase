@@ -4126,6 +4126,14 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
         match &item.node {
             OracleNodeIr::Spell(ability_ir) => {
                 let mut def = lower_ability_ir(ability_ir);
+                // CR 115.10a + CR 303.4b + CR 301.5f: a lone "enchanted/equipped
+                // X" instruction that is the whole ability names its host
+                // without targeting it. Decided here, on the card's own ability,
+                // because only this level knows nothing precedes or follows it.
+                crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
+                    &mut def,
+                    &ability_ir.body.clauses,
+                );
                 stamp_printed_ability_slot(&mut def, printed_ability_slot);
                 result.abilities.push(def);
                 ability_ids.push(item.id);

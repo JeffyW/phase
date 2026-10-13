@@ -1997,7 +1997,7 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
 /// the whole ability, so such chains keep their stack-time target (the
 /// followers of a host reference are follow-up work). Donor shapes ("becomes a
 /// copy of", "gains all activated abilities of" the host) also keep theirs.
-pub(super) fn convert_terminal_attachment_host_reference(
+pub(crate) fn convert_terminal_attachment_host_reference(
     def: &mut AbilityDefinition,
     clauses: &[ClauseIr],
 ) {
