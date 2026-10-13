@@ -22368,7 +22368,7 @@ pub(crate) enum AttachmentHostSlot {
     /// The slot supplies characteristics or abilities to a different recipient
     /// (the copy source of "becomes a copy of", the donor of "gains all
     /// activated abilities of"). Host binding does not establish a donor's
-    /// identity contract, so such a node is refused and does nothing.
+    /// identity contract, so such an instruction keeps its stack-time target.
     Donor,
 }
 
@@ -34090,15 +34090,6 @@ pub enum ParentTargetMissingReason {
     /// `EffectOutcomeSignal::RevealUntilMatched` guard of a "When you reveal a
     /// <filter> card this way" reflexive: that trigger event did not occur.
     RevealUntil,
-    /// CR 115.10a + CR 303.4b + CR 301.5f + CR 608.2c: an instruction naming its
-    /// source's "enchanted/equipped X" had no provable host
-    /// (`targeting::ResolutionHostBinding::Absent`) or took it as a refused
-    /// donor, so it did nothing and bound no object. The instructions after it
-    /// that refer back to that object ("It deals damage to you equal to its
-    /// power", "its controller") have no referent, and must not fall back to
-    /// the trigger event or the source's attachment history; the ones that
-    /// don't refer back ("Create a Treasure token") still happen.
-    AttachmentHost,
 }
 
 #[cfg(test)]
@@ -34787,8 +34778,7 @@ pub struct ResolvedAbility {
     /// sub_ability of a `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice/
     /// `ExileTop`/`RevealUntil` that
     /// came up with nothing (empty library, no eligible card to choose, or an
-    /// empty reveal-choice eligible set respectively), or of an "enchanted /
-    /// equipped X" instruction with no provable host — never set any other
+    /// empty reveal-choice eligible set respectively) — never set any other
     /// way, so it cannot be confused with a stale value from an unrelated
     /// resolution. See [`ParentTargetMissingReason`] for what each variant
     /// gates and who consults it.

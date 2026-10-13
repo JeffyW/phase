@@ -106,9 +106,6 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  123 — game_setup and state_update carry GameState whose sub-abilities may
- *       hold ParentTargetMissingReason AttachmentHost. Bumped in lockstep with
- *       full-game protocol 141.
  *  122 — game_setup and state_update carry GameState whose ability player scopes
  *       may hold AttackSubject EventAttackers. Bumped in lockstep with full-game
  *       protocol 140.
@@ -671,7 +668,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 123 as const;
+export const WIRE_PROTOCOL_VERSION = 122 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

@@ -4341,6 +4341,10 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // CR 608.2d: gate the whole "if they guessed wrong/right" branch, including
     // any "and ..." continuation steps.
     super::propagate_guess_branch_condition_to_continuations(&mut result);
+    // CR 115.10a + CR 303.4b + CR 301.5f: a lone "enchanted/equipped X"
+    // instruction names its host without targeting it. Decided on the final
+    // tree, the only place that knows the instruction is the whole ability.
+    super::lower::convert_terminal_attachment_host_reference(&mut result, &ir.clauses);
 
     result
 }

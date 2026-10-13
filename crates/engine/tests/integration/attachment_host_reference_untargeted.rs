@@ -17,7 +17,7 @@
 use engine::game::combat::AttackTarget;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{Effect, TargetChoiceTiming};
+use engine::types::ability::{AbilityDefinition, Effect, TargetChoiceTiming};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
@@ -301,141 +301,6 @@ fn bind_the_monster_taps_host_and_host_deals_its_power_to_you() {
         s.players[P0.0 as usize].life,
         life_before - 6,
         "the enchanted creature deals damage equal to its power to Bind the Monster's controller"
-    );
-}
-
-/// Control-change sibling with an anaphor chain: "gain control of enchanted
-/// permanent until end of turn. Untap that permanent. It gains haste until end of
-/// turn." Ward triggers only for the Aura spell, and "that permanent"/"It" follow
-/// the host the first instruction acted on.
-#[test]
-fn frenzied_fugue_steals_untaps_and_hastes_ward_host_with_one_ward_trigger() {
-    let mut sc = GameScenario::new();
-    sc.at_phase(Phase::PreCombatMain);
-    let host = sc
-        .add_creature(P1, "Warded Brute", 4, 4)
-        .with_keyword(Keyword::Ward(WardCost::Mana(ManaCost::generic(2))))
-        .id();
-    let aura = aura_in_hand(&mut sc, P0, "Frenzied Fugue", FRENZIED_FUGUE);
-    sc.add_creature(P0, "Grizzly Bears", 2, 2);
-    sc.with_mana_pool(P0, pool(0, 2));
-    let mut runner = sc.build();
-    set_tapped(&mut runner, host, true);
-
-    let d = cast_aura_and_resolve(&mut runner, aura, host, CastPaymentMode::Auto);
-    let s = runner.state();
-    assert_eq!(
-        s.objects[&aura].attached_to,
-        Some(AttachTarget::Object(host)),
-        "reach: Frenzied Fugue resolved and attached"
-    );
-    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
-    assert_eq!(
-        s.objects[&host].controller, P0,
-        "Fugue's controller gains control"
-    );
-    assert!(
-        !s.objects[&host].tapped,
-        "'Untap that permanent' untaps the host"
-    );
-    assert!(
-        s.objects[&host]
-            .keywords
-            .iter()
-            .any(|k| matches!(k, Keyword::Haste)),
-        "'It gains haste' grants haste to the host"
-    );
-}
-
-/// Conditional-sub sibling: "you may pay {3}. If you do, tap enchanted
-/// permanent." The host binding happens when the "if you do" instruction runs.
-#[test]
-fn marooned_paid_taps_ward_host_with_one_ward_trigger() {
-    let mut sc = GameScenario::new();
-    sc.at_phase(Phase::PreCombatMain);
-    let host = sc
-        .add_creature(P1, "Patchwork Automaton", 1, 1)
-        .with_keyword(Keyword::Ward(WardCost::Mana(ManaCost::generic(2))))
-        .id();
-    let aura = aura_in_hand(&mut sc, P0, "Marooned", MAROONED);
-    sc.add_creature(P0, "Grizzly Bears", 2, 2);
-    sc.with_mana_pool(P0, pool(0, 5));
-    let mut runner = sc.build();
-
-    let d = cast_aura_and_resolve(&mut runner, aura, host, CastPaymentMode::Auto);
-    let s = runner.state();
-    assert_eq!(
-        s.objects[&aura].attached_to,
-        Some(AttachTarget::Object(host)),
-        "reach: Marooned resolved and attached"
-    );
-    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
-    assert!(
-        s.objects[&host].tapped,
-        "the paid ETB taps the enchanted permanent"
-    );
-}
-
-/// Optional + modal sibling: "{3}: You may tap or untap equipped creature." The
-/// chosen tap/untap branch acts on the bound host (shrouded here).
-#[test]
-fn sword_of_the_paruns_untaps_a_shrouded_equipped_creature() {
-    let mut sc = GameScenario::new();
-    sc.at_phase(Phase::PreCombatMain);
-    let host = sc
-        .add_creature(P0, "Shrouded Bear", 2, 2)
-        .with_keyword(Keyword::Shroud)
-        .id();
-    let sword = sc
-        .add_creature(P0, "Sword of the Paruns", 0, 0)
-        .as_artifact()
-        .with_subtypes(vec!["Equipment"])
-        .from_oracle_text(SWORD_OF_THE_PARUNS)
-        .id();
-    sc.with_mana_pool(P0, pool(0, 3));
-    let mut runner = sc.build();
-    attach(&mut runner, sword, host);
-    set_tapped(&mut runner, host, true);
-
-    let index = ability_index(&runner, sword, |e| matches!(e, Effect::TargetOnly { .. }));
-    runner
-        .act(GameAction::ActivateAbility {
-            source_id: sword,
-            ability_index: index,
-        })
-        .expect("CR 115.10a: 'tap or untap equipped creature' does not target");
-    let mut chose_branch = false;
-    for _ in 0..16 {
-        let action = match &runner.state().waiting_for {
-            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
-            WaitingFor::Priority { .. } => GameAction::PassPriority,
-            WaitingFor::OptionalEffectChoice { .. } => {
-                GameAction::DecideOptionalEffect { accept: true }
-            }
-            WaitingFor::ChooseOneOfBranch { branches, .. } => {
-                chose_branch = true;
-                let untap = branches
-                    .iter()
-                    .position(|b| {
-                        matches!(
-                            &*b.effect,
-                            Effect::SetTapState {
-                                state: engine::types::ability::TapStateChange::Untap,
-                                ..
-                            }
-                        )
-                    })
-                    .expect("an untap branch");
-                GameAction::ChooseBranch { index: untap }
-            }
-            other => panic!("unexpected prompt: {other:?}"),
-        };
-        runner.act(action).expect("prompt accepts");
-    }
-    assert!(chose_branch, "reach: the tap-or-untap choice was offered");
-    assert!(
-        !runner.state().objects[&host].tapped,
-        "the shrouded equipped creature is untapped"
     );
 }
 
@@ -859,126 +724,6 @@ fn penumbra_umbra_with_its_host_exiled_copies_nothing() {
     assert_eq!(copies, 0, "no token is created");
 }
 
-/// The instructions an Aura's ETB names after a host-less instruction
-/// ("Create a Treasure token.") still happen; only those that refer back to the
-/// host ("It deals damage to you equal to its power.") do nothing. Which kind
-/// follows the host-less one.
-#[derive(Clone, Copy)]
-enum AfterHostless {
-    /// "Put a +1/+1 counter on enchanted creature. Create a Treasure token."
-    IndependentInstruction,
-    /// "Tap enchanted creature. It deals 2 damage to you. Create a Treasure
-    /// token." — a dependent instruction between them.
-    DependentDamage,
-    /// "Tap enchanted creature and put a +1/+1 counter on it. Create a Treasure
-    /// token." — a dependent instruction whose operand is "it".
-    DependentCounterOnIt,
-}
-
-/// Review probe R4-1 (SYNTHETIC; Oracle-parsed): the ETB is pending and the
-/// host is blinked in response (a new object the Aura was never attached to).
-/// Returns (P0's life lost, Treasures P0 controls, +1/+1 counters on the
-/// returned creature).
-fn hostless_etb_followed_by_a_treasure(shape: AfterHostless) -> (i32, usize, u32) {
-    let text = match shape {
-        AfterHostless::IndependentInstruction => {
-            "Enchant creature\nWhen this Aura enters, put a +1/+1 counter on enchanted creature. Create a Treasure token."
-        }
-        AfterHostless::DependentDamage => {
-            "Enchant creature\nWhen this Aura enters, tap enchanted creature. It deals 2 damage to you. Create a Treasure token."
-        }
-        AfterHostless::DependentCounterOnIt => {
-            "Enchant creature\nWhen this Aura enters, tap enchanted creature and put a +1/+1 counter on it. Create a Treasure token."
-        }
-    };
-    let (mut runner, aura, host, _) =
-        aura_etb_on_stack("Treasure Charm", text, 3, Bystander::Absent);
-    let has_token_node = |ability: &engine::types::ability::ResolvedAbility| {
-        let mut node = Some(ability);
-        while let Some(current) = node {
-            if matches!(current.effect, Effect::Token { .. }) {
-                return true;
-            }
-            node = current.sub_ability.as_deref();
-        }
-        false
-    };
-    assert!(
-        runner.state().stack.iter().any(|e| matches!(
-            &e.kind,
-            StackEntryKind::TriggeredAbility { source_id, ability, .. }
-                if *source_id == aura && has_token_node(ability)
-        )),
-        "reach: the ETB is on the stack with its independent Token instruction"
-    );
-    let life_before = runner.state().players[P0.0 as usize].life;
-    blink(&mut runner, host);
-    runner.advance_until_stack_empty();
-    let s = runner.state();
-    assert!(s.stack.is_empty(), "reach: the ETB resolved");
-    assert_eq!(
-        s.objects[&host].zone,
-        Zone::Battlefield,
-        "reach: the returned creature is on the battlefield"
-    );
-    assert!(
-        !s.objects[&host].tapped,
-        "the returned creature is not tapped"
-    );
-    let treasures = s
-        .battlefield
-        .iter()
-        .filter(|id| {
-            let o = &s.objects[id];
-            o.is_token && o.name == "Treasure" && o.controller == P0
-        })
-        .count();
-    let counters = s.objects[&host]
-        .counters
-        .get(&CounterType::Plus1Plus1)
-        .copied()
-        .unwrap_or(0);
-    (
-        life_before - s.players[P0.0 as usize].life,
-        treasures,
-        counters,
-    )
-}
-
-#[test]
-fn hostless_counter_then_treasure_still_makes_the_treasure() {
-    let (life_lost, treasures, counters) =
-        hostless_etb_followed_by_a_treasure(AfterHostless::IndependentInstruction);
-    assert_eq!(counters, 0, "no counter on the returned creature");
-    assert_eq!(life_lost, 0, "reach: nothing deals damage");
-    assert_eq!(treasures, 1, "the independent Treasure is still created");
-}
-
-#[test]
-fn hostless_tap_then_dependent_damage_then_treasure_makes_only_the_treasure() {
-    let (life_lost, treasures, _) =
-        hostless_etb_followed_by_a_treasure(AfterHostless::DependentDamage);
-    assert_eq!(
-        life_lost, 0,
-        "'it' has no referent, so nothing deals the damage (not the Aura either)"
-    );
-    assert_eq!(
-        treasures, 1,
-        "the Treasure after the dependent instruction is still created"
-    );
-}
-
-#[test]
-fn hostless_tap_then_counter_on_it_then_treasure_makes_only_the_treasure() {
-    let (_, treasures, counters) =
-        hostless_etb_followed_by_a_treasure(AfterHostless::DependentCounterOnIt);
-    assert_eq!(
-        counters, 0,
-        "'it' has no referent, so the returned creature gets no counter"
-    );
-    assert_eq!(treasures, 1, "the Treasure is still created");
-}
-
 /// Review probe F1, disclosed limit (fail closed): Stamina, "Sacrifice this
 /// Aura: Regenerate enchanted creature." The cost moves the Aura to the
 /// graveyard before the ability is put on the stack, so the incarnation the
@@ -1220,82 +965,109 @@ fn last_voyage_host_blinked_after_the_aura_left_sacrifices_nothing() {
     assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
 }
 
-/// What a donor-shaped host reference asks for.
-#[derive(Clone, Copy)]
-enum DonorShape {
-    BecomesACopy,
-    GainsActivatedAbilities,
-}
-
-/// SYNTHETIC (fail-closed guard, N3): an Equipment whose own ability takes its
-/// equipped creature as a donor for itself ("becomes a copy of equipped
-/// creature" / "gains all activated abilities of equipped creature"). Host
-/// binding doesn't establish a donor's identity contract, so the node is
-/// refused even with a live host: the Equipment is unchanged.
-fn equipment_donor_case(shape: DonorShape) -> (GameRunner, ObjectId, usize) {
-    let (text, pick): (&str, fn(&Effect) -> bool) = match shape {
-        DonorShape::BecomesACopy => (
-            "{1}: This Equipment becomes a copy of equipped creature until end of turn.\nEquip {1}",
-            |e| matches!(e, Effect::BecomeCopy { .. }),
-        ),
-        DonorShape::GainsActivatedAbilities => (
-            "{1}: This Equipment gains all activated abilities of equipped creature until end of turn.\nEquip {1}",
-            |e| matches!(e, Effect::GainActivatedAbilitiesOfTarget { .. }),
-        ),
-    };
+/// Base-untargeted, cost-moved source, disclosed limit: "{3}{W}{W}, Sacrifice
+/// this Aura: Exile enchanted creature." The cost moves the Aura before the
+/// ability is put on the stack, so no record proves its host and nothing is
+/// exiled — the same as base, whose filter scan found nothing either.
+#[test]
+fn choking_restraints_sacrificed_as_cost_exiles_nothing() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
-    let host = sc
-        .add_creature_from_oracle(P0, "Donor Bear", 2, 2, "{T}: You gain 1 life.")
-        .id();
-    let equipment = sc
-        .add_creature(P0, "Donor Rig", 0, 0)
-        .as_artifact()
-        .with_subtypes(vec!["Equipment"])
-        .from_oracle_text(text)
-        .id();
-    sc.with_mana_pool(P0, pool(0, 1));
-    let mut runner = sc.build();
-    attach(&mut runner, equipment, host);
-    let index = ability_index(&runner, equipment, pick);
-    assert_eq!(
-        runner.state().objects[&equipment].abilities[index].target_choice_timing,
-        TargetChoiceTiming::Resolution,
-        "reach: the donor names the host without 'target'"
+    let host = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let aura = aura_on_battlefield(
+        &mut sc,
+        P0,
+        "Choking Restraints",
+        "Enchant creature\nEnchanted creature can't attack or block.\n{3}{W}{W}, Sacrifice this Aura: Exile enchanted creature.",
     );
-    let abilities_before = runner.state().objects[&equipment].abilities.len();
+    sc.with_mana_pool(P0, mana(ManaType::White, 5));
+    let mut runner = sc.build();
+    attach(&mut runner, aura, host);
+    let index = ability_index(&runner, aura, |e| matches!(e, Effect::ChangeZone { .. }));
     runner
         .act(GameAction::ActivateAbility {
-            source_id: equipment,
+            source_id: aura,
             ability_index: index,
         })
-        .expect("the ability names no target, so it can be activated");
+        .expect("the ability is activated");
+    for _ in 0..4 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::PayCost { choices, .. } => {
+                runner
+                    .act(GameAction::SelectCards { cards: choices })
+                    .expect("the Aura is sacrificed");
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&aura].zone,
+        Zone::Graveyard,
+        "reach: the cost sacrificed the Aura"
+    );
     runner.advance_until_stack_empty();
-    assert!(
-        runner.state().stack.is_empty(),
-        "reach: the ability resolved"
-    );
-    (runner, equipment, abilities_before)
-}
-
-#[test]
-fn equipment_becoming_a_copy_of_its_host_is_refused() {
-    let (runner, equipment, _) = equipment_donor_case(DonorShape::BecomesACopy);
     assert_eq!(
-        runner.state().objects[&equipment].name,
-        "Donor Rig",
-        "the Equipment does not become a copy"
+        runner.state().objects[&host].zone,
+        Zone::Battlefield,
+        "no provable host, so nothing is exiled (as at base)"
     );
 }
 
+/// Base-untargeted, cost-moved source, disclosed limit: Krasis Incubation,
+/// "{1}{G}{U}, Return this Aura to its owner's hand: Put two +1/+1 counters on
+/// enchanted creature." No record proves the host, so no counters — the same
+/// as base.
 #[test]
-fn equipment_gaining_its_hosts_activated_abilities_is_refused() {
-    let (runner, equipment, abilities_before) =
-        equipment_donor_case(DonorShape::GainsActivatedAbilities);
+fn krasis_incubation_returned_as_cost_counters_nothing() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let aura = aura_on_battlefield(
+        &mut sc,
+        P0,
+        "Krasis Incubation",
+        "Enchant creature\nEnchanted creature can't attack or block, and its activated abilities can't be activated.\n{1}{G}{U}, Return this Aura to its owner's hand: Put two +1/+1 counters on enchanted creature.",
+    );
+    sc.with_mana_pool(P0, mana(ManaType::Colorless, 3));
+    let mut runner = sc.build();
+    attach(&mut runner, aura, host);
+    for unit in mana(ManaType::Green, 1)
+        .into_iter()
+        .chain(mana(ManaType::Blue, 1))
+    {
+        let _ = runner.state_mut().add_mana_to_pool(P0, unit);
+    }
+    let index = ability_index(&runner, aura, |e| matches!(e, Effect::PutCounter { .. }));
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: aura,
+            ability_index: index,
+        })
+        .expect("the ability is activated");
+    for _ in 0..4 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::PayCost { choices, .. } => {
+                runner
+                    .act(GameAction::SelectCards { cards: choices })
+                    .expect("the Aura is returned");
+            }
+            _ => break,
+        }
+    }
     assert_eq!(
-        runner.state().objects[&equipment].abilities.len(),
-        abilities_before,
-        "the Equipment gains no abilities"
+        runner.state().objects[&aura].zone,
+        Zone::Hand,
+        "reach: the cost returned the Aura"
+    );
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&host]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "no provable host, so no counters (as at base)"
     );
 }
 
@@ -1724,61 +1496,6 @@ fn nurturing_licid_as_creature_regenerates_nothing() {
     );
 }
 
-/// GiveControl sibling: Assault Suit, "At the beginning of each opponent's
-/// upkeep, you may have that player gain control of equipped creature until end
-/// of turn. If you do, untap it." — on a shrouded equipped creature.
-#[test]
-fn assault_suit_gives_its_shrouded_equipped_creature_to_the_opponent() {
-    let mut sc = GameScenario::new();
-    sc.at_phase(Phase::PreCombatMain);
-    let host = sc
-        .add_creature(P0, "Shrouded Bear", 2, 2)
-        .with_keyword(Keyword::Shroud)
-        .id();
-    let suit = sc
-        .add_creature(P0, "Assault Suit", 0, 0)
-        .as_artifact()
-        .with_subtypes(vec!["Equipment"])
-        .from_oracle_text(ASSAULT_SUIT)
-        .id();
-    let mut runner = sc.build();
-    attach(&mut runner, suit, host);
-    set_tapped(&mut runner, host, true);
-    // From P0's end step to P1's upkeep.
-    {
-        let state = runner.state_mut();
-        state.phase = Phase::End;
-        state.active_player = P0;
-        state.priority_player = P0;
-        state.waiting_for = WaitingFor::Priority { player: P0 };
-    }
-    runner.advance_to_phase(Phase::Upkeep);
-    let mut accepted = false;
-    for _ in 0..16 {
-        let action = match &runner.state().waiting_for {
-            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
-            WaitingFor::Priority { .. } => GameAction::PassPriority,
-            WaitingFor::OptionalEffectChoice { .. } => {
-                accepted = true;
-                GameAction::DecideOptionalEffect { accept: true }
-            }
-            other => panic!("unexpected prompt: {other:?}"),
-        };
-        runner.act(action).expect("prompt accepts");
-    }
-    let s = runner.state();
-    assert_eq!(s.active_player, P1, "reach: it is P1's upkeep");
-    assert!(accepted, "reach: Assault Suit's 'you may' was offered");
-    assert_eq!(
-        s.objects[&host].controller, P1,
-        "the opponent gains control"
-    );
-    assert!(
-        !s.objects[&host].tapped,
-        "'If you do, untap it' untaps the host"
-    );
-}
-
 /// RemoveFromCombat sibling with a controller anaphor: Observed Stasis (Flash),
 /// "When this Aura enters, remove enchanted creature from combat. Then draw a
 /// card for each tapped creature its controller controls." — flashed in on an
@@ -1854,26 +1571,6 @@ fn observed_stasis_removes_attacking_host_from_combat_and_counts_its_controller(
     );
 }
 
-/// The other side of the tail rule: with no provable host the "tap enchanted
-/// creature" node does nothing, but "and you become the monarch" names no
-/// object and still happens. Fall from Favor's ETB is pending; the host is
-/// returned to hand in response.
-#[test]
-fn fall_from_favor_host_bounced_still_makes_you_the_monarch() {
-    let (mut runner, _aura, host, _) =
-        aura_etb_on_stack("Fall from Favor", FALL_FROM_FAVOR, 2, Bystander::Absent);
-    let mut events = Vec::new();
-    engine::game::zones::move_to_zone(runner.state_mut(), host, Zone::Hand, &mut events);
-    runner.advance_until_stack_empty();
-    let s = runner.state();
-    assert_eq!(s.objects[&host].zone, Zone::Hand, "reach: the host left");
-    assert!(
-        !s.battlefield.iter().any(|id| s.objects[id].tapped),
-        "nothing is tapped"
-    );
-    assert_eq!(s.monarch, Some(P0), "P0 becomes the monarch");
-}
-
 /// Disclosed limit (fail closed): Observed Stasis's ETB is pending on a
 /// creature P1 controls but P0 owns, and the creature is blinked, returning as
 /// a new object under its owner's control. The Aura, now unattached, has no
@@ -1928,52 +1625,6 @@ fn observed_stasis_host_blinked_draws_nothing() {
         hand_before,
         "no provable host, so no card is drawn"
     );
-}
-
-/// GainControl branch: Captivating Glance at P0's end step, enchanting P1's
-/// shrouded creature, with P0's library top card of greater mana value so P0
-/// wins the clash and gains control of the enchanted creature.
-#[test]
-fn captivating_glance_won_clash_gains_control_of_enchanted_creature() {
-    let mut sc = GameScenario::new();
-    sc.at_phase(Phase::PostCombatMain);
-    let host = sc
-        .add_creature(P1, "Shrouded Bear", 2, 2)
-        .with_keyword(Keyword::Shroud)
-        .id();
-    let aura = aura_on_battlefield(&mut sc, P0, "Captivating Glance", CAPTIVATING_GLANCE);
-    sc.add_spell_to_library_top(P0, "P0 Top", false)
-        .with_mana_cost(ManaCost::generic(5));
-    sc.add_spell_to_library_top(P1, "P1 Top", false)
-        .with_mana_cost(ManaCost::generic(1));
-    let mut runner = sc.build();
-    attach(&mut runner, aura, host);
-    runner.advance_to_phase(Phase::End);
-    let mut clashed = false;
-    for _ in 0..16 {
-        let action = match &runner.state().waiting_for {
-            WaitingFor::Priority { .. } if runner.state().stack.is_empty() && clashed => break,
-            WaitingFor::Priority { .. } => GameAction::PassPriority,
-            WaitingFor::ClashChooseOpponent { .. } => {
-                GameAction::ChooseClashOpponent { opponent: P1 }
-            }
-            WaitingFor::ClashCardPlacement { .. } => {
-                clashed = true;
-                GameAction::ChooseTopOrBottom { top: true }
-            }
-            other => panic!("unexpected prompt: {other:?}"),
-        };
-        runner.act(action).expect("prompt accepts");
-    }
-    assert!(
-        clashed,
-        "reach: Captivating Glance's end-step trigger clashed"
-    );
-    assert!(
-        runner.state().stack.is_empty(),
-        "reach: the trigger resolved"
-    );
-    assert_eq!(runner.state().objects[&host].controller, P0);
 }
 
 /// Sacrifice sibling (LKI): Last Voyage of the _____, "When this Aura leaves the
@@ -2073,4 +1724,359 @@ fn host_reference_is_resolution_timed_and_literal_target_stays_stack() {
     let timing = |id: ObjectId| runner.state().objects[&id].abilities[0].target_choice_timing;
     assert_eq!(timing(described), TargetChoiceTiming::Resolution);
     assert_eq!(timing(targeted), TargetChoiceTiming::Stack);
+}
+
+/// The kind of permanent a host-referring source is.
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Aura,
+    Equipment,
+}
+
+fn source_from_text(sc: &mut GameScenario, name: &str, text: &str, kind: SourceKind) -> ObjectId {
+    match kind {
+        SourceKind::Aura => aura_on_battlefield(sc, P0, name, text),
+        SourceKind::Equipment => sc
+            .add_creature(P0, name, 0, 0)
+            .as_artifact()
+            .with_subtypes(vec!["Equipment"])
+            .from_oracle_text(text)
+            .id(),
+    }
+}
+
+fn add_sources(
+    sc: &mut GameScenario,
+    cards: &[(&'static str, &'static str, SourceKind)],
+) -> Vec<(&'static str, ObjectId)> {
+    cards
+        .iter()
+        .map(|(name, text, kind)| (*name, source_from_text(sc, name, text, *kind)))
+        .collect()
+}
+
+/// The target-choice timing of every node of `source`'s abilities and triggers
+/// that names its "enchanted/equipped X".
+fn host_reference_timings(runner: &GameRunner, source: ObjectId) -> Vec<TargetChoiceTiming> {
+    let object = &runner.state().objects[&source];
+    let mut definitions: Vec<&AbilityDefinition> = object.abilities.iter().collect();
+    definitions.extend(
+        object
+            .trigger_definitions
+            .iter_unchecked()
+            .filter_map(|entry| entry.definition.execute.as_deref()),
+    );
+    let mut timings = Vec::new();
+    for definition in definitions {
+        let mut node = Some(definition);
+        while let Some(current) = node {
+            if current
+                .effect
+                .target_filter()
+                .is_some_and(|filter| filter.contains_source_attachment_host())
+            {
+                timings.push(current.target_choice_timing);
+            }
+            node = current.sub_ability.as_deref();
+        }
+    }
+    timings
+}
+
+/// SHAPE (scope): only a host instruction that is the whole ability stops
+/// targeting its host. A chain where other instructions precede or follow it,
+/// and a donor shape, keep base's stack-time target; an instruction that was
+/// already untargeted at base keeps that.
+#[test]
+fn only_a_lone_host_instruction_stops_targeting() {
+    let lone = [
+        ("Malfunction", MALFUNCTION, SourceKind::Aura),
+        ("Claustrophobia", CLAUSTROPHOBIA, SourceKind::Aura),
+        (
+            "Parallax Dementia",
+            PARALLAX_DEMENTIA_LEAVES,
+            SourceKind::Aura,
+        ),
+        ("Pemmin's Aura", PEMMINS_AURA, SourceKind::Aura),
+        ("Stamina", STAMINA, SourceKind::Aura),
+        (
+            "Cloak of the Philosopher",
+            CLOAK_OF_THE_PHILOSOPHER,
+            SourceKind::Equipment,
+        ),
+    ];
+    let kept = [
+        ("Bind the Monster", BIND_THE_MONSTER, SourceKind::Aura),
+        ("Frenzied Fugue", FRENZIED_FUGUE, SourceKind::Aura),
+        ("Marooned", MAROONED, SourceKind::Aura),
+        ("Observed Stasis", OBSERVED_STASIS, SourceKind::Aura),
+        ("Captivating Glance", CAPTIVATING_GLANCE, SourceKind::Aura),
+        ("Fall from Favor", FALL_FROM_FAVOR, SourceKind::Aura),
+        ("Assault Suit", ASSAULT_SUIT, SourceKind::Equipment),
+        ("Sword of the Paruns", SWORD_OF_THE_PARUNS, SourceKind::Equipment),
+        ("Helm of the Host", HELM_OF_THE_HOST, SourceKind::Equipment),
+        (
+            "Copy Rig",
+            "{1}: This Equipment becomes a copy of equipped creature until end of turn.\nEquip {1}",
+            SourceKind::Equipment,
+        ),
+        (
+            "Ability Rig",
+            "{1}: This Equipment gains all activated abilities of equipped creature until end of turn.\nEquip {1}",
+            SourceKind::Equipment,
+        ),
+    ];
+    let base_untargeted = [(
+        "Ephara's Enlightenment",
+        EPHARAS_ENLIGHTENMENT,
+        SourceKind::Aura,
+    )];
+    let mut sc = GameScenario::new();
+    let lone = add_sources(&mut sc, &lone);
+    let kept = add_sources(&mut sc, &kept);
+    let base_untargeted = add_sources(&mut sc, &base_untargeted);
+    let runner = sc.build();
+    let expect = |cards: &[(&str, ObjectId)], timing: TargetChoiceTiming| {
+        for (name, id) in cards {
+            let timings = host_reference_timings(&runner, *id);
+            assert!(!timings.is_empty(), "reach: {name} names its host");
+            assert!(
+                timings.iter().all(|t| *t == timing),
+                "{name}: expected {timing:?}, got {timings:?}"
+            );
+        }
+    };
+    expect(&lone, TargetChoiceTiming::Resolution);
+    expect(&kept, TargetChoiceTiming::Stack);
+    expect(&base_untargeted, TargetChoiceTiming::Resolution);
+}
+
+/// The Reviewer's r5 probes, and two neighbours, as ETBs whose host instruction
+/// is followed by other instructions: not converted, so they keep base's
+/// stack-time target.
+#[derive(Clone, Copy)]
+enum ChainedEtb {
+    /// P5-1: "tap enchanted creature. You may put a +1/+1 counter on it.
+    /// Create a Treasure token."
+    OptionalCounterOnIt,
+    /// P5-2: "tap enchanted creature. You gain life equal to its mana value.
+    /// Create a Treasure token."
+    LifeEqualToItsManaValue,
+    /// P5-3: "tap enchanted creature. If you control an artifact, you gain 1
+    /// life. Put a +1/+1 counter on it. Create a Treasure token."
+    ConditionalLifeThenCounterOnIt,
+    /// "tap enchanted creature. It deals 2 damage to you. Create a Treasure
+    /// token."
+    DependentDamage,
+    /// Already untargeted at base (PutCounter): "put a +1/+1 counter on
+    /// enchanted creature. Create a Treasure token."
+    BaseUntargetedCounter,
+}
+
+/// What happens to the enchanted creature before the ETB resolves.
+#[derive(Clone, Copy)]
+enum HostFate {
+    StaysPut,
+    BlinkedInResponse,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct EtbOutcome {
+    life_change: i32,
+    treasures: usize,
+    counters: u32,
+    host_tapped: bool,
+    optional_prompts: usize,
+}
+
+/// SYNTHETIC (Oracle-parsed) Aura with `shape`'s ETB, cast on P1's creature;
+/// the host is worth MV 3 and the Aura MV 2, so a fallback read of the wrong
+/// object shows in the life change.
+fn chained_etb(shape: ChainedEtb, fate: HostFate) -> EtbOutcome {
+    let body = match shape {
+        ChainedEtb::OptionalCounterOnIt => {
+            "tap enchanted creature. You may put a +1/+1 counter on it. Create a Treasure token."
+        }
+        ChainedEtb::LifeEqualToItsManaValue => {
+            "tap enchanted creature. You gain life equal to its mana value. Create a Treasure token."
+        }
+        ChainedEtb::ConditionalLifeThenCounterOnIt => {
+            "tap enchanted creature. If you control an artifact, you gain 1 life. Put a +1/+1 counter on it. Create a Treasure token."
+        }
+        ChainedEtb::DependentDamage => {
+            "tap enchanted creature. It deals 2 damage to you. Create a Treasure token."
+        }
+        ChainedEtb::BaseUntargetedCounter => {
+            "put a +1/+1 counter on enchanted creature. Create a Treasure token."
+        }
+    };
+    let text = format!("Enchant creature\nWhen this Aura enters, {body}");
+    let (mut runner, aura, host, _) = aura_etb_on_stack("Probe Charm", &text, 2, Bystander::Absent);
+    runner.state_mut().objects.get_mut(&host).unwrap().mana_cost = ManaCost::generic(3);
+    runner.state_mut().objects.get_mut(&aura).unwrap().mana_cost = ManaCost::generic(2);
+    let expected_timing = match shape {
+        ChainedEtb::BaseUntargetedCounter => TargetChoiceTiming::Resolution,
+        ChainedEtb::OptionalCounterOnIt
+        | ChainedEtb::LifeEqualToItsManaValue
+        | ChainedEtb::ConditionalLifeThenCounterOnIt
+        | ChainedEtb::DependentDamage => TargetChoiceTiming::Stack,
+    };
+    assert!(
+        runner.state().stack.iter().any(|e| matches!(
+            &e.kind,
+            StackEntryKind::TriggeredAbility { source_id, ability, .. }
+                if *source_id == aura && ability.target_choice_timing == expected_timing
+        )),
+        "reach: the ETB is on the stack with its head at {expected_timing:?}"
+    );
+    let life_before = runner.state().players[P0.0 as usize].life;
+    if let HostFate::BlinkedInResponse = fate {
+        blink(&mut runner, host);
+    }
+    let mut optional_prompts = 0;
+    for _ in 0..64 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        let action = match runner.state().waiting_for {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                optional_prompts += 1;
+                GameAction::DecideOptionalEffect { accept: true }
+            }
+            _ => GameAction::PassPriority,
+        };
+        runner.act(action).expect("the ETB resolves");
+    }
+    let s = runner.state();
+    assert!(s.stack.is_empty(), "reach: the ETB resolved");
+    EtbOutcome {
+        life_change: s.players[P0.0 as usize].life - life_before,
+        treasures: s
+            .battlefield
+            .iter()
+            .filter(|id| s.objects[id].is_token && s.objects[id].name == "Treasure")
+            .count(),
+        counters: s.objects[&host]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        host_tapped: s.objects[&host].tapped,
+        optional_prompts,
+    }
+}
+
+/// P5-1, positive control: with the creature in place the targeted chain
+/// resolves against it (the tap happens). What its followers then do is base's
+/// unchanged behaviour for this synthetic shape.
+#[test]
+fn optional_counter_chain_with_its_host_in_place() {
+    let outcome = chained_etb(ChainedEtb::OptionalCounterOnIt, HostFate::StaysPut);
+    assert!(outcome.host_tapped, "the enchanted creature is tapped");
+}
+
+/// P5-1: the creature is blinked in response. The chain keeps base's target, so
+/// with that target gone the ETB does nothing at all — no prompt, no counter on
+/// the returned creature, no Treasure (CR 608.2b, as at base).
+#[test]
+fn optional_counter_chain_with_its_host_blinked_does_nothing() {
+    assert_eq!(
+        chained_etb(ChainedEtb::OptionalCounterOnIt, HostFate::BlinkedInResponse),
+        EtbOutcome {
+            life_change: 0,
+            treasures: 0,
+            counters: 0,
+            host_tapped: false,
+            optional_prompts: 0,
+        }
+    );
+}
+
+/// P5-2, positive control: "its mana value" is the creature's, 3.
+#[test]
+fn life_equal_to_its_mana_value_with_its_host_in_place() {
+    let outcome = chained_etb(ChainedEtb::LifeEqualToItsManaValue, HostFate::StaysPut);
+    assert_eq!(
+        outcome.life_change, 3,
+        "the enchanted creature's mana value"
+    );
+    assert_eq!(outcome.treasures, 1);
+    assert!(outcome.host_tapped);
+}
+
+/// P5-2: blinked in response, nothing happens; in particular no life from the
+/// Aura's or the returned creature's mana value.
+#[test]
+fn life_equal_to_its_mana_value_with_its_host_blinked_does_nothing() {
+    let outcome = chained_etb(
+        ChainedEtb::LifeEqualToItsManaValue,
+        HostFate::BlinkedInResponse,
+    );
+    assert_eq!(outcome.life_change, 0);
+    assert_eq!(outcome.treasures, 0);
+    assert!(!outcome.host_tapped);
+}
+
+/// P5-3, positive control: with the creature in place the targeted chain
+/// resolves against it; no artifact, so no life, and the Treasure is created.
+#[test]
+fn conditional_then_counter_chain_with_its_host_in_place() {
+    let outcome = chained_etb(
+        ChainedEtb::ConditionalLifeThenCounterOnIt,
+        HostFate::StaysPut,
+    );
+    assert!(outcome.host_tapped, "the enchanted creature is tapped");
+    assert_eq!(outcome.life_change, 0, "no artifact, so no life");
+    assert_eq!(outcome.treasures, 1);
+}
+
+/// P5-3: blinked in response, nothing happens.
+#[test]
+fn conditional_then_counter_chain_with_its_host_blinked_does_nothing() {
+    assert_eq!(
+        chained_etb(
+            ChainedEtb::ConditionalLifeThenCounterOnIt,
+            HostFate::BlinkedInResponse
+        ),
+        EtbOutcome {
+            life_change: 0,
+            treasures: 0,
+            counters: 0,
+            host_tapped: false,
+            optional_prompts: 0,
+        }
+    );
+}
+
+/// "It deals 2 damage to you": blinked in response, nothing happens.
+#[test]
+fn dependent_damage_chain_with_its_host_blinked_does_nothing() {
+    let outcome = chained_etb(ChainedEtb::DependentDamage, HostFate::BlinkedInResponse);
+    assert_eq!(outcome.life_change, 0);
+    assert_eq!(outcome.treasures, 0);
+}
+
+/// Base-untargeted (PutCounter) with the creature in place: same as base.
+#[test]
+fn base_untargeted_counter_then_treasure_with_its_host_in_place() {
+    let outcome = chained_etb(ChainedEtb::BaseUntargetedCounter, HostFate::StaysPut);
+    assert_eq!(
+        outcome.counters, 1,
+        "the enchanted creature gets the counter"
+    );
+    assert_eq!(outcome.treasures, 1);
+}
+
+/// Base-untargeted (PutCounter), creature blinked in response. Base put the
+/// counter on the returned creature, a new object the Aura was never attached
+/// to; now there is no provable host and the counter goes nowhere (the accepted
+/// difference from base). The Treasure is created, as at base.
+#[test]
+fn base_untargeted_counter_then_treasure_with_its_host_blinked_counters_nothing() {
+    let outcome = chained_etb(
+        ChainedEtb::BaseUntargetedCounter,
+        HostFate::BlinkedInResponse,
+    );
+    assert_eq!(outcome.counters, 0, "the returned creature gets no counter");
+    assert_eq!(outcome.treasures, 1, "the Treasure is created, as at base");
 }

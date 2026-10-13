@@ -1,6 +1,6 @@
 use crate::types::ability::{
-    AttachmentHostSlot, ControllerRef, FilterProp, ResolvedAbility, TargetChoiceTiming,
-    TargetFilter, TargetRef, TypeFilter, TypedFilter,
+    ControllerRef, FilterProp, ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef,
+    TypeFilter, TypedFilter,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -1869,9 +1869,6 @@ pub(crate) enum ResolutionHostBinding {
     /// never fall back to a filter scan ("any creature with an Aura attached")
     /// or to an object reusing a departed host's storage id.
     Absent,
-    /// The node takes its source's host as a donor for a different recipient
-    /// ([`AttachmentHostSlot::Donor`]): refused, so the instruction does nothing.
-    RefusedDonor,
 }
 
 /// CR 115.10a + CR 608.2c: binds the host of a resolution-timed "enchanted /
@@ -1892,10 +1889,6 @@ pub(crate) fn bind_resolution_attachment_hosts(
     else {
         return ResolutionHostBinding::NotApplicable;
     };
-    match ability.effect.attachment_host_slot() {
-        AttachmentHostSlot::Donor => return ResolutionHostBinding::RefusedDonor,
-        AttachmentHostSlot::Operand => {}
-    }
     match source_attachment_host(state, ability)
         .filter(|host| live_host_meets_recipient(state, ability, recipient, host.object_id))
     {
@@ -1906,15 +1899,6 @@ pub(crate) fn bind_resolution_attachment_hosts(
         }
         None => ResolutionHostBinding::Absent,
     }
-}
-
-/// CR 608.2c + CR 115.10a: whether `ability` follows an "enchanted / equipped
-/// X" instruction that had no provable host and so bound no object — its
-/// anaphors ("it", "its controller", "its owner") then have no referent and
-/// must not fall back to the trigger event or the source's attachment history.
-pub(crate) fn parent_referent_missing_after_attachment_host(ability: &ResolvedAbility) -> bool {
-    ability.parent_target_missing_reason
-        == Some(crate::types::ability::ParentTargetMissingReason::AttachmentHost)
 }
 
 /// Resolve a filter with a caller-supplied semantic context. This preserves the
@@ -2652,11 +2636,6 @@ pub fn resolve_effect_player_ref(
             }),
         TargetFilter::ParentTargetController => {
             crate::game::ability_utils::parent_target_controller(ability, state).or_else(|| {
-                // CR 608.2c: after a host-less "enchanted/equipped X"
-                // instruction there is no "it", so "its controller" is no one.
-                if parent_referent_missing_after_attachment_host(ability) {
-                    return None;
-                }
                 resolve_event_context_target(state, filter, ability.source_id).and_then(|target| {
                     match target {
                         TargetRef::Player(player) => Some(player),
@@ -2691,9 +2670,6 @@ pub fn resolve_effect_player_ref(
         // source's AttachedTo host for Aura phase triggers).
         TargetFilter::ParentTargetOwner => {
             crate::game::ability_utils::parent_target_owner(ability, state).or_else(|| {
-                if parent_referent_missing_after_attachment_host(ability) {
-                    return None;
-                }
                 resolve_event_context_target(state, filter, ability.source_id).and_then(|target| {
                     match target {
                         TargetRef::Player(player) => Some(player),
