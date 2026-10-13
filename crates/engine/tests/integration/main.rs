@@ -1321,6 +1321,7 @@ mod resolution_optional_payments;
 mod resolve_all_consent;
 mod retarget_prompt_softlock;
 mod rev_tithe_extractor_facedown_cast;
+mod reveal_this_way_single_execution;
 mod reveal_until_simultaneous_kept_delivery;
 mod reveal_until_that_many;
 mod revealed_card_type_disjunction_518;

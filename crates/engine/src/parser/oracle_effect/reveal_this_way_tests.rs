@@ -189,6 +189,58 @@ fn reveal_gate_fails_closed_unless_it_restates_the_parent_until_condition() {
     assert!(is_reveal_gate_gap(&two), "{two:?}");
 }
 
+fn has_reveal_gate_gap_anywhere(def: &AbilityDefinition) -> bool {
+    matches!(
+        def.effect.as_ref(),
+        Effect::Unimplemented { name, .. } if name == "reveal_this_way_reflexive_gate"
+    ) || def
+        .sub_ability
+        .as_deref()
+        .is_some_and(has_reveal_gate_gap_anywhere)
+}
+
+/// The guard reads one reveal-until's own verdict. With any earlier
+/// instruction — a non-reveal one included (whole-scope fallback) — the
+/// multi-instruction antecedent and occurrence set are not proven by this
+/// lowering, so the head stays explicitly unsupported.
+#[test]
+fn reveal_gate_fails_closed_after_an_earlier_instruction() {
+    for (label, lead) in [
+        ("earlier non-reveal instruction", "You gain 1 life. "),
+        (
+            "earlier reveal-until",
+            "Reveal cards from the top of your library until you reveal a land card. Put that card into your hand and the rest on the bottom of your library in a random order. ",
+        ),
+    ] {
+        let def = gate_outcome(&format!(
+            "{lead}{REVEAL_UNTIL_CREATURE_HEAD}When you reveal a creature card this way, you gain 2 life."
+        ));
+        let parent = def
+            .sub_ability
+            .as_deref()
+            .expect("reach guard: the earlier instruction heads the chain");
+        assert!(
+            matches!(parent.effect.as_ref(), Effect::RevealUntil { .. }),
+            "{label}: reach guard: the reveal-until follows the earlier instruction: {def:?}"
+        );
+        assert!(has_reveal_gate_gap_anywhere(&def), "{label}: {def:?}");
+    }
+}
+
+/// An optional reveal can be declined, so its verdict slot never speaks for a
+/// reveal that did not happen.
+#[test]
+fn reveal_gate_fails_closed_after_an_optional_reveal() {
+    let def = gate_outcome(
+        "You may reveal cards from the top of your library until you reveal a creature card. If you do, put that card into your hand and the rest on the bottom of your library in a random order. When you reveal a creature card this way, you gain 2 life.",
+    );
+    assert!(
+        def.optional && matches!(def.effect.as_ref(), Effect::RevealUntil { .. }),
+        "reach guard: an optional reveal-until heads the chain: {def:?}"
+    );
+    assert!(has_reveal_gate_gap_anywhere(&def), "{def:?}");
+}
+
 const CAIT_SITH_TRIGGER: &str = "Lucky Slots — At the beginning of combat on your turn, scry 1, then exile the top card of your library. You may play that card this turn. When you exile a card this way, target creature you control gets +X/+0 until end of turn, where X is that card's mana value.";
 
 fn trigger_json(text: &str, name: &str) -> serde_json::Value {
