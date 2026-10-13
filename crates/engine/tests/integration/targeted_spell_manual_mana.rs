@@ -1374,3 +1374,126 @@ fn cost_sized_yield_is_not_a_proven_payment() {
         );
     }
 }
+
+/// Probe R10 infrastructure fixture: "Pay 3 life: Add an amount of {U} equal
+/// to <count>." on a creature, with P0 at 4 life and no other producer;
+/// Unsubstantiate ({1}{U}) in hand.
+fn life_sized_board(
+    count: engine::types::ability::QuantityExpr,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    sc.with_life(P0, 4);
+    let source = sc
+        .add_creature(P0, "Life Battery", 0, 3)
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: ManaProduction::AnyOneColor {
+                        count,
+                        color_options: vec![ManaColor::Blue],
+                        contribution: ManaContribution::Base,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::PayLife {
+                amount: engine::types::ability::QuantityExpr::Fixed { value: 3 },
+            }),
+        )
+        .id();
+    let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let spell = sc
+        .add_spell_to_hand_from_oracle(P0, "Unsubstantiate", true, UNSUBSTANTIATE)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+        .id();
+    (sc.build(), spell, source, bears)
+}
+
+fn activate_until_payment(runner: &mut GameRunner, source: ObjectId) {
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        })
+        .expect("the source activates during payment");
+    if let WaitingFor::ChooseManaColor { .. } = runner.state().waiting_for {
+        runner
+            .act(GameAction::ChooseManaColor {
+                choice: engine::types::game_state::ManaChoice::SingleColor(ManaType::Blue),
+                count: 1,
+            })
+            .expect("blue is chosen");
+    }
+}
+
+/// Probe R10 (CR 602.2b + CR 608.2h + CR 119.4): "Pay 3 life: Add {U} equal to
+/// your life total" pays its life before the amount is read, so at 4 life it
+/// makes only {U}. Its amount reads what its own cost changes, so it is never
+/// proven and the targeted {1}{U} cast isn't offered. Reach guards: the broad
+/// gate generates the cast with plain Auto payment; cast anyway, its locked
+/// cost is {1}{U}, and the activation leaves 1 life and one {U} in the pool,
+/// so the payment can't finish. Control: the same source making a fixed {U}{U}
+/// is offered and the cast resolves.
+#[test]
+fn amount_read_after_its_own_life_payment_is_not_proven() {
+    use engine::types::ability::{PlayerScope, QuantityExpr, QuantityRef};
+    let (runner, spell, source, bears) = life_sized_board(QuantityExpr::Ref {
+        qty: QuantityRef::LifeTotal {
+            player: PlayerScope::Controller,
+        },
+    });
+    let action = auto_cast(&runner, spell);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: generated with plain Auto payment"
+    );
+    assert!(!legal_actions(runner.state()).contains(&action));
+
+    let mut announced = GameRunner::from_state(runner.state().clone());
+    announced.act(action).expect("the cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: target selection")
+    };
+    assert_eq!(pending_cast.cost, cost(vec![ManaCostShard::Blue], 1));
+    announced
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(bears)],
+        })
+        .expect("the target is accepted");
+    activate_until_payment(&mut announced, source);
+    assert_eq!(
+        announced.state().players[0].life,
+        1,
+        "3 life was paid first"
+    );
+    assert_eq!(
+        announced.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Blue),
+        1,
+        "the amount was read after the payment"
+    );
+    assert!(
+        announced.act(GameAction::PassPriority).is_err(),
+        "{{U}} can't pay {{1}}{{U}}"
+    );
+
+    let (mut control, control_spell, control_source, control_bears) =
+        life_sized_board(QuantityExpr::Fixed { value: 2 });
+    let control_action = auto_cast(&control, control_spell);
+    assert!(legal_actions(control.state()).contains(&control_action));
+    announce_and_target(&mut control, control_action, Some(control_bears));
+    activate_until_payment(&mut control, control_source);
+    control
+        .act(GameAction::PassPriority)
+        .expect("{U}{U} pays {1}{U}");
+    control.advance_until_stack_empty();
+    assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
+}

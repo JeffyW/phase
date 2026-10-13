@@ -16,9 +16,9 @@
 use crate::types::ability::ManaSpendRestriction;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, ControllerRef,
-    CostPaidObjectSnapshot, Effect, ManaProduction, PlayerFilter, QuantityExpr, ResolvedAbility,
-    SacrificeCost, SacrificeRequirement, TargetFilter, TriggerDefinition, TriggerDefinitionRef,
-    TypedFilter,
+    CostPaidObjectSnapshot, Effect, ManaProduction, PlayerFilter, QuantityExpr, QuantityRef,
+    ResolvedAbility, SacrificeCost, SacrificeRequirement, TargetFilter, TriggerDefinition,
+    TriggerDefinitionRef, TypedFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
@@ -3188,22 +3188,34 @@ enum ProofOutput {
     /// The same mana whenever it's activated: a literal output, or a fixed
     /// count of fixed color options.
     Constant,
-    /// Fixed at activation from the board (Nyx Lotus's devotion; colors among
-    /// permanents). Reliable only while no other activation in the plan moves
-    /// an object it may count.
+    /// Fixed at activation from the board, unchanged by any cost a proof
+    /// admits beside it: a devotion amount (Nyx Lotus), or a fixed count of
+    /// colors read from the board. Reliable only while no other activation in
+    /// the plan moves or taps an object.
     BoardSized,
-    /// Sized by X or by the object its own cost chose (Soldevi Adnate's
-    /// "equal to the sacrificed creature's mana value"), or by a trigger
-    /// event: never proven.
+    /// Any other non-fixed amount (X; the object its own cost chose, as in
+    /// Soldevi Adnate's "equal to the sacrificed creature's mana value"; a
+    /// count its own cost changes, such as a life total after paying life),
+    /// or a trigger event's mana type: never proven.
     Variable,
 }
 
 fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOutput {
+    // A non-fixed amount is board-sized only when it is a quantity no cost a
+    // proof admits beside it can change. Devotion (CR 700.5) counts mana
+    // symbols among permanents' mana costs: tapping, untapping, exerting,
+    // paying life or removing a source's own counters leave it unchanged, and
+    // a plan can't hold it beside a cost that moves or taps an object
+    // (`proof_plan_is_affordable`). Any other quantity may read what the
+    // activation's own cost changes before it resolves (CR 602.2b + CR 608.2h:
+    // "Pay 3 life: Add {U} equal to your life total"), so it is never proven.
     let by_count = |count: &QuantityExpr, fixed_colors: bool| match count {
         QuantityExpr::Fixed { .. } if fixed_colors => ProofOutput::Constant,
         QuantityExpr::Fixed { .. } => ProofOutput::BoardSized,
-        _ if count.contains_x() || cost_moves_objects => ProofOutput::Variable,
-        _ => ProofOutput::BoardSized,
+        QuantityExpr::Ref {
+            qty: QuantityRef::Devotion { .. },
+        } if !cost_moves_objects => ProofOutput::BoardSized,
+        _ => ProofOutput::Variable,
     };
     match produced {
         ManaProduction::Fixed { .. }
