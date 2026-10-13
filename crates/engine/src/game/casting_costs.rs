@@ -11578,7 +11578,7 @@ pub(super) fn pay_and_push_adventure(
         && cost.mana_value() > 0
         && !super::casting::can_pay_cost_after_auto_tap(state, player, object_id, cost)
         && super::casting::spell_payment_manual_route(state, player, object_id, cost)
-            != super::casting::ManualPaymentRoute::Infeasible;
+            == super::casting::ManualPaymentRoute::Feasible;
     if has_x || convoke_mode.is_some() || manual_payment || auto_payment_needs_input {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
         pending.base_cost = base_cost.clone();
@@ -15553,19 +15553,7 @@ pub(crate) fn post_origin_auto_payment_verdict(
     let player = pending.ability.controller;
     let tap_payment_mode = eligible_tap_payment_mode(state, player, pending, None);
     choice_free_auto_payment_verdict(pending, tap_payment_mode, || {
-        // CR 601.2g + CR 605.3a: once targets are chosen, the reducer carries
-        // an Auto cast the Auto payer can't finish into the mana-payment step
-        // when a manual mana route may pay it (`pay_and_push_adventure`),
-        // exactly as it does an untargeted cast. The offer additionally needs
-        // that route proven (CR 118.3: no two activations spending the same
-        // card or life). It reads the board before the scratch payment below
-        // taps sources; CR 613.1 characteristics first.
-        if state.layers_dirty.is_dirty() {
-            super::layers::flush_layers(state);
-        }
-        super::casting::spell_payment_manual_route(state, player, pending.object_id, &pending.cost)
-            == super::casting::ManualPaymentRoute::Proven
-            || super::casting::can_pay_pending_cast_after_auto_tap_in_scratch(state, pending)
+        super::casting::can_pay_pending_cast_after_auto_tap_in_scratch(state, pending)
     })
 }
 
@@ -17671,7 +17659,7 @@ mod tests {
         assert!(state.resolving_trigger_firing.is_none());
     }
 
-    fn choice_bearing_offer_test_mana_ability(zone: Zone) -> AbilityDefinition {
+    fn choice_bearing_offer_test_mana_ability() -> AbilityDefinition {
         AbilityDefinition::new(
             AbilityKind::Activated,
             Effect::Mana {
@@ -17687,23 +17675,18 @@ mod tests {
         )
         .cost(AbilityCost::Exile {
             count: 1,
-            zone: Some(zone),
+            zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::Typed(
                 TypedFilter::card()
                     .controller(ControllerRef::You)
-                    .properties(vec![FilterProp::InZone { zone }]),
+                    .properties(vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }]),
             )),
         })
     }
 
-    /// `graveyard_fodder`: the choice-bearing source exiles from a graveyard
-    /// holding one card, so it pays during the mana-payment step. Otherwise it
-    /// exiles from hand, where the spell is the only card: fodder before the
-    /// cast is announced, none once the spell is on the stack (CR 601.2a).
-    fn target_payment_stability_scenario(
-        strive: bool,
-        graveyard_fodder: bool,
-    ) -> (GameScenario, ObjectId) {
+    fn target_payment_stability_scenario(strive: bool) -> (GameScenario, ObjectId) {
         let mut scenario = GameScenario::new();
         scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
         let mut spell = scenario.add_spell_to_hand(PlayerId(0), "Target Stability Spell", true);
@@ -17723,31 +17706,16 @@ mod tests {
         scenario.add_creature(PlayerId(1), "Target Stability B", 2, 2);
         scenario
             .add_creature(PlayerId(0), "Target Stability Mana Source", 0, 3)
-            .with_ability_definition(choice_bearing_offer_test_mana_ability(
-                if graveyard_fodder {
-                    Zone::Graveyard
-                } else {
-                    Zone::Hand
-                },
-            ));
-        if graveyard_fodder {
-            scenario.add_spell_to_graveyard(PlayerId(0), "Target Stability Fodder", true);
-        }
+            .with_ability_definition(choice_bearing_offer_test_mana_ability());
+        scenario.add_spell_to_graveyard(PlayerId(0), "Target Stability Fodder", true);
         (scenario, spell)
     }
 
-    /// The deferred (target-dependent) verdict is `None`. A fixed-target
-    /// verdict is judged: `Some(true)` when the choice-bearing source pays
-    /// (CR 601.2g + CR 605.3a: the reducer carries the cast to the
-    /// mana-payment step), `Some(false)` when nothing can.
     #[test]
     fn target_dependent_payment_prompt_is_deferred_but_fixed_target_payment_is_checked() {
-        for (strive, graveyard_fodder, expected_verdict, offered) in [
-            (true, true, None, true),
-            (false, true, Some(true), true),
-            (false, false, Some(false), false),
-        ] {
-            let (scenario, spell) = target_payment_stability_scenario(strive, graveyard_fodder);
+        for (strive, expected_verdict, offered) in [(true, None, true), (false, Some(false), false)]
+        {
+            let (scenario, spell) = target_payment_stability_scenario(strive);
             let mut runner = scenario.build();
             let action = GameAction::CastSpell {
                 object_id: spell,

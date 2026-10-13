@@ -21532,19 +21532,16 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
     )
 }
 
-/// CR 601.2g-h + CR 605.3a: What the castability planner can establish about
-/// paying a residual mana cost by activating mana abilities the Auto payer
-/// can't (choice-bearing or non-tap ones, or the exact filter-land route).
+/// CR 601.2g-h + CR 605.3a: Whether the caster can pay a residual mana cost by
+/// activating mana abilities the Auto payer can't (choice-bearing or non-tap
+/// ones, or the exact filter-land route).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ManualPaymentRoute {
-    /// A payment exists: the exact filter-land witness, a pool that already
-    /// covers it, or an affordable activation set whose costs are all
-    /// modelled exactly (`mana_sources::manual_mana_payment_is_proven`).
-    Proven,
-    /// The optimistic planner admits a payment that could not be proven (an
-    /// unmodelled cost, shared resources it can't budget, or a bounded search).
-    Plausible,
-    /// Not even the optimistic planner finds a payment.
+    /// The castability planner finds such a payment: the exact filter-land
+    /// witness, or a choice-bearing mana ability with activatable mana that
+    /// covers the residual cost.
+    Feasible,
+    /// It finds none.
     Infeasible,
 }
 
@@ -21552,14 +21549,11 @@ pub(crate) enum ManualPaymentRoute {
 /// the Auto payer can't complete on its own. When a route exists the caster
 /// activates those mana abilities at the mana-payment step (CR 117.1d).
 ///
-/// The single authority, read by two consumers:
-/// - the reducer (`casting_costs::pay_and_push_adventure`) carries an Auto cast
-///   into `WaitingFor::ManaPayment` unless the route is `Infeasible`, exactly
-///   as the castability gate admits it (`auto-tap || !Infeasible`);
-/// - the post-target offer seam (`casting_costs::post_origin_auto_payment_verdict`)
-///   offers the cast only on `Proven`: a castable spell is never hidden by an
-///   exact proof, and an offer never rests on two activations spending the
-///   same card or life.
+/// The single authority, read by two consumers: the castability gate
+/// ([`can_feasibly_pay_mana_cost_without_x_with_probe`]: auto-tap or
+/// `Feasible`), and the reducer (`casting_costs::pay_and_push_adventure`),
+/// which carries an Auto cast the Auto payer can't finish into
+/// `WaitingFor::ManaPayment` exactly when the route is `Feasible`.
 pub(crate) fn spell_payment_manual_route(
     state: &GameState,
     player: PlayerId,
@@ -21571,23 +21565,9 @@ pub(crate) fn spell_payment_manual_route(
     if super::casting_costs::cost_has_x(cost) {
         let mut concrete = cost.clone();
         concrete.concretize_x(0);
-        return manual_mana_payment_route(
-            state,
-            player,
-            Some(source_id),
-            &concrete,
-            None,
-            RouteDepth::Proof,
-        );
+        return manual_mana_payment_route(state, player, Some(source_id), &concrete, None);
     }
-    manual_mana_payment_route(
-        state,
-        player,
-        Some(source_id),
-        cost,
-        None,
-        RouteDepth::Proof,
-    )
+    manual_mana_payment_route(state, player, Some(source_id), cost, None)
 }
 
 /// CR 601.2g-h: Choose the payment mode for an already-prepared spell cost.
@@ -22033,14 +22013,7 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         ) => return true,
     }
 
-    manual_mana_payment_route(
-        state,
-        player,
-        source_id,
-        cost,
-        probe,
-        RouteDepth::Feasibility,
-    ) != ManualPaymentRoute::Infeasible
+    manual_mana_payment_route(state, player, source_id, cost, probe) == ManualPaymentRoute::Feasible
 }
 
 /// CR 601.2h: The unpaid part of `cost` once the caster's floating mana is
@@ -22069,60 +22042,18 @@ fn spell_cost_residual_after_pool(
     ))
 }
 
-/// CR 601.2b + CR 601.2f-h: Whether casting `spell` still owes a cost beyond
-/// its mana on any carrier of the cast (the live `pending_cast`, or one parked
-/// in a prompt): a deferred random discard or sacrifice, a required additional
-/// cost or additional-cost step not yet processed, or a printed additional cost
-/// on the spell itself or granted to it (which a carrier built before
-/// additional-cost processing doesn't show yet).
-fn cast_has_outstanding_cost_obligation(
-    state: &GameState,
-    player: PlayerId,
-    spell: ObjectId,
-) -> bool {
-    let carrier_owes = |pending: &PendingCast| {
-        pending.object_id == spell
-            && (pending.deferred_random_discard_cost.is_some()
-                || !pending.deferred_sacrificed_permanents.is_empty()
-                || pending.deferred_required_additional_cost.is_some()
-                || pending.additional_cost_flow.is_some()
-                || !pending.additional_cost_queue.is_empty())
-    };
-    state.pending_cast.as_deref().is_some_and(carrier_owes)
-        || state
-            .waiting_for
-            .pending_cast_ref()
-            .is_some_and(carrier_owes)
-        || state
-            .objects
-            .get(&spell)
-            .is_some_and(|object| object.additional_cost.is_some())
-        || !casting_costs::build_effective_additional_cost_queue(state, player, spell).is_empty()
-}
-
-/// How far [`manual_mana_payment_route`] goes. The castability gate needs only
-/// whether the route is `Infeasible`, so it skips the proof search.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouteDepth {
-    Feasibility,
-    Proof,
-}
-
 /// CR 117.1d + CR 601.2g + CR 605.3a: The manual leg of the castability
-/// feasibility gate: what can be established about paying `cost` once the
-/// caster activates mana abilities the Auto payer can't (a choice-bearing or
-/// non-tap mana ability, or the exact producer -> filter-land route). It never
-/// asks whether the Auto payer alone would finish;
-/// [`can_feasibly_pay_mana_cost_without_x_with_probe`] tries that first. At
-/// `RouteDepth::Feasibility` a route that isn't `Infeasible` reads `Plausible`
-/// unless it is proven without a search.
+/// feasibility gate: whether `cost` can be paid once the caster activates mana
+/// abilities the Auto payer can't (a choice-bearing or non-tap mana ability,
+/// or the exact producer -> filter-land route). It never asks whether the Auto
+/// payer alone would finish; [`can_feasibly_pay_mana_cost_without_x_with_probe`]
+/// tries that first.
 fn manual_mana_payment_route(
     state: &GameState,
     player: PlayerId,
     source_id: Option<ObjectId>,
     cost: &ManaCost,
     probe: Option<&PriorityCastProbe>,
-    depth: RouteDepth,
 ) -> ManualPaymentRoute {
     // CR 117.1d + CR 601.2g + CR 605.3a + CR 605.3b: Before the residual approximation
     // rejects the cast for lacking a manually activated non-tap source, prove
@@ -22130,7 +22061,7 @@ fn manual_mana_payment_route(
     // a clone through their normal reducer actions and exact choice prompts.
     if let Some(sid) = source_id {
         if has_exact_filter_land_payment_witness(state, player, sid, cost, probe) {
-            return ManualPaymentRoute::Proven;
+            return ManualPaymentRoute::Feasible;
         }
     }
 
@@ -22160,82 +22091,30 @@ fn manual_mana_payment_route(
         | crate::types::mana::ManaCost::SelfManaCost
         | crate::types::mana::ManaCost::SelfManaValue
         | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => {
-            return ManualPaymentRoute::Proven
+            return ManualPaymentRoute::Feasible
         }
         crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
     };
 
-    // The optimistic planner: every activatable object, each planned
-    // independently. Its failure is the only `Infeasible` verdict past this
-    // point, exactly the castability gate's historical rejection.
-    let spell_skip: HashSet<ObjectId> = source_id.into_iter().collect();
-    if !manual_residual_is_covered(
-        state,
-        player,
-        &spell_skip,
-        spell_ctx.as_ref(),
-        residual_shards,
-        residual_generic,
-    ) {
-        return ManualPaymentRoute::Infeasible;
-    }
-    match depth {
-        RouteDepth::Feasibility => ManualPaymentRoute::Plausible,
-        // CR 118.3 + CR 119.4: the optimistic planner lets two activations
-        // spend the same card, permanent or life; only an affordable,
-        // exactly modelled activation set proves the payment. CR 601.2b +
-        // CR 601.2h: a cast that still owes another cost (an additional cost
-        // not yet processed, or a deferred discard or sacrifice) may need the
-        // same cards or permanents, so its payment is never proven.
-        RouteDepth::Proof => {
-            if !source_id
-                .is_some_and(|spell| cast_has_outstanding_cost_obligation(state, player, spell))
-                && super::mana_sources::manual_mana_payment_is_proven(
-                    state,
-                    player,
-                    source_id,
-                    spell_ctx.as_ref(),
-                    residual_shards,
-                    residual_generic,
-                )
-            {
-                ManualPaymentRoute::Proven
-            } else {
-                ManualPaymentRoute::Plausible
-            }
-        }
-    }
-}
-
-/// CR 117.1d + CR 601.2g + CR 605.3a: Whether the activatable mana of the
-/// battlefield objects outside `skip` covers the residual shards and generic.
-fn manual_residual_is_covered(
-    state: &GameState,
-    player: PlayerId,
-    skip: &HashSet<ObjectId>,
-    spell_ctx: Option<&PaymentContext<'_>>,
-    residual_shards: &[ManaCostShard],
-    residual_generic: u32,
-) -> bool {
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
     let (shards_covered, shard_charge) =
         super::mana_sources::can_cover_shards_with_activatable_mana(
             state,
             player,
-            skip,
-            spell_ctx,
+            source_id,
+            spell_ctx.as_ref(),
             residual_shards,
         );
     if !residual_shards.is_empty() && !shards_covered {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     }
     if residual_generic == 0 {
-        return true;
+        return ManualPaymentRoute::Feasible;
     }
 
     // CR 117.1d + CR 605.3a: Sum the per-permanent feasible mana capacity
-    // across the controller's untapped non-skipped battlefield permanents.
+    // across the controller's untapped non-excluded battlefield permanents.
     // Each contribution is the largest single mana-ability output the
     // controller could currently activate (covering Sacrifice / Discard /
     // PayLife costs that auto-tap cannot simulate).
@@ -22246,23 +22125,28 @@ fn manual_residual_is_covered(
     // the color it was planned to make (blue from Nyx Lotus adds its blue
     // amount, not its larger green amount).
     //
-    // The per-permanent sum plans each object independently, so it over-counts
-    // when activations share fodder or life (two Skirge Familiars and one
-    // card; 2× KCI + 1 fodder reports cap=4 when the reachable yield is 2).
-    // The trade-off — over-count rather than under-count, since under-count
-    // was the original #562 bug — is intentional here: this optimistic plan
-    // only decides `Infeasible`. Proof that shared resources suffice is
-    // `mana_sources::manual_mana_payment_is_proven` (issue #1235 tracks a
-    // bounded-flow model for the castability gate itself).
+    // The per-permanent sum over-counts in chain-sacrifice configurations
+    // (e.g. 2× KCI + 1 fodder reports cap=4 when the actual reachable yield
+    // is 2). The trade-off — over-count rather than under-count, since
+    // under-count was the original #562 bug — is intentional. A bounded-
+    // flow model that respects sacrifice/discard/life supply is tracked in
+    // issue #1235.
+    let excluded = source_id;
     let capacity: u32 = state
         .battlefield
         .iter()
-        .filter(|id| !skip.contains(id))
-        .map(|&id| super::mana_sources::feasible_mana_capacity(state, id, player, spell_ctx))
+        .filter(|id| Some(**id) != excluded)
+        .map(|&id| {
+            super::mana_sources::feasible_mana_capacity(state, id, player, spell_ctx.as_ref())
+        })
         .sum::<u32>()
         .saturating_sub(shard_charge);
 
-    capacity >= residual_generic
+    if capacity >= residual_generic {
+        ManualPaymentRoute::Feasible
+    } else {
+        ManualPaymentRoute::Infeasible
+    }
 }
 
 /// Returns true if the player can pay this activated-ability mana cost after

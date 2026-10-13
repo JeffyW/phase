@@ -372,60 +372,9 @@ fn web_slinging_truly_unpayable_sacrificial_cost_is_not_offered() {
     )));
 }
 
-/// "Exile a card from your hand: Add {color}." — choice-bearing like
-/// [`interactive_graveyard_mana_ability`], but its fodder can be the spell
-/// itself before that spell is announced.
-fn interactive_hand_mana_ability(color: ManaColor) -> AbilityDefinition {
-    AbilityDefinition::new(
-        AbilityKind::Activated,
-        Effect::Mana {
-            produced: ManaProduction::Fixed {
-                colors: vec![color],
-                contribution: ManaContribution::Base,
-            },
-            restrictions: vec![],
-            grants: vec![],
-            expiry: None,
-            target: None,
-        },
-    )
-    .cost(AbilityCost::Exile {
-        count: 1,
-        zone: Some(Zone::Hand),
-        filter: Some(TargetFilter::Typed(
-            TypedFilter::card()
-                .controller(ControllerRef::You)
-                .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
-        )),
-    })
-}
-
-/// What the choice-bearing mana source can exile.
-#[derive(Clone, Copy, Debug)]
-enum ChoiceFodder {
-    /// "Exile a card from your graveyard", with one card there: the source
-    /// pays during the mana-payment step (CR 601.2g).
-    Graveyard,
-    /// The same source with an empty graveyard: it can never pay.
-    Absent,
-    /// "Exile a card from your hand", with the spell as the only card in hand.
-    /// The broad pre-announcement gate counts the spell as fodder; once it is
-    /// announced it is on the stack (CR 601.2a) and nothing can pay. Only the
-    /// post-target offer verdict can reject this board.
-    SpellItself,
-}
-
-fn interactive_mana_ability_for(fodder: ChoiceFodder, color: ManaColor) -> AbilityDefinition {
-    match fodder {
-        ChoiceFodder::Graveyard | ChoiceFodder::Absent => interactive_graveyard_mana_ability(color),
-        ChoiceFodder::SpellItself => interactive_hand_mana_ability(color),
-    }
-}
-
 fn setup_murder_with_static(
     plain_land_count: usize,
     target_sensitive_static: Option<StaticDefinition>,
-    fodder: ChoiceFodder,
 ) -> (GameRunner, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -445,20 +394,18 @@ fn setup_murder_with_static(
     }
     scenario
         .add_creature(P0, "Choice-Bearing Mana Source", 0, 3)
-        .with_ability_definition(interactive_mana_ability_for(fodder, ManaColor::Black));
+        .with_ability_definition(interactive_graveyard_mana_ability(ManaColor::Black));
     if let Some(definition) = target_sensitive_static {
         scenario
             .add_creature(P1, "Target-Sensitive Cost Static", 1, 4)
             .with_static_definition(definition);
     }
-    if matches!(fodder, ChoiceFodder::Graveyard) {
-        scenario.add_spell_to_graveyard(P0, "Mana Source Exile Fodder", true);
-    }
+    scenario.add_spell_to_graveyard(P0, "Mana Source Exile Fodder", true);
     (scenario.build(), murder, victim)
 }
 
-fn setup_murder(plain_land_count: usize, fodder: ChoiceFodder) -> (GameRunner, ObjectId, ObjectId) {
-    setup_murder_with_static(plain_land_count, None, fodder)
+fn setup_murder(plain_land_count: usize) -> (GameRunner, ObjectId, ObjectId) {
+    setup_murder_with_static(plain_land_count, None)
 }
 
 fn cost_static_with_filter(
@@ -512,57 +459,9 @@ fn auto_cast_action(state: &engine::types::game_state::GameState, spell: ObjectI
     }
 }
 
-/// The battlefield permanent carrying the choice-bearing mana ability.
-fn choice_source(runner: &GameRunner) -> ObjectId {
-    runner
-        .state()
-        .battlefield
-        .iter()
-        .copied()
-        .find(|id| runner.state().objects[id].name.contains("Choice"))
-        .expect("fixture has a choice-bearing mana source")
-}
-
-/// CR 601.2g-h: from the mana-payment step, activate the choice-bearing source,
-/// answer its exile choice, then finish the payment.
-fn pay_with_choice_source(runner: &mut GameRunner) {
-    assert!(
-        matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
-        "the Auto payer can't answer the exile choice, so the cast waits at the mana-payment step: {:?}",
-        runner.state().waiting_for
-    );
-    let source = choice_source(runner);
-    runner
-        .act(GameAction::ActivateAbility {
-            source_id: source,
-            ability_index: 0,
-        })
-        .expect("the choice-bearing source activates during payment");
-    let WaitingFor::PayCost { choices, .. } = runner.state().waiting_for.clone() else {
-        panic!(
-            "the exile cost asks for a card: {:?}",
-            runner.state().waiting_for
-        )
-    };
-    runner
-        .act(GameAction::SelectCards {
-            cards: vec![choices[0]],
-        })
-        .expect("the fodder is exiled");
-    runner
-        .act(GameAction::PassPriority)
-        .expect("passing finishes the payment");
-}
-
-/// CR 601.2g + CR 605.3a: once the target is chosen, the reducer carries an
-/// Auto cast the Auto payer can't finish into the mana-payment step, where the
-/// interactive source pays. That cast is castable, so it is offered, exactly
-/// like an untargeted cast on the same board. (Restates #7007's
-/// `ordinary_auto_cast_is_not_offered_when_only_interactive_mana_source_completes_cost`,
-/// whose cast this test completes; see phase-rs/phase#9812.)
 #[test]
-fn ordinary_auto_cast_completed_by_interactive_mana_source_is_offered_and_completes() {
-    let (mut runner, murder, victim) = setup_murder(0, ChoiceFodder::Graveyard);
+fn ordinary_auto_cast_is_not_offered_when_only_interactive_mana_source_completes_cost() {
+    let (runner, murder, _) = setup_murder(0);
     let action = auto_cast_action(runner.state(), murder);
     assert!(
         candidate_actions(runner.state())
@@ -570,72 +469,36 @@ fn ordinary_auto_cast_completed_by_interactive_mana_source_is_offered_and_comple
             .any(|candidate| candidate.action == action),
         "reach guard: broad generation must expose the manually payable cast"
     );
-    assert!(legal_actions(runner.state()).contains(&action));
 
-    runner.act(action).expect("the offered action applies");
+    let before = runner.state().clone();
+    let before_json = serde_json::to_value(&before).expect("state snapshot must serialize");
+    let mut disposable = GameRunner::from_state(before.clone());
+    disposable
+        .act(action.clone())
+        .expect("the production reducer must reach target selection before payment");
     assert!(matches!(
-        runner.state().waiting_for,
+        disposable.state().waiting_for,
         WaitingFor::TargetSelection { .. }
     ));
-    runner
-        .act(GameAction::SelectTargets {
-            targets: vec![TargetRef::Object(victim)],
-        })
-        .expect("the target is accepted");
-    pay_with_choice_source(&mut runner);
-    runner.advance_until_stack_empty();
-    assert_eq!(runner.state().objects[&victim].zone, Zone::Graveyard);
-}
 
-/// CR 601.2h: an Auto cast whose interactive source can't pay is not offered,
-/// and the offer probe leaves the live state untouched. `Absent`: the source
-/// has nothing to exile. `SpellItself`: only the spell being cast could have
-/// been exiled (CR 601.2a), so the broad gate generates the cast and only the
-/// post-target verdict rejects it.
-#[test]
-fn ordinary_auto_cast_is_not_offered_when_its_interactive_source_cannot_pay() {
-    for fodder in [ChoiceFodder::Absent, ChoiceFodder::SpellItself] {
-        let (runner, murder, _) = setup_murder(0, fodder);
-        let action = auto_cast_action(runner.state(), murder);
-        let generated = candidate_actions(runner.state())
-            .iter()
-            .any(|candidate| candidate.action == action);
-        assert_eq!(
-            generated,
-            matches!(fodder, ChoiceFodder::SpellItself),
-            "reach guard ({fodder:?}): only the self-fodder board passes the broad gate"
-        );
-
-        let before = runner.state().clone();
-        let before_json = serde_json::to_value(&before).expect("state snapshot must serialize");
-        let mut disposable = GameRunner::from_state(before.clone());
-        disposable
-            .act(action.clone())
-            .expect("the production reducer must reach target selection before payment");
-        assert!(matches!(
-            disposable.state().waiting_for,
-            WaitingFor::TargetSelection { .. }
-        ));
-
-        assert!(
-            !legal_actions(runner.state()).contains(&action),
-            "REVERT-PROOF ({fodder:?}): an Auto cast nothing can pay must not be offered"
-        );
-        assert_eq!(
-            runner.state().players[0].mana_pool,
-            before.players[0].mana_pool
-        );
-        assert_eq!(runner.state().battlefield, before.battlefield);
-        assert_eq!(
-            serde_json::to_value(runner.state()).expect("live state must serialize"),
-            before_json
-        );
-    }
+    assert!(
+        !legal_actions(runner.state()).contains(&action),
+        "REVERT-PROOF: Auto must not be offered when its payer cannot answer the mana-source choice"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool,
+        before.players[0].mana_pool
+    );
+    assert_eq!(runner.state().battlefield, before.battlefield);
+    assert_eq!(
+        serde_json::to_value(runner.state()).expect("live state must serialize"),
+        before_json
+    );
 }
 
 #[test]
 fn ordinary_auto_cast_is_offered_and_completes_with_plain_land() {
-    let (mut runner, murder, victim) = setup_murder(1, ChoiceFodder::Graveyard);
+    let (mut runner, murder, victim) = setup_murder(1);
     let action = auto_cast_action(runner.state(), murder);
     assert!(legal_actions(runner.state()).contains(&action));
 
@@ -669,10 +532,7 @@ fn only_applicable_target_sensitive_cost_statics_defer_strict_auto_payment() {
     ];
 
     for (reason, definition) in irrelevant_statics {
-        // SpellItself: the broad gate generates the cast, but once announced
-        // nothing can pay it, so only a wrongly deferred verdict would offer it.
-        let (runner, murder, _) =
-            setup_murder_with_static(0, Some(definition.clone()), ChoiceFodder::SpellItself);
+        let (runner, murder, _) = setup_murder_with_static(0, Some(definition));
         let action = auto_cast_action(runner.state(), murder);
         assert!(
             candidate_actions(runner.state())
@@ -684,21 +544,10 @@ fn only_applicable_target_sensitive_cost_statics_defer_strict_auto_payment() {
             !legal_actions(runner.state()).contains(&action),
             "an irrelevant target-sensitive static with {reason} must not rescue an uncompletable Auto cast"
         );
-
-        // CR 601.2g: with real fodder the interactive source pays, so the
-        // judged (not deferred) verdict offers the cast.
-        let (payable, payable_murder, _) =
-            setup_murder_with_static(0, Some(definition), ChoiceFodder::Graveyard);
-        assert!(
-            legal_actions(payable.state())
-                .contains(&auto_cast_action(payable.state(), payable_murder)),
-            "{reason}: the interactive source completes the judged cast, so it is offered"
-        );
     }
 
     let relevant = target_sensitive_cost_static(ControllerRef::Opponent, None, TypedFilter::card());
-    let (runner, murder, _) =
-        setup_murder_with_static(0, Some(relevant), ChoiceFodder::SpellItself);
+    let (runner, murder, _) = setup_murder_with_static(0, Some(relevant));
     let action = auto_cast_action(runner.state(), murder);
     assert!(
         candidate_actions(runner.state())
@@ -714,11 +563,7 @@ fn only_applicable_target_sensitive_cost_statics_defer_strict_auto_payment() {
 
 fn assert_target_independent_composed_filter_offer_pair(label: &str, spell_filter: TargetFilter) {
     let definition = cost_static_with_filter(ControllerRef::Opponent, None, spell_filter.clone());
-    // SpellItself: before announcement the spell is the hand source's fodder,
-    // so the taxed {2}{B}{B} is broadly payable (two Swamps, an Island and the
-    // source); after announcement only three sources remain.
-    let (runner, murder, _) =
-        setup_murder_with_static(1, Some(definition), ChoiceFodder::SpellItself);
+    let (runner, murder, _) = setup_murder_with_static(1, Some(definition));
     let action = auto_cast_action(runner.state(), murder);
     assert!(
         candidate_actions(runner.state())
@@ -747,20 +592,9 @@ fn assert_target_independent_composed_filter_offer_pair(label: &str, spell_filte
         "REVERT-PROOF: {label} must not defer the strict verdict and offer an uncompletable Auto cast"
     );
 
-    // CR 601.2g: the same taxed cast with graveyard fodder is completed by
-    // the interactive source, so the judged verdict offers it.
-    let manual_definition =
-        cost_static_with_filter(ControllerRef::Opponent, None, spell_filter.clone());
-    let (manual, manual_murder, _) =
-        setup_murder_with_static(1, Some(manual_definition), ChoiceFodder::Graveyard);
-    assert!(
-        legal_actions(manual.state()).contains(&auto_cast_action(manual.state(), manual_murder)),
-        "{label}: the interactive source completes the taxed cast, so it is offered"
-    );
-
     let payable_definition = cost_static_with_filter(ControllerRef::Opponent, None, spell_filter);
     let (mut payable, payable_murder, victim) =
-        setup_murder_with_static(2, Some(payable_definition), ChoiceFodder::Graveyard);
+        setup_murder_with_static(2, Some(payable_definition));
     let payable_action = auto_cast_action(payable.state(), payable_murder);
     assert!(
         legal_actions(payable.state()).contains(&payable_action),
@@ -801,10 +635,7 @@ fn target_independent_not_filter_does_not_rescue_uncompletable_auto_cast() {
     );
 }
 
-fn setup_prepared_copy(
-    add_plain_land: bool,
-    fodder: ChoiceFodder,
-) -> Option<(GameRunner, ObjectId, ObjectId)> {
+fn setup_prepared_copy(add_plain_land: bool) -> Option<(GameRunner, ObjectId, ObjectId)> {
     let db = load_db()?;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -813,10 +644,8 @@ fn setup_prepared_copy(
     scenario.add_creature(P1, "Second Prepared Target", 1, 1);
     scenario
         .add_creature(P0, "Prepared Choice-Bearing Source", 0, 3)
-        .with_ability_definition(interactive_mana_ability_for(fodder, ManaColor::White));
-    if matches!(fodder, ChoiceFodder::Graveyard) {
-        scenario.add_spell_to_graveyard(P0, "Prepared Mana Fodder", true);
-    }
+        .with_ability_definition(interactive_graveyard_mana_ability(ManaColor::White));
+    scenario.add_spell_to_graveyard(P0, "Prepared Mana Fodder", true);
     if add_plain_land {
         scenario.add_basic_land(P0, ManaColor::White);
     }
@@ -832,48 +661,45 @@ fn setup_prepared_copy(
     Some((runner, emeritus, victim))
 }
 
-/// CR 601.2g + CR 601.2h: a prepared copy nothing can pay is neither offered
-/// nor castable. `Absent`: the interactive source has nothing to exile. The
-/// copy's own castability gate (`cast_prepared_copy` -> `can_cast_object_now`)
-/// and the offer agree, and the live state is untouched. (The copy is never in
-/// a hand or graveyard, so it can't be its own fodder; the self-fodder board,
-/// which only the post-target verdict can reject, is covered by the ordinary
-/// and EffectZoneChoice tests.)
 #[test]
 fn prepared_copy_auto_cast_is_not_offered_when_unpayable() {
-    // Reach guard: with fodder, this exact action is generated, so the prepared
-    // source and its copy are live and only the payment differs below.
-    let Some((payable, payable_emeritus, _)) = setup_prepared_copy(false, ChoiceFodder::Graveyard)
-    else {
-        return;
-    };
-    let payable_action = GameAction::CastPreparedCopy {
-        source: payable_emeritus,
-    };
-    assert!(candidate_actions(payable.state())
-        .iter()
-        .any(|candidate| candidate.action == payable_action));
-
-    let Some((runner, emeritus, _)) = setup_prepared_copy(false, ChoiceFodder::Absent) else {
+    let Some((runner, emeritus, victim)) = setup_prepared_copy(false) else {
         return;
     };
     let action = GameAction::CastPreparedCopy { source: emeritus };
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach guard: prepared-copy candidate must reach strict simulation"
+    );
+    let mut disposable = GameRunner::from_state(runner.state().clone());
+    disposable
+        .act(action.clone())
+        .expect("prepared production reducer must synthesize the exact copy");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &disposable.state().waiting_for else {
+        panic!("prepared copy must reach target selection")
+    };
+    assert_eq!(
+        pending_cast.cost,
+        ManaCost::Cost {
+            shards: vec![ManaCostShard::White],
+            generic: 0,
+        }
+    );
+    assert!(pending_cast.casting_permission_index.is_some());
+    assert_eq!(pending_cast.ability.controller, P0);
+    assert!(pending_cast
+        .ability
+        .targets
+        .iter()
+        .all(|target| *target != TargetRef::Object(victim)));
+
     let before = runner.state().clone();
     let before_json = serde_json::to_value(&before).expect("state snapshot must serialize");
     assert!(
-        !candidate_actions(runner.state())
-            .iter()
-            .any(|candidate| candidate.action == action),
-        "the broad gate drops a prepared copy nothing can pay"
-    );
-    assert!(
         !legal_actions(runner.state()).contains(&action),
-        "REVERT-PROOF: implicit-Auto prepared copy must be filtered when nothing can pay it"
-    );
-    let mut disposable = GameRunner::from_state(before.clone());
-    assert!(
-        disposable.act(action).is_err(),
-        "CR 601.2g: the prepared copy's own castability gate refuses the cast"
+        "REVERT-PROOF: implicit-Auto prepared copy must be filtered when the real payer cannot complete"
     );
     assert!(runner.state().objects[&emeritus].prepared.is_some());
     assert_eq!(
@@ -881,40 +707,10 @@ fn prepared_copy_auto_cast_is_not_offered_when_unpayable() {
         before_json
     );
 }
-/// CR 601.2g + CR 605.3a: the same prepared copy paid by the interactive
-/// source is castable, so it is offered and completes through the
-/// mana-payment step. (Restates #7007's negative on this board; see
-/// phase-rs/phase#9812.)
-#[test]
-fn prepared_copy_auto_cast_completed_by_interactive_source_is_offered_and_completes() {
-    let Some((mut runner, emeritus, victim)) = setup_prepared_copy(false, ChoiceFodder::Graveyard)
-    else {
-        return;
-    };
-    let action = GameAction::CastPreparedCopy { source: emeritus };
-    assert!(legal_actions(runner.state()).contains(&action));
-    runner
-        .act(action)
-        .expect("the prepared copy starts its real cast");
-    assert!(matches!(
-        runner.state().waiting_for,
-        WaitingFor::TargetSelection { .. }
-    ));
-    runner
-        .act(GameAction::ChooseTarget {
-            target: Some(TargetRef::Object(victim)),
-        })
-        .expect("the target is accepted");
-    pay_with_choice_source(&mut runner);
-    runner.advance_until_stack_empty();
-    assert_eq!(runner.state().objects[&victim].zone, Zone::Exile);
-    assert!(runner.state().objects[&emeritus].prepared.is_none());
-}
 
 #[test]
 fn prepared_copy_auto_cast_is_offered_and_completes_when_payable() {
-    let Some((mut runner, emeritus, victim)) = setup_prepared_copy(true, ChoiceFodder::Graveyard)
-    else {
+    let Some((mut runner, emeritus, victim)) = setup_prepared_copy(true) else {
         return;
     };
     let action = GameAction::CastPreparedCopy { source: emeritus };
@@ -943,10 +739,7 @@ fn prepared_copy_auto_cast_is_offered_and_completes_when_payable() {
     assert!(runner.state().objects[&emeritus].prepared.is_none());
 }
 
-fn setup_face_of_boe(
-    add_plain_red_source: bool,
-    fodder: ChoiceFodder,
-) -> Option<(GameRunner, ObjectId)> {
+fn setup_face_of_boe(add_plain_red_source: bool) -> Option<(GameRunner, ObjectId)> {
     let db = load_db()?;
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -991,10 +784,8 @@ fn setup_face_of_boe(
     let rift_bolt = scenario.add_real_card(P0, "Rift Bolt", Zone::Hand, db);
     scenario
         .add_creature(P0, "Alternative-Mana Choice Source", 0, 3)
-        .with_ability_definition(interactive_mana_ability_for(fodder, ManaColor::Red));
-    if matches!(fodder, ChoiceFodder::Graveyard) {
-        scenario.add_spell_to_graveyard(P0, "Alternative-Mana Fodder", true);
-    }
+        .with_ability_definition(interactive_graveyard_mana_ability(ManaColor::Red));
+    scenario.add_spell_to_graveyard(P0, "Alternative-Mana Fodder", true);
     if add_plain_red_source {
         scenario.add_basic_land(P0, ManaColor::Red);
     }
@@ -1071,84 +862,48 @@ fn select_cards_action(card: ObjectId) -> GameAction {
     GameAction::SelectCards { cards: vec![card] }
 }
 
-/// CR 601.2h: the exact EffectZoneChoice selection is filtered when nothing
-/// can pay Suspend {R}. `Absent`: the interactive source has nothing to exile.
-/// `SpellItself`: Rift Bolt is the hand source's only fodder, but once it is
-/// selected and announced it is on the stack (CR 601.2a).
 #[test]
 fn effect_zone_alternative_mana_targeted_cast_is_not_offered_when_auto_cannot_pay() {
-    for fodder in [ChoiceFodder::Absent, ChoiceFodder::SpellItself] {
-        let Some((runner, rift_bolt)) = setup_face_of_boe(false, fodder) else {
-            return;
-        };
-        let action = select_cards_action(rift_bolt);
-        assert!(
-            candidate_actions(runner.state())
-                .iter()
-                .any(|candidate| candidate.action == action),
-            "reach guard ({fodder:?}): the production EffectZoneChoice must generate Rift Bolt's SelectCards action"
-        );
-        let before_json = serde_json::to_value(runner.state()).expect("state must serialize");
-        let mut disposable = GameRunner::from_state(runner.state().clone());
-        disposable
-            .act(action.clone())
-            .expect("selection must bind the Suspend alternative-mana authority");
-        let WaitingFor::TargetSelection { pending_cast, .. } = &disposable.state().waiting_for
-        else {
-            panic!("Rift Bolt must reach its targeted pending cast")
-        };
-        assert_eq!(pending_cast.object_id, rift_bolt);
-        assert_eq!(
-            pending_cast.cost,
-            ManaCost::Cost {
-                shards: vec![ManaCostShard::Red],
-                generic: 0,
-            }
-        );
-        assert!(pending_cast.casting_permission_index.is_some());
-        assert!(
-            !legal_actions(runner.state()).contains(&action),
-            "REVERT-PROOF ({fodder:?}): the exact EffectZoneChoice source action must be filtered when nothing can pay Suspend {{R}}"
-        );
-        assert_eq!(
-            serde_json::to_value(runner.state()).expect("live state must serialize"),
-            before_json
-        );
-    }
-}
-
-/// CR 601.2g + CR 605.3a: with graveyard fodder the interactive source pays
-/// Suspend {R}, so the selection is offered and the cast completes through the
-/// mana-payment step. (Restates #7007's negative on this board; see
-/// phase-rs/phase#9812.)
-#[test]
-fn effect_zone_alternative_mana_targeted_cast_completed_by_interactive_source_is_offered() {
-    let Some((mut runner, rift_bolt)) = setup_face_of_boe(false, ChoiceFodder::Graveyard) else {
+    let Some((runner, rift_bolt)) = setup_face_of_boe(false) else {
         return;
     };
     let action = select_cards_action(rift_bolt);
-    assert!(legal_actions(runner.state()).contains(&action));
-    runner
-        .act(action)
-        .expect("the selection begins the exact cast");
-    assert!(matches!(
-        runner.state().waiting_for,
-        WaitingFor::TargetSelection { .. }
-    ));
-    let life_before = runner.state().players[1].life;
-    runner
-        .act(GameAction::ChooseTarget {
-            target: Some(TargetRef::Player(P1)),
-        })
-        .expect("the target is accepted");
-    pay_with_choice_source(&mut runner);
-    runner.advance_until_stack_empty();
-    assert_eq!(runner.state().players[1].life, life_before - 3);
-    assert_eq!(runner.state().objects[&rift_bolt].zone, Zone::Graveyard);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach guard: the production EffectZoneChoice must generate Rift Bolt's SelectCards action"
+    );
+    let before_json = serde_json::to_value(runner.state()).expect("state must serialize");
+    let mut disposable = GameRunner::from_state(runner.state().clone());
+    disposable
+        .act(action.clone())
+        .expect("selection must bind the Suspend alternative-mana authority");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &disposable.state().waiting_for else {
+        panic!("Rift Bolt must reach its targeted pending cast")
+    };
+    assert_eq!(pending_cast.object_id, rift_bolt);
+    assert_eq!(
+        pending_cast.cost,
+        ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        }
+    );
+    assert!(pending_cast.casting_permission_index.is_some());
+    assert!(
+        !legal_actions(runner.state()).contains(&action),
+        "REVERT-PROOF: the exact EffectZoneChoice source action must be filtered when Suspend {{R}} is not Auto-payable"
+    );
+    assert_eq!(
+        serde_json::to_value(runner.state()).expect("live state must serialize"),
+        before_json
+    );
 }
+
 #[test]
 fn effect_zone_alternative_mana_targeted_cast_is_offered_and_completes_when_payable() {
-    let Some((mut runner, rift_bolt)) = setup_face_of_boe(true, ChoiceFodder::Graveyard) else {
+    let Some((mut runner, rift_bolt)) = setup_face_of_boe(true) else {
         return;
     };
     let action = select_cards_action(rift_bolt);
@@ -1570,19 +1325,8 @@ fn exile_alt_cost_permission(
     }
 }
 
-/// CR 601.2a + CR 601.2g: each cast origin binds its own pending object and
-/// permission. `exile_a`'s {R} permission is payable only through the
-/// interactive red source: with graveyard fodder it is offered (restating
-/// #7007's `false`, see phase-rs/phase#9812); with none it is not, though the
-/// reducer still binds its announcement to the right permission.
 #[test]
 fn same_state_cast_origins_bind_distinct_pending_objects_and_permissions() {
-    for fodder in [ChoiceFodder::Graveyard, ChoiceFodder::Absent] {
-        assert_same_state_cast_origins_bind(fodder);
-    }
-}
-
-fn assert_same_state_cast_origins_bind(fodder: ChoiceFodder) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let add_targeted_spell = |scenario: &mut GameScenario, name: &str| {
@@ -1602,10 +1346,8 @@ fn assert_same_state_cast_origins_bind(fodder: ChoiceFodder) {
     scenario.add_basic_land(P0, ManaColor::Blue);
     scenario
         .add_creature(P0, "Authority Red Choice Source", 0, 3)
-        .with_ability_definition(interactive_mana_ability_for(fodder, ManaColor::Red));
-    if matches!(fodder, ChoiceFodder::Graveyard) {
-        scenario.add_spell_to_graveyard(P0, "Authority Red Fodder", true);
-    }
+        .with_ability_definition(interactive_graveyard_mana_ability(ManaColor::Red));
+    scenario.add_spell_to_graveyard(P0, "Authority Red Fodder", true);
     let mut runner = scenario.build();
     engine::game::zones::move_to_zone(runner.state_mut(), exile_a, Zone::Exile, &mut Vec::new());
     engine::game::zones::move_to_zone(runner.state_mut(), exile_b, Zone::Exile, &mut Vec::new());
@@ -1643,21 +1385,16 @@ fn assert_same_state_cast_origins_bind(fodder: ChoiceFodder) {
         ),
     ];
 
-    let red_payable = matches!(fodder, ChoiceFodder::Graveyard);
     let cases = [
         (hand, None, true),
-        (exile_a, Some(CastingPermissionIndex(0)), red_payable),
+        (exile_a, Some(CastingPermissionIndex(0)), false),
         (exile_b, Some(CastingPermissionIndex(1)), true),
     ];
     let raw = candidate_actions(runner.state());
     let exact = legal_actions(runner.state());
     for (spell, permission, offered) in cases {
         let action = auto_cast_action(runner.state(), spell);
-        assert_eq!(
-            raw.iter().any(|candidate| candidate.action == action),
-            offered,
-            "{fodder:?}: the broad gate agrees on whether {spell:?} is payable"
-        );
+        assert!(raw.iter().any(|candidate| candidate.action == action));
 
         let mut disposable = GameRunner::from_state(runner.state().clone());
         disposable
@@ -1669,6 +1406,6 @@ fn assert_same_state_cast_origins_bind(fodder: ChoiceFodder) {
         };
         assert_eq!(pending_cast.object_id, spell);
         assert_eq!(pending_cast.casting_permission_index, permission);
-        assert_eq!(exact.contains(&action), offered, "{fodder:?}: {spell:?}");
+        assert_eq!(exact.contains(&action), offered);
     }
 }

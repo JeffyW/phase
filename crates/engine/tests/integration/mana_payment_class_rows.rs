@@ -873,9 +873,6 @@ fn unchanged_boards_read_as_before() {
 const UNCHANGED: &[Row] = &[
     ("t/cryptex", "Cryptex", "{T}, Collect evidence 3: Add one mana of any color. Put an unlock counter on ~.", &[("Hill Giant", G, 'f')], &[], "Llanowar Elves", true, "tt/BF"),
     ("t/master-of-dark-rites", "Master of Dark Rites", "{T}, Sacrifice another creature: Add {B}{B}{B}. Spend this mana only to cast Vampire, Cleric, and/or Demon spells.", &[("Grizzly Bears", B, 'f')], &[], "Vampire Nighthawk", false, "ff/H"),
-    // phase-rs/phase#9812: its reflexive "When you do" sub-ability keeps it
-    // out of the post-target payment proof (direct mana leaves only), so the
-    // targeted Lightning Bolt stays castable but unlisted.
     ("t/rubble-rouser", "Rubble Rouser", "{T}, Exile a card from your graveyard: Add {R}. When you do, ~ deals 1 damage to each opponent.", &[("Grizzly Bears", G, 'f')], &[], "Lightning Bolt", true, "ft/H"),
     ("t/springjack-pasture", "Springjack Pasture", "{T}, Sacrifice X Goats: Add X mana of any one color. You gain X life.", &[("Mountain Goat", B, 'f')], &[], "Llanowar Elves", false, "ff/H"),
     ("t/thornvault-forager", "Thornvault Forager", "{T}, Forage: Add two mana in any combination of colors.", &[("Hill Giant", G, 'f'), ("Hill Giant", G, 'f'), ("Hill Giant", G, 'f')], &[], "Grizzly Bears", false, "ff/H"),

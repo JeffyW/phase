@@ -16,9 +16,9 @@
 use crate::types::ability::ManaSpendRestriction;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, ControllerRef,
-    CostPaidObjectSnapshot, Effect, ManaProduction, PlayerFilter, QuantityExpr, QuantityRef,
-    ResolvedAbility, SacrificeCost, SacrificeRequirement, TargetFilter, TriggerDefinition,
-    TriggerDefinitionRef, TypedFilter,
+    CostPaidObjectSnapshot, Effect, ManaProduction, PlayerFilter, QuantityExpr, ResolvedAbility,
+    SacrificeCost, SacrificeRequirement, TargetFilter, TriggerDefinition, TriggerDefinitionRef,
+    TypedFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
@@ -31,7 +31,6 @@ use crate::types::mana::{
     ManaSourceSelection, ManaType, PaymentContext, TapsForManaSelection,
 };
 use crate::types::player::PlayerId;
-use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::Zone;
 use crate::types::TriggerMode;
 
@@ -39,7 +38,6 @@ use super::engine::{EngineError, PriorityAnnouncementFacadeAccess, PriorityPrinc
 use super::mana_abilities;
 use super::mana_abilities::ManaPayabilityMode;
 use super::mana_payment;
-use super::replacement;
 use super::restrictions;
 use super::triggers::trigger_source_context_for_latch;
 use super::turn_control;
@@ -2724,24 +2722,6 @@ fn activatable_mana_profiles_for_object(
     controller: PlayerId,
     payment_context: Option<&PaymentContext<'_>>,
 ) -> Vec<ActivatableManaProfile> {
-    activatable_mana_profiles_for_object_with(
-        state,
-        object_id,
-        controller,
-        payment_context,
-        |_, _| true,
-    )
-}
-
-/// [`activatable_mana_profiles_for_object`] over only the abilities `allow`
-/// admits (by index and definition).
-fn activatable_mana_profiles_for_object_with(
-    state: &GameState,
-    object_id: ObjectId,
-    controller: PlayerId,
-    payment_context: Option<&PaymentContext<'_>>,
-    allow: impl Fn(usize, &AbilityDefinition) -> bool,
-) -> Vec<ActivatableManaProfile> {
     let Some(obj) = state.objects.get(&object_id) else {
         return Vec::new();
     };
@@ -2760,7 +2740,7 @@ fn activatable_mana_profiles_for_object_with(
         .abilities
         .iter()
         .enumerate()
-        .filter(|(idx, ability)| is_payment_mana_ability(ability) && allow(*idx, ability))
+        .filter(|(_, ability)| is_payment_mana_ability(ability))
         .partition(|(_, ability)| {
             !(has_tap_component(&ability.cost)
                 && mana_abilities::mana_sub_cost_of(&ability.cost).is_some())
@@ -2893,13 +2873,13 @@ fn profile_kind_allowed_for_context(
 fn collect_activatable_mana_profiles(
     state: &GameState,
     player: PlayerId,
-    skip: &std::collections::HashSet<ObjectId>,
+    exclude: Option<ObjectId>,
     payment_context: Option<&PaymentContext<'_>>,
 ) -> Vec<ActivatableManaProfile> {
     state
         .battlefield
         .iter()
-        .filter(|id| !skip.contains(id))
+        .filter(|id| Some(**id) != exclude)
         .flat_map(|&id| activatable_mana_profiles_for_object(state, id, player, payment_context))
         .collect()
 }
@@ -3148,538 +3128,21 @@ fn assign_profiles_to_shards(
 /// covering assignment uses up (each covered shard, plus any output an
 /// activation forgoes against its object's planned capacity). Callers must
 /// subtract it from the summed `feasible_mana_capacity` to avoid counting one
-/// activation twice or crediting a color that was not chosen. Objects in
-/// `skip` (the spell's own object) contribute nothing.
+/// activation twice or crediting a color that was not chosen.
 pub(crate) fn can_cover_shards_with_activatable_mana(
     state: &GameState,
     player: PlayerId,
-    skip: &std::collections::HashSet<ObjectId>,
+    exclude: Option<ObjectId>,
     payment_context: Option<&PaymentContext<'_>>,
     shards: &[ManaCostShard],
 ) -> (bool, u32) {
     if shards.is_empty() {
         return (true, 0);
     }
-    let profiles = collect_activatable_mana_profiles(state, player, skip, payment_context);
+    let profiles = collect_activatable_mana_profiles(state, player, exclude, payment_context);
     assign_profiles_to_shards(&profiles, shards)
         .map(|consumed| (true, consumed))
         .unwrap_or((false, 0))
-}
-
-/// One battlefield object as a payment proof may use it: only the abilities
-/// whose costs the proof models exactly
-/// (`mana_abilities::mana_ability_cost_resource_legs`), with the shared
-/// resources activating any one of them could spend.
-struct ProofSource {
-    object_id: ObjectId,
-    capacity: u32,
-    kinds: Vec<ActivatableManaProfileKind>,
-    /// Each admitted ability's shared-resource legs; any one may be the one
-    /// activated, so the proof budgets for the most demanding.
-    ability_legs: Vec<Vec<mana_abilities::ManaCostResourceLeg>>,
-    /// Some admitted ability's output is sized or colored by the board.
-    board_sized: bool,
-    /// Some admitted ability's cost moves or taps an object.
-    moves_objects: bool,
-}
-
-/// CR 106.1 + CR 605.1a: What an activation's mana output depends on, for a
-/// payment proof (whose plan is an unordered set of activations).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProofOutput {
-    /// The same mana whenever it's activated: a literal output, or a fixed
-    /// count of fixed color options.
-    Constant,
-    /// A devotion amount (CR 700.5) of fixed color options, as on Nyx Lotus:
-    /// read from the board at activation, and unchanged by any cost a proof
-    /// admits beside it. Reliable only while no other activation in the plan
-    /// moves or taps an object.
-    BoardSized,
-    /// Any other output that reads the game (X; the object its own cost
-    /// chose, as in Soldevi Adnate's "equal to the sacrificed creature's mana
-    /// value"; a count its own cost changes, such as a life total after paying
-    /// life; colors read from the board, which its own cost may empty), or a
-    /// trigger event's mana type: never proven.
-    Variable,
-}
-
-/// CR 605.1a + CR 608.2c: the production of a payment mana ability the proof
-/// may read, only when the whole ability is one direct `Effect::Mana` leaf.
-/// A sub-ability, else branch, condition, choice, repetition or target can
-/// change what resolves after its cost is paid (CR 602.2b + CR 608.2h: a
-/// `ConditionInstead` sub-ability swaps "Add {U}{U}" for "Add {U}" once paying
-/// life drops the total), so any of them leaves the ability unproven. The
-/// destructuring is exhaustive: a new field must be classified here.
-fn direct_mana_leaf(ability: &AbilityDefinition) -> Option<&ManaProduction> {
-    let AbilityDefinition {
-        effect,
-        declares_chosen_group,
-        reads_chosen_group,
-        declares_return_result,
-        reads_return_result,
-        sub_ability,
-        else_ability,
-        condition,
-        optional_targeting,
-        optional,
-        optional_player,
-        optional_for,
-        multi_target,
-        distribute,
-        unless_pay,
-        modal,
-        mode_abilities,
-        repeat_for,
-        announced_x,
-        cost_reduction,
-        forward_result,
-        player_scope,
-        starting_with,
-        target_chooser,
-        repeat_until,
-        iteration_kind_binding,
-        sibling_condition,
-        unlowered_guard,
-        activation_restrictions,
-        // Inert for a targetless mana leaf: classification, timing and
-        // activation permissions (checked by the activatability profiles), the
-        // cost (modelled by `mana_ability_cost_resource_legs`), display text,
-        // and target bookkeeping with no target to read.
-        kind: _,
-        cost: _,
-        duration: _,
-        description: _,
-        target_prompt: _,
-        activation_mana_payment_restriction: _,
-        activator_filter: _,
-        activation_zone: _,
-        ability_tag: _,
-        target_constraints: _,
-        target_choice_timing: _,
-        min_x_value: _,
-        cant_be_copied: _,
-        illegal_targets_disposition: _,
-        target_selection_mode: _,
-        sub_link: _,
-        target_reads: _,
-        face_down_in_exile: _,
-        granting_object: _,
-    } = ability;
-    let Effect::Mana {
-        produced,
-        target: None,
-        ..
-    } = &**effect
-    else {
-        return None;
-    };
-    let leaf = declares_chosen_group.is_none()
-        && reads_chosen_group.is_none()
-        && declares_return_result.is_none()
-        && reads_return_result.is_none()
-        && sub_ability.is_none()
-        && else_ability.is_none()
-        && condition.is_none()
-        && !optional_targeting
-        && !optional
-        && optional_player.is_none()
-        && optional_for.is_none()
-        && multi_target.is_none()
-        && distribute.is_none()
-        && unless_pay.is_none()
-        && modal.is_none()
-        && mode_abilities.is_empty()
-        && repeat_for.is_none()
-        && announced_x.is_none()
-        && cost_reduction.is_none()
-        && !forward_result
-        && player_scope.is_none()
-        && starting_with.is_none()
-        && target_chooser.is_none()
-        && repeat_until.is_none()
-        && iteration_kind_binding.is_none()
-        && *sibling_condition == crate::types::ability::SiblingCondition::Dependent
-        && unlowered_guard.is_none()
-        && activation_restrictions
-            .iter()
-            .all(activation_restriction_is_timing_only);
-    leaf.then_some(produced)
-}
-
-/// CR 602.1b + CR 602.5: an activation restriction the proof may hold fixed
-/// across a whole payment plan. Only timing restrictions qualify: the turn,
-/// phase and step can't change while one spell's mana is paid, and the
-/// activatability profiles already checked them. Any restriction that reads
-/// the board, the source, or a count of earlier activations may be changed by
-/// another planned activation ("Activate only if your life total is 4 or
-/// greater" after another source paid life), so it leaves the ability
-/// unproven.
-fn activation_restriction_is_timing_only(restriction: &ActivationRestriction) -> bool {
-    match restriction {
-        ActivationRestriction::AsSorcery
-        | ActivationRestriction::AsInstant
-        | ActivationRestriction::DuringYourTurn
-        | ActivationRestriction::DuringYourUpkeep
-        | ActivationRestriction::DuringCombat
-        | ActivationRestriction::BeforeAttackersDeclared
-        | ActivationRestriction::BeforeCombatDamage
-        | ActivationRestriction::MatchesCardCastTiming => true,
-        ActivationRestriction::OnlyOnceEachTurn
-        | ActivationRestriction::OnlyOnce
-        | ActivationRestriction::MaxTimesEachTurn { .. }
-        | ActivationRestriction::RequiresCondition { .. }
-        | ActivationRestriction::IsSolved
-        | ActivationRestriction::SourceIsHarnessed
-        | ActivationRestriction::ClassLevelIs { .. }
-        | ActivationRestriction::LevelCounterRange { .. }
-        | ActivationRestriction::CounterThreshold { .. } => false,
-    }
-}
-
-/// CR 614.1a + CR 614.6: whether any replacement effect could modify the mana
-/// `source` produces for `player` (Contamination's "produces {B} instead",
-/// Mana Reflection's doubling, a floating "produces no mana" shield). Asked of
-/// the replacement pipeline's own candidate query for every mana type, tapped
-/// or not, so a replacement keyed to any of them is found.
-fn mana_production_could_be_replaced(
-    state: &GameState,
-    player: PlayerId,
-    source: ObjectId,
-) -> bool {
-    let registry = replacement::replacement_registry();
-    [
-        ManaType::White,
-        ManaType::Blue,
-        ManaType::Black,
-        ManaType::Red,
-        ManaType::Green,
-        ManaType::Colorless,
-    ]
-    .into_iter()
-    .any(|mana_type| {
-        [true, false].into_iter().any(|tapped_for_mana| {
-            !replacement::find_applicable_replacements(
-                state,
-                &ProposedEvent::produce_mana_with_context(
-                    source,
-                    player,
-                    mana_type,
-                    tapped_for_mana,
-                ),
-                registry,
-            )
-            .is_empty()
-        })
-    })
-}
-
-fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOutput {
-    // Only two output shapes are proven. A fixed count of fixed colors is
-    // constant. A devotion count (CR 700.5) of fixed colors counts mana
-    // symbols among permanents' mana costs: tapping, untapping, exerting,
-    // paying life or removing a source's own counters leave it unchanged, and
-    // a plan can't hold it beside a cost that moves or taps an object
-    // (`proof_plan_is_affordable`). Any other output reads the board after the
-    // activation's own cost is paid (CR 602.2b + CR 608.2h): "Pay 3 life: Add
-    // {U} equal to your life total" at 4 life makes one {U}, and "Remove a
-    // charge counter: Add two mana of any one color among artifacts with
-    // charge counters" can leave no color to choose (CR 106.5). Those are
-    // never proven.
-    let fixed_colors = |count: &QuantityExpr| match count {
-        QuantityExpr::Fixed { .. } => ProofOutput::Constant,
-        QuantityExpr::Ref {
-            qty: QuantityRef::Devotion { .. },
-        } if !cost_moves_objects => ProofOutput::BoardSized,
-        _ => ProofOutput::Variable,
-    };
-    match produced {
-        ManaProduction::Fixed { .. }
-        | ManaProduction::Mixed { .. }
-        | ManaProduction::ChoiceAmongCombinations { .. } => ProofOutput::Constant,
-        ManaProduction::Colorless { count }
-        | ManaProduction::AnyOneColor { count, .. }
-        | ManaProduction::AnyCombination { count, .. }
-        | ManaProduction::ChosenColor { count, .. }
-        | ManaProduction::AnyInCommandersColorIdentity { count, .. } => fixed_colors(count),
-        ManaProduction::NotedType { .. }
-        | ManaProduction::OpponentLandColors { .. }
-        | ManaProduction::AnyCombinationOfObjectColors { .. }
-        | ManaProduction::AnyTypeProduceableBy { .. }
-        | ManaProduction::AnyOneColorAmongPermanents { .. }
-        | ManaProduction::ChoiceAmongExiledColors { .. }
-        | ManaProduction::DistinctColorsAmongPermanents { .. }
-        | ManaProduction::TriggerEventManaType => ProofOutput::Variable,
-    }
-}
-
-impl ProofSource {
-    fn pool_demand(&self, pool: mana_abilities::ManaCostObjectPool) -> usize {
-        self.ability_legs
-            .iter()
-            .map(|legs| {
-                legs.iter()
-                    .map(|leg| match leg {
-                        mana_abilities::ManaCostResourceLeg::Objects {
-                            pool: leg_pool,
-                            count,
-                            ..
-                        } if *leg_pool == pool => *count,
-                        mana_abilities::ManaCostResourceLeg::Objects { .. }
-                        | mana_abilities::ManaCostResourceLeg::Life { .. } => 0,
-                    })
-                    .sum::<usize>()
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn life_demand(&self) -> u32 {
-        self.ability_legs
-            .iter()
-            .map(|legs| {
-                legs.iter()
-                    .map(|leg| match leg {
-                        mana_abilities::ManaCostResourceLeg::Life { amount } => *amount,
-                        mana_abilities::ManaCostResourceLeg::Objects { .. } => 0,
-                    })
-                    .sum::<u32>()
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// Whether a plan may want to leave this source out: it spends a shared
-    /// resource, or its output and another source's cost can't share a plan.
-    fn contends(&self) -> bool {
-        self.ability_legs.iter().any(|legs| !legs.is_empty())
-            || self.board_sized
-            || self.moves_objects
-    }
-}
-
-const PROOF_OBJECT_POOLS: [mana_abilities::ManaCostObjectPool; 3] = [
-    mana_abilities::ManaCostObjectPool::HandCards,
-    mana_abilities::ManaCostObjectPool::GraveyardCards,
-    mana_abilities::ManaCostObjectPool::Permanents,
-];
-
-/// Most activation sets a payment proof plans over, and most it checks against
-/// the shared-resource budget. Reaching either leaves the payment unproven,
-/// never disproven.
-const MAX_PROOF_PLANS: usize = 64;
-const MAX_PROOF_SETS: usize = 4096;
-
-/// CR 118.3 + CR 119.4: Whether `plan`'s activations can each be paid at
-/// once. Within each object pool every leg must still find its objects after
-/// all the plan's other legs in that pool, and after the objects the plan
-/// activates (`plan` sources are committed, never fodder); life payments must
-/// fit the life total. Sufficient, not necessary: each source is budgeted for
-/// its most demanding admitted ability.
-fn proof_plan_is_affordable(plan: &[&ProofSource], life: u32) -> bool {
-    // A board-sized output (Nyx Lotus's devotion) is fixed at activation, but
-    // an unordered plan can't show it activates before another planned cost
-    // sacrifices, exiles, bounces or taps an object it counts.
-    if plan.iter().any(|source| source.board_sized)
-        && plan.iter().any(|source| source.moves_objects)
-    {
-        return false;
-    }
-    if plan.iter().map(|source| source.life_demand()).sum::<u32>() > life {
-        return false;
-    }
-    let committed: std::collections::HashSet<ObjectId> =
-        plan.iter().map(|source| source.object_id).collect();
-    PROOF_OBJECT_POOLS.into_iter().all(|pool| {
-        let demand: usize = plan.iter().map(|source| source.pool_demand(pool)).sum();
-        demand == 0
-            || plan
-                .iter()
-                .flat_map(|source| &source.ability_legs)
-                .flatten()
-                .all(|leg| match leg {
-                    mana_abilities::ManaCostResourceLeg::Objects {
-                        pool: leg_pool,
-                        eligible,
-                        reserved,
-                        ..
-                    } if *leg_pool == pool => {
-                        eligible.iter().filter(|id| !committed.contains(id)).count()
-                            >= demand + reserved
-                    }
-                    mana_abilities::ManaCostResourceLeg::Objects { .. }
-                    | mana_abilities::ManaCostResourceLeg::Life { .. } => true,
-                })
-    })
-}
-
-/// CR 117.1d + CR 601.2g-h + CR 605.3a: Whether the residual cost is PROVEN
-/// payable by activating mana abilities the Auto payer can't: some affordable
-/// set of activations (`proof_plan_is_affordable`), at most one per object and
-/// using only abilities whose costs are modelled exactly, covers the residual
-/// shards and generic. A cost component the proof does not model excludes its
-/// ability rather than reading as free.
-///
-/// `false` means unproven, not unpayable: the search is bounded
-/// (`MAX_PROOF_PLANS`, `MAX_PROOF_SETS`) and the budget is conservative.
-pub(crate) fn manual_mana_payment_is_proven(
-    state: &GameState,
-    player: PlayerId,
-    spell: Option<ObjectId>,
-    payment_context: Option<&PaymentContext<'_>>,
-    residual_shards: &[ManaCostShard],
-    residual_generic: u32,
-) -> bool {
-    let Some(requirements) = residual_shards
-        .iter()
-        .map(|shard| shard_payment_options(*shard))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    let life = state
-        .players
-        .iter()
-        .find(|p| p.id == player)
-        .map_or(0, |p| p.life.max(0) as u32);
-    let sources: Vec<ProofSource> = state
-        .battlefield
-        .iter()
-        .filter(|&&id| Some(id) != spell)
-        .filter_map(|&id| {
-            let object = state.objects.get(&id)?;
-            if object.controller != player {
-                return None;
-            }
-            // Each payment mana ability the proof admits: one direct mana
-            // leaf, its cost modelled exactly, and its output fixed
-            // (Constant), or board-sized with a cost that moves nothing (an
-            // unordered plan can't show it is read before its own cost changes
-            // the board).
-            let admitted: Vec<Option<(mana_abilities::ManaCostProofShape, ProofOutput)>> = object
-                .abilities
-                .iter()
-                .map(|ability| {
-                    let produced = direct_mana_leaf(ability)?;
-                    if !is_payment_mana_ability(ability) {
-                        return None;
-                    }
-                    let shape = mana_abilities::mana_ability_cost_resource_legs(
-                        state, player, id, ability,
-                    )?;
-                    match proof_output(produced, shape.moves_objects) {
-                        ProofOutput::Variable => None,
-                        ProofOutput::BoardSized if shape.moves_objects => None,
-                        output @ (ProofOutput::Constant | ProofOutput::BoardSized) => {
-                            Some((shape, output))
-                        }
-                    }
-                })
-                .collect();
-            let profiles = activatable_mana_profiles_for_object_with(
-                state,
-                id,
-                player,
-                payment_context,
-                |index, _| admitted.get(index).is_some_and(Option::is_some),
-            );
-            let capacity = profiles.first()?.capacity;
-            let admitted: Vec<_> = admitted.into_iter().flatten().collect();
-            Some(ProofSource {
-                object_id: id,
-                capacity,
-                kinds: profiles.into_iter().map(|profile| profile.kind).collect(),
-                board_sized: admitted
-                    .iter()
-                    .any(|(_, output)| *output == ProofOutput::BoardSized),
-                moves_objects: admitted.iter().any(|(shape, _)| shape.moves_objects),
-                ability_legs: admitted.into_iter().map(|(shape, _)| shape.legs).collect(),
-            })
-        })
-        .collect();
-    // CR 614.1a + CR 614.6: the proof sizes each source's raw production; a
-    // replacement that could change what any of them makes leaves it unproven.
-    if sources
-        .iter()
-        .any(|source| mana_production_could_be_replaced(state, player, source.object_id))
-    {
-        return false;
-    }
-    let (contenders, free): (Vec<&ProofSource>, Vec<&ProofSource>) =
-        sources.iter().partition(|source| source.contends());
-
-    let covers = |plan: &[&ProofSource]| -> bool {
-        let grouped: Vec<(ObjectId, u32, Vec<ActivatableManaProfileKind>)> = plan
-            .iter()
-            .map(|source| (source.object_id, source.capacity, source.kinds.clone()))
-            .collect();
-        let charge = if requirements.is_empty() {
-            Some(0)
-        } else {
-            ResidualShardSearch::new(&grouped).min_charge(0, requirements.clone())
-        };
-        charge.is_some_and(|charge| {
-            plan.iter().map(|source| source.capacity).sum::<u32>() >= charge + residual_generic
-        })
-    };
-
-    // Every contender first, then the smallest sets up: a payment that needs
-    // few shared-resource activations is found however many sources contend.
-    let mut subsets: Vec<Vec<usize>> = vec![(0..contenders.len()).collect()];
-    for size in 0..contenders.len() {
-        push_index_combinations(contenders.len(), size, MAX_PROOF_SETS, &mut subsets);
-        if subsets.len() >= MAX_PROOF_SETS {
-            break;
-        }
-    }
-    let mut plans = 0;
-    for subset in subsets.iter().take(MAX_PROOF_SETS) {
-        let plan: Vec<&ProofSource> = free
-            .iter()
-            .copied()
-            .chain(subset.iter().map(|&index| contenders[index]))
-            .collect();
-        if !proof_plan_is_affordable(&plan, life) {
-            continue;
-        }
-        if covers(&plan) {
-            return true;
-        }
-        plans += 1;
-        if plans >= MAX_PROOF_PLANS {
-            return false;
-        }
-    }
-    false
-}
-
-/// Append the `size`-element index combinations of `0..n`, in order, until
-/// `out` holds `limit` sets.
-fn push_index_combinations(n: usize, size: usize, limit: usize, out: &mut Vec<Vec<usize>>) {
-    fn extend(
-        n: usize,
-        size: usize,
-        start: usize,
-        current: &mut Vec<usize>,
-        limit: usize,
-        out: &mut Vec<Vec<usize>>,
-    ) {
-        if out.len() >= limit {
-            return;
-        }
-        if current.len() == size {
-            out.push(current.clone());
-            return;
-        }
-        for index in start..n {
-            current.push(index);
-            extend(n, size, index + 1, current, limit, out);
-            current.pop();
-            if out.len() >= limit {
-                return;
-            }
-        }
-    }
-    extend(n, size, 0, &mut Vec::new(), limit, out);
 }
 
 fn land_mana_options(
