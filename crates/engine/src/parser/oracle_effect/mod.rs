@@ -25,6 +25,7 @@ pub(crate) use lower::{
     parse_countless_counter_element, parse_with_counters_suffix,
     parse_with_counters_suffix_spanned, player_lookback_relative_clause_owns_suffix,
     publishes_chain_created_referent, strip_trailing_duration, strip_trailing_where_x,
+    PrintedTargetWord,
 };
 // pub(super) re-exports used by sibling submodules via `super::fn_name()`.
 pub(super) use lower::{

@@ -1992,6 +1992,62 @@ fn a_granted_ability_keeps_its_host_target() {
     );
 }
 
+/// SHAPE (scope, R7-1): a CR 614.15 self-replacement paragraph ("Fateful hour —
+/// If …, … instead.") is lowered as its own document item and only later folded
+/// into the preceding ability as a `ConditionInstead` follower. Conversion is
+/// judged on the composed ability, so neither host instruction converts; the
+/// same instruction alone still does.
+#[test]
+fn a_host_instruction_with_a_self_replacement_paragraph_keeps_its_target() {
+    let sorcery = ["Sorcery".to_string()];
+    let composed = engine::parser::oracle::parse_oracle_text(
+        "Tap enchanted creature.\nFateful hour — If you have 5 or less life, untap enchanted creature instead.",
+        "Override Probe",
+        &[],
+        &sorcery,
+        &[],
+    );
+    assert_eq!(
+        composed.abilities.len(),
+        1,
+        "reach: the paragraph folds into one ability"
+    );
+    let root = &composed.abilities[0];
+    let follower = root
+        .sub_ability
+        .as_deref()
+        .expect("reach: the override is the root's follower");
+    assert!(
+        matches!(
+            follower.condition,
+            Some(engine::types::ability::AbilityCondition::ConditionInstead { .. })
+        ),
+        "reach: the follower is the self-replacement override"
+    );
+    let json = serde_json::to_string(&composed.abilities).unwrap();
+    assert!(
+        !json.contains("Unimplemented"),
+        "reach: fully parsed: {json}"
+    );
+    assert_eq!(
+        parsed_host_timings(&composed.abilities),
+        vec!["Stack".to_string(), "Stack".to_string()],
+        "both host instructions of the composed ability keep their target"
+    );
+    let lone = engine::parser::oracle::parse_oracle_text(
+        "Tap enchanted creature.",
+        "Lone Probe",
+        &[],
+        &sorcery,
+        &[],
+    );
+    assert_eq!(
+        parsed_host_timings(&lone.abilities),
+        vec!["Resolution".to_string()],
+        "control: the same instruction as the whole ability converts"
+    );
+}
+
 /// The Reviewer's r5 probes, and two neighbours, as ETBs whose host instruction
 /// is followed by other instructions: not converted, so they keep base's
 /// stack-time target.

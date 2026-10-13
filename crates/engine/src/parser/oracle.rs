@@ -4122,26 +4122,35 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // The match stays EXHAUSTIVE over `OracleNodeIr` (no `_` arm): it is now the
     // single place a new node variant must declare whether it consumes a printed
     // slot, an obligation `finish()` used to carry.
-    // CR 700.2: a document that carries a modal choice owns its `Spell` items as
-    // that choice's modes — parts of one modal ability, never a whole ability —
-    // so none of them is a lone host instruction.
+    // CR 115.10a + CR 303.4b + CR 301.5f: candidates for a lone "enchanted/
+    // equipped X" instruction that names its host without targeting it. Only the
+    // card's own spell/activated items and parsed effect-chain triggers are
+    // candidates; each records its printed-clause evidence here, and the
+    // conversion itself runs after every document relation has composed the
+    // final abilities (`convert_terminal_attachment_host_references` below), so a
+    // candidate that composition gives a follower, or folds into another
+    // ability, keeps its target.
+    //
+    // CR 700.2: conservatively, a document that carries a modal choice
+    // contributes no spell candidates at all — its `Spell` items are that
+    // choice's modes (the item does not record its route), so none is treated as
+    // a whole ability.
     let owns_modal_modes = ir
         .items
         .iter()
         .any(|item| matches!(item.node, OracleNodeIr::Modal(_)));
+    let mut host_reference_candidates = HostReferenceCandidates::default();
     for item in &ir.items {
         match &item.node {
             OracleNodeIr::Spell(ability_ir) => {
                 let mut def = lower_ability_ir(ability_ir);
-                // CR 115.10a + CR 303.4b + CR 301.5f: a lone "enchanted/equipped
-                // X" instruction that is the whole ability names its host
-                // without targeting it. Decided here, on the card's own ability,
-                // because only this level knows nothing precedes or follows it.
                 if !owns_modal_modes {
-                    crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
-                        &mut def,
-                        &ability_ir.body.clauses,
-                    );
+                    host_reference_candidates.abilities.push((
+                        item.id,
+                        crate::parser::oracle_effect::PrintedTargetWord::from_clauses(
+                            &ability_ir.body.clauses,
+                        ),
+                    ));
                 }
                 stamp_printed_ability_slot(&mut def, printed_ability_slot);
                 result.abilities.push(def);
@@ -4182,18 +4191,18 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
             }
             OracleNodeIr::Trigger(trigger_node) => {
                 let mut def = lower_trigger_node_ir(trigger_node);
-                // CR 115.10a + CR 303.4b + CR 301.5f: the card's own trigger
-                // whose whole body is a lone host instruction. Decided here, not
-                // in `lower_trigger_ir`, which also lowers triggers quoted inside
-                // a grant ("… has 'When …'"); those keep their targets.
-                if let (TriggerNodeIr::Parsed(trigger_ir), Some(execute)) =
-                    (trigger_node, def.execute.as_deref_mut())
-                {
+                // The card's own parsed effect-chain trigger is a candidate.
+                // Recorded here, not in `lower_trigger_ir`, which also lowers
+                // triggers quoted inside a grant ("… has 'When …'"); those keep
+                // their targets.
+                if let TriggerNodeIr::Parsed(trigger_ir) = trigger_node {
                     if let Some(TriggerBody::EffectChain(chain_ir)) = &trigger_ir.body {
-                        crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
-                            execute,
-                            &chain_ir.clauses,
-                        );
+                        host_reference_candidates.triggers.push((
+                            item.id,
+                            crate::parser::oracle_effect::PrintedTargetWord::from_clauses(
+                                &chain_ir.clauses,
+                            ),
+                        ));
                     }
                 }
                 stamp_printed_trigger_slot(&mut def, result.triggers.len());
@@ -4354,6 +4363,15 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     apply_active_player_punisher(&mut result, &ir.relations, &ability_ids);
     demote_refused_granter_names(&mut result, ir, &tracks);
 
+    // PLACEMENT PIN: last, after every document relation has composed the final
+    // abilities and triggers, so the converter judges the composed tree.
+    convert_terminal_attachment_host_references(
+        &mut result,
+        &host_reference_candidates,
+        &ability_ids,
+        &trigger_ids,
+    );
+
     // The doc IR's diagnostics channel is the single source of parse warnings.
     // Assigned once, here, so it carries BOTH the parse-time diagnostics sealed by
     // `finish()` and the swallow-audit diagnostics emitted above, in that order.
@@ -4361,6 +4379,49 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // equivalent to assigning before them.
     result.parse_warnings = ir.diagnostics.clone();
     result
+}
+
+// --- CR 115.10a + CR 303.4b: lone host instruction → resolution-bound host ---
+
+/// The card's own abilities and triggers that may be a lone host instruction,
+/// by document item, with each one's printed-clause evidence.
+#[derive(Default)]
+struct HostReferenceCandidates {
+    abilities: Vec<(
+        OracleItemId,
+        crate::parser::oracle_effect::PrintedTargetWord,
+    )>,
+    triggers: Vec<(
+        OracleItemId,
+        crate::parser::oracle_effect::PrintedTargetWord,
+    )>,
+}
+
+/// CR 115.10a + CR 303.4b + CR 301.5f: convert each candidate that is still a
+/// whole ability of the card after document composition. A candidate is
+/// resolved through its own category's id track only: one that a relation
+/// folded into another ability (a CR 614.15 self-replacement override) or moved
+/// elsewhere is no longer there and keeps its target, and one that composition
+/// gave a follower is refused by the converter.
+fn convert_terminal_attachment_host_references(
+    result: &mut ParsedAbilities,
+    candidates: &HostReferenceCandidates,
+    ability_ids: &[OracleItemId],
+    trigger_ids: &[OracleItemId],
+) {
+    use crate::parser::oracle_effect::convert_terminal_attachment_host_reference;
+    for (id, printed) in &candidates.abilities {
+        if let Some(pos) = position_of(ability_ids, *id) {
+            convert_terminal_attachment_host_reference(&mut result.abilities[pos], *printed);
+        }
+    }
+    for (id, printed) in &candidates.triggers {
+        if let Some(execute) = position_of(trigger_ids, *id)
+            .and_then(|pos| result.triggers[pos].execute.as_deref_mut())
+        {
+            convert_terminal_attachment_host_reference(execute, *printed);
+        }
+    }
 }
 
 // --- CR 102.1 + CR 608.2c: active-player coerce → delayed punisher --
