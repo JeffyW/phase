@@ -4361,16 +4361,19 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // former `synthesize`/`bind` passes ran (the audit reads `result` first).
     apply_etb_exile_ltb_return(&mut result, &ir.relations, &trigger_ids);
     apply_active_player_punisher(&mut result, &ir.relations, &ability_ids);
-    demote_refused_granter_names(&mut result, ir, &tracks);
 
-    // PLACEMENT PIN: last, after every document relation has composed the final
-    // abilities and triggers, so the converter judges the composed tree.
+    // PLACEMENT PIN: after every document relation has composed the final
+    // abilities and triggers, so the converter judges the composed tree; and
+    // before `demote_refused_granter_names`, the first pass that moves
+    // definitions between categories without their id tracks (a demoted
+    // definition is a residual, so its timing is moot).
     convert_terminal_attachment_host_references(
         &mut result,
         &host_reference_candidates,
         &ability_ids,
         &trigger_ids,
     );
+    demote_refused_granter_names(&mut result, ir, &tracks);
 
     // The doc IR's diagnostics channel is the single source of parse warnings.
     // Assigned once, here, so it carries BOTH the parse-time diagnostics sealed by
@@ -4410,14 +4413,23 @@ fn convert_terminal_attachment_host_references(
     trigger_ids: &[OracleItemId],
 ) {
     use crate::parser::oracle_effect::convert_terminal_attachment_host_reference;
+    debug_assert_eq!(
+        ability_ids.len(),
+        result.abilities.len(),
+        "ability id track"
+    );
+    debug_assert_eq!(trigger_ids.len(), result.triggers.len(), "trigger id track");
     for (id, printed) in &candidates.abilities {
-        if let Some(pos) = position_of(ability_ids, *id) {
-            convert_terminal_attachment_host_reference(&mut result.abilities[pos], *printed);
+        if let Some(def) =
+            position_of(ability_ids, *id).and_then(|pos| result.abilities.get_mut(pos))
+        {
+            convert_terminal_attachment_host_reference(def, *printed);
         }
     }
     for (id, printed) in &candidates.triggers {
         if let Some(execute) = position_of(trigger_ids, *id)
-            .and_then(|pos| result.triggers[pos].execute.as_deref_mut())
+            .and_then(|pos| result.triggers.get_mut(pos))
+            .and_then(|trigger| trigger.execute.as_deref_mut())
         {
             convert_terminal_attachment_host_reference(execute, *printed);
         }
