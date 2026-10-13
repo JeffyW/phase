@@ -4607,8 +4607,17 @@ fn resolve_ref(
                     return v;
                 }
             }
+            // CR 601.2a: a spell being cast has moved to the stack, though its
+            // object's hand membership is deferred to finalization; it is not
+            // a card in hand (Lion's Eye Diamond's "Discard your hand" while
+            // paying for a spell discards only the rest of the hand).
             resolve_per_player_scalar(state, scope, controller, ctx, targets, ability, |p| {
-                usize_to_i32_saturating(p.hand.len())
+                usize_to_i32_saturating(
+                    p.hand
+                        .iter()
+                        .filter(|&&id| !super::casting::is_spell_being_cast(state, id))
+                        .count(),
+                )
             })
         }
         // CR 119 + CR 810.9a: a single player's life total reads the team's

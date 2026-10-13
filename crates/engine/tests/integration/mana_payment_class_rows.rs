@@ -844,6 +844,9 @@ const OBJECT_CHOOSING_TAP: &[Row] = &[
     ("t/lazotep-quarry", "Lazotep Quarry", "{T}, Sacrifice a creature: Add one mana of any color.", &[("Grizzly Bears", B, 'f')], &[], "Llanowar Elves", true, "tt/BF"),
     ("t/loam-dryad", "Loam Dryad", "{T}, Tap an untapped creature you control: Add one mana of any color.", &[("Grizzly Bears", B, 'f')], &[], "Llanowar Elves", true, "tt/BF"),
     ("t/molt-tender", "Molt Tender", "{T}, Exile a card from your graveyard: Add one mana of any color.", &[("Grizzly Bears", G, 'f')], &[], "Llanowar Elves", true, "tt/BF"),
+    // phase-rs/phase#9812: a targeted spell (Lightning Bolt) paid this way is
+    // listed too; this row read "ft/H" (castable, never listed) before.
+    ("t/rubble-rouser", "Rubble Rouser", "{T}, Exile a card from your graveyard: Add {R}. When you do, ~ deals 1 damage to each opponent.", &[("Grizzly Bears", G, 'f')], &[], "Lightning Bolt", true, "tt/GY"),
     ("t/moonsnare-prototype", "Moonsnare Prototype", "{T}, Tap an untapped artifact or creature you control: Add {C}.", &[("Memnite", B, 'f')], &[], "Signal Pest", true, "tt/BF"),
     ("t/orcish-lumberjack", "Orcish Lumberjack", "{T}, Sacrifice a Forest: Add three mana in any combination of {R} and/or {G}.", &[("Forest", B, 'f')], &[], "Goblin Piker", true, "tt/BF"),
     ("t/pep", "Pep, Raucous Raider", "{T}, Sacrifice an artifact: Add three mana of any one color.", &[("Memnite", B, 'f')], &[], "Eternal Scourge", true, "tt/BF"),
@@ -873,7 +876,6 @@ fn unchanged_boards_read_as_before() {
 const UNCHANGED: &[Row] = &[
     ("t/cryptex", "Cryptex", "{T}, Collect evidence 3: Add one mana of any color. Put an unlock counter on ~.", &[("Hill Giant", G, 'f')], &[], "Llanowar Elves", true, "tt/BF"),
     ("t/master-of-dark-rites", "Master of Dark Rites", "{T}, Sacrifice another creature: Add {B}{B}{B}. Spend this mana only to cast Vampire, Cleric, and/or Demon spells.", &[("Grizzly Bears", B, 'f')], &[], "Vampire Nighthawk", false, "ff/H"),
-    ("t/rubble-rouser", "Rubble Rouser", "{T}, Exile a card from your graveyard: Add {R}. When you do, ~ deals 1 damage to each opponent.", &[("Grizzly Bears", G, 'f')], &[], "Lightning Bolt", true, "ft/H"),
     ("t/springjack-pasture", "Springjack Pasture", "{T}, Sacrifice X Goats: Add X mana of any one color. You gain X life.", &[("Mountain Goat", B, 'f')], &[], "Llanowar Elves", false, "ff/H"),
     ("t/thornvault-forager", "Thornvault Forager", "{T}, Forage: Add two mana in any combination of colors.", &[("Hill Giant", G, 'f'), ("Hill Giant", G, 'f'), ("Hill Giant", G, 'f')], &[], "Grizzly Bears", false, "ff/H"),
     ("x/Eldrazi Temple", "Eldrazi Temple", "{T}: Add {C}{C}. Spend this mana only to cast colorless Eldrazi spells or activate abilities of colorless Eldrazi.", &[("Phyrexian Altar", B, 'a'), ("Grizzly Bears", B, 'f')], &[], "Glaring Fleshraker", true, "tt/BF"),

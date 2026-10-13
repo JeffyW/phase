@@ -7025,15 +7025,18 @@ mod tests {
                 target: None,
             },
         )
+        // "Exile N cards from your hand: Add {B}" with the N spells as the only
+        // cards in hand. Before a cast is announced all N are eligible, so the
+        // broad gate generates every cast; once one is announced it is on the
+        // stack (CR 601.2a) and only N - 1 remain, so no manual route exists
+        // and every cast still reaches the strict post-origin Auto payer.
         .cost(AbilityCost::Exile {
-            count: 1,
-            zone: Some(Zone::Graveyard),
+            count: N as u32,
+            zone: Some(Zone::Hand),
             filter: Some(TargetFilter::Typed(
                 TypedFilter::card()
                     .controller(ControllerRef::You)
-                    .properties(vec![FilterProp::InZone {
-                        zone: Zone::Graveyard,
-                    }]),
+                    .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
             )),
         });
         {
@@ -7044,13 +7047,6 @@ mod tests {
             Arc::make_mut(&mut object.base_abilities).push(interactive_mana);
             object.summoning_sick = false;
         }
-        create_object(
-            &mut state,
-            CardId(80_002),
-            PlayerId(0),
-            "Offer Probe Fodder".to_string(),
-            Zone::Graveyard,
-        );
 
         let mut spell_ids = Vec::new();
         for index in 0..N {
