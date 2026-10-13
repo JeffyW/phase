@@ -10,12 +10,28 @@
 //! split off before the multiply parser sees the clause. The synthetic chapters
 //! swap that conjunct for a grant to the Saga itself.
 
+use engine::game::layers::evaluate_layers;
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::triggers::drain_order_triggers_with_identity;
+use engine::game::turns::execute_cleanup;
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{AbilityDefinition, Effect};
+use engine::types::ability::{AbilityDefinition, ContinuousModification, Effect, TargetFilter};
+use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
+use engine::types::game_state::WaitingFor;
+use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
+use engine::types::phase::Phase;
 
 const SAGA_REMINDER: &str =
     "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)";
 const HULK_I_II: &str = "I \u{2014} The next red or green creature spell you cast this turn can be cast without paying its mana cost.\nII \u{2014} Put three +1/+1 counters on target creature you control.";
+const HULK_III: &str = "Choose target creature you control. Until end of turn, double its power and toughness and it gains trample.";
+const SELF_GRANT_III: &str = "Choose target creature you control. Until end of turn, double its power and toughness and this Saga gains hexproof.";
+
+fn hulk_oracle(chapter_three: &str) -> String {
+    format!("{SAGA_REMINDER}\n{HULK_I_II}\nIII \u{2014} {chapter_three}")
+}
 
 /// Every effect node in an ability chain: sub, else, and mode branches.
 fn collect(def: &AbilityDefinition, out: &mut Vec<Effect>) {
@@ -32,7 +48,7 @@ fn collect(def: &AbilityDefinition, out: &mut Vec<Effect>) {
 }
 
 fn hulk_chapter_three(name: &str, chapter_three: &str) -> Vec<Effect> {
-    let oracle = format!("{SAGA_REMINDER}\n{HULK_I_II}\nIII \u{2014} {chapter_three}");
+    let oracle = hulk_oracle(chapter_three);
     let parsed = parse_oracle_text(
         &oracle,
         name,
@@ -88,22 +104,41 @@ fn is_trailing_gap(effect: &Effect, fragment: &str) -> bool {
         if name == "multiply_pt_trailing_clause" && d.contains(fragment))
 }
 
-/// Control. Printed World War Hulk III keeps its DoublePT and its trample grant.
+/// Control. Printed World War Hulk III keeps its DoublePT and its trample grant
+/// to the chosen creature.
 #[test]
 fn world_war_hulk_keeps_double_pt_and_its_gains_conjunct() {
-    let nodes = hulk_chapter_three(
-        "World War Hulk",
-        "Choose target creature you control. Until end of turn, double its power and toughness and it gains trample.",
-    );
+    let nodes = hulk_chapter_three("World War Hulk", HULK_III);
     assert!(
-        nodes.iter().any(is_multiply_pt),
-        "chapter III doubles P/T, got {nodes:#?}"
+        nodes.iter().any(|e| matches!(
+            e,
+            Effect::DoublePT {
+                target: TargetFilter::ParentTarget,
+                factor: 2,
+                ..
+            }
+        )),
+        "chapter III doubles the chosen creature's P/T, got {nodes:#?}"
     );
+    let trample_grants: Vec<_> = nodes
+        .iter()
+        .filter_map(|e| match e {
+            Effect::GenericEffect {
+                static_abilities, ..
+            } => Some(static_abilities),
+            _ => None,
+        })
+        .flatten()
+        .collect();
     assert!(
-        nodes
-            .iter()
-            .any(|e| matches!(e, Effect::GenericEffect { .. })),
-        "\"and it gains trample\" lowers to a grant, got {nodes:#?}"
+        trample_grants.len() == 1
+            && trample_grants[0].affected == Some(TargetFilter::ParentTarget)
+            && trample_grants[0].modifications
+                == vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Trample,
+                }],
+        "\"and it gains trample\" grants exactly trample to the chosen creature, \
+         got {trample_grants:#?}"
     );
     assert!(
         nodes
@@ -190,4 +225,164 @@ fn every_multiply_pt_arm_fails_closed_on_a_trailing_tail() {
             "{tailed:?} must not report a P/T multiply, got {nodes:#?}"
         );
     }
+}
+
+fn lore_count(runner: &GameRunner, saga: ObjectId) -> u32 {
+    runner.state().objects[&saga]
+        .counters
+        .get(&CounterType::Lore)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A Saga built from `oracle` with two lore counters, and a vanilla 2/2 P0
+/// controls, so the lore counter added after P0's draw step fires chapter III.
+fn hulk_board(name: &str, oracle: &str) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let saga = scenario
+        .add_creature(P0, name, 0, 0)
+        .as_enchantment()
+        .with_subtypes(vec!["Saga"])
+        .from_oracle_text(oracle)
+        .id();
+    scenario.with_counter(saga, CounterType::Lore, 2);
+    let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    scenario.with_library_top(P0, &["Plains"; 10]);
+    scenario.with_library_top(P1, &["Plains"; 10]);
+    (scenario.build(), saga, bears)
+}
+
+/// CR 714.3c + CR 714.2b: advance from P0's upkeep through the draw step, where
+/// the third lore counter fires chapter III. The 2/2 is the only creature P0
+/// controls, so it is the chapter's target; resolve the stack through the
+/// runner. Returns whether the chapter trigger was on the stack (the reach
+/// guard).
+fn fire_chapter_three(runner: &mut GameRunner, saga: ObjectId) -> bool {
+    {
+        let state = runner.state_mut();
+        state.turn_number = 2;
+        state.active_player = P0;
+        state.phase = Phase::Upkeep;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    runner.advance_to_phase(Phase::PreCombatMain);
+    assert_eq!(
+        lore_count(runner, saga),
+        3,
+        "CR 714.3c must add the third lore counter, firing chapter III"
+    );
+
+    let mut on_stack = false;
+    for _ in 0..64 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .choose_first_legal_target()
+                    .expect("choose the creature");
+            }
+            WaitingFor::Priority { .. } => {
+                if runner.state().stack.is_empty() {
+                    break;
+                }
+                on_stack |= runner
+                    .state()
+                    .stack
+                    .iter()
+                    .any(|entry| entry.source_id == saga);
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("unexpected prompt while resolving chapter III: {other:?}"),
+        }
+    }
+    assert!(
+        runner.state().stack.is_empty(),
+        "chapter III must resolve, waiting_for={:?}",
+        runner.state().waiting_for
+    );
+    on_stack
+}
+
+/// Runtime control. World War Hulk III makes the chosen 2/2 a 4/4 with trample
+/// until end of turn (CR 701.10a + CR 514.2), with no unsupported telemetry.
+#[test]
+fn world_war_hulk_chapter_three_doubles_and_grants_trample_until_end_of_turn() {
+    let (mut runner, saga, bears) = hulk_board("World War Hulk", &hulk_oracle(HULK_III));
+
+    assert!(
+        fire_chapter_three(&mut runner, saga),
+        "reach: chapter III went on the stack"
+    );
+    let obj = &runner.state().objects[&bears];
+    assert_eq!((obj.power, obj.toughness), (Some(4), Some(4)), "doubled");
+    assert!(obj.has_keyword(&Keyword::Trample), "gained trample");
+    assert!(
+        runner.state().unimplemented_oracle_ids.is_empty(),
+        "the printed chapter hits no unsupported effect, got {:?}",
+        runner.state().unimplemented_oracle_ids
+    );
+
+    // CR 514.2: both effects end in the cleanup step.
+    let mut events = Vec::new();
+    execute_cleanup(runner.state_mut(), &mut events);
+    evaluate_layers(runner.state_mut());
+    let obj = &runner.state().objects[&bears];
+    assert_eq!(
+        (obj.power, obj.toughness),
+        (Some(2), Some(2)),
+        "the doubling ends at cleanup"
+    );
+    assert!(
+        !obj.has_keyword(&Keyword::Trample),
+        "trample ends at cleanup"
+    );
+}
+
+/// Runtime defect. With the trample conjunct replaced by a grant to the Saga,
+/// the Saga in play carries chapter III's clause as an explicit gap, and
+/// resolving the chapter does not apply the doubling on its own.
+///
+/// The resolver skips an `Unimplemented` node inside a chain before the
+/// `unimplemented_oracle_ids` recorder, so that set is not a signal here; the
+/// gap is read from the live object's chapter definition instead.
+#[test]
+fn saga_self_grant_chapter_three_fails_closed_without_partial_doubling() {
+    let (mut runner, saga, bears) = hulk_board("Synthetic Hulk Saga", &hulk_oracle(SELF_GRANT_III));
+
+    let chapter_three = runner.state().objects[&saga]
+        .trigger_definitions
+        .iter_unchecked()
+        .map(|entry| &entry.definition)
+        .find(|t| t.saga_chapter == Some(3))
+        .cloned()
+        .expect("reach: the Saga in play has a chapter III trigger");
+    let mut nodes = Vec::new();
+    collect(
+        chapter_three
+            .execute
+            .as_deref()
+            .expect("chapter III has an ability"),
+        &mut nodes,
+    );
+    assert!(
+        nodes
+            .iter()
+            .any(|e| is_trailing_gap(e, "double its power and toughness and ~ gains")),
+        "the Saga in play carries the clause as an explicit gap, got {nodes:#?}"
+    );
+
+    assert!(
+        fire_chapter_three(&mut runner, saga),
+        "reach: chapter III went on the stack"
+    );
+    let obj = &runner.state().objects[&bears];
+    assert_eq!(
+        (obj.power, obj.toughness),
+        (Some(2), Some(2)),
+        "no partial doubling: the clause is unsupported as a whole"
+    );
 }
