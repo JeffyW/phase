@@ -2187,21 +2187,32 @@ fn chained_etb(shape: ChainedEtb, fate: HostFate) -> EtbOutcome {
         blink(&mut runner, host);
     }
     let mut optional_prompts = 0;
+    let mut settled = false;
     for _ in 0..64 {
-        if runner.state().stack.is_empty() {
-            break;
-        }
         let action = match runner.state().waiting_for {
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => {
+                settled = true;
+                break;
+            }
+            // A paused optional instruction is answered even once the stack
+            // is empty: the ETB is still resolving.
             WaitingFor::OptionalEffectChoice { .. } => {
                 optional_prompts += 1;
                 GameAction::DecideOptionalEffect { accept: true }
             }
-            _ => GameAction::PassPriority,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            ref other => panic!("unexpected prompt: {other:?}"),
         };
         runner.act(action).expect("the ETB resolves");
     }
     let s = runner.state();
-    assert!(s.stack.is_empty(), "reach: the ETB resolved");
+    assert!(settled, "reach: the ETB finished resolving");
+    assert!(s.stack.is_empty(), "reach: the stack is empty");
+    assert!(
+        matches!(s.waiting_for, WaitingFor::Priority { .. }),
+        "reach: the game is back at priority, not paused mid-resolution: {:?}",
+        s.waiting_for
+    );
     EtbOutcome {
         life_change: s.players[P0.0 as usize].life - life_before,
         treasures: s
@@ -2220,12 +2231,20 @@ fn chained_etb(shape: ChainedEtb, fate: HostFate) -> EtbOutcome {
 }
 
 /// P5-1, positive control: with the creature in place the targeted chain
-/// resolves against it (the tap happens). What its followers then do is base's
-/// unchanged behaviour for this synthetic shape.
+/// resolves fully against it, as at base: tapped, the optional counter is
+/// offered once and accepted, and the Treasure is created.
 #[test]
 fn optional_counter_chain_with_its_host_in_place() {
-    let outcome = chained_etb(ChainedEtb::OptionalCounterOnIt, HostFate::StaysPut);
-    assert!(outcome.host_tapped, "the enchanted creature is tapped");
+    assert_eq!(
+        chained_etb(ChainedEtb::OptionalCounterOnIt, HostFate::StaysPut),
+        EtbOutcome {
+            life_change: 0,
+            treasures: 1,
+            counters: 1,
+            host_tapped: true,
+            optional_prompts: 1,
+        }
+    );
 }
 
 /// P5-1: the creature is blinked in response. The chain keeps base's target, so
@@ -2281,6 +2300,7 @@ fn conditional_then_counter_chain_with_its_host_in_place() {
     assert!(outcome.host_tapped, "the enchanted creature is tapped");
     assert_eq!(outcome.life_change, 0, "no artifact, so no life");
     assert_eq!(outcome.treasures, 1);
+    assert_eq!(outcome.optional_prompts, 0);
 }
 
 /// P5-3: blinked in response, nothing happens.
