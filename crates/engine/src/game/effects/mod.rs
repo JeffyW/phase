@@ -12784,10 +12784,27 @@ fn hydrate_event_context_targets<'a>(
     state: &GameState,
     ability: &'a ResolvedAbility,
 ) -> Cow<'a, ResolvedAbility> {
+    // CR 608.2c: after a host-less "enchanted/equipped X" instruction, "it" and
+    // "its controller" name the object that instruction never bound; they must
+    // not be re-bound from the trigger event or the source's attachment history.
+    let parent_referent_missing =
+        crate::game::targeting::parent_referent_missing_after_attachment_host(ability);
     let root_ref = if ability.targets.is_empty() {
-        extract_event_context_filter(&ability.effect).and_then(|filter| {
-            crate::game::targeting::resolve_event_context_target(state, filter, ability.source_id)
-        })
+        extract_event_context_filter(&ability.effect)
+            .filter(|filter| {
+                !(parent_referent_missing
+                    && matches!(
+                        filter,
+                        TargetFilter::ParentTarget | TargetFilter::ParentTargetController
+                    ))
+            })
+            .and_then(|filter| {
+                crate::game::targeting::resolve_event_context_target(
+                    state,
+                    filter,
+                    ability.source_id,
+                )
+            })
     } else {
         None
     };
@@ -15516,29 +15533,25 @@ fn resolve_chain_body(
             host_bound = *bound;
             &host_bound
         }
-        // CR 608.2c: the instructions after this one that refer back to its
-        // object ("Then draw a card for each tapped creature its controller
-        // controls") have no referent either. Without one, their anaphors would
-        // fall back to the trigger event or the source's attachment history and
-        // name some other object or player, so a tail that reads its parent's
-        // context is dropped; one that doesn't ("and you become the monarch")
-        // still happens.
-        crate::game::targeting::ResolutionHostBinding::Absent
-        | crate::game::targeting::ResolutionHostBinding::RefusedDonor
-            if ability
-                .sub_ability
-                .as_deref()
-                .is_some_and(crate::game::ability_scan::ability_uses_event_context) =>
-        {
-            let mut without_tail = ability.clone();
-            without_tail.sub_ability = None;
-            host_bound = without_tail;
-            &host_bound
-        }
         crate::game::targeting::ResolutionHostBinding::NotApplicable
         | crate::game::targeting::ResolutionHostBinding::Absent
         | crate::game::targeting::ResolutionHostBinding::RefusedDonor => ability,
     };
+    // CR 608.2c + CR 609.3: a node after a host-less one whose own operand is
+    // the object that node would have bound ("put X sleep counters on it",
+    // "its controller draws") has nothing to act on, so it does nothing. Its
+    // sibling instructions that name no such object still happen.
+    let parent_referent_missing =
+        crate::game::targeting::parent_referent_missing_after_attachment_host(ability)
+            && ability.targets.is_empty()
+            && ability.effect.target_filter().is_some_and(|filter| {
+                matches!(
+                    filter,
+                    TargetFilter::ParentTarget
+                        | TargetFilter::ParentTargetController
+                        | TargetFilter::ParentTargetOwner
+                )
+            });
     // CR 608.2c: Snapshot the `pending_continuation` *value* at chain-body
     // entry so the sub_ability guard further down can compare by IDENTITY, not
     // mere presence. An unrelated outer continuation (e.g. a `player_scope`
@@ -17065,8 +17078,14 @@ fn resolve_chain_body(
         // source's host when there is no provable live host (or one refused as
         // a donor) does nothing — skipped here like a failed group constraint,
         // so no resolver can re-read the description as a scan or act on a new
-        // object under a departed host's storage id.
-        if shares_quality_failed || host_effect_impossible {
+        // object under a departed host's storage id. It binds no object, so the
+        // next hand-off tells the instructions after it that "it" is missing
+        // (CR 608.2c), exactly as an empty Dig does.
+        if host_effect_impossible {
+            state.last_parent_target_missing_reason =
+                Some(crate::types::ability::ParentTargetMissingReason::AttachmentHost);
+        }
+        if shares_quality_failed || host_effect_impossible || parent_referent_missing {
             // Group constraint not met — emit EffectResolved but skip execution.
             events.push(GameEvent::EffectResolved {
                 kind: crate::types::ability::EffectKind::from(&ability.effect),
@@ -21839,6 +21858,49 @@ mod tests {
             resolved_optional_decision_subject_id(&state, &hostile),
             None,
             "a populated multi-role effect is not implicitly a decision subject"
+        );
+    }
+
+    /// CR 608.2c: after a host-less "enchanted/equipped X" instruction, a later
+    /// node's "it" is never hydrated from the source's attachment; without that
+    /// record the same node binds the source's host.
+    #[test]
+    fn hydration_binds_no_parent_referent_after_a_hostless_attachment_instruction() {
+        let mut state = GameState::new_two_player(42);
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Host".to_string(),
+            Zone::Battlefield,
+        );
+        let aura = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Aura".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&aura).unwrap().attached_to = Some(host.into());
+        state.objects.get_mut(&host).unwrap().attachments.push(aura);
+        let mut ability = ResolvedAbility::new(
+            effect_from_json(r#"{"type":"Destroy","target":{"type":"ParentTarget"}}"#),
+            vec![],
+            aura,
+            PlayerId(0),
+        );
+        assert_eq!(
+            hydrate_event_context_targets(&state, &ability).targets,
+            vec![TargetRef::Object(host)],
+            "reach: with no such record, 'it' hydrates to the source's host"
+        );
+        ability.parent_target_missing_reason =
+            Some(crate::types::ability::ParentTargetMissingReason::AttachmentHost);
+        assert!(
+            hydrate_event_context_targets(&state, &ability)
+                .targets
+                .is_empty(),
+            "after a host-less instruction, 'it' names nothing"
         );
     }
 

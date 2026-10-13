@@ -837,8 +837,15 @@ fn penumbra_umbra_with_its_host_exiled_copies_nothing() {
     // CR 303.4c: the now-unattached Aura goes to the graveyard; its trigger fires.
     engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
     engine::game::triggers::process_triggers(runner.state_mut(), &events);
+    assert!(
+        runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }),
+        "reach: Penumbra Umbra's put-into-a-graveyard trigger went on the stack"
+    );
     runner.advance_until_stack_empty();
     let s = runner.state();
+    assert!(s.stack.is_empty(), "reach: the trigger resolved");
     assert_eq!(
         s.objects[&aura].zone,
         Zone::Graveyard,
@@ -850,6 +857,126 @@ fn penumbra_umbra_with_its_host_exiled_copies_nothing() {
         .filter(|id| s.objects[id].is_token)
         .count();
     assert_eq!(copies, 0, "no token is created");
+}
+
+/// The instructions an Aura's ETB names after a host-less instruction
+/// ("Create a Treasure token.") still happen; only those that refer back to the
+/// host ("It deals damage to you equal to its power.") do nothing. Which kind
+/// follows the host-less one.
+#[derive(Clone, Copy)]
+enum AfterHostless {
+    /// "Put a +1/+1 counter on enchanted creature. Create a Treasure token."
+    IndependentInstruction,
+    /// "Tap enchanted creature. It deals 2 damage to you. Create a Treasure
+    /// token." — a dependent instruction between them.
+    DependentDamage,
+    /// "Tap enchanted creature and put a +1/+1 counter on it. Create a Treasure
+    /// token." — a dependent instruction whose operand is "it".
+    DependentCounterOnIt,
+}
+
+/// Review probe R4-1 (SYNTHETIC; Oracle-parsed): the ETB is pending and the
+/// host is blinked in response (a new object the Aura was never attached to).
+/// Returns (P0's life lost, Treasures P0 controls, +1/+1 counters on the
+/// returned creature).
+fn hostless_etb_followed_by_a_treasure(shape: AfterHostless) -> (i32, usize, u32) {
+    let text = match shape {
+        AfterHostless::IndependentInstruction => {
+            "Enchant creature\nWhen this Aura enters, put a +1/+1 counter on enchanted creature. Create a Treasure token."
+        }
+        AfterHostless::DependentDamage => {
+            "Enchant creature\nWhen this Aura enters, tap enchanted creature. It deals 2 damage to you. Create a Treasure token."
+        }
+        AfterHostless::DependentCounterOnIt => {
+            "Enchant creature\nWhen this Aura enters, tap enchanted creature and put a +1/+1 counter on it. Create a Treasure token."
+        }
+    };
+    let (mut runner, aura, host, _) =
+        aura_etb_on_stack("Treasure Charm", text, 3, Bystander::Absent);
+    let has_token_node = |ability: &engine::types::ability::ResolvedAbility| {
+        let mut node = Some(ability);
+        while let Some(current) = node {
+            if matches!(current.effect, Effect::Token { .. }) {
+                return true;
+            }
+            node = current.sub_ability.as_deref();
+        }
+        false
+    };
+    assert!(
+        runner.state().stack.iter().any(|e| matches!(
+            &e.kind,
+            StackEntryKind::TriggeredAbility { source_id, ability, .. }
+                if *source_id == aura && has_token_node(ability)
+        )),
+        "reach: the ETB is on the stack with its independent Token instruction"
+    );
+    let life_before = runner.state().players[P0.0 as usize].life;
+    blink(&mut runner, host);
+    runner.advance_until_stack_empty();
+    let s = runner.state();
+    assert!(s.stack.is_empty(), "reach: the ETB resolved");
+    assert_eq!(
+        s.objects[&host].zone,
+        Zone::Battlefield,
+        "reach: the returned creature is on the battlefield"
+    );
+    assert!(
+        !s.objects[&host].tapped,
+        "the returned creature is not tapped"
+    );
+    let treasures = s
+        .battlefield
+        .iter()
+        .filter(|id| {
+            let o = &s.objects[id];
+            o.is_token && o.name == "Treasure" && o.controller == P0
+        })
+        .count();
+    let counters = s.objects[&host]
+        .counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0);
+    (
+        life_before - s.players[P0.0 as usize].life,
+        treasures,
+        counters,
+    )
+}
+
+#[test]
+fn hostless_counter_then_treasure_still_makes_the_treasure() {
+    let (life_lost, treasures, counters) =
+        hostless_etb_followed_by_a_treasure(AfterHostless::IndependentInstruction);
+    assert_eq!(counters, 0, "no counter on the returned creature");
+    assert_eq!(life_lost, 0, "reach: nothing deals damage");
+    assert_eq!(treasures, 1, "the independent Treasure is still created");
+}
+
+#[test]
+fn hostless_tap_then_dependent_damage_then_treasure_makes_only_the_treasure() {
+    let (life_lost, treasures, _) =
+        hostless_etb_followed_by_a_treasure(AfterHostless::DependentDamage);
+    assert_eq!(
+        life_lost, 0,
+        "'it' has no referent, so nothing deals the damage (not the Aura either)"
+    );
+    assert_eq!(
+        treasures, 1,
+        "the Treasure after the dependent instruction is still created"
+    );
+}
+
+#[test]
+fn hostless_tap_then_counter_on_it_then_treasure_makes_only_the_treasure() {
+    let (_, treasures, counters) =
+        hostless_etb_followed_by_a_treasure(AfterHostless::DependentCounterOnIt);
+    assert_eq!(
+        counters, 0,
+        "'it' has no referent, so the returned creature gets no counter"
+    );
+    assert_eq!(treasures, 1, "the Treasure is still created");
 }
 
 /// Review probe F1, disclosed limit (fail closed): Stamina, "Sacrifice this

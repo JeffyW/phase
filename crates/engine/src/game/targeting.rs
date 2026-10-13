@@ -1908,6 +1908,15 @@ pub(crate) fn bind_resolution_attachment_hosts(
     }
 }
 
+/// CR 608.2c + CR 115.10a: whether `ability` follows an "enchanted / equipped
+/// X" instruction that had no provable host and so bound no object — its
+/// anaphors ("it", "its controller", "its owner") then have no referent and
+/// must not fall back to the trigger event or the source's attachment history.
+pub(crate) fn parent_referent_missing_after_attachment_host(ability: &ResolvedAbility) -> bool {
+    ability.parent_target_missing_reason
+        == Some(crate::types::ability::ParentTargetMissingReason::AttachmentHost)
+}
+
 /// Resolve a filter with a caller-supplied semantic context. This preserves the
 /// usual explicit-target-first behavior while allowing effects whose later text
 /// is relative to an earlier chosen object to bind `recipient_id`.
@@ -2643,6 +2652,11 @@ pub fn resolve_effect_player_ref(
             }),
         TargetFilter::ParentTargetController => {
             crate::game::ability_utils::parent_target_controller(ability, state).or_else(|| {
+                // CR 608.2c: after a host-less "enchanted/equipped X"
+                // instruction there is no "it", so "its controller" is no one.
+                if parent_referent_missing_after_attachment_host(ability) {
+                    return None;
+                }
                 resolve_event_context_target(state, filter, ability.source_id).and_then(|target| {
                     match target {
                         TargetRef::Player(player) => Some(player),
@@ -2677,6 +2691,9 @@ pub fn resolve_effect_player_ref(
         // source's AttachedTo host for Aura phase triggers).
         TargetFilter::ParentTargetOwner => {
             crate::game::ability_utils::parent_target_owner(ability, state).or_else(|| {
+                if parent_referent_missing_after_attachment_host(ability) {
+                    return None;
+                }
                 resolve_event_context_target(state, filter, ability.source_id).and_then(|target| {
                     match target {
                         TargetRef::Player(player) => Some(player),
