@@ -1497,3 +1497,145 @@ fn amount_read_after_its_own_life_payment_is_not_proven() {
     control.advance_until_stack_empty();
     assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
 }
+
+/// Probe R11 infrastructure fixture: a blue artifact creature with one charge
+/// counter, "Remove a charge counter from this artifact: Add <produced>.",
+/// with no other producer; Unsubstantiate ({1}{U}) in hand. The source is a
+/// creature so the cast has two legal targets and stops at `TargetSelection`,
+/// the only state the post-target offer verdict judges; with one legal target
+/// the cast skips straight to mana payment, which that verdict defers.
+fn counter_colored_board(produced: ManaProduction) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    use engine::types::ability::CounterCostSelection;
+    use engine::types::counter::{CounterMatch, CounterType};
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let source = sc
+        .add_creature(P0, "Charged Prism", 0, 1)
+        .as_artifact_creature()
+        .with_color(vec![ManaColor::Blue])
+        .with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced,
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::RemoveCounter {
+                count: 1,
+                counter_type: CounterMatch::OfType(CounterType::Generic("charge".to_string())),
+                target: None,
+                selection: CounterCostSelection::SingleObject,
+            }),
+        )
+        .id();
+    sc.with_counter(source, CounterType::Generic("charge".to_string()), 1);
+    let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let spell = sc
+        .add_spell_to_hand_from_oracle(P0, "Unsubstantiate", true, UNSUBSTANTIATE)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+        .id();
+    (sc.build(), spell, source, bears)
+}
+
+/// Probe R11 (CR 602.2b + CR 608.2h + CR 106.5): "Remove a charge counter from
+/// this artifact: Add two mana of any one color among artifacts you control
+/// with charge counters on them" reads its colors after its counter is
+/// removed, so with its own counter the only one it finds no color and makes
+/// no mana. Board-read colors are never proven, so the targeted {1}{U} cast
+/// isn't offered. Reach guards: generated with plain Auto payment; cast
+/// anyway, the locked cost is {1}{U}; the activation removes the counter and
+/// leaves the pool empty, so the payment can't finish. Control: the same cost
+/// adding {U}{U} of a fixed color is offered and the cast resolves.
+#[test]
+fn colors_read_after_their_own_counter_cost_are_not_proven() {
+    use engine::types::ability::{Comparator, QuantityExpr};
+    use engine::types::counter::{CounterMatch, CounterType};
+    let charge = CounterType::Generic("charge".to_string());
+    let (runner, spell, source, bears) =
+        counter_colored_board(ManaProduction::AnyOneColorAmongPermanents {
+            count: QuantityExpr::Fixed { value: 2 },
+            filter: TargetFilter::Typed(
+                TypedFilter::new(engine::types::ability::TypeFilter::Artifact)
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::Counters {
+                        counters: CounterMatch::OfType(charge.clone()),
+                        comparator: Comparator::GE,
+                        count: QuantityExpr::Fixed { value: 1 },
+                    }]),
+            ),
+            contribution: ManaContribution::Base,
+        });
+    let action = auto_cast(&runner, spell);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: generated with plain Auto payment"
+    );
+    assert!(!legal_actions(runner.state()).contains(&action));
+
+    let mut announced = GameRunner::from_state(runner.state().clone());
+    announced.act(action).expect("the cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: target selection")
+    };
+    assert_eq!(pending_cast.cost, cost(vec![ManaCostShard::Blue], 1));
+    announced
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(bears)],
+        })
+        .expect("the target is accepted");
+    assert!(
+        matches!(
+            announced.state().waiting_for,
+            WaitingFor::ManaPayment { .. }
+        ),
+        "reach: mana payment"
+    );
+    let _ = announced.act(GameAction::ActivateAbility {
+        source_id: source,
+        ability_index: 0,
+    });
+    if let WaitingFor::ChooseManaColor { .. } = announced.state().waiting_for {
+        let _ = announced.act(GameAction::ChooseManaColor {
+            choice: engine::types::game_state::ManaChoice::SingleColor(ManaType::Blue),
+            count: 2,
+        });
+    }
+    assert_eq!(
+        announced.state().objects[&source].counters.get(&charge),
+        None,
+        "the charge counter was removed"
+    );
+    assert_eq!(
+        announced.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Blue),
+        0,
+        "no color remained to choose"
+    );
+    assert!(
+        announced.act(GameAction::PassPriority).is_err(),
+        "an empty pool can't pay {{1}}{{U}}"
+    );
+
+    let (mut control, control_spell, control_source, control_bears) =
+        counter_colored_board(ManaProduction::AnyOneColor {
+            count: QuantityExpr::Fixed { value: 2 },
+            color_options: vec![ManaColor::Blue],
+            contribution: ManaContribution::Base,
+        });
+    let control_action = auto_cast(&control, control_spell);
+    assert!(legal_actions(control.state()).contains(&control_action));
+    announce_and_target(&mut control, control_action, Some(control_bears));
+    activate_until_payment(&mut control, control_source);
+    control
+        .act(GameAction::PassPriority)
+        .expect("{U}{U} pays {1}{U}");
+    control.advance_until_stack_empty();
+    assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
+}

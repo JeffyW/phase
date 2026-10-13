@@ -3188,30 +3188,33 @@ enum ProofOutput {
     /// The same mana whenever it's activated: a literal output, or a fixed
     /// count of fixed color options.
     Constant,
-    /// Fixed at activation from the board, unchanged by any cost a proof
-    /// admits beside it: a devotion amount (Nyx Lotus), or a fixed count of
-    /// colors read from the board. Reliable only while no other activation in
-    /// the plan moves or taps an object.
+    /// A devotion amount (CR 700.5) of fixed color options, as on Nyx Lotus:
+    /// read from the board at activation, and unchanged by any cost a proof
+    /// admits beside it. Reliable only while no other activation in the plan
+    /// moves or taps an object.
     BoardSized,
-    /// Any other non-fixed amount (X; the object its own cost chose, as in
-    /// Soldevi Adnate's "equal to the sacrificed creature's mana value"; a
-    /// count its own cost changes, such as a life total after paying life),
-    /// or a trigger event's mana type: never proven.
+    /// Any other output that reads the game (X; the object its own cost
+    /// chose, as in Soldevi Adnate's "equal to the sacrificed creature's mana
+    /// value"; a count its own cost changes, such as a life total after paying
+    /// life; colors read from the board, which its own cost may empty), or a
+    /// trigger event's mana type: never proven.
     Variable,
 }
 
 fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOutput {
-    // A non-fixed amount is board-sized only when it is a quantity no cost a
-    // proof admits beside it can change. Devotion (CR 700.5) counts mana
+    // Only two output shapes are proven. A fixed count of fixed colors is
+    // constant. A devotion count (CR 700.5) of fixed colors counts mana
     // symbols among permanents' mana costs: tapping, untapping, exerting,
     // paying life or removing a source's own counters leave it unchanged, and
     // a plan can't hold it beside a cost that moves or taps an object
-    // (`proof_plan_is_affordable`). Any other quantity may read what the
-    // activation's own cost changes before it resolves (CR 602.2b + CR 608.2h:
-    // "Pay 3 life: Add {U} equal to your life total"), so it is never proven.
-    let by_count = |count: &QuantityExpr, fixed_colors: bool| match count {
-        QuantityExpr::Fixed { .. } if fixed_colors => ProofOutput::Constant,
-        QuantityExpr::Fixed { .. } => ProofOutput::BoardSized,
+    // (`proof_plan_is_affordable`). Any other output reads the board after the
+    // activation's own cost is paid (CR 602.2b + CR 608.2h): "Pay 3 life: Add
+    // {U} equal to your life total" at 4 life makes one {U}, and "Remove a
+    // charge counter: Add two mana of any one color among artifacts with
+    // charge counters" can leave no color to choose (CR 106.5). Those are
+    // never proven.
+    let fixed_colors = |count: &QuantityExpr| match count {
+        QuantityExpr::Fixed { .. } => ProofOutput::Constant,
         QuantityExpr::Ref {
             qty: QuantityRef::Devotion { .. },
         } if !cost_moves_objects => ProofOutput::BoardSized,
@@ -3225,15 +3228,15 @@ fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOut
         | ManaProduction::AnyOneColor { count, .. }
         | ManaProduction::AnyCombination { count, .. }
         | ManaProduction::ChosenColor { count, .. }
-        | ManaProduction::AnyInCommandersColorIdentity { count, .. } => by_count(count, true),
-        ManaProduction::NotedType { count }
-        | ManaProduction::OpponentLandColors { count }
-        | ManaProduction::AnyCombinationOfObjectColors { count, .. }
-        | ManaProduction::AnyTypeProduceableBy { count, .. }
-        | ManaProduction::AnyOneColorAmongPermanents { count, .. } => by_count(count, false),
-        ManaProduction::ChoiceAmongExiledColors { .. }
-        | ManaProduction::DistinctColorsAmongPermanents { .. } => ProofOutput::BoardSized,
-        ManaProduction::TriggerEventManaType => ProofOutput::Variable,
+        | ManaProduction::AnyInCommandersColorIdentity { count, .. } => fixed_colors(count),
+        ManaProduction::NotedType { .. }
+        | ManaProduction::OpponentLandColors { .. }
+        | ManaProduction::AnyCombinationOfObjectColors { .. }
+        | ManaProduction::AnyTypeProduceableBy { .. }
+        | ManaProduction::AnyOneColorAmongPermanents { .. }
+        | ManaProduction::ChoiceAmongExiledColors { .. }
+        | ManaProduction::DistinctColorsAmongPermanents { .. }
+        | ManaProduction::TriggerEventManaType => ProofOutput::Variable,
     }
 }
 
