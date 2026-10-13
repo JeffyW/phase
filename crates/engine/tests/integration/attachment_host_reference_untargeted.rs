@@ -632,12 +632,19 @@ fn convenient_target_suspects_ward_host_with_one_ward_trigger() {
     );
 }
 
+/// Whether the board also has a P1 bystander wearing an unrelated Aura.
+#[derive(Clone, Copy)]
+enum Bystander {
+    Absent,
+    WearingAnotherAura,
+}
+
 /// Puts Claustrophobia onto the battlefield attached to `host` (as a resolved
 /// Aura spell would) and leaves its ETB trigger waiting on the stack.
 fn claustrophobia_etb_on_stack(
-    extra_aura_host: bool,
+    bystander: Bystander,
 ) -> (GameRunner, ObjectId, ObjectId, Option<ObjectId>) {
-    aura_etb_on_stack("Claustrophobia", CLAUSTROPHOBIA, 2, extra_aura_host)
+    aura_etb_on_stack("Claustrophobia", CLAUSTROPHOBIA, 2, bystander)
 }
 
 /// Casts the Aura `text` at a P1 creature of power `host_power` and stops with
@@ -646,15 +653,18 @@ fn aura_etb_on_stack(
     name: &str,
     text: &str,
     host_power: i32,
-    extra_aura_host: bool,
+    bystander: Bystander,
 ) -> (GameRunner, ObjectId, ObjectId, Option<ObjectId>) {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P1, "Grizzly Bears", host_power, 2).id();
-    let bystander = extra_aura_host.then(|| sc.add_creature(P1, "Bystander", 2, 2).id());
+    let bystander = match bystander {
+        Bystander::Absent => None,
+        Bystander::WearingAnotherAura => Some(sc.add_creature(P1, "Bystander", 2, 2).id()),
+    };
     let aura = aura_in_hand(&mut sc, P0, name, text);
-    let other_aura = extra_aura_host
-        .then(|| aura_on_battlefield(&mut sc, P1, "Rancor Dummy", "Enchant creature"));
+    let other_aura =
+        bystander.map(|_| aura_on_battlefield(&mut sc, P1, "Rancor Dummy", "Enchant creature"));
     let mut runner = sc.build();
     if let (Some(other), Some(bystander)) = (other_aura, bystander) {
         attach(&mut runner, other, bystander);
@@ -696,7 +706,7 @@ fn blink(runner: &mut GameRunner, id: ObjectId) {
 /// object, not the enchanted creature, so it stays untapped.
 #[test]
 fn host_blinked_before_etb_resolves_returned_creature_stays_untapped() {
-    let (mut runner, aura, host, _) = claustrophobia_etb_on_stack(false);
+    let (mut runner, aura, host, _) = claustrophobia_etb_on_stack(Bystander::Absent);
     let incarnation_before = runner.state().objects[&host].incarnation;
     blink(&mut runner, host);
     assert_ne!(
@@ -729,7 +739,7 @@ fn host_blinked_before_etb_resolves_returned_creature_stays_untapped() {
 #[test]
 fn bind_the_monster_host_bounced_still_deals_its_last_known_power() {
     let (mut runner, aura, host, _) =
-        aura_etb_on_stack("Bind the Monster", BIND_THE_MONSTER, 6, false);
+        aura_etb_on_stack("Bind the Monster", BIND_THE_MONSTER, 6, Bystander::Absent);
     let life_before = runner.state().players[P0.0 as usize].life;
     let mut events = Vec::new();
     engine::game::zones::move_to_zone(runner.state_mut(), host, Zone::Hand, &mut events);
@@ -1043,7 +1053,7 @@ fn bind_the_monster_host_blinked_deals_its_last_known_power() {
 /// creature it was attached to is still tapped.
 #[test]
 fn aura_bounced_in_response_still_taps_its_last_known_host() {
-    let (mut runner, aura, host, _) = claustrophobia_etb_on_stack(false);
+    let (mut runner, aura, host, _) = claustrophobia_etb_on_stack(Bystander::Absent);
     let mut events = Vec::new();
     engine::game::zones::move_to_zone(runner.state_mut(), aura, Zone::Hand, &mut events);
     runner.advance_until_stack_empty();
@@ -1065,7 +1075,8 @@ fn aura_bounced_in_response_still_taps_its_last_known_host() {
 /// other creature that happens to wear an Aura.
 #[test]
 fn host_gone_before_etb_resolves_taps_nothing() {
-    let (mut runner, aura, host, bystander) = claustrophobia_etb_on_stack(true);
+    let (mut runner, aura, host, bystander) =
+        claustrophobia_etb_on_stack(Bystander::WearingAnotherAura);
     let bystander = bystander.expect("bystander staged");
     let mut events = Vec::new();
     engine::game::zones::move_to_zone(runner.state_mut(), host, Zone::Hand, &mut events);
@@ -1448,6 +1459,60 @@ fn observed_stasis_removes_attacking_host_from_combat_and_counts_its_controller(
         runner.state().players[P0.0 as usize].hand.len(),
         hand_before,
         "one card is drawn for the one tapped creature the host's controller controls"
+    );
+}
+
+/// Review probe (CR 400.7 + CR 608.2h): Observed Stasis's ETB is pending on a
+/// creature P1 controls but P0 owns, and the creature is blinked, returning as
+/// a new object under its owner's control. "Its controller" is the controller
+/// of the creature as it last existed, P1, so P0 draws one card per tapped
+/// creature P1 controls, not per tapped creature P0 now controls.
+#[test]
+fn observed_stasis_host_blinked_counts_its_last_known_controller() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P0, "Borrowed Bears", 2, 2)
+        .controlled_by(P1)
+        .id();
+    let p1_tapped = [
+        sc.add_creature(P1, "Tapped One", 1, 1).id(),
+        sc.add_creature(P1, "Tapped Two", 1, 1).id(),
+    ];
+    let aura = aura_in_hand(&mut sc, P0, "Observed Stasis", OBSERVED_STASIS);
+    sc.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let mut runner = sc.build();
+    for id in p1_tapped {
+        set_tapped(&mut runner, id, true);
+    }
+    runner.cast(aura).target_object(host).commit();
+    runner.act(GameAction::PassPriority).expect("pass");
+    for _ in 0..8 {
+        if runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }) {
+            break;
+        }
+        runner.act(GameAction::PassPriority).expect("pass");
+    }
+    assert!(
+        runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }),
+        "reach: the ETB trigger is on the stack"
+    );
+    let hand_before = runner.state().players[P0.0 as usize].hand.len();
+    blink(&mut runner, host);
+    assert_eq!(
+        runner.state().objects[&host].controller,
+        P0,
+        "reach: the returned creature is a new object under its owner's control"
+    );
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().players[P0.0 as usize].hand.len(),
+        hand_before + 2,
+        "one card per tapped creature the departed host's last controller (P1) controls"
     );
 }
 
