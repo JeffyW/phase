@@ -31,6 +31,7 @@ use crate::types::mana::{
     ManaSourceSelection, ManaType, PaymentContext, TapsForManaSelection,
 };
 use crate::types::player::PlayerId;
+use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::Zone;
 use crate::types::TriggerMode;
 
@@ -38,6 +39,7 @@ use super::engine::{EngineError, PriorityAnnouncementFacadeAccess, PriorityPrinc
 use super::mana_abilities;
 use super::mana_abilities::ManaPayabilityMode;
 use super::mana_payment;
+use super::replacement;
 use super::restrictions;
 use super::triggers::trigger_source_context_for_latch;
 use super::turn_control;
@@ -3238,6 +3240,7 @@ fn direct_mana_leaf(ability: &AbilityDefinition) -> Option<&ManaProduction> {
         iteration_kind_binding,
         sibling_condition,
         unlowered_guard,
+        activation_restrictions,
         // Inert for a targetless mana leaf: classification, timing and
         // activation permissions (checked by the activatability profiles), the
         // cost (modelled by `mana_ability_cost_resource_legs`), display text,
@@ -3247,7 +3250,6 @@ fn direct_mana_leaf(ability: &AbilityDefinition) -> Option<&ManaProduction> {
         duration: _,
         description: _,
         target_prompt: _,
-        activation_restrictions: _,
         activation_mana_payment_restriction: _,
         activator_filter: _,
         activation_zone: _,
@@ -3297,8 +3299,78 @@ fn direct_mana_leaf(ability: &AbilityDefinition) -> Option<&ManaProduction> {
         && repeat_until.is_none()
         && iteration_kind_binding.is_none()
         && *sibling_condition == crate::types::ability::SiblingCondition::Dependent
-        && unlowered_guard.is_none();
+        && unlowered_guard.is_none()
+        && activation_restrictions
+            .iter()
+            .all(activation_restriction_is_timing_only);
     leaf.then_some(produced)
+}
+
+/// CR 602.1b + CR 602.5: an activation restriction the proof may hold fixed
+/// across a whole payment plan. Only timing restrictions qualify: the turn,
+/// phase and step can't change while one spell's mana is paid, and the
+/// activatability profiles already checked them. Any restriction that reads
+/// the board, the source, or a count of earlier activations may be changed by
+/// another planned activation ("Activate only if your life total is 4 or
+/// greater" after another source paid life), so it leaves the ability
+/// unproven.
+fn activation_restriction_is_timing_only(restriction: &ActivationRestriction) -> bool {
+    match restriction {
+        ActivationRestriction::AsSorcery
+        | ActivationRestriction::AsInstant
+        | ActivationRestriction::DuringYourTurn
+        | ActivationRestriction::DuringYourUpkeep
+        | ActivationRestriction::DuringCombat
+        | ActivationRestriction::BeforeAttackersDeclared
+        | ActivationRestriction::BeforeCombatDamage
+        | ActivationRestriction::MatchesCardCastTiming => true,
+        ActivationRestriction::OnlyOnceEachTurn
+        | ActivationRestriction::OnlyOnce
+        | ActivationRestriction::MaxTimesEachTurn { .. }
+        | ActivationRestriction::RequiresCondition { .. }
+        | ActivationRestriction::IsSolved
+        | ActivationRestriction::SourceIsHarnessed
+        | ActivationRestriction::ClassLevelIs { .. }
+        | ActivationRestriction::LevelCounterRange { .. }
+        | ActivationRestriction::CounterThreshold { .. } => false,
+    }
+}
+
+/// CR 614.1a + CR 614.6: whether any replacement effect could modify the mana
+/// `source` produces for `player` (Contamination's "produces {B} instead",
+/// Mana Reflection's doubling, a floating "produces no mana" shield). Asked of
+/// the replacement pipeline's own candidate query for every mana type, tapped
+/// or not, so a replacement keyed to any of them is found.
+fn mana_production_could_be_replaced(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+) -> bool {
+    let registry = replacement::replacement_registry();
+    [
+        ManaType::White,
+        ManaType::Blue,
+        ManaType::Black,
+        ManaType::Red,
+        ManaType::Green,
+        ManaType::Colorless,
+    ]
+    .into_iter()
+    .any(|mana_type| {
+        [true, false].into_iter().any(|tapped_for_mana| {
+            !replacement::find_applicable_replacements(
+                state,
+                &ProposedEvent::produce_mana_with_context(
+                    source,
+                    player,
+                    mana_type,
+                    tapped_for_mana,
+                ),
+                registry,
+            )
+            .is_empty()
+        })
+    })
 }
 
 fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOutput {
@@ -3524,6 +3596,14 @@ pub(crate) fn manual_mana_payment_is_proven(
             })
         })
         .collect();
+    // CR 614.1a + CR 614.6: the proof sizes each source's raw production; a
+    // replacement that could change what any of them makes leaves it unproven.
+    if sources
+        .iter()
+        .any(|source| mana_production_could_be_replaced(state, player, source.object_id))
+    {
+        return false;
+    }
     let (contenders, free): (Vec<&ProofSource>, Vec<&ProofSource>) =
         sources.iter().partition(|source| source.contends());
 

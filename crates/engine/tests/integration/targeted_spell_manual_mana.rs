@@ -341,6 +341,43 @@ fn offered_auto_cast_completes_through_mana_payment() {
     );
 }
 
+/// Companion on the issue's Nyx Lotus board: the offered targeted cast
+/// completes. The Ogre pays its 3 life during mana payment and the Lotus's
+/// devotion-sized {U} (blue devotion 1) pays the rest.
+#[test]
+fn offered_auto_cast_completes_with_nyx_lotus() {
+    let mut b = board(BlueSource::NyxLotus);
+    reach(&b, BlueSource::NyxLotus);
+    let lotus = b.blue_source.expect("the Lotus");
+    let action = auto_cast(&b.runner, b.unsubstantiate);
+    assert!(legal_actions(b.runner.state()).contains(&action));
+    announce_and_target(&mut b.runner, action, Some(b.bear));
+    assert!(
+        matches!(b.runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
+        "reach: mana payment"
+    );
+    b.runner
+        .act(GameAction::ActivateAbility {
+            source_id: b.ogre,
+            ability_index: 0,
+        })
+        .expect("the Ogre's mana ability activates during payment");
+    b.runner
+        .act(GameAction::PassPriority)
+        .expect("passing finishes the payment");
+    b.runner.advance_until_stack_empty();
+    assert_eq!(b.runner.state().players[0].life, 17, "the Ogre paid 3 life");
+    assert!(
+        b.runner.state().objects[&lotus].tapped,
+        "the Lotus paid {{U}}"
+    );
+    assert_eq!(
+        b.runner.state().objects[&b.bear].zone,
+        Zone::Hand,
+        "Unsubstantiate resolved"
+    );
+}
+
 /// "Exile a card from your hand: Add {B}." (a choice-bearing, non-tap mana
 /// ability; Auto can't activate it).
 fn exile_from_hand_mana() -> AbilityDefinition {
@@ -1764,4 +1801,214 @@ fn mana_swapped_by_a_condition_after_its_cost_is_not_proven() {
         .expect("{U}{U} pays {1}{U}");
     control.advance_until_stack_empty();
     assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
+}
+
+/// Probes R13/R14 infrastructure fixtures: 0/3 battery creatures for P0, each
+/// carrying one of `batteries`, with P0 at `life` and no other producer;
+/// Unsubstantiate ({1}{U}) in hand and Grizzly Bears for P1. `setup` adds the
+/// rest of the board.
+fn battery_board(
+    life: i32,
+    batteries: Vec<AbilityDefinition>,
+    setup: impl FnOnce(&mut GameScenario),
+) -> (GameRunner, ObjectId, Vec<ObjectId>, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    sc.with_life(P0, life);
+    let sources = batteries
+        .into_iter()
+        .map(|ability| {
+            sc.add_creature(P0, "Life Battery", 0, 3)
+                .with_ability_definition(ability)
+                .id()
+        })
+        .collect();
+    setup(&mut sc);
+    let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let spell = sc
+        .add_spell_to_hand_from_oracle(P0, "Unsubstantiate", true, UNSUBSTANTIATE)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+        .id();
+    (sc.build(), spell, sources, bears)
+}
+
+/// "Pay 3 life: Add <colors>." as a direct mana leaf.
+fn pay_three_life_for(colors: Vec<ManaColor>) -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Mana {
+            produced: ManaProduction::Fixed {
+                colors,
+                contribution: ManaContribution::Base,
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .cost(AbilityCost::PayLife {
+        amount: engine::types::ability::QuantityExpr::Fixed { value: 3 },
+    })
+}
+
+/// Shared reach guards: the cast is generated with plain Auto payment and,
+/// cast anyway, stops at target selection with its locked {1}{U} cost and
+/// accepts the Bears.
+fn cast_unoffered_to_payment(runner: &GameRunner, spell: ObjectId, bears: ObjectId) -> GameRunner {
+    let action = auto_cast(runner, spell);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: generated with plain Auto payment"
+    );
+    assert!(!legal_actions(runner.state()).contains(&action));
+    let mut announced = GameRunner::from_state(runner.state().clone());
+    announced.act(action).expect("the cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: target selection")
+    };
+    assert_eq!(pending_cast.cost, cost(vec![ManaCostShard::Blue], 1));
+    announced
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(bears)],
+        })
+        .expect("the target is accepted");
+    announced
+}
+
+/// Probe R13 (CR 614.1a + CR 614.6): a ProduceMana replacement ("it produces
+/// {B} instead") rewrites what the battery makes, so the proof, which sizes
+/// raw production, declines and the targeted {1}{U} cast isn't offered. Cast
+/// anyway, the activation makes {B}{B}, which can't pay {1}{U}. Control: the
+/// same board without the replacement is offered and the cast resolves.
+#[test]
+fn mana_production_replacement_leaves_the_payment_unproven() {
+    use engine::types::ability::{ManaModification, ReplacementDefinition};
+    use engine::types::replacements::ReplacementEvent;
+    let (runner, spell, sources, bears) = battery_board(
+        4,
+        vec![pay_three_life_for(vec![ManaColor::Blue, ManaColor::Blue])],
+        |sc| {
+            sc.add_creature(P0, "Contamination Stand-in", 0, 1)
+                .as_artifact()
+                .with_replacement_definition(
+                    ReplacementDefinition::new(ReplacementEvent::ProduceMana).mana_modification(
+                        ManaModification::ReplaceWith {
+                            mana_type: ManaType::Black,
+                        },
+                    ),
+                );
+        },
+    );
+    let mut announced = cast_unoffered_to_payment(&runner, spell, bears);
+    activate_until_payment(&mut announced, sources[0]);
+    let pool = &announced.state().players[0].mana_pool;
+    assert_eq!(
+        (
+            pool.count_color(ManaType::Black),
+            pool.count_color(ManaType::Blue)
+        ),
+        (2, 0),
+        "the replacement made {{B}}{{B}}"
+    );
+    assert!(
+        announced.act(GameAction::PassPriority).is_err(),
+        "{{B}}{{B}} can't pay {{1}}{{U}}"
+    );
+
+    let (mut control, control_spell, control_sources, control_bears) = battery_board(
+        4,
+        vec![pay_three_life_for(vec![ManaColor::Blue, ManaColor::Blue])],
+        |_| {},
+    );
+    let control_action = auto_cast(&control, control_spell);
+    assert!(legal_actions(control.state()).contains(&control_action));
+    announce_and_target(&mut control, control_action, Some(control_bears));
+    activate_until_payment(&mut control, control_sources[0]);
+    control
+        .act(GameAction::PassPriority)
+        .expect("{U}{U} pays {1}{U}");
+    control.advance_until_stack_empty();
+    assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
+}
+
+/// Probe R14 (CR 602.1b + CR 602.5): two batteries with "Pay 3 life: Add {U}.
+/// Activate only if your life total is 4 or greater." at 6 life. The first
+/// activation leaves 3 life, so the second can't be activated. A restriction
+/// that reads the board isn't held fixed across the plan, so the targeted
+/// {1}{U} cast isn't offered. Controls: at 7 life the same batteries without
+/// the restriction are offered and the cast resolves; with it they are still
+/// unproven (the decline is by kind) but the cast completes when cast.
+#[test]
+fn state_reading_activation_restriction_leaves_the_payment_unproven() {
+    use engine::types::ability::{
+        ActivationRestriction, Comparator, ParsedCondition, PlayerScope, QuantityExpr, QuantityRef,
+    };
+    let restricted = || {
+        pay_three_life_for(vec![ManaColor::Blue]).activation_restrictions(vec![
+            ActivationRestriction::RequiresCondition {
+                condition: Some(ParsedCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::LifeTotal {
+                            player: PlayerScope::Controller,
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 4 },
+                }),
+            },
+        ])
+    };
+    let (runner, spell, sources, bears) =
+        battery_board(6, vec![restricted(), restricted()], |_| {});
+    let mut announced = cast_unoffered_to_payment(&runner, spell, bears);
+    activate_until_payment(&mut announced, sources[0]);
+    assert_eq!(announced.state().players[0].life, 3);
+    assert!(
+        announced
+            .act(GameAction::ActivateAbility {
+                source_id: sources[1],
+                ability_index: 0,
+            })
+            .is_err(),
+        "at 3 life the second battery can't be activated"
+    );
+    assert!(
+        announced.act(GameAction::PassPriority).is_err(),
+        "{{U}} can't pay {{1}}{{U}}"
+    );
+
+    let unrestricted = || pay_three_life_for(vec![ManaColor::Blue]);
+    let (mut control, control_spell, control_sources, control_bears) =
+        battery_board(7, vec![unrestricted(), unrestricted()], |_| {});
+    let control_action = auto_cast(&control, control_spell);
+    assert!(
+        legal_actions(control.state()).contains(&control_action),
+        "without the restriction the same plan is proven and offered"
+    );
+    announce_and_target(&mut control, control_action, Some(control_bears));
+    activate_until_payment(&mut control, control_sources[0]);
+    activate_until_payment(&mut control, control_sources[1]);
+    assert_eq!(control.state().players[0].life, 1);
+    control
+        .act(GameAction::PassPriority)
+        .expect("{U}{U} pays {1}{U}");
+    control.advance_until_stack_empty();
+    assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
+
+    // The decline is by kind, not by count: at 7 life the restricted plan is
+    // payable but still unproven (an accepted under-offer); cast anyway, it
+    // completes.
+    let (rich, rich_spell, rich_sources, rich_bears) =
+        battery_board(7, vec![restricted(), restricted()], |_| {});
+    let mut rich = cast_unoffered_to_payment(&rich, rich_spell, rich_bears);
+    activate_until_payment(&mut rich, rich_sources[0]);
+    activate_until_payment(&mut rich, rich_sources[1]);
+    assert_eq!(rich.state().players[0].life, 1);
+    rich.act(GameAction::PassPriority)
+        .expect("{U}{U} pays {1}{U}");
+    rich.advance_until_stack_empty();
+    assert_eq!(rich.state().objects[&rich_bears].zone, Zone::Hand);
 }
