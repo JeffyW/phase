@@ -49,6 +49,7 @@ use super::oracle_nom::primitives::{
 };
 use super::oracle_nom::target::parse_chosen_object_reference;
 use super::oracle_nom::target::parse_type_phrase as parse_type_phrase_nom;
+use super::oracle_nom::target::{controller_phrase_among, ControllerPhrase};
 use super::oracle_static::{
     add_property, parse_commander_subject_filter_prefix, typed_filter_for_subtype,
 };
@@ -1074,6 +1075,20 @@ fn parse_referenced_player_phrase(input: &str) -> OracleResult<'_, ()> {
     .parse(input)
 }
 
+/// CR 508.6: the players an attack head names. Adds the plural set
+/// ("one or more players", Zurzoth, Chaos Rider) to the single referents
+/// of `parse_referenced_player_phrase`. Attack heads only: a damage head's
+/// damaged players are not a `DefendingPlayer` antecedent.
+fn parse_attacked_player_phrase(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        parse_referenced_player_phrase,
+        // CR 508.6: "one or more players" — the attacked players a plural attack
+        // head introduces (Zurzoth, Chaos Rider).
+        value((), tag::<_, _, OracleError<'_>>("one or more players")),
+    ))
+    .parse(input)
+}
+
 /// CR 508.3e: the attacked-player OBJECT of a bare "you attack …" trigger
 /// condition, i.e. the `[another player]` slot in "Whenever [a player] attacks
 /// [another player], . . .".
@@ -1126,7 +1141,7 @@ fn condition_introduces_defending_player(cond_lower: &str) -> bool {
     while !remaining.is_empty() {
         if let Ok((after_actor, ())) = parse_trigger_actor(remaining) {
             if let Ok((after_verb, ())) = parse_attack_verb(after_actor) {
-                if parse_referenced_player_phrase(after_verb).is_ok() {
+                if parse_attacked_player_phrase(after_verb).is_ok() {
                     return true;
                 }
             }
@@ -1139,7 +1154,7 @@ fn condition_introduces_defending_player(cond_lower: &str) -> bool {
         // unambiguous in trigger-condition text — "attack" never appears as a
         // noun before "a player" here.
         if let Ok((after_verb, ())) = parse_attack_verb(remaining) {
-            if parse_referenced_player_phrase(after_verb).is_ok() {
+            if parse_attacked_player_phrase(after_verb).is_ok() {
                 return true;
             }
         }
@@ -9614,7 +9629,11 @@ fn try_parse_ability_activation_trigger(lower: &str) -> Option<(TriggerMode, Tri
         // player (Avalanche of Sector 7). Only a third-person subject can be its
         // antecedent.
         let (rest, they_control) = if person == SubjectPerson::Third {
-            opt(value((), tag(" they control"))).parse(rest)?
+            opt(preceded(
+                tag(" "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+            ))
+            .parse(rest)?
         } else {
             (rest, None)
         };
@@ -14586,6 +14605,9 @@ fn try_parse_event(
                     preceded(tag(" "), parse_one_of_your_opponents),
                 ),
                 value(AttackTargetFilter::Player, tag(" a player")),
+                // CR 508.3a: an attack head naming players restricts its
+                // attackers to player attacks.
+                value(AttackTargetFilter::Player, tag(" one or more players")),
                 // CR 102.1 + CR 508.1b: "attacks the player with the most life or
                 // tied for most life" (Preacher of the Schism, Seraphic
                 // Greatsword, Undercover Butler). Only matched when the whole
@@ -24047,5 +24069,36 @@ mod saga_chapter_ability_trigger_tests {
                 scope: ObjectScope::EventSource
             }
         );
+    }
+}
+
+/// Structural-marker site: "<source> they control" after an activation trigger's
+/// third-person subject. The phrase is a marker; the construct binds the
+/// source's controller to the activating player.
+#[cfg(test)]
+mod structural_marker_tests {
+    use super::try_parse_ability_activation_trigger;
+    use crate::types::ability::{ControllerRef, TargetFilter};
+
+    #[test]
+    fn ability_object_they_control_marker() {
+        let parse = |controller: &str| {
+            try_parse_ability_activation_trigger(&format!(
+                "whenever an opponent activates an ability of an artifact {controller}"
+            ))
+        };
+        let (_, def) = parse("they control").expect("activation trigger");
+        let Some(TargetFilter::Typed(source)) = def.valid_card else {
+            panic!("typed source filter: {:?}", def.valid_card);
+        };
+        assert_eq!(source.controller, Some(ControllerRef::TriggeringPlayer));
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(parse(declined).is_none(), "{declined:?}");
+        }
     }
 }
