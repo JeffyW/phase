@@ -1807,16 +1807,18 @@ pub(crate) fn source_attachment_host(
         Some(object) => {
             let host = object.attached_to.and_then(|target| target.as_object())?;
             let host_object = state.objects.get(&host)?;
-            // Attached to the host's current incarnation (re-attached after a
-            // departure, or never separated from it).
+            let left_while_attached = host_left_with_source(Some(host));
+            // Still the object the source is attached to: it never left while
+            // attached, or the source was re-attached to its new incarnation.
             if host_object.zone == Zone::Battlefield
-                && host_object.attachments.contains(&source.object_id)
+                && (left_while_attached.is_none()
+                    || host_object.attachments.contains(&source.object_id))
             {
                 return Some(AttachmentHost::Live(ObjectIncarnationRef::from_object(
                     host_object,
                 )));
             }
-            host_left_with_source(Some(host))
+            left_while_attached
                 .and_then(departed_ref)
                 .map(AttachmentHost::Departed)
         }

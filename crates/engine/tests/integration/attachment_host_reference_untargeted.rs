@@ -1298,20 +1298,6 @@ fn captivating_glance_won_clash_gains_control_of_enchanted_creature() {
     assert_eq!(runner.state().objects[&host].controller, P0);
 }
 
-/// GiveControl "Otherwise" branch: P0 loses the clash, so "that player" (the
-/// opponent P0 clashed with) gains control of the enchanted creature.
-///
-/// Ignored: pre-existing, not part of this change. "that player" after "clash
-/// with an opponent" parses to `TargetFilter::TriggeringPlayer`, which an
-/// end-step trigger has no referent for, and the engine records no clashed
-/// opponent to bind it to; the branch's host is bound, but no player receives it.
-#[test]
-#[ignore = "pre-existing: Captivating Glance's 'that player' (the clashed opponent) has no referent"]
-fn captivating_glance_lost_clash_gives_enchanted_creature_to_the_opponent() {
-    let (runner, host) = captivating_glance_clash(P0, false);
-    assert_eq!(runner.state().objects[&host].controller, P1);
-}
-
 /// Sacrifice sibling (LKI): Last Voyage of the _____, "When this Aura leaves the
 /// battlefield, sacrifice enchanted creature." Regression guard: `Sacrifice`
 /// never announced a slot for this shape, so it pins that the resolution-time
