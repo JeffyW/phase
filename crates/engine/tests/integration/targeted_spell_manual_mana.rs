@@ -170,6 +170,14 @@ fn targeted_spell_payable_with_ogre_mana_is_offered_nyx_lotus() {
         "CR 601.2g + CR 605.1a: the targeted {{1}}{{U}} on the same board is payable the same way \
          and must be offered too"
     );
+    let mut announced = GameRunner::from_state(b.runner.state().clone());
+    announced
+        .act(auto_cast(&b.runner, b.unsubstantiate))
+        .expect("the offered cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: the offer was judged at a stable target selection")
+    };
+    assert_eq!(pending_cast.cost, cost(vec![ManaCostShard::Blue], 1));
 }
 
 /// Control: a basic Island instead of Nyx Lotus. Island U + Ogre R pays {1}{U}.
@@ -1629,6 +1637,124 @@ fn colors_read_after_their_own_counter_cost_are_not_proven() {
             color_options: vec![ManaColor::Blue],
             contribution: ManaContribution::Base,
         });
+    let control_action = auto_cast(&control, control_spell);
+    assert!(legal_actions(control.state()).contains(&control_action));
+    announce_and_target(&mut control, control_action, Some(control_bears));
+    activate_until_payment(&mut control, control_source);
+    control
+        .act(GameAction::PassPriority)
+        .expect("{U}{U} pays {1}{U}");
+    control.advance_until_stack_empty();
+    assert_eq!(control.state().objects[&control_bears].zone, Zone::Hand);
+}
+
+/// Probe R12 infrastructure fixture ("Conditional Life Battery", 0/3): "Pay 3
+/// life: Add {U}{U}. If your life total is 1 or less, add {U} instead.", with
+/// P0 at 4 life and no other producer; Unsubstantiate ({1}{U}) in hand.
+/// `instead` false drops the sub-ability, leaving a direct "Add {U}{U}" leaf.
+fn conditional_life_board(instead: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    use engine::types::ability::{
+        AbilityCondition, Comparator, PlayerScope, QuantityExpr, QuantityRef,
+    };
+    let mana = |colors: Vec<ManaColor>| Effect::Mana {
+        produced: ManaProduction::Fixed {
+            colors,
+            contribution: ManaContribution::Base,
+        },
+        restrictions: vec![],
+        grants: vec![],
+        expiry: None,
+        target: None,
+    };
+    let mut ability = AbilityDefinition::new(
+        AbilityKind::Activated,
+        mana(vec![ManaColor::Blue, ManaColor::Blue]),
+    )
+    .cost(AbilityCost::PayLife {
+        amount: QuantityExpr::Fixed { value: 3 },
+    });
+    if instead {
+        ability = ability.sub_ability(
+            AbilityDefinition::new(AbilityKind::Activated, mana(vec![ManaColor::Blue])).condition(
+                AbilityCondition::ConditionInstead {
+                    inner: Box::new(AbilityCondition::QuantityCheck {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::LifeTotal {
+                                player: PlayerScope::Controller,
+                            },
+                        },
+                        comparator: Comparator::LE,
+                        rhs: QuantityExpr::Fixed { value: 1 },
+                    }),
+                },
+            ),
+        );
+    }
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    sc.with_life(P0, 4);
+    let source = sc
+        .add_creature(P0, "Conditional Life Battery", 0, 3)
+        .with_ability_definition(ability)
+        .id();
+    let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let spell = sc
+        .add_spell_to_hand_from_oracle(P0, "Unsubstantiate", true, UNSUBSTANTIATE)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+        .id();
+    (sc.build(), spell, source, bears)
+}
+
+/// Probe R12 (CR 602.2b + CR 608.2c + CR 608.2h): "Pay 3 life: Add {U}{U}. If
+/// your life total is 1 or less, add {U} instead." checks its condition after
+/// the life is paid, so at 4 life it makes only {U}. An ability with a
+/// sub-ability is not a direct mana leaf, so it is never proven and the
+/// targeted {1}{U} cast isn't offered. Reach guards: generated with plain Auto
+/// payment; cast anyway, the locked cost is {1}{U}; the activation leaves 1
+/// life and one {U}, so the payment can't finish. Control: the same ability
+/// without the "instead" clause is offered and the cast resolves.
+#[test]
+fn mana_swapped_by_a_condition_after_its_cost_is_not_proven() {
+    let (runner, spell, source, bears) = conditional_life_board(true);
+    let action = auto_cast(&runner, spell);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: generated with plain Auto payment"
+    );
+    assert!(!legal_actions(runner.state()).contains(&action));
+
+    let mut announced = GameRunner::from_state(runner.state().clone());
+    announced.act(action).expect("the cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: target selection")
+    };
+    assert_eq!(pending_cast.cost, cost(vec![ManaCostShard::Blue], 1));
+    announced
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(bears)],
+        })
+        .expect("the target is accepted");
+    activate_until_payment(&mut announced, source);
+    assert_eq!(
+        announced.state().players[0].life,
+        1,
+        "3 life was paid first"
+    );
+    assert_eq!(
+        announced.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Blue),
+        1,
+        "the condition swapped in {{U}} after the payment"
+    );
+    assert!(
+        announced.act(GameAction::PassPriority).is_err(),
+        "{{U}} can't pay {{1}}{{U}}"
+    );
+
+    let (mut control, control_spell, control_source, control_bears) = conditional_life_board(false);
     let control_action = auto_cast(&control, control_spell);
     assert!(legal_actions(control.state()).contains(&control_action));
     announce_and_target(&mut control, control_action, Some(control_bears));

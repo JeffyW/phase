@@ -3201,6 +3201,106 @@ enum ProofOutput {
     Variable,
 }
 
+/// CR 605.1a + CR 608.2c: the production of a payment mana ability the proof
+/// may read, only when the whole ability is one direct `Effect::Mana` leaf.
+/// A sub-ability, else branch, condition, choice, repetition or target can
+/// change what resolves after its cost is paid (CR 602.2b + CR 608.2h: a
+/// `ConditionInstead` sub-ability swaps "Add {U}{U}" for "Add {U}" once paying
+/// life drops the total), so any of them leaves the ability unproven. The
+/// destructuring is exhaustive: a new field must be classified here.
+fn direct_mana_leaf(ability: &AbilityDefinition) -> Option<&ManaProduction> {
+    let AbilityDefinition {
+        effect,
+        declares_chosen_group,
+        reads_chosen_group,
+        declares_return_result,
+        reads_return_result,
+        sub_ability,
+        else_ability,
+        condition,
+        optional_targeting,
+        optional,
+        optional_player,
+        optional_for,
+        multi_target,
+        distribute,
+        unless_pay,
+        modal,
+        mode_abilities,
+        repeat_for,
+        announced_x,
+        cost_reduction,
+        forward_result,
+        player_scope,
+        starting_with,
+        target_chooser,
+        repeat_until,
+        iteration_kind_binding,
+        sibling_condition,
+        unlowered_guard,
+        // Inert for a targetless mana leaf: classification, timing and
+        // activation permissions (checked by the activatability profiles), the
+        // cost (modelled by `mana_ability_cost_resource_legs`), display text,
+        // and target bookkeeping with no target to read.
+        kind: _,
+        cost: _,
+        duration: _,
+        description: _,
+        target_prompt: _,
+        activation_restrictions: _,
+        activation_mana_payment_restriction: _,
+        activator_filter: _,
+        activation_zone: _,
+        ability_tag: _,
+        target_constraints: _,
+        target_choice_timing: _,
+        min_x_value: _,
+        cant_be_copied: _,
+        illegal_targets_disposition: _,
+        target_selection_mode: _,
+        sub_link: _,
+        target_reads: _,
+        face_down_in_exile: _,
+        granting_object: _,
+    } = ability;
+    let Effect::Mana {
+        produced,
+        target: None,
+        ..
+    } = &**effect
+    else {
+        return None;
+    };
+    let leaf = declares_chosen_group.is_none()
+        && reads_chosen_group.is_none()
+        && declares_return_result.is_none()
+        && reads_return_result.is_none()
+        && sub_ability.is_none()
+        && else_ability.is_none()
+        && condition.is_none()
+        && !optional_targeting
+        && !optional
+        && optional_player.is_none()
+        && optional_for.is_none()
+        && multi_target.is_none()
+        && distribute.is_none()
+        && unless_pay.is_none()
+        && modal.is_none()
+        && mode_abilities.is_empty()
+        && repeat_for.is_none()
+        && announced_x.is_none()
+        && cost_reduction.is_none()
+        && !forward_result
+        && player_scope.is_none()
+        && starting_with.is_none()
+        && target_chooser.is_none()
+        && repeat_until.is_none()
+        && iteration_kind_binding.is_none()
+        && *sibling_condition == crate::types::ability::SiblingCondition::Dependent
+        && unlowered_guard.is_none();
+    leaf.then_some(produced)
+}
+
 fn proof_output(produced: &ManaProduction, cost_moves_objects: bool) -> ProofOutput {
     // Only two output shapes are proven. A fixed count of fixed colors is
     // constant. A devotion count (CR 700.5) of fixed colors counts mana
@@ -3378,17 +3478,16 @@ pub(crate) fn manual_mana_payment_is_proven(
             if object.controller != player {
                 return None;
             }
-            // Each payment mana ability the proof admits: its cost modelled
-            // exactly, and its output fixed (Constant), or board-sized with a
-            // cost that moves nothing (an unordered plan can't show it is read
-            // before its own cost changes the board).
+            // Each payment mana ability the proof admits: one direct mana
+            // leaf, its cost modelled exactly, and its output fixed
+            // (Constant), or board-sized with a cost that moves nothing (an
+            // unordered plan can't show it is read before its own cost changes
+            // the board).
             let admitted: Vec<Option<(mana_abilities::ManaCostProofShape, ProofOutput)>> = object
                 .abilities
                 .iter()
                 .map(|ability| {
-                    let Effect::Mana { produced, .. } = &*ability.effect else {
-                        return None;
-                    };
+                    let produced = direct_mana_leaf(ability)?;
                     if !is_payment_mana_ability(ability) {
                         return None;
                     }
