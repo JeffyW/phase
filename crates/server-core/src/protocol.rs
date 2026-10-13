@@ -3346,13 +3346,17 @@ mod tests {
         }
     }
 
-    /// v141: CR 603.10d control-change evidence —
+    /// v142: CR 603.10d control-change evidence —
     /// `GameEvent::ControllerChanged::evidence`,
     /// `ResolvedAbility::control_change_instruction`,
     /// `GameState::control_change_observations` and
     /// `GameState::control_change_captures`, inside `GameState`; look-back
-    /// control-change triggers read them, so a v140 peer must be refused before
-    /// it receives v141 state.
+    /// control-change triggers read them, so a v141 peer must be refused before
+    /// it receives v142 state.
+    ///
+    /// v141: `ExileLinkKind` gains `CastCost` (CR 607.2q cast-cost exile links),
+    /// carried in `GameState::exile_links`; a v140 peer cannot parse the tag, so
+    /// it must be refused before it receives v141 state.
     ///
     /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
     /// attack event's attackers attacked), carried in a resolving or pending
@@ -3552,8 +3556,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_141_for_control_change_evidence() {
-        assert_eq!(PROTOCOL_VERSION, 141);
+    fn protocol_version_is_142_for_control_change_evidence() {
+        assert_eq!(PROTOCOL_VERSION, 142);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3564,7 +3568,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_141_for_control_change_provenance` stays
+    /// `protocol_version_is_142_for_control_change_evidence` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
