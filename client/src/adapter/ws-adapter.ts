@@ -210,10 +210,16 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 140 — CR 603.10d control-change provenance: GameObject gains
- *      controller_changed_turn — see PROTOCOL_VERSION's own `/// 140` entry in
+ * 141 — CR 603.10d control-change provenance: GameObject gains
+ *      controller_changed_turn — see PROTOCOL_VERSION's own `/// 141` entry in
  *      crates/lobby-broker/src/protocol.rs. Look-back control-change triggers
- *      read it, so a v139 peer resolves them differently. Wire 122 moves with it.
+ *      read it, so a v140 peer resolves them differently. Wire 123 moves with it.
+ * 140 — AttackSubject gains EventAttackers (the players a trigger's attack
+ *      event's attackers attacked), carried in an ability's player_scope
+ *      inside GameState — see PROTOCOL_VERSION's own `/// 140` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v139 peer cannot parse the tag;
+ *      the exact-match version check at connect refuses the pairing. Wire 122
+ *      moves with it.
  * 139 — CR 702.122c per-turn crew relation: GameState gains
  *      crew_history_this_turn and FilterProp gains CrewedThisTurn — see
  *      PROTOCOL_VERSION's own `/// 139` entry in crates/lobby-broker/src/protocol.rs.
@@ -852,7 +858,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 140;
+export const PROTOCOL_VERSION = 141;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

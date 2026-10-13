@@ -3346,10 +3346,15 @@ mod tests {
         }
     }
 
-    /// v140: CR 603.10d control-change provenance —
+    /// v141: CR 603.10d control-change provenance —
     /// `GameObject::controller_changed_turn`, inside `GameState`; look-back
-    /// control-change triggers read it, so a v139 peer must be refused before
-    /// it receives v140 state.
+    /// control-change triggers read it, so a v140 peer must be refused before
+    /// it receives v141 state.
+    ///
+    /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
+    /// attack event's attackers attacked), carried in a resolving or pending
+    /// ability's `player_scope` inside `GameState`; a v139 peer cannot parse the
+    /// tag, so it must be refused before it receives v140 state.
     ///
     /// v139: CR 702.122c per-turn crew relation —
     /// `GameState::crew_history_this_turn` and `FilterProp::CrewedThisTurn`, both
@@ -3544,8 +3549,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_140_for_control_change_provenance() {
-        assert_eq!(PROTOCOL_VERSION, 140);
+    fn protocol_version_is_141_for_control_change_provenance() {
+        assert_eq!(PROTOCOL_VERSION, 141);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3556,7 +3561,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_140_for_control_change_provenance` stays
+    /// `protocol_version_is_141_for_control_change_provenance` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

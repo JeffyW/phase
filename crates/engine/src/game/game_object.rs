@@ -1026,12 +1026,16 @@ pub struct GameObject {
     /// CR 613.1b + CR 603.10d: the last global turn on which this permanent's
     /// controller changed, by any layer-2 change (an effect starting or
     /// ending, a static ability starting or stopping to apply). Written only
-    /// by `layers::finish_layer_evaluation`'s controller diff. Look-back
-    /// control-change triggers read it as provenance: a source whose stamp
-    /// isn't the current turn has had the same controller for the whole turn.
+    /// by `layers::finish_layer_evaluation`'s controller diff, which every
+    /// legal-game control change of a permanent passes through (the debug
+    /// sandbox's direct controller setter does not). Look-back control-change
+    /// triggers read it as provenance: a source whose stamp isn't the current
+    /// turn has had the same controller for the whole turn.
     /// Never cleared: a stale stamp only makes that proof unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_changed_turn: Option<u32>,
+
+    // CR 702.187b: Global turn on which this card was put into a graveyard as a
     // result of a discard. Used by the Mayhem keyword's "as long as you
     // discarded this card this turn" gate. Compared against the current turn
     // number at query time, so it auto-expires when the turn advances; reset to

@@ -3649,7 +3649,8 @@ pub(crate) fn changes_controller_look_back_you(
 /// layer 2 without any `ControllerChanged` being published (an Aura's static
 /// ability starting or stopping to apply), so a missing event isn't proof; the
 /// proof is `controller_changed_turn`, stamped by the layer-2 controller diff
-/// that every control change of a permanent passes through. A stamp from this
+/// that every legal-game control change of a permanent passes through (the
+/// debug sandbox's direct controller setter is outside it). A stamp from this
 /// turn makes "you" unprovable: `None`, the trigger doesn't fire. A source that
 /// isn't a live battlefield object (a delayed trigger's graveyard spell, or a
 /// latched snapshot) has a controller layer 2 can't move.
