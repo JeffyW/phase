@@ -22358,17 +22358,18 @@ impl fmt::Debug for Effect {
     }
 }
 
-/// CR 400.7 + CR 608.2h + CR 609.3: how an effect uses an object operand that
-/// has left the battlefield ([`Effect::departed_operand_use`]).
+/// CR 115.10a + CR 303.4b + CR 301.5f: what a resolution-bound "enchanted /
+/// equipped X" slot is to an effect ([`Effect::attachment_host_slot`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DepartedOperandUse {
-    /// The effect acts on the object; on an object that no longer exists it
-    /// does nothing (CR 609.3).
-    Acts,
-    /// The effect reads the object's copiable values (a token copy of it), which
-    /// a departed object supplies through its last known information (CR 608.2h
-    /// + CR 707.2).
-    ReadsCopiableValues,
+pub(crate) enum AttachmentHostSlot {
+    /// The effect resolves the slot through its bound target occurrence: it
+    /// acts on the host, or (a token copy) copies it in place.
+    Operand,
+    /// The slot supplies characteristics or abilities to a different recipient
+    /// (the copy source of "becomes a copy of", the donor of "gains all
+    /// activated abilities of"). Host binding does not establish a donor's
+    /// identity contract, so such a node is refused and does nothing.
+    Donor,
 }
 
 impl Effect {
@@ -22705,18 +22706,16 @@ impl Effect {
         }
     }
 
-    /// CR 400.7 + CR 608.2h + CR 609.3 + CR 707.2: what this effect does with
-    /// its object operand when that operand is a resolution-bound host that has
-    /// since left the battlefield. Exhaustive and wildcard-free on purpose: a new
-    /// variant must answer here. Only a token copy reads the departed object
-    /// (its last known copiable values); every other effect acts on its operand,
-    /// and an action on an object that no longer exists does nothing.
-    pub(crate) fn departed_operand_use(&self) -> DepartedOperandUse {
+    /// CR 115.10a + CR 303.4b + CR 301.5f + CR 707.2: what this effect's slot is
+    /// when it names a resolution-bound host. Exhaustive and wildcard-free on
+    /// purpose: a new variant must answer here. Only "becomes a copy of" and
+    /// "gains all activated abilities of" take their slot as a donor for a
+    /// different recipient; every other effect resolves it as its operand.
+    pub(crate) fn attachment_host_slot(&self) -> AttachmentHostSlot {
         match self {
-            Effect::CopyTokenOf {
-                source_filter: None,
-                ..
-            } => DepartedOperandUse::ReadsCopiableValues,
+            Effect::BecomeCopy { .. } | Effect::GainActivatedAbilitiesOfTarget { .. } => {
+                AttachmentHostSlot::Donor
+            }
             Effect::StartYourEngines { .. }
             | Effect::ChangeSpeed { .. }
             | Effect::DealDamage { .. }
@@ -22786,9 +22785,7 @@ impl Effect {
             | Effect::ExileHaunting { .. }
             | Effect::HideawayConceal { .. }
             | Effect::CopyTokenBlockingAttacker { .. }
-            | Effect::BecomeCopy { .. }
             | Effect::ChoosePermanent { .. }
-            | Effect::GainActivatedAbilitiesOfTarget { .. }
             | Effect::ChooseCard { .. }
             | Effect::PutCounter { .. }
             | Effect::ChooseCounterKind { .. }
@@ -22950,7 +22947,7 @@ impl Effect {
             | Effect::Intensify { .. }
             | Effect::DraftFromSpellbook { .. }
             | Effect::ChooseOneOf { .. }
-            | Effect::Unimplemented { .. } => DepartedOperandUse::Acts,
+            | Effect::Unimplemented { .. } => AttachmentHostSlot::Operand,
         }
     }
 

@@ -15501,28 +15501,43 @@ fn resolve_chain_body(
     // CR 115.10a + CR 301.5f + CR 303.4b: an untargeted "enchanted/equipped X"
     // recipient is bound to the source's host as this instruction begins to
     // resolve, before its conditions, effect and inheriting sub-abilities read it.
-    // With no host the instruction itself does nothing (`host_effect_impossible`). A host
-    // that left the battlefield stays bound for the instructions that read it,
-    // but an instruction that acts on it does nothing (CR 609.3); only a copy of
-    // it reads its last known copiable values (CR 608.2h + CR 707.2).
+    // With no provable live host, or a host taken as a donor, the instruction
+    // itself does nothing (`host_effect_impossible`).
     let host_binding = crate::game::targeting::bind_resolution_attachment_hosts(state, ability);
     let host_effect_impossible = match &host_binding {
-        crate::game::targeting::ResolutionHostBinding::Absent => true,
-        crate::game::targeting::ResolutionHostBinding::Departed(bound) => {
-            bound.effect.departed_operand_use() == crate::types::ability::DepartedOperandUse::Acts
-        }
+        crate::game::targeting::ResolutionHostBinding::Absent
+        | crate::game::targeting::ResolutionHostBinding::RefusedDonor => true,
         crate::game::targeting::ResolutionHostBinding::NotApplicable
         | crate::game::targeting::ResolutionHostBinding::Bound(_) => false,
     };
     let host_bound;
     let ability = match host_binding {
-        crate::game::targeting::ResolutionHostBinding::Bound(bound)
-        | crate::game::targeting::ResolutionHostBinding::Departed(bound) => {
+        crate::game::targeting::ResolutionHostBinding::Bound(bound) => {
             host_bound = *bound;
             &host_bound
         }
+        // CR 608.2c: the instructions after this one that refer back to its
+        // object ("Then draw a card for each tapped creature its controller
+        // controls") have no referent either. Without one, their anaphors would
+        // fall back to the trigger event or the source's attachment history and
+        // name some other object or player, so a tail that reads its parent's
+        // context is dropped; one that doesn't ("and you become the monarch")
+        // still happens.
+        crate::game::targeting::ResolutionHostBinding::Absent
+        | crate::game::targeting::ResolutionHostBinding::RefusedDonor
+            if ability
+                .sub_ability
+                .as_deref()
+                .is_some_and(crate::game::ability_scan::ability_uses_event_context) =>
+        {
+            let mut without_tail = ability.clone();
+            without_tail.sub_ability = None;
+            host_bound = without_tail;
+            &host_bound
+        }
         crate::game::targeting::ResolutionHostBinding::NotApplicable
-        | crate::game::targeting::ResolutionHostBinding::Absent => ability,
+        | crate::game::targeting::ResolutionHostBinding::Absent
+        | crate::game::targeting::ResolutionHostBinding::RefusedDonor => ability,
     };
     // CR 608.2c: Snapshot the `pending_continuation` *value* at chain-body
     // entry so the sub_ability guard further down can compare by IDENTITY, not
@@ -17046,11 +17061,11 @@ fn resolve_chain_body(
         // If targets don't share the required quality, skip the effect.
         let shares_quality_failed = fails_shared_quality(state, effective);
 
-        // CR 115.10a + CR 303.4b + CR 301.5f + CR 609.3: an instruction naming
-        // its source's host when there is no host, or one that acts on a host
-        // that has left the battlefield, does nothing — skipped here like a
-        // failed group constraint, so no resolver can re-read the description as
-        // a scan or act on a new object under the departed host's storage id.
+        // CR 115.10a + CR 303.4b + CR 301.5f: an instruction naming its
+        // source's host when there is no provable live host (or one refused as
+        // a donor) does nothing — skipped here like a failed group constraint,
+        // so no resolver can re-read the description as a scan or act on a new
+        // object under a departed host's storage id.
         if shares_quality_failed || host_effect_impossible {
             // Group constraint not met — emit EffectResolved but skip execution.
             events.push(GameEvent::EffectResolved {

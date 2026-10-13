@@ -298,25 +298,6 @@ fn target_damage_source(state: &GameState, ability: &ResolvedAbility) -> Option<
         // historical lookup — first object anywhere in the list, ability source
         // as the last resort — unchanged.
         None => {
-            // CR 400.7 + CR 608.2h: "If an ability states that an object does
-            // something, it's the object as it exists—or as it most recently
-            // existed—that does it." When the subject is this ability's source
-            // host and it has left the battlefield, it deals the damage as it
-            // last existed, never as the new object reusing its storage id;
-            // with no record of it, nothing deals the damage. Any other subject
-            // keeps the lookup below, which finds an object this effect moved
-            // (CR 400.7j).
-            if let Some((_, pin)) = ability
-                .target_occurrences()
-                .into_iter()
-                .find(|(target, _)| matches!(target, TargetRef::Object(_)))
-            {
-                if let Some(host) =
-                    crate::game::targeting::departed_attachment_host_pin(state, ability, pin)
-                {
-                    return DamageContext::from_last_known(state, host);
-                }
-            }
             return Some(
                 ability
                     .targets
@@ -328,7 +309,7 @@ fn target_damage_source(state: &GameState, ability: &ResolvedAbility) -> Option<
                     .unwrap_or_else(|| {
                         DamageContext::fallback(ability.source_id, ability.controller)
                     }),
-            );
+            )
         }
     };
 
@@ -417,44 +398,6 @@ impl DamageContext {
             excess_recipient: None,
             // CR 702.15b: set only on a redirect leg; from_source rebuilds the base
             // context, so the resume restores the bonus from the parked record.
-            lifelink_bonus: 0,
-        })
-    }
-
-    /// CR 400.7 + CR 608.2h: context for a damage source that has left the zone
-    /// it was identified in, read from the last known information of exactly
-    /// that incarnation (controller, creature-ness, damage keywords — CR
-    /// 702.2b / 702.15c). `None` when no such record exists.
-    pub(crate) fn from_last_known(
-        state: &GameState,
-        source: crate::types::identifiers::ObjectIncarnationRef,
-    ) -> Option<Self> {
-        let lki = state
-            .lki_by_incarnation
-            .get(&source.object_id)?
-            .get(&source.incarnation)?;
-        let has = |kind: &crate::types::keywords::Keyword| lki.keywords.contains(kind);
-        Some(Self {
-            source_id: source.object_id,
-            source_incarnation: Some(source.incarnation),
-            controller: lki.controller,
-            source_is_creature: lki.card_types.contains(&CoreType::Creature),
-            has_deathtouch: has(&crate::types::keywords::Keyword::Deathtouch),
-            has_lifelink: has(&crate::types::keywords::Keyword::Lifelink),
-            has_wither: has(&crate::types::keywords::Keyword::Wither),
-            has_infect: has(&crate::types::keywords::Keyword::Infect),
-            combat_damage_poison: lki
-                .keywords
-                .iter()
-                .filter_map(|keyword| {
-                    if let crate::types::keywords::Keyword::Toxic(amount) = keyword {
-                        Some(*amount)
-                    } else {
-                        None
-                    }
-                })
-                .sum(),
-            excess_recipient: None,
             lifelink_bonus: 0,
         })
     }

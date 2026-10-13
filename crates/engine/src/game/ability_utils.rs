@@ -883,18 +883,6 @@ pub(crate) fn incarnation_controller(
 /// object target (CR 109.4 — controller of an object), in target-list order.
 /// Returns `None` if the ability has no targets.
 pub fn parent_target_controller(ability: &ResolvedAbility, state: &GameState) -> Option<PlayerId> {
-    // CR 400.7 + CR 608.2h: when the first parent target is this ability's own
-    // attachment host and that host has left the battlefield ("Then draw a card
-    // for each tapped creature its controller controls"), its controller is the
-    // one it had as it last existed there, never that of a new object reusing
-    // its storage id.
-    if let Some(host) = crate::game::targeting::departed_attachment_host_pin(
-        state,
-        ability,
-        ability.target_pin_at(0),
-    ) {
-        return incarnation_controller(state, host.object_id, host.incarnation);
-    }
     if let Some(player) = ability.targets.iter().find_map(|t| match t {
         // CR 608.2h (issue #1582): If the parent target has left the
         // battlefield — e.g. a token Recoil bounced to hand, which then ceases

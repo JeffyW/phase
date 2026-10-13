@@ -8377,26 +8377,8 @@ where
                 targets.iter().find_map(|t| match t {
                     // CR 608.2h: guarded live-then-LKI read so a fight source
                     // that has left the battlefield still reports its P/T.
-                    // CR 400.7: when the source is this ability's departed
-                    // attachment host, read that exact incarnation's last known
-                    // information, never the new object reusing its storage id.
                     TargetRef::Object(id) => {
-                        let departed_host = ability.and_then(|a| {
-                            let pin =
-                                a.target_occurrences()
-                                    .into_iter()
-                                    .find_map(|(target, pin)| {
-                                        (target == TargetRef::Object(*id)).then_some(pin).flatten()
-                                    });
-                            crate::game::targeting::departed_attachment_host_pin(state, a, pin)
-                        });
-                        read_object_pt_by_id_for_incarnation(
-                            state,
-                            *id,
-                            departed_host.map(|host| host.incarnation),
-                            &obj_extract,
-                            &lki_extract,
-                        )
+                        read_object_pt_by_id(state, *id, &obj_extract, &lki_extract)
                     }
                     _ => None,
                 })

@@ -7,15 +7,17 @@
 //! Aura spell is targeted, but an Aura permanent targets nothing. So such an
 //! instruction never makes its host "become the target" (no ward trigger, CR
 //! 702.21a), is not stopped by shroud/hexproof (CR 702.18a / CR 702.11b), and
-//! reads its host when it resolves, using the source's last known information
-//! when the source has left the battlefield (CR 608.2h).
+//! reads its host when it resolves. The host is used only when it is provably
+//! the object the source is, or (by the source's own last known information,
+//! CR 608.2h) was, attached to and hasn't moved since; otherwise the
+//! instruction does nothing.
 //!
 //! Oracle text below is verbatim from Scryfall `cards/named`.
 
 use engine::game::combat::AttackTarget;
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{Effect, TargetChoiceTiming, TargetRef};
+use engine::types::ability::{Effect, TargetChoiceTiming};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
@@ -52,6 +54,9 @@ const LAST_VOYAGE: &str = "When this enchantment enters, you may put a name stic
 const PENUMBRA_UMBRA: &str = "Enchant creature you control\nWhen Penumbra Umbra is put into a graveyard from the battlefield, create a token that's a copy of enchanted creature, except the token is black.\nUmbra armor (If enchanted creature would be destroyed, instead remove all damage from it and destroy this Aura.)";
 const CAPTIVATING_GLANCE: &str = "Enchant creature\nAt the beginning of your end step, clash with an opponent. If you win, gain control of enchanted creature. Otherwise, that player gains control of enchanted creature. (Each clashing player reveals the top card of their library, then puts that card on their choice of the top or bottom. A player wins if their card had a greater mana value.)";
 const STAMINA: &str = "Enchant creature\nEnchanted creature has vigilance.\nSacrifice this Aura: Regenerate enchanted creature.";
+const EPHARAS_ENLIGHTENMENT: &str = "Enchant creature\nWhen this Aura enters, put a +1/+1 counter on enchanted creature.\nEnchanted creature has flying.\nWhenever a creature you control enters, you may return this Aura to its owner's hand.";
+const HELM_OF_THE_HOST: &str = "At the beginning of combat on your turn, create a token that's a copy of equipped creature, except the token isn't legendary. That token gains haste.\nEquip {5}";
+const FALL_FROM_FAVOR: &str = "Enchant creature\nWhen this Aura enters, tap enchanted creature and you become the monarch.\nEnchanted creature doesn't untap during its controller's untap step unless that player is the monarch.";
 
 fn free_cost() -> ManaCost {
     ManaCost::Cost {
@@ -732,12 +737,13 @@ fn host_blinked_before_etb_resolves_returned_creature_stays_untapped() {
     );
 }
 
-/// Review probe P3 (CR 608.2h): Bind the Monster's ETB is pending on P1's
-/// 6-power creature and P1 returns that creature to hand (Unsummon). The tap
-/// can't happen, but "It deals damage to you equal to its power" still does,
-/// through the creature's last known information (Bind the Monster ruling).
+/// Review probe P3, disclosed limit (fail closed): Bind the Monster's ETB is
+/// pending on P1's 6-power creature and P1 returns that creature to hand
+/// (Unsummon). The Aura, now unattached, goes to the graveyard, so there is no
+/// provable host: nothing is tapped and no damage is dealt (base: the same —
+/// the targeted ETB lost its only target).
 #[test]
-fn bind_the_monster_host_bounced_still_deals_its_last_known_power() {
+fn bind_the_monster_host_bounced_deals_nothing() {
     let (mut runner, aura, host, _) =
         aura_etb_on_stack("Bind the Monster", BIND_THE_MONSTER, 6, Bystander::Absent);
     let life_before = runner.state().players[P0.0 as usize].life;
@@ -756,9 +762,8 @@ fn bind_the_monster_host_bounced_still_deals_its_last_known_power() {
         "nothing on the battlefield is tapped"
     );
     assert_eq!(
-        s.players[P0.0 as usize].life,
-        life_before - 6,
-        "the departed creature deals damage equal to its last known power"
+        s.players[P0.0 as usize].life, life_before,
+        "no provable host, so no damage"
     );
 }
 
@@ -814,12 +819,13 @@ fn pemmins_aura_flickered_onto_another_creature_untaps_its_original_host() {
     assert!(s.objects[&b].tapped, "B stays tapped");
 }
 
-/// CR 608.2h + CR 707.2: Penumbra Umbra, "When Penumbra Umbra is put into a
-/// graveyard from the battlefield, create a token that's a copy of enchanted
-/// creature, except the token is black." — the creature was exiled first, so
-/// the copy uses its last known copiable values.
+/// Disclosed limit (fail closed): Penumbra Umbra, "When Penumbra Umbra is put
+/// into a graveyard from the battlefield, create a token that's a copy of
+/// enchanted creature, except the token is black." — the creature was exiled
+/// first, so the Aura was attached to nothing as it left and there is no
+/// provable host to copy (base: no token either).
 #[test]
-fn penumbra_umbra_copies_its_exiled_host_from_last_known_values() {
+fn penumbra_umbra_with_its_host_exiled_copies_nothing() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P0, "Exiled Beast", 4, 4).id();
@@ -838,26 +844,22 @@ fn penumbra_umbra_copies_its_exiled_host_from_last_known_values() {
         Zone::Graveyard,
         "reach: the Aura was put into the graveyard"
     );
-    let copies: Vec<_> = s
+    let copies = s
         .battlefield
         .iter()
-        .map(|id| &s.objects[id])
-        .filter(|o| o.is_token && o.name == "Exiled Beast")
-        .collect();
-    assert_eq!(copies.len(), 1, "one token copy of the exiled creature");
-    assert_eq!(
-        copies[0].power,
-        Some(4),
-        "the copy has the creature's copiable power"
-    );
+        .filter(|id| s.objects[id].is_token)
+        .count();
+    assert_eq!(copies, 0, "no token is created");
 }
 
-/// Review probe F1 (CR 602.2 + CR 113.7a + CR 608.2h): Stamina, "Sacrifice this
+/// Review probe F1, disclosed limit (fail closed): Stamina, "Sacrifice this
 /// Aura: Regenerate enchanted creature." The cost moves the Aura to the
-/// graveyard before the ability is put on the stack; "enchanted creature" is
-/// still the creature it was attached to as it was sacrificed.
+/// graveyard before the ability is put on the stack, so the incarnation the
+/// ability records is the sacrificed card's, which never left the
+/// battlefield; there is no record proving the host, and nothing is
+/// regenerated (base: no shield either).
 #[test]
-fn stamina_sacrificed_as_cost_regenerates_its_last_known_host() {
+fn stamina_sacrificed_as_cost_regenerates_nothing() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
@@ -888,8 +890,12 @@ fn stamina_sacrificed_as_cost_regenerates_its_last_known_host() {
     );
     runner.advance_until_stack_empty();
     assert!(
-        has_regeneration_shield(&runner, host),
-        "the creature Stamina enchanted as it was sacrificed gets the shield"
+        runner.state().stack.is_empty(),
+        "reach: the ability resolved"
+    );
+    assert!(
+        !has_regeneration_shield(&runner, host),
+        "no provable host, so no shield"
     );
 }
 
@@ -912,12 +918,16 @@ enum CloakHistory {
     /// Earlier in the turn the creature was blinked (a new object) and the
     /// Cloak re-equipped to it.
     BlinkedThenReequipped,
+    /// As `BlinkedThenReequipped`, then the creature transformed (CR 613.7g: a
+    /// new timestamp; still the same object, still equipped).
+    BlinkedReequippedThenTransformed,
 }
 
-/// Review probe F2 (CR 400.7 + CR 613.7e): Cloak of the Philosopher's "{2}:
+/// Review probe F2 (CR 400.7 + CR 608.2h): Cloak of the Philosopher's "{2}:
 /// Untap equipped creature." is activated, and the Cloak is destroyed in
-/// response. An earlier departure of the creature must not override a later
-/// attachment to its returned object.
+/// response. The Cloak's departure says what it was attached to, and that
+/// creature hasn't moved since, so it untaps — including when an earlier blink
+/// made it a new object the Cloak was then re-equipped to (base: nothing).
 fn cloak_destroyed_in_response(history: CloakHistory) -> bool {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
@@ -933,12 +943,33 @@ fn cloak_destroyed_in_response(history: CloakHistory) -> bool {
     equip(&mut runner, cloak, bears);
     match history {
         CloakHistory::EquippedOnce => {}
-        CloakHistory::BlinkedThenReequipped => {
+        CloakHistory::BlinkedThenReequipped | CloakHistory::BlinkedReequippedThenTransformed => {
             blink(&mut runner, bears);
             let mut events = Vec::new();
             engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
             equip(&mut runner, cloak, bears);
         }
+    }
+    if let CloakHistory::BlinkedReequippedThenTransformed = history {
+        let timestamp_before = runner.state().objects[&bears].timestamp;
+        let obj = runner.state_mut().objects.get_mut(&bears).unwrap();
+        let mut back = engine::game::printed_cards::snapshot_object_face(obj);
+        back.name = "Insectile Aberration".to_string();
+        obj.back_face = Some(back);
+        let mut events = Vec::new();
+        engine::game::transform::transform_permanent(runner.state_mut(), bears, &mut events)
+            .expect("the creature transforms");
+        let s = runner.state();
+        assert_eq!(s.objects[&bears].name, "Insectile Aberration", "reach");
+        assert!(
+            s.objects[&bears].timestamp > timestamp_before,
+            "reach: CR 613.7g, transforming gave the creature a new timestamp"
+        );
+        assert_eq!(
+            s.objects[&cloak].attached_to,
+            Some(AttachTarget::Object(bears)),
+            "reach: the Cloak is still attached"
+        );
     }
     set_tapped(&mut runner, bears, true);
     let index = ability_index(&runner, cloak, |e| matches!(e, Effect::SetTapState { .. }));
@@ -972,13 +1003,256 @@ fn cloak_reequipped_after_a_blink_then_destroyed_untaps_the_returned_creature() 
     ));
 }
 
-/// Review probe F3 (CR 400.7 + CR 608.2h): Bind the Monster's ETB is pending on
-/// P1's 2/2 grown to 5/5, and P1 blinks the creature (a new 2/2). The tap can't
-/// happen to the departed creature and the returned one stays untapped, but "It
-/// deals damage to you equal to its power" uses the departed creature's last
-/// known power, 5.
+/// Review probe N1: a re-attached host that then transformed is still provably
+/// the equipped creature — the attachment edge, not a timestamp, is the proof.
 #[test]
-fn bind_the_monster_host_blinked_deals_its_last_known_power() {
+fn cloak_reequipped_host_transformed_then_cloak_destroyed_untaps_it() {
+    assert!(cloak_destroyed_in_response(
+        CloakHistory::BlinkedReequippedThenTransformed
+    ));
+}
+
+/// CR 608.2h (PutCounter on the host): Ephara's Enlightenment, "When this Aura
+/// enters, put a +1/+1 counter on enchanted creature." The Aura is returned to
+/// hand in response; its departure record says what it was attached to, and
+/// that creature never moved, so it gets the counter.
+#[test]
+fn ephara_s_enlightenment_bounced_in_response_still_counters_its_host() {
+    let (mut runner, aura, host, _) = aura_etb_on_stack(
+        "Ephara's Enlightenment",
+        EPHARAS_ENLIGHTENMENT,
+        2,
+        Bystander::Absent,
+    );
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), aura, Zone::Hand, &mut events);
+    runner.advance_until_stack_empty();
+    let s = runner.state();
+    assert_eq!(s.objects[&aura].zone, Zone::Hand, "reach: the Aura left");
+    assert_eq!(
+        s.objects[&host]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the creature the Aura was attached to gets the counter"
+    );
+}
+
+/// When the host moved, relative to the source's departure.
+#[derive(Clone, Copy)]
+enum HostBlink {
+    BeforeTheAuraLeft,
+    AfterTheAuraLeft,
+}
+
+/// Negative controls for the departed-source admission: Last Voyage of the
+/// _____'s leaves-the-battlefield trigger, with the host blinked before or after
+/// the Aura left. Either way the returned creature is a new object the Aura was
+/// never attached to, so nothing is sacrificed.
+fn last_voyage_with_host_blinked(blink_at: HostBlink) -> (GameRunner, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let aura = aura_on_battlefield(&mut sc, P0, "Last Voyage of the _____", LAST_VOYAGE);
+    let mut runner = sc.build();
+    attach(&mut runner, aura, host);
+    let mut events = Vec::new();
+    if let HostBlink::BeforeTheAuraLeft = blink_at {
+        blink(&mut runner, host);
+    }
+    engine::game::zones::move_to_zone(runner.state_mut(), aura, Zone::Graveyard, &mut events);
+    engine::game::triggers::process_triggers(runner.state_mut(), &events);
+    assert!(
+        runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }),
+        "reach: the leaves-the-battlefield trigger went on the stack"
+    );
+    if let HostBlink::AfterTheAuraLeft = blink_at {
+        blink(&mut runner, host);
+    }
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the trigger resolved"
+    );
+    (runner, host)
+}
+
+#[test]
+fn last_voyage_host_blinked_before_the_aura_left_sacrifices_nothing() {
+    let (runner, host) = last_voyage_with_host_blinked(HostBlink::BeforeTheAuraLeft);
+    assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
+}
+
+#[test]
+fn last_voyage_host_blinked_after_the_aura_left_sacrifices_nothing() {
+    let (runner, host) = last_voyage_with_host_blinked(HostBlink::AfterTheAuraLeft);
+    assert_eq!(runner.state().objects[&host].zone, Zone::Battlefield);
+}
+
+/// What a donor-shaped host reference asks for.
+#[derive(Clone, Copy)]
+enum DonorShape {
+    BecomesACopy,
+    GainsActivatedAbilities,
+}
+
+/// SYNTHETIC (fail-closed guard, N3): an Equipment whose own ability takes its
+/// equipped creature as a donor for itself ("becomes a copy of equipped
+/// creature" / "gains all activated abilities of equipped creature"). Host
+/// binding doesn't establish a donor's identity contract, so the node is
+/// refused even with a live host: the Equipment is unchanged.
+fn equipment_donor_case(shape: DonorShape) -> (GameRunner, ObjectId, usize) {
+    let (text, pick): (&str, fn(&Effect) -> bool) = match shape {
+        DonorShape::BecomesACopy => (
+            "{1}: This Equipment becomes a copy of equipped creature until end of turn.\nEquip {1}",
+            |e| matches!(e, Effect::BecomeCopy { .. }),
+        ),
+        DonorShape::GainsActivatedAbilities => (
+            "{1}: This Equipment gains all activated abilities of equipped creature until end of turn.\nEquip {1}",
+            |e| matches!(e, Effect::GainActivatedAbilitiesOfTarget { .. }),
+        ),
+    };
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature_from_oracle(P0, "Donor Bear", 2, 2, "{T}: You gain 1 life.")
+        .id();
+    let equipment = sc
+        .add_creature(P0, "Donor Rig", 0, 0)
+        .as_artifact()
+        .with_subtypes(vec!["Equipment"])
+        .from_oracle_text(text)
+        .id();
+    sc.with_mana_pool(P0, pool(0, 1));
+    let mut runner = sc.build();
+    attach(&mut runner, equipment, host);
+    let index = ability_index(&runner, equipment, pick);
+    assert_eq!(
+        runner.state().objects[&equipment].abilities[index].target_choice_timing,
+        TargetChoiceTiming::Resolution,
+        "reach: the donor names the host without 'target'"
+    );
+    let abilities_before = runner.state().objects[&equipment].abilities.len();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: equipment,
+            ability_index: index,
+        })
+        .expect("the ability names no target, so it can be activated");
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the ability resolved"
+    );
+    (runner, equipment, abilities_before)
+}
+
+#[test]
+fn equipment_becoming_a_copy_of_its_host_is_refused() {
+    let (runner, equipment, _) = equipment_donor_case(DonorShape::BecomesACopy);
+    assert_eq!(
+        runner.state().objects[&equipment].name,
+        "Donor Rig",
+        "the Equipment does not become a copy"
+    );
+}
+
+#[test]
+fn equipment_gaining_its_hosts_activated_abilities_is_refused() {
+    let (runner, equipment, abilities_before) =
+        equipment_donor_case(DonorShape::GainsActivatedAbilities);
+    assert_eq!(
+        runner.state().objects[&equipment].abilities.len(),
+        abilities_before,
+        "the Equipment gains no abilities"
+    );
+}
+
+/// Whether the Helm was attached to anything as it left.
+#[derive(Clone, Copy)]
+enum HelmFate {
+    StaysUnattached,
+    DestroyedUnattached,
+}
+
+/// Review probe N2: Helm of the Host's beginning-of-combat trigger is pending;
+/// the equipped creature is blinked (the Helm is now unattached). An explicit
+/// "attached to nothing" is final: no earlier host is read, so no token is
+/// created, whether the Helm then stays on the battlefield or is destroyed.
+fn helm_of_the_host_with_its_host_blinked(fate: HelmFate) -> GameRunner {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let bears = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let helm = sc
+        .add_creature(P0, "Helm of the Host", 0, 0)
+        .as_artifact()
+        .with_subtypes(vec!["Equipment"])
+        .from_oracle_text(HELM_OF_THE_HOST)
+        .id();
+    let mut runner = sc.build();
+    attach(&mut runner, helm, bears);
+    runner.advance_to_phase(Phase::BeginCombat);
+    assert!(
+        runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == helm)
+        }),
+        "reach: the Helm's combat trigger is on the stack"
+    );
+    blink(&mut runner, bears);
+    assert_eq!(
+        runner.state().objects[&helm].attached_to,
+        None,
+        "reach: the Helm is unattached"
+    );
+    if let HelmFate::DestroyedUnattached = fate {
+        let mut events = Vec::new();
+        engine::game::zones::move_to_zone(runner.state_mut(), helm, Zone::Graveyard, &mut events);
+        assert!(
+            runner
+                .state()
+                .zone_changes_this_turn
+                .iter()
+                .rev()
+                .find(|record| record.object_id == helm)
+                .is_some_and(|record| record.attached_to.is_none()),
+            "reach: the Helm's departure records no attachment"
+        );
+    }
+    runner.advance_until_stack_empty();
+    runner
+}
+
+#[test]
+fn helm_of_the_host_destroyed_unattached_copies_nothing() {
+    let runner = helm_of_the_host_with_its_host_blinked(HelmFate::DestroyedUnattached);
+    let s = runner.state();
+    assert!(
+        !s.battlefield.iter().any(|id| s.objects[id].is_token),
+        "no token is created"
+    );
+}
+
+#[test]
+fn helm_of_the_host_left_unattached_copies_nothing() {
+    let runner = helm_of_the_host_with_its_host_blinked(HelmFate::StaysUnattached);
+    let s = runner.state();
+    assert!(
+        !s.battlefield.iter().any(|id| s.objects[id].is_token),
+        "no token is created"
+    );
+}
+
+/// Review probe F3, disclosed limit (fail closed): Bind the Monster's ETB is
+/// pending on P1's 2/2 grown to 5/5 with three +1/+1 counters, and P1 blinks the
+/// creature (a new 2/2). The Aura, now unattached, has no provable host:
+/// nothing is tapped and no damage is dealt — in particular the returned 2/2 is
+/// never read as "it" (base: the same; the targeted ETB lost its target).
+#[test]
+fn bind_the_monster_host_blinked_deals_nothing() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
@@ -1007,7 +1281,6 @@ fn bind_the_monster_host_blinked_deals_its_last_known_power() {
         "reach: the host is 5/5 as the trigger waits"
     );
     let life_before = runner.state().players[P0.0 as usize].life;
-    let departed_incarnation = runner.state().objects[&host].incarnation;
     blink(&mut runner, host);
     let mut events = Vec::new();
     while !runner.state().stack.is_empty() {
@@ -1029,22 +1302,14 @@ fn bind_the_monster_host_blinked_deals_its_last_known_power() {
         "the returned creature is not tapped"
     );
     assert_eq!(
-        s.players[P0.0 as usize].life,
-        life_before - 5,
-        "the departed creature deals damage equal to its last known power"
+        s.players[P0.0 as usize].life, life_before,
+        "no provable host, so neither the departed nor the returned creature deals damage"
     );
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            GameEvent::DamageDealt {
-                source_id,
-                target: TargetRef::Player(P0),
-                amount: 5,
-                source_incarnation: Some(incarnation),
-                ..
-            } if *source_id == host && *incarnation == departed_incarnation
-        )),
-        "CR 608.2h: the damage is dealt by the creature as it last existed, not by the returned one"
+        !events
+            .iter()
+            .any(|event| matches!(event, GameEvent::DamageDealt { .. })),
+        "no damage event at all"
     );
 }
 
@@ -1462,27 +1727,49 @@ fn observed_stasis_removes_attacking_host_from_combat_and_counts_its_controller(
     );
 }
 
-/// Review probe (CR 400.7 + CR 608.2h): Observed Stasis's ETB is pending on a
-/// creature P1 controls but P0 owns, and the creature is blinked, returning as
-/// a new object under its owner's control. "Its controller" is the controller
-/// of the creature as it last existed, P1, so P0 draws one card per tapped
-/// creature P1 controls, not per tapped creature P0 now controls.
+/// The other side of the tail rule: with no provable host the "tap enchanted
+/// creature" node does nothing, but "and you become the monarch" names no
+/// object and still happens. Fall from Favor's ETB is pending; the host is
+/// returned to hand in response.
 #[test]
-fn observed_stasis_host_blinked_counts_its_last_known_controller() {
+fn fall_from_favor_host_bounced_still_makes_you_the_monarch() {
+    let (mut runner, _aura, host, _) =
+        aura_etb_on_stack("Fall from Favor", FALL_FROM_FAVOR, 2, Bystander::Absent);
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), host, Zone::Hand, &mut events);
+    runner.advance_until_stack_empty();
+    let s = runner.state();
+    assert_eq!(s.objects[&host].zone, Zone::Hand, "reach: the host left");
+    assert!(
+        !s.battlefield.iter().any(|id| s.objects[id].tapped),
+        "nothing is tapped"
+    );
+    assert_eq!(s.monarch, Some(P0), "P0 becomes the monarch");
+}
+
+/// Disclosed limit (fail closed): Observed Stasis's ETB is pending on a
+/// creature P1 controls but P0 owns, and the creature is blinked, returning as
+/// a new object under its owner's control. The Aura, now unattached, has no
+/// provable host, so nothing is removed from combat and "its controller" names
+/// no one: P0 draws nothing — neither for P1's tapped creatures nor for the
+/// returned creature's new controller's (base: the same).
+#[test]
+fn observed_stasis_host_blinked_draws_nothing() {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc
         .add_creature(P0, "Borrowed Bears", 2, 2)
         .controlled_by(P1)
         .id();
-    let p1_tapped = [
+    let tapped = [
         sc.add_creature(P1, "Tapped One", 1, 1).id(),
         sc.add_creature(P1, "Tapped Two", 1, 1).id(),
+        sc.add_creature(P0, "Tapped Mine", 1, 1).id(),
     ];
     let aura = aura_in_hand(&mut sc, P0, "Observed Stasis", OBSERVED_STASIS);
     sc.with_library_top(P0, &["Card A", "Card B", "Card C"]);
     let mut runner = sc.build();
-    for id in p1_tapped {
+    for id in tapped {
         set_tapped(&mut runner, id, true);
     }
     runner.cast(aura).target_object(host).commit();
@@ -1511,8 +1798,8 @@ fn observed_stasis_host_blinked_counts_its_last_known_controller() {
     runner.advance_until_stack_empty();
     assert_eq!(
         runner.state().players[P0.0 as usize].hand.len(),
-        hand_before + 2,
-        "one card per tapped creature the departed host's last controller (P1) controls"
+        hand_before,
+        "no provable host, so no card is drawn"
     );
 }
 
