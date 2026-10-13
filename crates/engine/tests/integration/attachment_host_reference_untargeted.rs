@@ -1976,9 +1976,10 @@ fn a_granted_ability_keeps_its_host_target() {
         &["Aura".to_string()],
     );
     let timings = parsed_host_timings(&parsed.statics);
-    assert!(
-        !timings.is_empty(),
-        "reach: the granted abilities name a host"
+    assert_eq!(
+        timings.len(),
+        2,
+        "reach: both the granted trigger and the granted activated ability name a host: {timings:?}"
     );
     assert!(
         timings.iter().all(|t| t == "Stack"),
