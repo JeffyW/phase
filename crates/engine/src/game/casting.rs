@@ -21435,32 +21435,62 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
     )
 }
 
-/// CR 601.2g + CR 605.3a: Whether an Auto-mode spell payment that the Auto
-/// payer can't complete on its own still reaches the mana-payment step: an
-/// engine-proven manual mana route (a choice-bearing or non-tap mana ability,
-/// or the exact filter-land route) pays the cost, so the caster activates
-/// those mana abilities there (CR 117.1d). This is the castability
-/// feasibility gate's manual leg, so `auto-tap || this` is exactly that gate.
+/// CR 601.2g-h + CR 605.3a: What the castability planner can establish about
+/// paying a residual mana cost by activating mana abilities the Auto payer
+/// can't (choice-bearing or non-tap ones, or the exact filter-land route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualPaymentRoute {
+    /// A payment exists: the exact filter-land witness, a pool that already
+    /// covers it, or an affordable activation set whose costs are all
+    /// modelled exactly (`mana_sources::manual_mana_payment_is_proven`).
+    Proven,
+    /// The optimistic planner admits a payment that could not be proven (an
+    /// unmodelled cost, shared resources it can't budget, or a bounded search).
+    Plausible,
+    /// Not even the optimistic planner finds a payment.
+    Infeasible,
+}
+
+/// CR 601.2g + CR 605.3a: The manual mana route for an Auto-mode spell payment
+/// the Auto payer can't complete on its own. When a route exists the caster
+/// activates those mana abilities at the mana-payment step (CR 117.1d).
 ///
-/// The single authority for both the reducer, which routes such an Auto cast
-/// into `WaitingFor::ManaPayment` instead of finalizing it
-/// (`casting_costs::pay_and_push_adventure`), and the offer seam, which must
-/// not hide a cast the reducer carries to that step
-/// (`casting_costs::post_origin_auto_payment_verdict`).
-pub(crate) fn spell_payment_has_manual_route(
+/// The single authority, read by two consumers:
+/// - the reducer (`casting_costs::pay_and_push_adventure`) carries an Auto cast
+///   into `WaitingFor::ManaPayment` unless the route is `Infeasible`, exactly
+///   as the castability gate admits it (`auto-tap || !Infeasible`);
+/// - the post-target offer seam (`casting_costs::post_origin_auto_payment_verdict`)
+///   offers the cast only on `Proven`: a castable spell is never hidden by an
+///   exact proof, and an offer never rests on two activations spending the
+///   same card or life.
+pub(crate) fn spell_payment_manual_route(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     cost: &ManaCost,
-) -> bool {
+) -> ManualPaymentRoute {
     // CR 601.2f + CR 107.1b: as in the feasibility gate, X = 0 is the cheapest
     // concrete probe of a cost whose X is not yet announced.
     if super::casting_costs::cost_has_x(cost) {
         let mut concrete = cost.clone();
         concrete.concretize_x(0);
-        return manual_mana_payment_is_feasible(state, player, Some(source_id), &concrete, None);
+        return manual_mana_payment_route(
+            state,
+            player,
+            Some(source_id),
+            &concrete,
+            None,
+            RouteDepth::Proof,
+        );
     }
-    manual_mana_payment_is_feasible(state, player, Some(source_id), cost, None)
+    manual_mana_payment_route(
+        state,
+        player,
+        Some(source_id),
+        cost,
+        None,
+        RouteDepth::Proof,
+    )
 }
 
 /// CR 601.2g-h: Choose the payment mode for an already-prepared spell cost.
@@ -21906,7 +21936,14 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
         ) => return true,
     }
 
-    manual_mana_payment_is_feasible(state, player, source_id, cost, probe)
+    manual_mana_payment_route(
+        state,
+        player,
+        source_id,
+        cost,
+        probe,
+        RouteDepth::Feasibility,
+    ) != ManualPaymentRoute::Infeasible
 }
 
 /// CR 601.2h: The unpaid part of `cost` once the caster's floating mana is
@@ -21935,26 +21972,37 @@ fn spell_cost_residual_after_pool(
     ))
 }
 
+/// How far [`manual_mana_payment_route`] goes. The castability gate needs only
+/// whether the route is `Infeasible`, so it skips the proof search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteDepth {
+    Feasibility,
+    Proof,
+}
+
 /// CR 117.1d + CR 601.2g + CR 605.3a: The manual leg of the castability
-/// feasibility gate: whether `cost` can be paid once the caster activates mana
-/// abilities the Auto payer can't (a choice-bearing or non-tap mana ability,
-/// or the exact producer -> filter-land route). It never asks whether the Auto
-/// payer alone would finish; [`can_feasibly_pay_mana_cost_without_x_with_probe`]
-/// tries that first.
-fn manual_mana_payment_is_feasible(
+/// feasibility gate: what can be established about paying `cost` once the
+/// caster activates mana abilities the Auto payer can't (a choice-bearing or
+/// non-tap mana ability, or the exact producer -> filter-land route). It never
+/// asks whether the Auto payer alone would finish;
+/// [`can_feasibly_pay_mana_cost_without_x_with_probe`] tries that first. At
+/// `RouteDepth::Feasibility` a route that isn't `Infeasible` reads `Plausible`
+/// unless it is proven without a search.
+fn manual_mana_payment_route(
     state: &GameState,
     player: PlayerId,
     source_id: Option<ObjectId>,
     cost: &ManaCost,
     probe: Option<&PriorityCastProbe>,
-) -> bool {
+    depth: RouteDepth,
+) -> ManualPaymentRoute {
     // CR 117.1d + CR 601.2g + CR 605.3a + CR 605.3b: Before the residual approximation
     // rejects the cast for lacking a manually activated non-tap source, prove
     // the narrow producer -> filter-land route by executing both abilities on
     // a clone through their normal reducer actions and exact choice prompts.
     if let Some(sid) = source_id {
         if has_exact_filter_land_payment_witness(state, player, sid, cost, probe) {
-            return true;
+            return ManualPaymentRoute::Proven;
         }
     }
 
@@ -21971,41 +22019,58 @@ fn manual_mana_payment_is_feasible(
         source_id,
         spell_ctx.as_ref(),
     ) {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     }
 
     let Some(residual) =
         spell_cost_residual_after_pool(state, player, source_id, cost, spell_ctx.as_ref())
     else {
-        return false;
+        return ManualPaymentRoute::Infeasible;
     };
     let (residual_shards, residual_generic) = match &residual {
         crate::types::mana::ManaCost::NoCost
         | crate::types::mana::ManaCost::SelfManaCost
         | crate::types::mana::ManaCost::SelfManaValue
-        | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => return true,
+        | crate::types::mana::ManaCost::SelfManaCostReduced { .. } => {
+            return ManualPaymentRoute::Proven
+        }
         crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
     };
 
-    // CR 118.3 + CR 601.2h: the activations one payment plans share the
-    // player's cards, life and permanents (two Skirge Familiars can't both
-    // discard the one card in hand). Plan over each affordable choice of
-    // activated objects; with no shared resource oversubscribed that is the
-    // whole board, and with too many contenders to enumerate, nothing (fail
-    // closed).
-    super::mana_sources::affordable_activation_skip_sets(state, player, source_id)
-        .into_iter()
-        .any(|mut skip| {
-            skip.extend(source_id);
-            manual_residual_is_covered(
+    // The optimistic planner: every activatable object, each planned
+    // independently. Its failure is the only `Infeasible` verdict past this
+    // point, exactly the castability gate's historical rejection.
+    let spell_skip: HashSet<ObjectId> = source_id.into_iter().collect();
+    if !manual_residual_is_covered(
+        state,
+        player,
+        &spell_skip,
+        spell_ctx.as_ref(),
+        residual_shards,
+        residual_generic,
+    ) {
+        return ManualPaymentRoute::Infeasible;
+    }
+    match depth {
+        RouteDepth::Feasibility => ManualPaymentRoute::Plausible,
+        // CR 118.3 + CR 119.4: the optimistic planner lets two activations
+        // spend the same card, permanent or life; only an affordable,
+        // exactly modelled activation set proves the payment.
+        RouteDepth::Proof => {
+            if super::mana_sources::manual_mana_payment_is_proven(
                 state,
                 player,
-                &skip,
+                source_id,
                 spell_ctx.as_ref(),
                 residual_shards,
                 residual_generic,
-            )
-        })
+            ) {
+                ManualPaymentRoute::Proven
+            } else {
+                ManualPaymentRoute::Plausible
+            }
+        }
+    }
 }
 
 /// CR 117.1d + CR 601.2g + CR 605.3a: Whether the activatable mana of the
@@ -22047,14 +22112,14 @@ fn manual_residual_is_covered(
     // the color it was planned to make (blue from Nyx Lotus adds its blue
     // amount, not its larger green amount).
     //
-    // The shared-resource budget (`affordable_activation_skip_sets`) bounds
-    // activations by the player's whole hand, graveyard, life and permanents,
-    // ignoring the costs' filters, so the per-permanent sum still over-counts
-    // when the filters narrow the fodder (e.g. 2× KCI + 1 fodder reports cap=4
-    // when the actual reachable yield is 2). The trade-off — over-count rather
-    // than under-count, since under-count was the original #562 bug — is
-    // intentional. A bounded-flow model that respects each cost's own fodder
-    // is tracked in issue #1235.
+    // The per-permanent sum plans each object independently, so it over-counts
+    // when activations share fodder or life (two Skirge Familiars and one
+    // card; 2× KCI + 1 fodder reports cap=4 when the reachable yield is 2).
+    // The trade-off — over-count rather than under-count, since under-count
+    // was the original #562 bug — is intentional here: this optimistic plan
+    // only decides `Infeasible`. Proof that shared resources suffice is
+    // `mana_sources::manual_mana_payment_is_proven` (issue #1235 tracks a
+    // bounded-flow model for the castability gate itself).
     let capacity: u32 = state
         .battlefield
         .iter()

@@ -11603,7 +11603,8 @@ pub(super) fn pay_and_push_adventure(
     let auto_payment_needs_input = payment_mode == CastPaymentMode::Auto
         && cost.mana_value() > 0
         && !super::casting::can_pay_cost_after_auto_tap(state, player, object_id, cost)
-        && super::casting::spell_payment_has_manual_route(state, player, object_id, cost);
+        && super::casting::spell_payment_manual_route(state, player, object_id, cost)
+            != super::casting::ManualPaymentRoute::Infeasible;
     if has_x || convoke_mode.is_some() || manual_payment || auto_payment_needs_input {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
         pending.base_cost = base_cost.clone();
@@ -15580,19 +15581,17 @@ pub(crate) fn post_origin_auto_payment_verdict(
     choice_free_auto_payment_verdict(pending, tap_payment_mode, || {
         // CR 601.2g + CR 605.3a: once targets are chosen, the reducer carries
         // an Auto cast the Auto payer can't finish into the mana-payment step
-        // when a manual mana route pays it (`pay_and_push_adventure`), exactly
-        // as it does an untargeted cast, so the offer is judged by that same
-        // authority. It reads the board before the scratch payment below taps
-        // sources; CR 613.1 characteristics first.
+        // when a manual mana route may pay it (`pay_and_push_adventure`),
+        // exactly as it does an untargeted cast. The offer additionally needs
+        // that route proven (CR 118.3: no two activations spending the same
+        // card or life). It reads the board before the scratch payment below
+        // taps sources; CR 613.1 characteristics first.
         if state.layers_dirty.is_dirty() {
             super::layers::flush_layers(state);
         }
-        super::casting::spell_payment_has_manual_route(
-            state,
-            player,
-            pending.object_id,
-            &pending.cost,
-        ) || super::casting::can_pay_pending_cast_after_auto_tap_in_scratch(state, pending)
+        super::casting::spell_payment_manual_route(state, player, pending.object_id, &pending.cost)
+            == super::casting::ManualPaymentRoute::Proven
+            || super::casting::can_pay_pending_cast_after_auto_tap_in_scratch(state, pending)
     })
 }
 

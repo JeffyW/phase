@@ -2,7 +2,8 @@ use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
     is_chosen_remove_counter_cost_count, AbilityCondition, AbilityCost, AbilityDefinition,
     CardSelectionMode, ChoiceValue, ChosenAttribute, ContinuousModification,
-    CostPaidObjectSnapshot, Effect, ManaProduction, QuantityExpr, QuantityRef, ResolvedAbility,
+    CostPaidObjectSnapshot, DiscardSelfScope, Effect, ManaProduction, QuantityExpr, QuantityRef,
+    ResolvedAbility, SacrificeCost, SacrificeRequirement, TapCreaturesRequirement,
     TapCreaturesSelectionMode, TargetFilter, REMOVE_COUNTER_COST_ALL, REMOVE_COUNTER_COST_X,
 };
 use crate::types::ability_visit::{
@@ -5478,6 +5479,220 @@ pub(crate) fn cost_requires_object_choice(
             .as_ref()
             .and_then(collect_evidence_cost_amount)
             .is_some()
+}
+
+/// Where a [`ManaCostResourceLeg::Objects`] leg takes its objects from. Legs of
+/// different pools never compete for the same object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManaCostObjectPool {
+    HandCards,
+    GraveyardCards,
+    /// Permanents the player controls (sacrificed, tapped or exiled).
+    Permanents,
+}
+
+/// CR 118.3 + CR 605.3a: One part of a mana ability's cost that spends a
+/// resource other mana abilities may also need within the same payment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManaCostResourceLeg {
+    /// Choose `count` distinct objects from `eligible` (exactly the choices
+    /// the payment prompt offers), with `reserved` more of the pool already
+    /// committed to the pending spell.
+    Objects {
+        pool: ManaCostObjectPool,
+        count: usize,
+        eligible: Vec<ObjectId>,
+        reserved: usize,
+    },
+    /// CR 119.4: pay `amount` life.
+    Life { amount: u32 },
+}
+
+/// Per-kind tally of a cost's shared-resource legs while classifying it.
+#[derive(Default)]
+struct SharedLegKinds {
+    discard: usize,
+    exile: usize,
+    sacrifice: usize,
+    tap: usize,
+    life: u32,
+}
+
+/// Whether every component of `cost` is one a payment proof models exactly:
+/// paid by the source itself (its own tap, untap, exert, sacrifice, exile,
+/// return or counters), or a fixed shared-resource leg the payment prompts
+/// surface. `false` declines the proof for this ability.
+fn cost_components_are_modelled(cost: &AbilityCost, kinds: &mut SharedLegKinds) -> bool {
+    match cost {
+        AbilityCost::Tap | AbilityCost::Untap | AbilityCost::Exert => true,
+        AbilityCost::RemoveCounter { target: None, .. } => true,
+        AbilityCost::Sacrifice(SacrificeCost {
+            target: TargetFilter::SelfRef,
+            ..
+        }) => true,
+        AbilityCost::Sacrifice(SacrificeCost {
+            requirement: SacrificeRequirement::Count { .. },
+            ..
+        }) => {
+            kinds.sacrifice += 1;
+            true
+        }
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value },
+        } if *value >= 0 => {
+            kinds.life += *value as u32;
+            true
+        }
+        AbilityCost::Discard {
+            count: QuantityExpr::Fixed { .. },
+            selection: CardSelectionMode::Chosen,
+            self_scope: DiscardSelfScope::FromHand,
+            ..
+        } => {
+            kinds.discard += 1;
+            true
+        }
+        AbilityCost::Exile {
+            filter: Some(TargetFilter::SelfRef),
+            ..
+        } => true,
+        AbilityCost::Exile { zone, filter, .. } => {
+            kinds.exile += 1;
+            matches!(
+                super::cost_payability::exile_cost_effective_zone(*zone, filter.as_ref()),
+                Zone::Hand | Zone::Graveyard | Zone::Battlefield
+            )
+        }
+        AbilityCost::TapCreatures {
+            requirement: TapCreaturesRequirement::Count { .. },
+            ..
+        } => {
+            kinds.tap += 1;
+            true
+        }
+        AbilityCost::ReturnToHand {
+            filter: Some(TargetFilter::SelfRef),
+            ..
+        } => true,
+        AbilityCost::Composite { costs } => costs
+            .iter()
+            .all(|cost| cost_components_are_modelled(cost, kinds)),
+        // Declines the proof: mana sub-costs (paid by other mana), dynamic or
+        // aggregate amounts, alternatives, non-self returns, and resources the
+        // proof does not track (energy, speed, counters elsewhere, the
+        // library, evidence, materials, reveals, effects).
+        AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::Sacrifice(_)
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::Discard { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::ExileWithAggregate { .. }
+        | AbilityCost::TapCreatures { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::OneOf { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::PerCounter { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::GetPlayerCounters { .. }
+        | AbilityCost::Unimplemented { .. } => false,
+    }
+}
+
+/// CR 118.3 + CR 601.2h + CR 605.3a: The shared-resource legs of a mana
+/// ability's cost, each with the exact objects its payment prompt would offer
+/// now, for a payment proof that must not spend one object or point of life
+/// twice. `None` when any component is outside the modelled set (or a kind
+/// appears twice): the proof then declines this ability rather than reading it
+/// as free.
+pub(crate) fn mana_ability_cost_resource_legs(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability: &AbilityDefinition,
+) -> Option<Vec<ManaCostResourceLeg>> {
+    let mut kinds = SharedLegKinds::default();
+    if let Some(cost) = &ability.cost {
+        if !cost_components_are_modelled(cost, &mut kinds) {
+            return None;
+        }
+    }
+    if [kinds.discard, kinds.exile, kinds.sacrifice, kinds.tap]
+        .iter()
+        .any(|&count| count > 1)
+    {
+        return None;
+    }
+    let mut legs = Vec::new();
+    if kinds.discard == 1 {
+        let (count, eligible) = discard_cost_choice(state, player, source_id, ability)?;
+        let reserved = state
+            .pending_cast
+            .as_ref()
+            .filter(|pending| pending.ability.controller == player)
+            .and_then(|pending| pending.deferred_random_discard_cost.as_ref())
+            .map_or(0, |cost| cost.count);
+        legs.push(ManaCostResourceLeg::Objects {
+            pool: ManaCostObjectPool::HandCards,
+            count,
+            eligible,
+            reserved,
+        });
+    }
+    if kinds.exile == 1 {
+        let (count, zone, eligible) = exile_cost_choice(state, player, source_id, ability)?;
+        let pool = match zone {
+            Zone::Hand => ManaCostObjectPool::HandCards,
+            Zone::Graveyard => ManaCostObjectPool::GraveyardCards,
+            Zone::Battlefield => ManaCostObjectPool::Permanents,
+            Zone::Library | Zone::Stack | Zone::Exile | Zone::Command => return None,
+        };
+        legs.push(ManaCostResourceLeg::Objects {
+            pool,
+            count,
+            eligible,
+            reserved: 0,
+        });
+    }
+    if kinds.sacrifice == 1 {
+        let (count, eligible) = sacrifice_cost_choice(state, player, source_id, ability)?;
+        legs.push(ManaCostResourceLeg::Objects {
+            pool: ManaCostObjectPool::Permanents,
+            count,
+            eligible,
+            reserved: 0,
+        });
+    }
+    if kinds.tap == 1 {
+        let (min_count, max_count, eligible, _) =
+            tap_creature_cost_choice(state, player, source_id, ability)?;
+        if min_count != max_count {
+            return None;
+        }
+        legs.push(ManaCostResourceLeg::Objects {
+            pool: ManaCostObjectPool::Permanents,
+            count: min_count,
+            eligible,
+            reserved: 0,
+        });
+    }
+    if kinds.life > 0 {
+        legs.push(ManaCostResourceLeg::Life { amount: kinds.life });
+    }
+    Some(legs)
 }
 
 /// CR 118.3 + CR 608.2h: The objects a mana ability's exile or sacrifice cost

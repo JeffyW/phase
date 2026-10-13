@@ -843,9 +843,11 @@ fn twin_skirge_board(other_cards: usize) -> TwinSkirgeBoard {
 
 /// Probe R1 (CR 601.2a + CR 601.2h + CR 118.3): two Skirge Familiars can't
 /// both discard the one other card in hand, so Victim of Night's {B}{B} can't
-/// be paid and the cast is not offered. Reach guards: the broad gate generates
-/// it, its locked cost is {B}{B}, and one Familiar's discard prompt holds only
-/// the other card; after that discard nothing pays the second {B}.
+/// be paid and the cast is not offered (the payment is unproven). Reach
+/// guards: the broad gate generates it, its locked cost is {B}{B}, and, cast
+/// anyway, the reducer parks it at the mana-payment step as it did before this
+/// change, where one Familiar's discard prompt holds only the other card and
+/// after that discard the second Familiar can't be activated.
 #[test]
 fn two_discard_sources_cannot_share_one_card() {
     let b = twin_skirge_board(1);
@@ -871,10 +873,12 @@ fn two_discard_sources_cannot_share_one_card() {
         cost(vec![ManaCostShard::Black, ManaCostShard::Black], 0),
         "reach: the locked cost is {{B}}{{B}}"
     );
-    let selected = announced.act(GameAction::SelectTargets {
-        targets: vec![TargetRef::Object(b.bears)],
-    });
-    if selected.is_ok() {
+    announced
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(b.bears)],
+        })
+        .expect("the target is accepted");
+    {
         assert!(matches!(
             announced.state().waiting_for,
             WaitingFor::ManaPayment { .. }
@@ -939,13 +943,14 @@ fn two_discard_sources_with_two_cards_pay_and_resolve() {
     assert_eq!(b.runner.state().objects[&b.bears].zone, Zone::Graveyard);
 }
 
-/// CR 119.4 + CR 118.3: two Treasonous Ogres share one life total. At 5 life the
-/// second "Pay 3 life" can't be paid, so a {R}{R} spell isn't offered,
-/// targeted or not; at 6 life both payments fit and it is.
+/// CR 119.4 + CR 118.3: two Treasonous Ogres share one life total. At 5 life
+/// the second "Pay 3 life" can't be paid, so a targeted {R}{R} spell's payment
+/// is unproven and the cast isn't offered; at 6 life both payments fit and it
+/// is (targeted and untargeted).
 #[test]
 fn two_life_sources_share_one_life_total() {
-    for (life, payable) in [(5, false), (6, true)] {
-        for targeted in [false, true] {
+    for (life, targeted, offered) in [(5, true, false), (6, true, true), (6, false, true)] {
+        {
             let mut sc = GameScenario::new();
             sc.at_phase(Phase::PreCombatMain);
             sc.with_life(P0, life);
@@ -969,9 +974,266 @@ fn two_life_sources_share_one_life_total() {
             let action = auto_cast(&runner, spell);
             assert_eq!(
                 legal_actions(runner.state()).contains(&action),
-                payable,
+                offered,
                 "life {life}, targeted={targeted}"
             );
         }
+    }
+}
+
+const CITANUL_STALWART: &str =
+    "{T}, Tap an untapped artifact or creature you control: Add one mana of any color.";
+
+/// Probe R3-A (CR 118.3 + CR 601.2h): two Citanul Stalwarts and `helpers`
+/// extra Grizzly Bears for P0, Victim of Night ({B}{B}) in hand, P1's Bears.
+fn twin_stalwart_board(helpers: usize) -> (GameRunner, ObjectId, [ObjectId; 2], ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let stalwart = |sc: &mut GameScenario| {
+        sc.add_creature(P0, "Citanul Stalwart", 1, 1)
+            .from_oracle_text(CITANUL_STALWART)
+            .with_mana_cost(cost(vec![ManaCostShard::Green], 0))
+            .id()
+    };
+    let stalwarts = [stalwart(&mut sc), stalwart(&mut sc)];
+    for _ in 0..helpers {
+        sc.add_creature(P0, "Grizzly Bears", 2, 2);
+    }
+    let target = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let victim_of_night = sc
+        .add_spell_to_hand_from_oracle(P0, "Victim of Night", true, VICTIM_OF_NIGHT)
+        .with_mana_cost(cost(vec![ManaCostShard::Black, ManaCostShard::Black], 0))
+        .id();
+    (sc.build(), victim_of_night, stalwarts, target)
+}
+
+/// Answer the Stalwart's helper prompt with a helper that is not a Stalwart and the color
+/// prompt with black, until the mana-payment step returns.
+fn activate_stalwart(
+    runner: &mut GameRunner,
+    stalwart: ObjectId,
+    stalwarts: &[ObjectId],
+) -> Result<(), String> {
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: stalwart,
+            ability_index: 0,
+        })
+        .map_err(|e| format!("{e:?}"))?;
+    for _ in 0..4 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::PayCost { choices, .. } => {
+                let helper = choices
+                    .iter()
+                    .copied()
+                    .find(|id| !stalwarts.contains(id))
+                    .ok_or("no helper other than a Stalwart")?;
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![helper],
+                    })
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+            WaitingFor::ChooseManaColor { .. } => {
+                runner
+                    .act(GameAction::ChooseManaColor {
+                        choice: engine::types::game_state::ManaChoice::SingleColor(ManaType::Black),
+                        count: 1,
+                    })
+                    .map_err(|e| format!("{e:?}"))?;
+            }
+            _ => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// Probe R3-A: with one helper Bears, the two Stalwarts can't both tap an
+/// untapped creature (each Stalwart taps itself; the other Stalwart can't be
+/// tapped for its partner and still activate), so only one {B} is reachable and
+/// the cast is not offered. Reach guards: the broad gate generates it, its cost
+/// is {B}{B}, and cast anyway the first Stalwart activates while the second has
+/// no helper left.
+#[test]
+fn two_tap_helper_sources_cannot_share_one_helper() {
+    let (runner, victim_of_night, stalwarts, target) = twin_stalwart_board(1);
+    let action = auto_cast(&runner, victim_of_night);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: the broad gate generates the cast"
+    );
+    assert!(
+        !legal_actions(runner.state()).contains(&action),
+        "one helper can't be tapped for both Stalwarts"
+    );
+    let mut announced = GameRunner::from_state(runner.state().clone());
+    announced.act(action).expect("the cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: target selection")
+    };
+    assert_eq!(
+        pending_cast.cost,
+        cost(vec![ManaCostShard::Black, ManaCostShard::Black], 0)
+    );
+    announced
+        .act(GameAction::SelectTargets {
+            targets: vec![TargetRef::Object(target)],
+        })
+        .expect("the target is accepted");
+    assert!(matches!(
+        announced.state().waiting_for,
+        WaitingFor::ManaPayment { .. }
+    ));
+    activate_stalwart(&mut announced, stalwarts[0], &stalwarts)
+        .expect("the first Stalwart activates");
+    assert_eq!(
+        announced.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Black),
+        1,
+        "reach: the first Stalwart added {{B}}"
+    );
+    assert!(
+        activate_stalwart(&mut announced, stalwarts[1], &stalwarts).is_err(),
+        "the second Stalwart has no untapped helper left"
+    );
+}
+
+/// Positive sibling: a second helper Bears lets both Stalwarts activate.
+#[test]
+fn two_tap_helper_sources_with_two_helpers_pay_and_resolve() {
+    let (mut runner, victim_of_night, stalwarts, target) = twin_stalwart_board(2);
+    let action = auto_cast(&runner, victim_of_night);
+    assert!(legal_actions(runner.state()).contains(&action));
+    announce_and_target(&mut runner, action, Some(target));
+    for stalwart in stalwarts {
+        activate_stalwart(&mut runner, stalwart, &stalwarts).expect("a Stalwart activates");
+    }
+    runner
+        .act(GameAction::PassPriority)
+        .expect("passing finishes the payment");
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&target].zone, Zone::Graveyard);
+}
+
+/// Multi-ability infrastructure fixture: Skirge Familiar's printed ability plus
+/// a synthetic "{T}: Add {C}." sibling.
+const SKIRGE_WITH_FREE_SIBLING: &str = "Flying\nDiscard a card: Add {B}.\n{T}: Add {C}.";
+
+fn twin_skirge_with_free_sibling_board(other_cards: usize) -> (GameRunner, ObjectId, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    for _ in 0..2 {
+        sc.add_creature(P0, "Skirge Familiar", 3, 2)
+            .from_oracle_text_with_keywords(&["Flying"], SKIRGE_WITH_FREE_SIBLING)
+            .with_mana_cost(cost(vec![ManaCostShard::Black], 4));
+    }
+    let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let victim_of_night = sc
+        .add_spell_to_hand_from_oracle(P0, "Victim of Night", true, VICTIM_OF_NIGHT)
+        .with_mana_cost(cost(vec![ManaCostShard::Black, ManaCostShard::Black], 0))
+        .id();
+    for i in 0..other_cards {
+        sc.add_spell_to_hand_from_oracle(P0, &format!("Other Card {i}"), true, "Draw a card.")
+            .with_mana_cost(cost(vec![ManaCostShard::Red, ManaCostShard::Red], 5));
+    }
+    (sc.build(), victim_of_night, bears)
+}
+
+/// Probe R3-B: a free "{T}: Add {C}" sibling doesn't erase the discard
+/// ability's demand. With one other card, {B}{B} still needs two discards, so
+/// the cast is not offered; with two other cards it is.
+#[test]
+fn free_sibling_ability_does_not_erase_discard_demand() {
+    let (runner, victim_of_night, _) = twin_skirge_with_free_sibling_board(1);
+    let action = auto_cast(&runner, victim_of_night);
+    assert!(
+        candidate_actions(runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: the broad gate generates the cast"
+    );
+    assert!(!legal_actions(runner.state()).contains(&action));
+
+    let (payable, payable_spell, _) = twin_skirge_with_free_sibling_board(2);
+    assert!(legal_actions(payable.state()).contains(&auto_cast(&payable, payable_spell)));
+}
+
+/// Probe R4 (CR 117.1d + CR 601.2g-h): however many discard sources are on the
+/// battlefield, an untargeted {1}{U} payable with the Island and one discard is
+/// offered, and the Auto cast completes through the mana-payment step.
+/// Controls: ten Familiars, and eleven with {U}{C} already floating.
+#[test]
+fn many_discard_sources_do_not_hide_a_cast_one_of_them_pays() {
+    for (familiars, floating) in [(11, false), (10, false), (11, true)] {
+        let mut sc = GameScenario::new();
+        sc.at_phase(Phase::PreCombatMain);
+        let island = sc.add_basic_land(P0, ManaColor::Blue);
+        let skirges: Vec<ObjectId> = (0..familiars)
+            .map(|_| {
+                sc.add_creature(P0, "Skirge Familiar", 3, 2)
+                    .from_oracle_text_with_keywords(&["Flying"], SKIRGE_FAMILIAR)
+                    .with_mana_cost(cost(vec![ManaCostShard::Black], 4))
+                    .id()
+            })
+            .collect();
+        sc.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+        sc.with_library_top(P1, &["Card D", "Card E"]);
+        if floating {
+            sc.with_mana_pool(
+                P0,
+                vec![
+                    ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]),
+                    ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+                ],
+            );
+        }
+        let words = sc
+            .add_spell_to_hand_from_oracle(P0, "Words of Wisdom", true, WORDS_OF_WISDOM)
+            .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+            .id();
+        for i in 0..2 {
+            sc.add_spell_to_hand_from_oracle(P0, &format!("Other Card {i}"), true, "Draw a card.")
+                .with_mana_cost(cost(vec![ManaCostShard::Red, ManaCostShard::Red], 5));
+        }
+        let mut runner = sc.build();
+        let action = auto_cast(&runner, words);
+        assert!(
+            legal_actions(runner.state()).contains(&action),
+            "{familiars} Familiars, floating={floating}: offered"
+        );
+        runner.act(action).expect("the cast is announced");
+        if !floating {
+            assert!(
+                matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
+                "{familiars} Familiars: the Auto cast waits at the mana-payment step"
+            );
+            runner
+                .act(GameAction::ActivateAbility {
+                    source_id: skirges[0],
+                    ability_index: 0,
+                })
+                .expect("one Familiar activates");
+            let WaitingFor::PayCost { choices, .. } = runner.state().waiting_for.clone() else {
+                panic!("the discard prompt")
+            };
+            runner
+                .act(GameAction::SelectCards {
+                    cards: vec![choices[0]],
+                })
+                .expect("one card is discarded");
+            runner
+                .act(GameAction::PassPriority)
+                .expect("the Island finishes the payment");
+            assert!(runner.state().objects[&island].tapped);
+        }
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            runner.state().objects[&words].zone,
+            Zone::Graveyard,
+            "{familiars} Familiars, floating={floating}: Words of Wisdom resolved"
+        );
     }
 }
