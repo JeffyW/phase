@@ -1958,6 +1958,28 @@ fn whistle_hit_then_discard(respond: bool) -> (GameRunner, ObjectId, ObjectId) {
         1,
         "reach guard: the reflexive is on the stack"
     );
+    let reflexive = runner
+        .state()
+        .stack
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::TriggeredAbility { ability, .. } => Some(ability.clone()),
+            _ => None,
+        })
+        .expect("the reflexive stack entry");
+    assert!(
+        format!("{:?}", reflexive.condition).contains("RevealUntilMatched"),
+        "reach guard: the reflexive carries the reveal-until-hit guard: {:?}",
+        reflexive.condition
+    );
+    assert_eq!(
+        reflexive
+            .effect_context_object
+            .as_ref()
+            .map(|snapshot| snapshot.object_id),
+        Some(hit),
+        "reach guard: the reflexive carries the hit's snapshot for X"
+    );
     if respond {
         runner.act(GameAction::PassPriority).unwrap();
         runner
@@ -1980,10 +2002,12 @@ fn whistle_hit_then_discard(respond: bool) -> (GameRunner, ObjectId, ObjectId) {
 
 /// CR 603.12: the reveal already happened when the reflexive triggered, so
 /// discarding the revealed card in response neither undoes the trigger nor
-/// changes X (the card's mana value as it was revealed).
+/// changes X.
 #[test]
 fn discarding_the_hit_in_response_keeps_the_reflexive_and_its_x() {
     let (runner, bear, _) = whistle_hit_then_discard(true);
+    // CR 608.2h: the revealed card is no longer where the effect expected it,
+    // so X uses its last known information (mana value 2).
     assert_eq!(p1p1(runner.state(), bear), 2);
 }
 

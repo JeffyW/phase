@@ -1203,23 +1203,24 @@ fn reveal_gate_producer_executes_once(preceding: &[ClauseIr]) -> bool {
 /// [`reveal_gate_producer_executes_once`]). Runs over the finished clause
 /// sequence, so a "repeat this process" directive printed after the gate — or
 /// any other chain-level repetition, which leaves no mark on the clauses
-/// themselves — is accounted for.
+/// themselves — is accounted for. A gate is recognized by the reveal-until-hit
+/// guard's membership in its root condition (the same classifier the runtime
+/// uses), so extra intervening-if guards composed onto it cannot hide it. A
+/// rejected clause becomes a whole gap: no disposition, condition or other
+/// metadata of the reflexive survives to patch the reveal-until.
 fn demote_unproven_reveal_this_way_gates(clauses: &mut [ClauseIr], repeats_a_process: bool) {
-    let gate = reveal_this_way_gate_condition();
     for index in 0..clauses.len() {
-        if clauses[index].condition.as_ref() != Some(&gate) {
+        let is_gate = clauses[index]
+            .condition
+            .as_ref()
+            .is_some_and(crate::game::effects::condition_has_reveal_until_matched_guard);
+        if !is_gate {
             continue;
         }
         if !repeats_a_process && reveal_gate_producer_executes_once(&clauses[..index]) {
             continue;
         }
-        let gated = &mut clauses[index];
-        let fragment = gated.source.fragment().unwrap_or_default().to_string();
-        gated.parsed = parsed_clause(Effect::unimplemented(
-            "reveal_this_way_reflexive_gate",
-            fragment,
-        ));
-        gated.condition = None;
+        clauses[index].replace_with_gap("reveal_this_way_reflexive_gate");
     }
 }
 
