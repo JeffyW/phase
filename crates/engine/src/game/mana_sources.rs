@@ -2873,13 +2873,13 @@ fn profile_kind_allowed_for_context(
 fn collect_activatable_mana_profiles(
     state: &GameState,
     player: PlayerId,
-    exclude: Option<ObjectId>,
+    skip: &std::collections::HashSet<ObjectId>,
     payment_context: Option<&PaymentContext<'_>>,
 ) -> Vec<ActivatableManaProfile> {
     state
         .battlefield
         .iter()
-        .filter(|id| Some(**id) != exclude)
+        .filter(|id| !skip.contains(id))
         .flat_map(|&id| activatable_mana_profiles_for_object(state, id, player, payment_context))
         .collect()
 }
@@ -3128,21 +3128,296 @@ fn assign_profiles_to_shards(
 /// covering assignment uses up (each covered shard, plus any output an
 /// activation forgoes against its object's planned capacity). Callers must
 /// subtract it from the summed `feasible_mana_capacity` to avoid counting one
-/// activation twice or crediting a color that was not chosen.
+/// activation twice or crediting a color that was not chosen. Objects in
+/// `skip` (the spell's own object, and any [`affordable_activation_skip_sets`]
+/// leaves out) contribute nothing.
 pub(crate) fn can_cover_shards_with_activatable_mana(
     state: &GameState,
     player: PlayerId,
-    exclude: Option<ObjectId>,
+    skip: &std::collections::HashSet<ObjectId>,
     payment_context: Option<&PaymentContext<'_>>,
     shards: &[ManaCostShard],
 ) -> (bool, u32) {
     if shards.is_empty() {
         return (true, 0);
     }
-    let profiles = collect_activatable_mana_profiles(state, player, exclude, payment_context);
+    let profiles = collect_activatable_mana_profiles(state, player, skip, payment_context);
     assign_profiles_to_shards(&profiles, shards)
         .map(|consumed| (true, consumed))
         .unwrap_or((false, 0))
+}
+
+/// CR 118.3 + CR 601.2h: A cost resource several mana abilities can draw on
+/// within one payment. Each activation consumes its own units of it (distinct
+/// cards or permanents, or points of life), so the activations one payment
+/// plans can't together consume more than the player has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SharedCostResource {
+    /// Cards in hand (discard, exile from hand). CR 601.2a: a spell being cast
+    /// is on the stack, not in hand.
+    HandCard,
+    /// Cards in the graveyard (exile from graveyard, collect evidence).
+    GraveyardCard,
+    /// CR 119.4: points of life paid.
+    Life,
+    /// Other permanents the player controls (sacrifice, tap, exile, return).
+    ControlledPermanent,
+}
+
+type ResourceUnits = std::collections::BTreeMap<SharedCostResource, u32>;
+
+/// The units of each shared resource one payment of `cost` consumes, at least.
+/// Costs whose amount isn't fixed, or whose objects needn't be distinct from
+/// another activation's, add nothing (no bound is claimed for them).
+fn add_cost_resource_units(cost: &AbilityCost, units: &mut ResourceUnits) {
+    use crate::types::ability::{DiscardSelfScope, TapCreaturesRequirement};
+    let mut add = |resource, amount: u32| {
+        if amount > 0 {
+            *units.entry(resource).or_insert(0) += amount;
+        }
+    };
+    let zone_resource = |zone: Zone| match zone {
+        Zone::Hand => Some(SharedCostResource::HandCard),
+        Zone::Graveyard => Some(SharedCostResource::GraveyardCard),
+        Zone::Battlefield => Some(SharedCostResource::ControlledPermanent),
+        Zone::Library | Zone::Stack | Zone::Exile | Zone::Command => None,
+    };
+    match cost {
+        AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value },
+            self_scope: DiscardSelfScope::FromHand,
+            ..
+        } => add(SharedCostResource::HandCard, (*value).max(0) as u32),
+        AbilityCost::Exile {
+            count,
+            zone,
+            filter,
+        } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
+            if let Some(resource) = zone_resource(
+                super::cost_payability::exile_cost_effective_zone(*zone, filter.as_ref()),
+            ) {
+                add(resource, *count);
+            }
+        }
+        AbilityCost::ExileWithAggregate { zone, .. } => {
+            if let Some(resource) = zone_resource(*zone) {
+                add(resource, 1);
+            }
+        }
+        AbilityCost::CollectEvidence { amount } => {
+            add(SharedCostResource::GraveyardCard, u32::from(*amount > 0));
+        }
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value },
+        } => add(SharedCostResource::Life, (*value).max(0) as u32),
+        AbilityCost::Sacrifice(SacrificeCost {
+            target,
+            requirement: SacrificeRequirement::Count { count },
+        }) if !matches!(target, TargetFilter::SelfRef) => {
+            add(SharedCostResource::ControlledPermanent, *count);
+        }
+        AbilityCost::TapCreatures {
+            requirement: TapCreaturesRequirement::Count { count },
+            ..
+        } => add(SharedCostResource::ControlledPermanent, *count),
+        AbilityCost::ReturnToHand {
+            count,
+            filter,
+            from_zone,
+        } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
+            if let Some(resource) = zone_resource(from_zone.unwrap_or(Zone::Battlefield)) {
+                add(resource, *count);
+            }
+        }
+        AbilityCost::Composite { costs } => {
+            for cost in costs {
+                add_cost_resource_units(cost, units);
+            }
+        }
+        // No shared-resource bound: no fixed amount, the source's own object,
+        // a non-shared resource (mana, counters, energy, the library), or a
+        // choice among alternatives (`OneOf`) this bound does not model.
+        AbilityCost::Discard { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::Sacrifice(_)
+        | AbilityCost::TapCreatures { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::OneOf { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::PerCounter { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::GetPlayerCounters { .. }
+        | AbilityCost::Unimplemented { .. } => {}
+    }
+}
+
+/// The least of each shared resource any one of the object's payment mana
+/// abilities consumes: activating the object at all costs at least this much.
+fn object_resource_demand(state: &GameState, object_id: ObjectId) -> ResourceUnits {
+    let Some(object) = state.objects.get(&object_id) else {
+        return ResourceUnits::new();
+    };
+    let per_ability: Vec<ResourceUnits> = object
+        .abilities
+        .iter()
+        .filter(|ability| is_payment_mana_ability(ability))
+        .map(|ability| {
+            let mut units = ResourceUnits::new();
+            if let Some(cost) = &ability.cost {
+                add_cost_resource_units(cost, &mut units);
+            }
+            units
+        })
+        .collect();
+    let Some((first, rest)) = per_ability.split_first() else {
+        return ResourceUnits::new();
+    };
+    first
+        .iter()
+        .filter_map(|(&resource, &amount)| {
+            let least = rest
+                .iter()
+                .map(|units| units.get(&resource).copied().unwrap_or(0))
+                .fold(amount, u32::min);
+            (least > 0).then_some((resource, least))
+        })
+        .collect()
+}
+
+/// What `player` has of each shared resource right now.
+fn resource_supply(state: &GameState, player: PlayerId, resource: SharedCostResource) -> u32 {
+    let Some(player_state) = state.players.iter().find(|p| p.id == player) else {
+        return 0;
+    };
+    let count = |ids: &mut dyn Iterator<Item = ObjectId>| {
+        ids.filter(|&id| !super::casting::is_spell_being_cast(state, id))
+            .count() as u32
+    };
+    match resource {
+        SharedCostResource::HandCard => count(&mut player_state.hand.iter().copied()),
+        SharedCostResource::GraveyardCard => count(&mut state.graveyard_of(player).iter().copied()),
+        SharedCostResource::Life => player_state.life.max(0) as u32,
+        SharedCostResource::ControlledPermanent => state
+            .battlefield
+            .iter()
+            .filter(|id| {
+                state
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.controller == player)
+            })
+            .count() as u32,
+    }
+}
+
+/// Most objects whose activations one shared-resource budget is enumerated
+/// over; past this the planner fails closed.
+const MAX_BUDGETED_MANA_OBJECTS: usize = 10;
+
+/// CR 118.3 + CR 601.2h: The sets of mana objects the castability planner
+/// should leave out so the activations it plans fit the shared cost resources
+/// the player has (two Skirge Familiars can't both discard the one card in
+/// hand). Each set is a maximal choice of objects to activate; the planner
+/// succeeds if it covers the cost with any one of them.
+///
+/// `vec![∅]` when no resource is oversubscribed (the planner is unchanged), and
+/// an empty list when too many objects contend to enumerate (fail closed: no
+/// payment is proven). The bound is necessary, not sufficient: each
+/// activation's demand is the least any of its object's abilities consumes,
+/// and a resource's supply ignores the costs' filters.
+pub(crate) fn affordable_activation_skip_sets(
+    state: &GameState,
+    player: PlayerId,
+    exclude: Option<ObjectId>,
+) -> Vec<std::collections::HashSet<ObjectId>> {
+    let demands: Vec<(ObjectId, ResourceUnits)> = state
+        .battlefield
+        .iter()
+        .filter(|&&id| {
+            Some(id) != exclude
+                && state
+                    .objects
+                    .get(&id)
+                    .is_some_and(|object| object.controller == player)
+        })
+        .map(|&id| (id, object_resource_demand(state, id)))
+        .filter(|(_, demand)| !demand.is_empty())
+        .collect();
+    let mut totals = ResourceUnits::new();
+    for (_, demand) in &demands {
+        for (&resource, &amount) in demand {
+            *totals.entry(resource).or_insert(0) += amount;
+        }
+    }
+    let supply: ResourceUnits = totals
+        .keys()
+        .map(|&resource| (resource, resource_supply(state, player, resource)))
+        .collect();
+    let oversubscribed: Vec<SharedCostResource> = totals
+        .iter()
+        .filter(|(resource, total)| **total > supply[resource])
+        .map(|(&resource, _)| resource)
+        .collect();
+    if oversubscribed.is_empty() {
+        return vec![std::collections::HashSet::new()];
+    }
+    let contenders: Vec<&(ObjectId, ResourceUnits)> = demands
+        .iter()
+        .filter(|(_, demand)| oversubscribed.iter().any(|r| demand.contains_key(r)))
+        .collect();
+    if contenders.len() > MAX_BUDGETED_MANA_OBJECTS {
+        return Vec::new();
+    }
+    let fits = |kept: u32| {
+        oversubscribed.iter().all(|resource| {
+            contenders
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| kept & (1 << index) != 0)
+                .map(|(_, (_, demand))| demand.get(resource).copied().unwrap_or(0))
+                .sum::<u32>()
+                <= supply[resource]
+        })
+    };
+    let all = (1u32 << contenders.len()) - 1;
+    let affordable: Vec<u32> = (0..=all).filter(|&kept| fits(kept)).collect();
+    affordable
+        .iter()
+        .filter(|&&kept| {
+            // Keeping more objects never hurts the planner, so only maximal
+            // affordable sets need trying.
+            !affordable
+                .iter()
+                .any(|&other| other != kept && other & kept == kept)
+        })
+        .map(|&kept| {
+            contenders
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| kept & (1 << index) == 0)
+                .map(|(_, (id, _))| *id)
+                .collect()
+        })
+        .collect()
 }
 
 fn land_mana_options(

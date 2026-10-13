@@ -4609,8 +4609,9 @@ fn resolve_ref(
             }
             // CR 601.2a: a spell being cast has moved to the stack, though its
             // object's hand membership is deferred to finalization; it is not
-            // a card in hand (Lion's Eye Diamond's "Discard your hand" while
-            // paying for a spell discards only the rest of the hand).
+            // a card in hand (an unrestricted "Discard your hand" mana cost
+            // activated while paying for a spell discards only the rest of
+            // the hand).
             resolve_per_player_scalar(state, scope, controller, ctx, targets, ability, |p| {
                 usize_to_i32_saturating(
                     p.hand

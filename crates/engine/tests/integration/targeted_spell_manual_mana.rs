@@ -520,7 +520,7 @@ fn skirge_board(targeted: bool, other_card: bool) -> HandExileBoard {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let source = sc
-        .add_creature(P0, "Skirge Familiar", 3, 1)
+        .add_creature(P0, "Skirge Familiar", 3, 2)
         .from_oracle_text_with_keywords(&["Flying"], SKIRGE_FAMILIAR)
         .with_mana_cost(cost(vec![ManaCostShard::Black], 4))
         .id();
@@ -795,4 +795,183 @@ fn collect_evidence_from_graveyard_uses_other_cards() {
     assert_eq!(runner.state().players[0].hand.len(), hand_before + 1);
     assert_eq!(runner.state().objects[&fuel].zone, Zone::Exile);
     assert_eq!(runner.state().objects[&spell].zone, Zone::Exile);
+}
+
+const VICTIM_OF_NIGHT: &str = "Destroy target non-Vampire, non-Werewolf, non-Zombie creature.";
+
+struct TwinSkirgeBoard {
+    runner: GameRunner,
+    victim_of_night: ObjectId,
+    skirges: [ObjectId; 2],
+    bears: ObjectId,
+    other_cards: Vec<ObjectId>,
+}
+
+/// Probe R1: P0 in its main phase, empty pool, no lands, two Skirge Familiars,
+/// Victim of Night ({B}{B}) and `other_cards` other cards in hand; P1 has
+/// Grizzly Bears.
+fn twin_skirge_board(other_cards: usize) -> TwinSkirgeBoard {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let skirge = |sc: &mut GameScenario| {
+        sc.add_creature(P0, "Skirge Familiar", 3, 2)
+            .from_oracle_text_with_keywords(&["Flying"], SKIRGE_FAMILIAR)
+            .with_mana_cost(cost(vec![ManaCostShard::Black], 4))
+            .id()
+    };
+    let skirges = [skirge(&mut sc), skirge(&mut sc)];
+    let bears = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let victim_of_night = sc
+        .add_spell_to_hand_from_oracle(P0, "Victim of Night", true, VICTIM_OF_NIGHT)
+        .with_mana_cost(cost(vec![ManaCostShard::Black, ManaCostShard::Black], 0))
+        .id();
+    let other_cards = (0..other_cards)
+        .map(|i| {
+            sc.add_spell_to_hand_from_oracle(P0, &format!("Other Card {i}"), true, "Draw a card.")
+                .with_mana_cost(cost(vec![ManaCostShard::Red, ManaCostShard::Red], 5))
+                .id()
+        })
+        .collect();
+    TwinSkirgeBoard {
+        runner: sc.build(),
+        victim_of_night,
+        skirges,
+        bears,
+        other_cards,
+    }
+}
+
+/// Probe R1 (CR 601.2a + CR 601.2h + CR 118.3): two Skirge Familiars can't
+/// both discard the one other card in hand, so Victim of Night's {B}{B} can't
+/// be paid and the cast is not offered. Reach guards: the broad gate generates
+/// it, its locked cost is {B}{B}, and one Familiar's discard prompt holds only
+/// the other card; after that discard nothing pays the second {B}.
+#[test]
+fn two_discard_sources_cannot_share_one_card() {
+    let b = twin_skirge_board(1);
+    let action = auto_cast(&b.runner, b.victim_of_night);
+    assert!(
+        candidate_actions(b.runner.state())
+            .iter()
+            .any(|candidate| candidate.action == action),
+        "reach: the broad gate generates the cast"
+    );
+    assert!(
+        !legal_actions(b.runner.state()).contains(&action),
+        "one card can't pay two Familiars' discard costs"
+    );
+
+    let mut announced = GameRunner::from_state(b.runner.state().clone());
+    announced.act(action).expect("the cast is announced");
+    let WaitingFor::TargetSelection { pending_cast, .. } = &announced.state().waiting_for else {
+        panic!("reach: target selection")
+    };
+    assert_eq!(
+        pending_cast.cost,
+        cost(vec![ManaCostShard::Black, ManaCostShard::Black], 0),
+        "reach: the locked cost is {{B}}{{B}}"
+    );
+    let selected = announced.act(GameAction::SelectTargets {
+        targets: vec![TargetRef::Object(b.bears)],
+    });
+    if selected.is_ok() {
+        assert!(matches!(
+            announced.state().waiting_for,
+            WaitingFor::ManaPayment { .. }
+        ));
+        announced
+            .act(GameAction::ActivateAbility {
+                source_id: b.skirges[0],
+                ability_index: 0,
+            })
+            .expect("the first Familiar activates");
+        let WaitingFor::PayCost { choices, .. } = announced.state().waiting_for.clone() else {
+            panic!("reach: the discard prompt")
+        };
+        assert_eq!(
+            choices, b.other_cards,
+            "reach: only the other card can be discarded"
+        );
+        announced
+            .act(GameAction::SelectCards { cards: choices })
+            .expect("the other card is discarded");
+        assert!(
+            announced
+                .act(GameAction::ActivateAbility {
+                    source_id: b.skirges[1],
+                    ability_index: 0,
+                })
+                .is_err(),
+            "the second Familiar has nothing left to discard"
+        );
+    }
+}
+
+/// Positive sibling: with two other cards, each Familiar discards one and
+/// Victim of Night resolves.
+#[test]
+fn two_discard_sources_with_two_cards_pay_and_resolve() {
+    let mut b = twin_skirge_board(2);
+    let action = auto_cast(&b.runner, b.victim_of_night);
+    assert!(legal_actions(b.runner.state()).contains(&action));
+    announce_and_target(&mut b.runner, action, Some(b.bears));
+    for skirge in b.skirges {
+        b.runner
+            .act(GameAction::ActivateAbility {
+                source_id: skirge,
+                ability_index: 0,
+            })
+            .expect("a Familiar activates");
+        let WaitingFor::PayCost { choices, .. } = b.runner.state().waiting_for.clone() else {
+            panic!("the discard prompt: {:?}", b.runner.state().waiting_for)
+        };
+        assert!(!choices.contains(&b.victim_of_night));
+        b.runner
+            .act(GameAction::SelectCards {
+                cards: vec![choices[0]],
+            })
+            .expect("one other card is discarded");
+    }
+    b.runner
+        .act(GameAction::PassPriority)
+        .expect("passing finishes the payment");
+    b.runner.advance_until_stack_empty();
+    assert_eq!(b.runner.state().objects[&b.bears].zone, Zone::Graveyard);
+}
+
+/// CR 119.4 + CR 118.3: two Treasonous Ogres share one life total. At 5 life the
+/// second "Pay 3 life" can't be paid, so a {R}{R} spell isn't offered,
+/// targeted or not; at 6 life both payments fit and it is.
+#[test]
+fn two_life_sources_share_one_life_total() {
+    for (life, payable) in [(5, false), (6, true)] {
+        for targeted in [false, true] {
+            let mut sc = GameScenario::new();
+            sc.at_phase(Phase::PreCombatMain);
+            sc.with_life(P0, life);
+            for _ in 0..2 {
+                sc.add_creature(P0, "Treasonous Ogre", 2, 3)
+                    .from_oracle_text_with_keywords(&["Dethrone"], TREASONOUS_OGRE)
+                    .with_mana_cost(cost(vec![ManaCostShard::Red], 3));
+            }
+            sc.add_creature(P1, "Grizzly Bears", 2, 2);
+            sc.with_library_top(P0, &["Card A", "Card B"]);
+            let text = if targeted {
+                "Destroy target creature."
+            } else {
+                "Draw a card."
+            };
+            let spell = sc
+                .add_spell_to_hand_from_oracle(P0, "Red Red Spell", true, text)
+                .with_mana_cost(cost(vec![ManaCostShard::Red, ManaCostShard::Red], 0))
+                .id();
+            let runner = sc.build();
+            let action = auto_cast(&runner, spell);
+            assert_eq!(
+                legal_actions(runner.state()).contains(&action),
+                payable,
+                "life {life}, targeted={targeted}"
+            );
+        }
+    }
 }

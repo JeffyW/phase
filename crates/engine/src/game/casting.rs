@@ -21987,14 +21987,45 @@ fn manual_mana_payment_is_feasible(
         crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
     };
 
+    // CR 118.3 + CR 601.2h: the activations one payment plans share the
+    // player's cards, life and permanents (two Skirge Familiars can't both
+    // discard the one card in hand). Plan over each affordable choice of
+    // activated objects; with no shared resource oversubscribed that is the
+    // whole board, and with too many contenders to enumerate, nothing (fail
+    // closed).
+    super::mana_sources::affordable_activation_skip_sets(state, player, source_id)
+        .into_iter()
+        .any(|mut skip| {
+            skip.extend(source_id);
+            manual_residual_is_covered(
+                state,
+                player,
+                &skip,
+                spell_ctx.as_ref(),
+                residual_shards,
+                residual_generic,
+            )
+        })
+}
+
+/// CR 117.1d + CR 601.2g + CR 605.3a: Whether the activatable mana of the
+/// battlefield objects outside `skip` covers the residual shards and generic.
+fn manual_residual_is_covered(
+    state: &GameState,
+    player: PlayerId,
+    skip: &HashSet<ObjectId>,
+    spell_ctx: Option<&PaymentContext<'_>>,
+    residual_shards: &[ManaCostShard],
+    residual_generic: u32,
+) -> bool {
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
     let (shards_covered, shard_charge) =
         super::mana_sources::can_cover_shards_with_activatable_mana(
             state,
             player,
-            source_id,
-            spell_ctx.as_ref(),
+            skip,
+            spell_ctx,
             residual_shards,
         );
     if !residual_shards.is_empty() && !shards_covered {
@@ -22005,7 +22036,7 @@ fn manual_mana_payment_is_feasible(
     }
 
     // CR 117.1d + CR 605.3a: Sum the per-permanent feasible mana capacity
-    // across the controller's untapped non-excluded battlefield permanents.
+    // across the controller's untapped non-skipped battlefield permanents.
     // Each contribution is the largest single mana-ability output the
     // controller could currently activate (covering Sacrifice / Discard /
     // PayLife costs that auto-tap cannot simulate).
@@ -22016,20 +22047,19 @@ fn manual_mana_payment_is_feasible(
     // the color it was planned to make (blue from Nyx Lotus adds its blue
     // amount, not its larger green amount).
     //
-    // The per-permanent sum over-counts in chain-sacrifice configurations
-    // (e.g. 2× KCI + 1 fodder reports cap=4 when the actual reachable yield
-    // is 2). The trade-off — over-count rather than under-count, since
-    // under-count was the original #562 bug — is intentional. A bounded-
-    // flow model that respects sacrifice/discard/life supply is tracked in
-    // issue #1235.
-    let excluded = source_id;
+    // The shared-resource budget (`affordable_activation_skip_sets`) bounds
+    // activations by the player's whole hand, graveyard, life and permanents,
+    // ignoring the costs' filters, so the per-permanent sum still over-counts
+    // when the filters narrow the fodder (e.g. 2× KCI + 1 fodder reports cap=4
+    // when the actual reachable yield is 2). The trade-off — over-count rather
+    // than under-count, since under-count was the original #562 bug — is
+    // intentional. A bounded-flow model that respects each cost's own fodder
+    // is tracked in issue #1235.
     let capacity: u32 = state
         .battlefield
         .iter()
-        .filter(|id| Some(**id) != excluded)
-        .map(|&id| {
-            super::mana_sources::feasible_mana_capacity(state, id, player, spell_ctx.as_ref())
-        })
+        .filter(|id| !skip.contains(id))
+        .map(|&id| super::mana_sources::feasible_mana_capacity(state, id, player, spell_ctx))
         .sum::<u32>()
         .saturating_sub(shard_charge);
 
