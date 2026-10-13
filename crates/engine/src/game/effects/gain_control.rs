@@ -2,7 +2,9 @@ use crate::types::ability::{
     ContinuousModification, Duration, Effect, EffectError, EffectKind, ResolvedAbility,
     TargetFilter, TargetRef,
 };
-use crate::types::events::{ControlChangeEvidence, ControlChangeInstructionCapture, GameEvent};
+use crate::types::events::{
+    ControlChangeEvidence, ControlChangeInstructionCapture, ControlChangeObservation, GameEvent,
+};
 use crate::types::game_state::{GameState, TransientContinuousEffectBindings};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::keywords::Keyword;
@@ -33,19 +35,16 @@ pub(crate) fn capture_control_change_instruction(
 
 /// The boundary one control-change resolution publishes against.
 pub(crate) enum InstructionBoundary {
-    Captured(Arc<ControlChangeInstructionCapture>),
-    /// `ControlChangeInstructionCarrier::Unobservable`: publish `Unrecorded`.
+    /// The resolver's own capture, taken at its entrance: every member is
+    /// published once, by this resolution.
+    Own(Arc<ControlChangeInstructionCapture>),
+    /// A player-scope link's pre-seat capture, keyed in
+    /// `GameState::control_change_captures`.
+    Carried(u64),
+    /// `ControlChangeInstructionCarrier::Unobservable`, or a carried id whose
+    /// capture is gone: publish `Unrecorded`, never a capture taken at some
+    /// other point.
     Unobservable,
-}
-
-/// A fan-out's carried capture (GameState::control_change_captures). An id
-/// whose capture is gone authorizes nothing: Unobservable, never a fresh
-/// capture taken at some other point.
-fn carried_boundary(state: &GameState, id: u64) -> InstructionBoundary {
-    state.control_change_captures.get(&id).cloned().map_or(
-        InstructionBoundary::Unobservable,
-        InstructionBoundary::Captured,
-    )
 }
 
 /// The boundary a control-change resolver publishes against: the one its
@@ -57,20 +56,31 @@ fn instruction_boundary(
     ability: &ResolvedAbility,
     population: impl FnOnce(&GameState) -> Vec<ObjectId>,
 ) -> (InstructionBoundary, Vec<ObjectId>) {
-    use crate::types::events::ControlChangeInstructionCarrier;
-    match &ability.control_change_instruction {
-        Some(ControlChangeInstructionCarrier::Captured(id)) => {
-            (carried_boundary(state, *id), population(state))
-        }
-        Some(ControlChangeInstructionCarrier::Unobservable) => {
-            (InstructionBoundary::Unobservable, population(state))
-        }
+    match carried_boundary(state, ability) {
+        Some(boundary) => (boundary, population(state)),
         None => {
             crate::game::layers::flush_layers(state);
             let members = population(state);
             let capture = capture_control_change_instruction(state, members.iter().copied());
-            (InstructionBoundary::Captured(capture), members)
+            (InstructionBoundary::Own(capture), members)
         }
+    }
+}
+
+fn carried_boundary(state: &GameState, ability: &ResolvedAbility) -> Option<InstructionBoundary> {
+    use crate::types::events::ControlChangeInstructionCarrier;
+    match &ability.control_change_instruction {
+        Some(ControlChangeInstructionCarrier::Captured(id)) => {
+            Some(if state.control_change_captures.contains_key(id) {
+                InstructionBoundary::Carried(*id)
+            } else {
+                InstructionBoundary::Unobservable
+            })
+        }
+        Some(ControlChangeInstructionCarrier::Unobservable) => {
+            Some(InstructionBoundary::Unobservable)
+        }
+        None => None,
     }
 }
 
@@ -82,67 +92,72 @@ pub(crate) fn exchange_boundary(
     ability: &ResolvedAbility,
     members: [ObjectId; 2],
 ) -> InstructionBoundary {
-    use crate::types::events::ControlChangeInstructionCarrier;
-    match &ability.control_change_instruction {
-        Some(ControlChangeInstructionCarrier::Captured(id)) => carried_boundary(state, *id),
-        Some(ControlChangeInstructionCarrier::Unobservable) => InstructionBoundary::Unobservable,
-        None => InstructionBoundary::Captured(capture_control_change_instruction(state, members)),
-    }
+    carried_boundary(state, ability).unwrap_or_else(|| {
+        InstructionBoundary::Own(capture_control_change_instruction(state, members))
+    })
 }
 
-/// One member's pre-change controller and the evidence its event carries.
+/// One member's pre-change controller and the observation its event records.
 pub(crate) struct MemberEvidence {
     object_id: ObjectId,
     old_controller: PlayerId,
-    evidence: ControlChangeEvidence,
+    observation: Option<ControlChangeObservation>,
+    /// The carried link to mark this member published in.
+    link: Option<u64>,
 }
 
 /// One member's evidence, read before its install.
 ///
 /// A captured member publishes its observation, and its observed controller is
-/// the loser, so the event and its evidence agree by construction. A member
-/// the capture doesn't hold (an object that didn't exist when the instruction
-/// began) and every member of an `Unobservable` boundary publish `Unrecorded`:
-/// no other observation is ever substituted for the instruction's boundary.
+/// the loser, so the event and its evidence agree by construction. It's
+/// `Unrecorded` (the live controller is the loser) when the capture doesn't
+/// hold it (an object that didn't exist when the instruction began), when it is
+/// no longer the incarnation the capture observed (CR 400.7), when its link has
+/// already published it (an earlier seat moved the same member), or when the
+/// boundary is `Unobservable`. No other observation is ever substituted for the
+/// instruction's boundary.
+///
+/// A carried member whose live controller moved only as a consequence of an
+/// earlier seat (an Aura that changed hands now controls its creature) is still
+/// the captured board's change: one action, processed simultaneously (CR
+/// 608.2e), so it publishes its captured observation.
 pub(crate) fn instruction_member(
     state: &GameState,
     boundary: &InstructionBoundary,
     object_id: ObjectId,
 ) -> Option<MemberEvidence> {
     let live = state.objects.get(&object_id)?;
-    let live_controller = live.controller;
     let live_identity = ObjectIncarnationRef::from_object(live);
-    // The capture speaks for this member only while the member is still the
-    // object it observed, under the controller it observed. A seat-major
-    // fan-out can move a member in an earlier seat (CR 608.2e would process
-    // the action once, simultaneously); that member's change is then not the
-    // captured board's, so it publishes `Unrecorded`.
-    let observation = match boundary {
-        InstructionBoundary::Captured(capture) => {
-            capture.observation_for(object_id).filter(|observation| {
-                observation.subject.identity == live_identity
-                    && observation.subject.controller == live_controller
-            })
+    let (capture, link) = match boundary {
+        InstructionBoundary::Own(capture) => (Some(capture), None),
+        InstructionBoundary::Carried(id) => {
+            let entry = &state.control_change_captures[id];
+            if entry.published.contains(&object_id) {
+                (None, Some(*id))
+            } else {
+                (Some(&entry.capture), Some(*id))
+            }
         }
-        InstructionBoundary::Unobservable => None,
+        InstructionBoundary::Unobservable => (None, None),
     };
-    Some(match observation {
-        Some(observation) => MemberEvidence {
-            object_id,
-            old_controller: observation.subject.controller,
-            evidence: ControlChangeEvidence::Observed(Box::new(observation)),
-        },
-        None => MemberEvidence {
-            object_id,
-            old_controller: live_controller,
-            evidence: ControlChangeEvidence::Unrecorded,
-        },
+    let observation = capture
+        .and_then(|capture| capture.observation_for(object_id))
+        .filter(|observation| observation.subject.identity == live_identity);
+    Some(MemberEvidence {
+        object_id,
+        old_controller: observation.as_ref().map_or(live.controller, |observation| {
+            observation.subject.controller
+        }),
+        observation,
+        link,
     })
 }
 
-/// CR 613.1b + CR 603.10d: publish one member's control change. A no-op
-/// self-handoff publishes nothing.
+/// CR 613.1b + CR 603.10d: publish one member's control change, recording its
+/// observation (the event carries only the key). A no-op self-handoff
+/// publishes nothing.
 pub(crate) fn publish_controller_changed(
+    state: &mut GameState,
     events: &mut Vec<GameEvent>,
     member: MemberEvidence,
     new_controller: PlayerId,
@@ -150,11 +165,21 @@ pub(crate) fn publish_controller_changed(
     if member.old_controller == new_controller {
         return;
     }
+    if let Some(link) = member
+        .link
+        .and_then(|id| state.control_change_captures.get_mut(&id))
+    {
+        link.published.insert(member.object_id);
+    }
+    let evidence = match member.observation {
+        Some(observation) => state.record_control_change_observation(observation),
+        None => ControlChangeEvidence::Unrecorded,
+    };
     events.push(GameEvent::ControllerChanged {
         object_id: member.object_id,
         old_controller: member.old_controller,
         new_controller,
-        evidence: member.evidence,
+        evidence,
     });
 }
 /// CR 613.3: GainControl creates a transient continuous effect that changes the
@@ -220,7 +245,7 @@ pub fn resolve(
         // triggers on the *previous* controller observe the loss (mirrors
         // `GainControlAll` and `GiveControl`). Skip no-op self-handoffs.
         if let Some(member) = member {
-            publish_controller_changed(events, member, new_controller);
+            publish_controller_changed(state, events, member, new_controller);
         }
     }
 
@@ -242,8 +267,7 @@ pub(crate) fn apply_permanent_control_change(
 ) {
     // CR 603.10d: a one-member instruction; settle, capture, then install.
     crate::game::layers::flush_layers(state);
-    let boundary =
-        InstructionBoundary::Captured(capture_control_change_instruction(state, [object_id]));
+    let boundary = InstructionBoundary::Own(capture_control_change_instruction(state, [object_id]));
     let member = instruction_member(state, &boundary, object_id);
     state.add_transient_continuous_effect(
         source_id,
@@ -255,7 +279,7 @@ pub(crate) fn apply_permanent_control_change(
     );
     mark_echo_due_for_new_controller(state, object_id);
     if let Some(member) = member {
-        publish_controller_changed(events, member, new_controller);
+        publish_controller_changed(state, events, member, new_controller);
     }
 }
 
@@ -321,7 +345,7 @@ pub fn resolve_all(
         }
         mark_echo_due_for_new_controller(state, obj_id);
         if let Some(member) = member {
-            publish_controller_changed(events, member, new_controller);
+            publish_controller_changed(state, events, member, new_controller);
         }
     }
 
@@ -477,7 +501,7 @@ pub fn resolve_give(
         // CR 110.2: Record the handoff for downstream "if they do" riders and
         // `ControllerChanged` triggers (mirrors `resolve_all`).
         if let Some(member) = member {
-            publish_controller_changed(events, member, recipient_id);
+            publish_controller_changed(state, events, member, recipient_id);
         }
     }
 
@@ -664,6 +688,76 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    /// CR 608.2e + CR 603.10d + CR 400.7: a carried link's member keeps its
+    /// captured observation when its live controller moved only as a
+    /// consequence of an earlier seat (one action, processed simultaneously).
+    /// It publishes `Unrecorded` once the link already published it (a second
+    /// change of one member within one action), or when it's no longer the
+    /// captured incarnation.
+    #[test]
+    fn carried_member_keeps_its_capture_until_published_once() {
+        let mut state = GameState::new_two_player(7);
+        let member = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Member".to_string(),
+            Zone::Battlefield,
+        );
+        let capture = capture_control_change_instruction(&state, [member]);
+        state.control_change_captures.insert(
+            0,
+            crate::types::events::ControlChangeLink {
+                capture,
+                published: Default::default(),
+            },
+        );
+        let boundary = InstructionBoundary::Carried(0);
+
+        // An earlier seat's layered consequence moved the member's controller.
+        state.objects.get_mut(&member).unwrap().controller = PlayerId(1);
+        let first = instruction_member(&state, &boundary, member).unwrap();
+        assert!(
+            first.observation.is_some(),
+            "the captured observation stands for the moved member"
+        );
+        assert_eq!(first.old_controller, PlayerId(0), "the captured loser");
+
+        let mut events = Vec::new();
+        publish_controller_changed(&mut state, &mut events, first, PlayerId(1));
+        assert!(
+            matches!(
+                events.as_slice(),
+                [GameEvent::ControllerChanged {
+                    evidence: ControlChangeEvidence::Observed(_),
+                    ..
+                }]
+            ),
+            "REACH: the first change published observed evidence"
+        );
+        let second = instruction_member(&state, &boundary, member).unwrap();
+        assert!(
+            second.observation.is_none(),
+            "a second change of one member within one action is unrecorded"
+        );
+        assert_eq!(second.old_controller, PlayerId(1), "the live loser");
+
+        state
+            .control_change_captures
+            .get_mut(&0)
+            .unwrap()
+            .published
+            .clear();
+        state.objects.get_mut(&member).unwrap().incarnation += 1;
+        assert!(
+            instruction_member(&state, &boundary, member)
+                .unwrap()
+                .observation
+                .is_none(),
+            "a different incarnation is a different object (CR 400.7)"
+        );
     }
 
     /// CR 611.2b + CR 122.1c: Shield Broker — "put a shield counter on target

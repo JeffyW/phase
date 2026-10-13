@@ -3588,7 +3588,7 @@ pub(super) fn match_changes_controller(
     if old_controller == new_controller {
         return false;
     }
-    let Some(observation) = evidence.observation() else {
+    let Some(observation) = state.control_change_observation(*evidence) else {
         return false;
     };
     let subject = &observation.subject;

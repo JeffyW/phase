@@ -249,10 +249,10 @@ pub fn resolve(
     // exchanging control with a cast Khârn the Betrayer), and for a producer
     // that functions from the stack.
     if let Some(member) = member_a {
-        super::gain_control::publish_controller_changed(events, member, controller_b);
+        super::gain_control::publish_controller_changed(state, events, member, controller_b);
     }
     if let Some(member) = member_b {
-        super::gain_control::publish_controller_changed(events, member, controller_a);
+        super::gain_control::publish_controller_changed(state, events, member, controller_a);
     }
 
     events.push(GameEvent::EffectResolved {

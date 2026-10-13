@@ -13709,6 +13709,70 @@ mod tests {
                  white Soldier creature tokens with lifelink.\nAt the beginning of your end \
                  step, each player gains control of all creatures they own.",
             ),
+            (
+                "Alicia Masters, Skilled Sculptor",
+                "Creature",
+                "At the beginning of combat on your turn, if you've cast a noncreature spell \
+                 this turn, create a Treasure token.\nSense the Good \u{2014} At the beginning \
+                 of your end step, each player gains control of all creatures they own.",
+            ),
+            (
+                "Aminatou, the Fateshifter",
+                "Planeswalker",
+                "+1: Draw a card, then put a card from your hand on top of your library.\n\
+                 \u{2212}1: Exile another target permanent you own, then return it to the \
+                 battlefield under your control.\n\u{2212}6: Choose left or right. Each player \
+                 gains control of all nonland permanents other than Aminatou controlled by the \
+                 next player in the chosen direction.\nAminatou, the Fateshifter can be your \
+                 commander.",
+            ),
+            (
+                "Herald of Leshrac",
+                "Creature",
+                "Flying\nCumulative upkeep\u{2014}Gain control of a land you don't control. (At \
+                 the beginning of your upkeep, put an age counter on this permanent, then \
+                 sacrifice it unless you pay its upkeep cost for each age counter on it.)\nThis \
+                 creature gets +1/+1 for each land you control but don't own.\nWhen this \
+                 creature leaves the battlefield, each player gains control of each land they \
+                 own that you control.",
+            ),
+            (
+                "Scrambleverse",
+                "Sorcery",
+                "For each nonland permanent, choose a player at random. Then each player gains \
+                 control of each permanent for which they were chosen. Untap those permanents.",
+            ),
+            (
+                "Inniaz, the Gale Force",
+                "Creature",
+                "Flying\n{2}{W/U}: Attacking creatures with flying get +1/+1 until end of turn. \
+                 ({W/U} can be paid with either {W} or {U}.)\nWhenever three or more creatures \
+                 you control with flying attack, each player gains control of a nonland \
+                 permanent of your choice controlled by the player to their right.",
+            ),
+            (
+                "Dack Fayden, Helping Hand",
+                "Creature",
+                "When Dack Fayden enters, reveal cards from the top of your library until you \
+                 reveal X creature cards, where X is the number of opponents you have. Put \
+                 those creature cards onto the battlefield, then shuffle. They're goaded for \
+                 the rest of the game. For each of those permanents, choose a different \
+                 opponent. Each opponent gains control of the permanent for which they were \
+                 chosen.",
+            ),
+            (
+                "Seize the Spotlight",
+                "Sorcery",
+                "Each opponent chooses fame or fortune. For each player who chose fame, gain \
+                 control of a creature that player controls until end of turn. Untap those \
+                 creatures and they gain haste until end of turn. For each player who chose \
+                 fortune, you draw a card and create a Treasure token.",
+            ),
+            (
+                "Optional Homeward (synthetic, the probe fixture)",
+                "Instant",
+                "Each player may gain control of all nontoken permanents they own.",
+            ),
         ] {
             let parsed =
                 crate::parser::parse_oracle_text(text, name, &[], &[types.to_string()], &[]);
@@ -13721,7 +13785,33 @@ mod tests {
                     scoped_nodes(execute, &mut scoped);
                 }
             }
-            assert!(!scoped.is_empty(), "REACH: {name} parses a scoped clause");
+            let serialized = serde_json::to_string(&(&parsed.abilities, &parsed.triggers))
+                .expect("the parse serializes");
+            assert!(
+                serialized.contains("\"player_scope\"") && serialized.contains("Control"),
+                "REACH: {name} parses a scoped control-change clause"
+            );
+            let mut missing = Vec::new();
+            super::check_abilities(
+                &parsed.abilities,
+                &super::build_trigger_registry(),
+                &super::build_static_registry(),
+                super::TokenStaticTraversal::Include,
+                &mut missing,
+            );
+            super::check_triggers(
+                &parsed.triggers,
+                &super::build_trigger_registry(),
+                &super::build_static_registry(),
+                super::TokenStaticTraversal::Include,
+                &mut missing,
+            );
+            assert!(
+                !missing
+                    .iter()
+                    .any(|label| label == super::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP),
+                "{name}: the production coverage walk doesn't mark it: {missing:?}"
+            );
             for def in scoped {
                 let resolved = crate::game::ability_utils::build_resolved_from_def(
                     &def,

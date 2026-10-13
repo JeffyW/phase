@@ -7599,7 +7599,13 @@ fn stamp_fan_out_head_capture(
     let capture = gain_control::capture_control_change_instruction(state, population);
     let id = state.next_control_change_capture_id;
     state.next_control_change_capture_id += 1;
-    state.control_change_captures.insert(id, capture);
+    state.control_change_captures.insert(
+        id,
+        crate::types::events::ControlChangeLink {
+            capture,
+            published: Default::default(),
+        },
+    );
     template.control_change_instruction =
         Some(crate::types::events::ControlChangeInstructionCarrier::Captured(id));
     Some(id)

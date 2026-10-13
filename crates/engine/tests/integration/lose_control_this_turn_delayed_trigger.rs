@@ -355,7 +355,7 @@ fn gain_to_you_does_not_fire_only_loss() {
         object_id: sword,
         old_controller: P1,
         new_controller: P0,
-        evidence: runner.state().control_change_evidence_for_test(sword),
+        evidence: runner.state_mut().control_change_evidence_for_test(sword),
     };
     let mut events = vec![gain];
     let out = check_delayed_triggers(runner.state_mut(), &events);
@@ -390,7 +390,7 @@ fn gain_to_you_does_not_fire_only_loss() {
         object_id: sword,
         old_controller: P0,
         new_controller: P1,
-        evidence: runner.state().control_change_evidence_for_test(sword),
+        evidence: runner.state_mut().control_change_evidence_for_test(sword),
     };
     let _ = check_delayed_triggers(runner.state_mut(), &[loss]);
     assert_eq!(

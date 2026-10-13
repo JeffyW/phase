@@ -5744,8 +5744,10 @@ fn collect_pending_triggers_with_collection(
         // triggers exactly as it would have then. `Unrecorded` evidence (a
         // legacy payload) latches no watcher, so nothing is collected.
         if let GameEvent::ControllerChanged { evidence, .. } = event {
-            if let Some(observation) = evidence.observation() {
-                let watchers = observation.watchers.clone();
+            if let Some(watchers) = state
+                .control_change_observation(*evidence)
+                .map(|observation| observation.watchers.clone())
+            {
                 for source_context in watchers.iter() {
                     let source_id = source_context.identity.reference.object_id;
                     let matched_triggers = collect_matching_triggers_from_context(

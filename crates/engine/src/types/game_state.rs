@@ -23183,11 +23183,24 @@ declare_game_state! {
     /// cleared at the next turn (no resolution spans a turn boundary).
     /// Serialized so authoritative save/restore resumes a paused fan-out.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub control_change_captures:
-        BTreeMap<u64, std::sync::Arc<crate::types::events::ControlChangeInstructionCapture>>,
+    pub control_change_captures: BTreeMap<u64, crate::types::events::ControlChangeLink>,
     /// The next `control_change_captures` key.
     #[serde(default)]
     pub next_control_change_capture_id: u64,
+    /// CR 603.10d: every published control change's immediately-before
+    /// observation, keyed by the id its `ControllerChanged` event carries
+    /// (`ControlChangeEvidence::Observed`). Held here, not in the event, so no
+    /// viewer copy of any event carrier can expose it: `filter_state_for_viewer`
+    /// drops this table. Matching reads it as events are collected; once each
+    /// action finishes, only entries a retained trigger-event carrier still
+    /// names are kept (`release_unreferenced_control_change_observations`). An
+    /// id with no entry authorizes nothing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub control_change_observations:
+        BTreeMap<u64, crate::types::events::ControlChangeObservation>,
+    /// The next `control_change_observations` key.
+    #[serde(default)]
+    pub next_control_change_observation_id: u64,
 
     /// CR 400.7 + CR 608.2c: Number of cards exiled from a hand by the most recent
     /// `Effect::ChangeZoneAll` resolution. Read by `QuantityRef::ExiledFromHandThisResolution`
@@ -27787,6 +27800,59 @@ impl GameState {
             .map(|subject| subject.snapshot)
     }
 
+    /// CR 603.10d: the observation a `ControllerChanged`'s evidence names, when
+    /// it was recorded and is still held. `Unrecorded`, or an id with no entry,
+    /// authorizes nothing.
+    pub fn control_change_observation(
+        &self,
+        evidence: crate::types::events::ControlChangeEvidence,
+    ) -> Option<&crate::types::events::ControlChangeObservation> {
+        match evidence {
+            crate::types::events::ControlChangeEvidence::Unrecorded => None,
+            crate::types::events::ControlChangeEvidence::Observed(id) => {
+                self.control_change_observations.get(&id)
+            }
+        }
+    }
+
+    /// CR 603.10d: release every control-change observation no retained
+    /// trigger-event carrier still names. An observation is read only while its
+    /// event is collected, which happens during the action that published it or
+    /// from a carrier that holds the event for later collection
+    /// (`for_each_trigger_event_carrier_mut`, the same authority loop
+    /// normalization uses). Run once each action finishes, so the table holds
+    /// only what can still be matched.
+    pub(crate) fn release_unreferenced_control_change_observations(&mut self) {
+        if self.control_change_observations.is_empty() {
+            return;
+        }
+        let mut referenced = BTreeSet::new();
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let GameEvent::ControllerChanged {
+                evidence: crate::types::events::ControlChangeEvidence::Observed(id),
+                ..
+            } = event
+            {
+                referenced.insert(*id);
+            }
+        });
+        self.control_change_observations
+            .retain(|id, _| referenced.contains(id));
+    }
+
+    /// Records one published control change's observation and returns the
+    /// evidence its event carries. Written only by
+    /// `gain_control::publish_controller_changed`.
+    pub(crate) fn record_control_change_observation(
+        &mut self,
+        observation: crate::types::events::ControlChangeObservation,
+    ) -> crate::types::events::ControlChangeEvidence {
+        let id = self.next_control_change_observation_id;
+        self.next_control_change_observation_id += 1;
+        self.control_change_observations.insert(id, observation);
+        crate::types::events::ControlChangeEvidence::Observed(id)
+    }
+
     /// Test support: the evidence a control-change instruction affecting only
     /// `object_id` would capture on this board, for a hand-built
     /// `ControllerChanged`. Production evidence is written only by
@@ -27794,17 +27860,18 @@ impl GameState {
     /// boundary; this is never reachable from a production build.
     #[cfg(any(test, feature = "test-support"))]
     pub fn control_change_evidence_for_test(
-        &self,
+        &mut self,
         object_id: ObjectId,
     ) -> crate::types::events::ControlChangeEvidence {
-        crate::game::effects::gain_control::capture_control_change_instruction(self, [object_id])
-            .observation_for(object_id)
-            .map_or(
-                crate::types::events::ControlChangeEvidence::Unrecorded,
-                |observation| {
-                    crate::types::events::ControlChangeEvidence::Observed(Box::new(observation))
-                },
-            )
+        match crate::game::effects::gain_control::capture_control_change_instruction(
+            self,
+            [object_id],
+        )
+        .observation_for(object_id)
+        {
+            Some(observation) => self.record_control_change_observation(observation),
+            None => crate::types::events::ControlChangeEvidence::Unrecorded,
+        }
     }
 
     /// Clears the event-filtering sidecar at the next outer action boundary.
@@ -29472,6 +29539,8 @@ impl GameState {
             clause_minimum_snapshot: None,
             control_change_captures: BTreeMap::new(),
             next_control_change_capture_id: 0,
+            control_change_observations: BTreeMap::new(),
+            next_control_change_observation_id: 0,
             exiled_from_hand_this_resolution: 0,
             monarch: None,
             city_blessing: HashSet::new(),
@@ -30996,6 +31065,41 @@ impl GameState {
     pub(crate) fn canonicalize_loop_identities(&mut self) {
         self.canonicalize_spell_announcements_for_loop();
         self.canonicalize_lki_incarnations_for_loop();
+        self.canonicalize_control_change_evidence_for_loop();
+    }
+
+    /// See `normalize_for_loop`. Control-change observation ids are a monotone
+    /// key into `control_change_observations`, history read only while the
+    /// events are collected: rank them across the trigger-event carriers and
+    /// drop the table, so two positions minted at different times compare
+    /// equal.
+    fn canonicalize_control_change_evidence_for_loop(&mut self) {
+        let mut present: Vec<u64> = Vec::new();
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let GameEvent::ControllerChanged {
+                evidence: crate::types::events::ControlChangeEvidence::Observed(id),
+                ..
+            } = event
+            {
+                present.push(*id);
+            }
+        });
+        present.sort_unstable();
+        present.dedup();
+        self.for_each_trigger_event_carrier_mut(&mut |event| {
+            if let GameEvent::ControllerChanged {
+                evidence: crate::types::events::ControlChangeEvidence::Observed(id),
+                ..
+            } = event
+            {
+                let rank = present
+                    .binary_search(id)
+                    .expect("every id was collected above");
+                *id = rank as u64 + 1;
+            }
+        });
+        self.control_change_observations.clear();
+        self.next_control_change_observation_id = 0;
     }
 
     /// See `normalize_for_loop`. Per object, rank-based over the retained
@@ -31005,57 +31109,6 @@ impl GameState {
     /// compare equal while which incarnation each event names — and its
     /// snapshot — is preserved.
     fn canonicalize_lki_incarnations_for_loop(&mut self) {
-        /// Every incarnation an event names, including the ones inside a
-        /// `ControllerChanged`'s observation: the subject snapshot's exact
-        /// identity and its incarnation-bearing relations, and each latched
-        /// watcher's identity and attachments. A watcher's other relations
-        /// (`linked_exile_snapshot`, pairing, saddling) are frozen ids with no
-        /// incarnation, so they need no renumbering.
-        fn visit_named_incarnations(event: &mut GameEvent, f: &mut impl FnMut(ObjectId, &mut u64)) {
-            if let GameEvent::ControllerChanged {
-                evidence: crate::types::events::ControlChangeEvidence::Observed(observation),
-                ..
-            } = event
-            {
-                let observation = &mut **observation;
-                let subject = &mut observation.subject;
-                let mut visit = |reference: &mut ObjectIncarnationRef| {
-                    f(reference.object_id, &mut reference.incarnation)
-                };
-                visit(&mut subject.identity);
-                subject
-                    .attachments
-                    .iter_mut()
-                    .for_each(|attachment| visit(&mut attachment.identity));
-                subject
-                    .combat
-                    .related_objects
-                    .iter_mut()
-                    .for_each(&mut visit);
-                subject
-                    .relations
-                    .saddled_sources
-                    .iter_mut()
-                    .for_each(&mut visit);
-                subject
-                    .relations
-                    .convoked_sources
-                    .iter_mut()
-                    .for_each(&mut visit);
-                for watcher in std::sync::Arc::make_mut(&mut observation.watchers) {
-                    visit(&mut watcher.identity.reference);
-                    watcher
-                        .attachments
-                        .iter_mut()
-                        .filter_map(|attachment| attachment.identity.as_mut())
-                        .for_each(&mut visit);
-                }
-                return;
-            }
-            if let Some((object_id, incarnation)) = named_incarnation(event) {
-                f(object_id, incarnation);
-            }
-        }
         fn named_incarnation(event: &mut GameEvent) -> Option<(ObjectId, &mut u64)> {
             match event {
                 GameEvent::ZoneChanged {
@@ -31128,8 +31181,6 @@ impl GameState {
                 | GameEvent::ObjectConjured { .. }
                 | GameEvent::CreatureDestroyed { .. }
                 | GameEvent::PermanentSacrificed { .. }
-                // Its observation's incarnations are visited by
-                // `visit_named_incarnations` before this is consulted.
                 | GameEvent::ControllerChanged { .. }
                 | GameEvent::EffectResolved { .. }
                 | GameEvent::Unattached { .. }
@@ -31229,9 +31280,9 @@ impl GameState {
                 .extend(history.keys().copied());
         }
         self.for_each_trigger_event_carrier_mut(&mut |event| {
-            visit_named_incarnations(event, &mut |object_id, incarnation| {
+            if let Some((object_id, incarnation)) = named_incarnation(event) {
                 present.entry(object_id).or_default().push(*incarnation);
-            });
+            }
         });
         for incarnations in present.values_mut() {
             incarnations.sort_unstable();
@@ -31265,9 +31316,9 @@ impl GameState {
                 })
                 .collect();
         self.for_each_trigger_event_carrier_mut(&mut |event| {
-            visit_named_incarnations(event, &mut |object_id, incarnation| {
+            if let Some((object_id, incarnation)) = named_incarnation(event) {
                 *incarnation = canonical(object_id, *incarnation);
-            });
+            }
         });
     }
 
@@ -32554,6 +32605,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         clause_minimum_snapshot: _,
         control_change_captures: _,
         next_control_change_capture_id: _,
+        control_change_observations: _,
+        next_control_change_observation_id: _,
         exiled_from_hand_this_resolution: _,
         monarch: _,
         city_blessing: _,
@@ -40603,11 +40656,11 @@ mod tests {
     /// are history rather than a change to the recurring game state. A snapshot
     /// still named by a trigger event remains rules-material and must distinguish
     /// normalized states.
-    /// CR 732.2a + CR 603.10d: a `ControllerChanged`'s observation names
-    /// incarnations (its subject and each latched watcher); two positions that
-    /// differ only in those incarnations are the same position.
+    /// CR 732.2a + CR 603.10d: a `ControllerChanged`'s evidence key is minted
+    /// from a monotone counter; two positions that differ only in that key are
+    /// the same position.
     #[test]
-    fn normalize_for_loop_canonicalizes_control_change_evidence_incarnations() {
+    fn normalize_for_loop_canonicalizes_control_change_evidence_keys() {
         let mut state = GameState::new_two_player(7);
         let subject = crate::game::zones::create_object(
             &mut state,
@@ -40617,9 +40670,11 @@ mod tests {
             Zone::Battlefield,
         );
         let evidence = state.control_change_evidence_for_test(subject);
+        // The same observation, minted later under another key.
+        let later = state.control_change_evidence_for_test(subject);
         assert!(
-            !evidence.is_unrecorded(),
-            "REACH: the subject's evidence is observed"
+            !evidence.is_unrecorded() && evidence != later,
+            "REACH: two observed keys"
         );
         let event =
             |evidence: crate::types::events::ControlChangeEvidence| GameEvent::ControllerChanged {
@@ -40656,17 +40711,13 @@ mod tests {
             });
             position
         };
-        let a = with_trigger_event(event(evidence.clone()));
-        let mut shifted = evidence;
-        if let crate::types::events::ControlChangeEvidence::Observed(observation) = &mut shifted {
-            observation.subject.identity.incarnation += 5;
-        }
-        let b = with_trigger_event(event(shifted));
+        let a = with_trigger_event(event(evidence));
+        let b = with_trigger_event(event(later));
         assert_ne!(a, b, "REACH: the positions differ in the evidence alone");
         assert_eq!(
             a.normalize_for_loop(),
             b.normalize_for_loop(),
-            "a minted incarnation inside the evidence is not position"
+            "a minted evidence key is not position"
         );
     }
 

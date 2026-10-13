@@ -61,9 +61,10 @@ pub struct TournamentRequestId(pub u64);
 /// can be refused. See 24.
 ///
 /// 141 — CR 603.10d control-change evidence: `GameEvent::ControllerChanged`
-///      gains `evidence` (the immediately-before watcher latch and subject
-///      snapshot look-back control-change triggers read), `ResolvedAbility`
+///      gains `evidence` (the key of the immediately-before watcher latch and
+///      subject snapshot look-back control-change triggers read), `ResolvedAbility`
 ///      gains `control_change_instruction` and `GameState` gains
+///      `control_change_observations` (the observations those events key) and
 ///      `control_change_captures` (a player-scope fan-out's pre-seat capture),
 ///      all serialized inside `GameState`; a v140 peer would drop the evidence
 ///      and resolve those triggers differently. Full-game peers and P2P move in

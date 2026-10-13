@@ -6,6 +6,7 @@
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::{filter_events_for_viewer, filter_state_for_viewer};
 use engine::types::ability::{TargetFilter, TypedFilter};
+use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::events::{ControlChangeEvidence, GameEvent};
 use engine::types::format::FormatConfig;
@@ -1057,11 +1058,14 @@ const DUPLICITY: &str = "When this enchantment enters, exile the top five cards 
 /// Labelled synthetic: a steal that can take a noncreature permanent.
 const STEAL_PERMANENT: &str = "Gain control of target permanent.";
 
-fn duplicity_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+fn duplicity_board(targeted_watcher: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_library_top(P0, &["One", "Two", "Three", "Four", "Five", "Six"]);
     add_zidane(&mut scenario, P0);
+    if targeted_watcher {
+        scenario.add_creature_from_oracle(P0, "Targeted Watcher", 1, 1, TARGETED_WATCHER);
+    }
     let duplicity = scenario
         .add_spell_to_hand_from_oracle(P0, "Duplicity", false, DUPLICITY)
         .as_enchantment()
@@ -1093,7 +1097,7 @@ fn face_down_exiles(runner: &GameRunner) -> Vec<ObjectId> {
 /// into their owner's graveyard; the same steal is a loss Zidane sees (P0 +1).
 #[test]
 fn duplicity_losing_control_puts_its_exiles_into_the_owners_graveyard() {
-    let (mut runner, duplicity, _, steal) = duplicity_board();
+    let (mut runner, duplicity, _, steal) = duplicity_board(false);
     let exiled = face_down_exiles(&runner);
     assert_eq!(
         exiled.len(),
@@ -1120,59 +1124,136 @@ fn duplicity_losing_control_puts_its_exiles_into_the_owners_graveyard() {
     assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
 }
 
-/// CR 400.2 + CR 603.10d: control-change evidence is rules authority. Its
-/// latched watchers include Duplicity, whose context records the face-down
-/// cards it exiled (ids and mana values). The authoritative event keeps that
-/// watcher; no viewer copy (the thief's, the owner's, a spectator's) carries
-/// any observation, in the event stream or in the filtered state.
+/// Labelled synthetic look-back watcher whose trigger targets, so with two
+/// legal players its trigger waits in `WaitingFor::TriggerTargetSelection`,
+/// a prompt that carries the `ControllerChanged` event.
+const TARGETED_WATCHER: &str =
+    "Whenever an opponent gains control of a permanent from you, target player draws a card.";
+
+/// Every `ControllerChanged` evidence value anywhere in a serialized state.
+fn serialized_evidence(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(|t| t.as_str()) == Some("ControllerChanged") {
+                if let Some(evidence) = map.get("data").and_then(|data| data.get("evidence")) {
+                    out.push(evidence.clone());
+                }
+            }
+            map.values()
+                .for_each(|child| serialized_evidence(child, out));
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .for_each(|child| serialized_evidence(child, out)),
+        _ => {}
+    }
+}
+
+/// CR 400.2 + CR 603.10d: control-change observations are rules authority.
+/// They latch Duplicity, whose context records the face-down cards it exiled
+/// (ids and mana values). Events and abilities carry only a key into
+/// `GameState::control_change_observations`, which no viewer copy keeps, so no
+/// carrier (stack entry, pending prompt, live event) can expose an
+/// observation. Projected while the event is held, by the two triggers it fired
+/// waiting in P0's prompt.
 #[test]
 fn control_change_evidence_never_reaches_a_viewer() {
-    let (mut runner, duplicity, bear, steal) = duplicity_board();
+    let (mut runner, duplicity, bear, steal) = duplicity_board(true);
     give_priority(&mut runner, P1);
 
-    let outcome = runner.cast(steal).target_object(bear).resolve();
-    let events = outcome.events().to_vec();
-    let authoritative = events
+    let mut events = Vec::new();
+    runner.cast(steal).target_object(bear).commit();
+    for _ in 0..2 {
+        if let Ok(result) = runner.act(GameAction::PassPriority) {
+            events.extend(result.events);
+        }
+    }
+    // Zidane's and the watcher's triggers fire together for P0, so they wait in
+    // P0's ordering prompt, whose pending contexts carry the event.
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OrderTriggers { .. } | WaitingFor::TriggerTargetSelection { .. }
+        ),
+        "REACH: the triggers wait in a prompt: {:?}",
+        runner.state().waiting_for
+    );
+    let evidence = events
         .iter()
         .find_map(|event| match event {
             GameEvent::ControllerChanged {
                 object_id,
-                evidence: ControlChangeEvidence::Observed(observation),
+                evidence,
                 ..
-            } if *object_id == bear => Some(observation.clone()),
+            } if *object_id == bear => Some(*evidence),
             _ => None,
         })
-        .expect("REACH: the steal published observed evidence");
+        .expect("REACH: the steal published its control change");
+    let authoritative = runner
+        .state()
+        .control_change_observation(evidence)
+        .expect("REACH: the authoritative state holds the observation");
     assert!(
         authoritative
             .watchers
             .iter()
             .any(|watcher| watcher.identity.reference.object_id == duplicity
                 && !watcher.linked_exile_snapshot.is_empty()),
-        "REACH: the authoritative evidence latched Duplicity with its exiles"
+        "REACH: the authoritative observation latched Duplicity with its exiles"
     );
-    runner.advance_until_stack_empty();
-    assert_eq!(treasures(&runner, P0), 1, "REACH: Zidane fired from it");
+    let held = {
+        let mut held = Vec::new();
+        serialized_evidence(&serde_json::to_value(runner.state()).unwrap(), &mut held);
+        held
+    };
+    assert!(
+        !held.is_empty(),
+        "REACH: the authoritative state holds the event (a carrier) when projected"
+    );
 
     for viewer in [P0, P1, PlayerId(9)] {
         for event in filter_events_for_viewer(&events, runner.state(), viewer) {
             if let GameEvent::ControllerChanged { evidence, .. } = event {
-                assert_eq!(
-                    evidence,
-                    ControlChangeEvidence::Unrecorded,
-                    "viewer {viewer:?}: the event stream drops the observation"
+                assert!(
+                    runner
+                        .state()
+                        .control_change_observation(evidence)
+                        .is_some()
+                        || evidence == ControlChangeEvidence::Unrecorded,
+                    "viewer {viewer:?}: the streamed event carries a key, not an observation"
                 );
             }
         }
-        let view = serde_json::to_string(&filter_state_for_viewer(runner.state(), viewer))
-            .expect("projection serializes");
+        let view = filter_state_for_viewer(runner.state(), viewer);
         assert!(
-            !view.contains("\"Observed\"") && !view.contains("control_change_captures"),
-            "viewer {viewer:?}: the filtered state carries no control-change evidence"
+            view.control_change_observations.is_empty() && view.control_change_captures.is_empty(),
+            "viewer {viewer:?}: the projection keeps no observation or capture"
+        );
+        let mut projected = Vec::new();
+        serialized_evidence(&serde_json::to_value(&view).unwrap(), &mut projected);
+        // The triggers' controller keeps every carrier of the event; an
+        // opponent's or spectator's copy may also drop pending trigger events.
+        if viewer == P0 {
+            assert_eq!(
+                projected.len(),
+                held.len(),
+                "REACH: the controller's projection kept every carrier of the event"
+            );
+        }
+        for value in projected {
+            assert!(
+                value
+                    .as_object()
+                    .is_some_and(|map| map.get("Observed").is_some_and(serde_json::Value::is_u64)),
+                "viewer {viewer:?}: a projected event's evidence is a bare key: {value}"
+            );
+        }
+        assert!(
+            view.control_change_observation(evidence).is_none(),
+            "viewer {viewer:?}: the key resolves to nothing in the projection"
         );
     }
 }
-
 /// Saved games from before control-change evidence carry `ControllerChanged`
 /// with no `evidence` field. It decodes to `Unrecorded` (never rebuilt from the
 /// current board). A trigger that had already fired from such an event still
@@ -1243,4 +1324,247 @@ fn strip_controller_changed_evidence(
         }
         _ => {}
     }
+}
+
+/// Labelled synthetic, castable at instant speed: Homeward Path's action made
+/// optional for each player, so each seat pauses on its own choice.
+const OPTIONAL_HOMEWARD_INSTANT: &str =
+    "Each player may gain control of all nontoken permanents they own.";
+
+fn cast_and_pass(runner: &mut GameRunner, spell: ObjectId) {
+    runner.cast(spell).commit();
+    // Every player passes once, so the spell starts resolving.
+    for _ in 0..runner.state().players.len() {
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+            && !runner.state().stack.is_empty()
+        {
+            let _ = runner.act(GameAction::PassPriority);
+        }
+    }
+}
+
+fn answer_optional(runner: &mut GameRunner) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ),
+        "REACH: a seat is choosing: {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("the seat accepts");
+}
+
+/// R3-2: a paused fan-out's capture survives authoritative save/restore. After
+/// Switcheroo (Zidane to P1, P1's bear to P0), P1 is active, so P1's seat
+/// returns the bear first (P1's Zidane, latched before the first seat, isn't
+/// "you" for P0's loss: nothing), and the game is saved while P0's seat is
+/// choosing. The parked seat carries `Captured(id)`; the table holds the
+/// pre-seat watcher (Zidane under P1) and subject (Zidane under P1). Restored
+/// and resumed, P0's seat returns Zidane from P1: P1 +1, exactly (1, 1).
+/// `drop_capture` removes the table entry from the save: the carried id then
+/// authorizes nothing (a damaged save fails closed, never recaptures), and
+/// that exact count changes to (1, 0).
+#[test]
+fn a_paused_fan_out_capture_survives_save_and_restore() {
+    for drop_capture in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P0);
+        let bear = scenario.add_vanilla(P1, 2, 2);
+        let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
+        let returns = scenario
+            .add_spell_to_hand_from_oracle(P0, "Optional Homeward", true, OPTIONAL_HOMEWARD_INSTANT)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        runner
+            .cast(switcheroo)
+            .target_objects(&[zidane, bear])
+            .resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
+
+        {
+            let state = runner.state_mut();
+            state.active_player = P1;
+            state.priority_player = P0;
+            state.waiting_for = WaitingFor::Priority { player: P0 };
+        }
+        cast_and_pass(&mut runner, returns);
+        answer_optional(&mut runner); // P1's seat (active player first)
+        assert_eq!(
+            controller(&runner, bear),
+            P1,
+            "REACH: P1's seat returned the bear"
+        );
+        assert_eq!(
+            controller(&runner, zidane),
+            P1,
+            "REACH: Zidane not yet returned"
+        );
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { .. }
+            ),
+            "REACH: paused on P0's seat"
+        );
+
+        let (&id, link) = runner
+            .state()
+            .control_change_captures
+            .iter()
+            .next()
+            .expect("REACH: the paused link holds its capture");
+        assert!(
+            link.capture
+                .watchers
+                .iter()
+                .any(|watcher| watcher.identity.reference.object_id == zidane
+                    && watcher.lki.controller == P1),
+            "the capture latched Zidane under P1, before the first seat"
+        );
+        assert!(
+            link.capture
+                .subjects
+                .iter()
+                .any(|subject| subject.identity.object_id == zidane && subject.controller == P1),
+            "the capture snapshotted Zidane under P1"
+        );
+
+        runner.state_mut().capture_rng_word_pos();
+        let mut saved = serde_json::to_value(runner.state()).expect("state serializes");
+        let text = saved.to_string();
+        assert!(
+            text.contains(&format!(
+                "\"control_change_instruction\":{{\"Captured\":{id}}}"
+            )),
+            "the parked seat carries Captured({id}) in the save"
+        );
+        if drop_capture {
+            saved["control_change_captures"]
+                .as_object_mut()
+                .expect("the save holds the capture table")
+                .remove(&id.to_string())
+                .expect("the entry is saved under its id");
+        }
+        let mut restored: engine::types::game_state::GameState =
+            serde_json::from_value(saved).expect("the saved state restores");
+        restored.rehydrate_rng();
+        if !drop_capture {
+            assert_eq!(
+                restored.control_change_captures,
+                runner.state().control_change_captures,
+                "the capture round-trips exactly"
+            );
+        }
+        *runner.state_mut() = restored;
+
+        answer_optional(&mut runner); // P0's seat, resumed from the restore
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, zidane),
+            P0,
+            "REACH: P0's seat returned Zidane"
+        );
+        let expected = if drop_capture { (1, 0) } else { (1, 1) };
+        assert_eq!(
+            (treasures(&runner, P0), treasures(&runner, P1)),
+            expected,
+            "drop_capture {drop_capture}"
+        );
+    }
+}
+
+/// Labelled synthetic: steal any permanent, for the probe setups below.
+const STEAL_ANY_PERMANENT: &str = "Gain control of target permanent.";
+
+/// The gate's `Head` probe pair (CR 608.2e + CR 603.10 + CR 603.10d + CR
+/// 603.2c). Three players, P0 active. P1 owns and controls Zidane; P0 owns
+/// Control Magic, which P1 has taken; P1 has also taken a creature P2 owns.
+/// "Each player may gain control of all nontoken permanents they own", every
+/// seat accepting: in one simultaneous action P1 loses the Aura to P0 and the
+/// creature to P2, so P1 gets exactly 2 Treasures, although the engine
+/// applies P0's seat (the Aura) before P2's (the creature).
+///
+/// The gate's hostile variant (Control Magic enchanting P2's creature, so P1
+/// controls the creature only through the stolen Aura) isn't reachable here:
+/// once P1 takes the Aura, the engine still gives the enchanted creature to
+/// the Aura's owner, P0, not to its new controller. That looks like a
+/// pre-existing layer-2 dependency defect (CR 613.8a: the static depends on the
+/// Aura's own control change), reported separately. The rule the hostile
+/// variant targets (a later seat's member whose live controller moved only as
+/// a consequence of an earlier seat keeps its captured observation) is pinned
+/// directly in `gain_control`'s unit tests.
+#[test]
+fn head_capture_two_losses_in_one_scoped_action() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P1);
+    let p2_creature = scenario.add_vanilla(P2, 2, 2);
+    let p1_creature = scenario.add_vanilla(P1, 1, 1);
+    let magic = add_control_magic(&mut scenario, P0);
+    let steal_aura = add_free_spell(&mut scenario, P1, "Steal Permanent", STEAL_ANY_PERMANENT);
+    let steal_creature = add_free_spell(&mut scenario, P1, "Steal Permanent", STEAL_ANY_PERMANENT);
+    let returns = scenario
+        .add_spell_to_hand_from_oracle(P0, "Optional Homeward", true, OPTIONAL_HOMEWARD_INSTANT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    make_enchantment_aura(&mut runner, magic);
+
+    give_priority(&mut runner, P0);
+    runner.cast(magic).target_object(p1_creature).resolve();
+    runner.advance_until_stack_empty();
+    give_priority(&mut runner, P1);
+    runner.cast(steal_aura).target_object(magic).resolve();
+    runner.advance_until_stack_empty();
+    runner
+        .cast(steal_creature)
+        .target_object(p2_creature)
+        .resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, magic),
+        P1,
+        "REACH: P1 controls the Aura"
+    );
+    assert_eq!(
+        controller(&runner, p2_creature),
+        P1,
+        "REACH: P1 controls P2's creature"
+    );
+    assert_eq!(controller(&runner, zidane), P1, "REACH: P1 controls Zidane");
+    let p1_before = treasures(&runner, P1);
+
+    give_priority(&mut runner, P0);
+    cast_and_pass(&mut runner, returns);
+    for _ in 0..3 {
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ) {
+            answer_optional(&mut runner);
+        }
+    }
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, magic),
+        P0,
+        "REACH: the Aura went home to P0"
+    );
+    assert_eq!(
+        controller(&runner, p2_creature),
+        P2,
+        "REACH: P2's creature went home to P2"
+    );
+    assert_eq!(
+        treasures(&runner, P1) - p1_before,
+        2,
+        "P1 lost the Aura and the creature in one action"
+    );
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P2)), (0, 0));
 }

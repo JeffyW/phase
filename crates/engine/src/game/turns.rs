@@ -2821,7 +2821,7 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
         .collect();
     let control_revert_boundary = (!control_reverting.is_empty()).then(|| {
         super::layers::flush_layers(state);
-        super::effects::gain_control::InstructionBoundary::Captured(
+        super::effects::gain_control::InstructionBoundary::Own(
             super::effects::gain_control::capture_control_change_instruction(
                 state,
                 control_reverting.iter().copied(),
@@ -2863,6 +2863,7 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
                 continue;
             };
             super::effects::gain_control::publish_controller_changed(
+                state,
                 events,
                 member,
                 new_controller,

@@ -212,7 +212,8 @@ export class NativeEngineVersionMismatchError extends Error {
  *
  * 141 — CR 603.10d control-change evidence: ControllerChanged gains evidence,
  *      ResolvedAbility gains control_change_instruction and GameState gains
- *      control_change_captures — see PROTOCOL_VERSION's own `/// 141` entry in
+ *      control_change_observations and control_change_captures — see
+ *      PROTOCOL_VERSION's own `/// 141` entry in
  *      crates/lobby-broker/src/protocol.rs. Look-back control-change triggers
  *      read them, so a v140 peer resolves them differently. Wire 123 moves with it.
  * 140 — AttackSubject gains EventAttackers (the players a trigger's attack

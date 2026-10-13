@@ -76,7 +76,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `FilterProp::CrewedThisTurn`).
 // v140 adds `AttackSubject::EventAttackers` (the attacked players of a trigger's attack
 // event) to ability player scopes in GameState.
-// v141 adds the CR 603.10d control-change evidence (`ControllerChanged.evidence`, the fan-out carrier and capture table).
+// v141 adds the CR 603.10d control-change evidence (`ControllerChanged.evidence` and its observation table, the fan-out carrier and capture table).
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.

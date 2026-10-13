@@ -108,7 +108,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * Bumps to date:
  *  123 — game_setup and state_update carry GameState whose ControllerChanged
  *       events may carry evidence, whose resolving abilities may carry
- *       control_change_instruction, and which may carry control_change_captures
+ *       control_change_instruction, and which may carry
+ *       control_change_observations and control_change_captures
  *       (CR 603.10d control-change evidence). Bumped in lockstep with full-game
  *       protocol 141.
  *  122 — game_setup and state_update carry GameState whose ability player scopes

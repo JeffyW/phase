@@ -1466,12 +1466,15 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     // value can encode hidden-zone information (for example, hand sizes), so it
     // belongs with the private discard cursor rather than any viewer payload.
     filtered.clause_minimum_snapshot = None;
-    // CR 603.10d + CR 400.2: control-change evidence is rules authority, not a
-    // viewer payload. Its latched watcher contexts and subject snapshots can
-    // carry hidden information (a face-down card exiled with Gustha's
-    // Scepter or Duplicity: its id and mana value), so every viewer copy drops
-    // the fan-out capture table and every event's observation, whoever owns it.
-    redact_control_change_evidence(&mut filtered);
+    // CR 603.10d + CR 400.2: control-change observations are rules authority,
+    // not a viewer payload. Their latched watcher contexts and subject
+    // snapshots can describe hidden cards (a face-down card exiled with
+    // Duplicity or Gustha's Scepter: its id and mana value). Every event and
+    // ability carries only a key into these two tables, so dropping the tables
+    // is the whole projection, whatever carrier (prompt, pending trigger,
+    // stack entry, continuation) holds a key.
+    filtered.control_change_observations.clear();
+    filtered.control_change_captures.clear();
     // Deferred life-cost owners can embed a complete PendingCast, including
     // hidden card and target context. The projected WaitingFor is the only
     // viewer-facing interaction surface.
@@ -3160,11 +3163,6 @@ pub fn filter_events_for_viewer(
                 redact_hidden_library_event(&mut event, &hidden_library);
                 event
             }
-            GameEvent::ControllerChanged { .. } => {
-                let mut event = event.clone();
-                redact_control_change_event(&mut event);
-                event
-            }
             other => other.clone(),
         })
         .collect()
@@ -3738,41 +3736,6 @@ fn redact_pending_trigger_context_for_observer(
 ) {
     redact_pending_trigger_for_observer(&mut ctx.pending);
     ctx.trigger_events.clear();
-}
-
-/// CR 603.10d + CR 400.2: a viewer copy of a `ControllerChanged` keeps the
-/// public change and drops its rules-only evidence.
-fn redact_control_change_event(event: &mut GameEvent) {
-    if let GameEvent::ControllerChanged { evidence, .. } = event {
-        *evidence = crate::types::events::ControlChangeEvidence::Unrecorded;
-    }
-}
-
-/// See the call in `filter_state_for_viewer`. The trigger-event carriers are
-/// enumerated by the same authority loop normalization uses
-/// (`for_each_trigger_event_carrier_mut`), plus the viewer-retained carriers it
-/// doesn't visit.
-fn redact_control_change_evidence(filtered: &mut GameState) {
-    filtered.control_change_captures.clear();
-    filtered.for_each_trigger_event_carrier_mut(&mut redact_control_change_event);
-    for event in filtered.pending_attack_trigger_events.iter_mut().chain(
-        filtered
-            .consumed_before_priority_trigger_events
-            .iter_mut()
-            .map(|occurrence| &mut occurrence.event),
-    ) {
-        redact_control_change_event(event);
-    }
-    if let WaitingFor::TriggerTargetSelection {
-        trigger_event,
-        trigger_events,
-        ..
-    } = &mut filtered.waiting_for
-    {
-        for event in trigger_event.iter_mut().chain(trigger_events.iter_mut()) {
-            redact_control_change_event(event);
-        }
-    }
 }
 
 /// CR 400.2 + CR 401.2: an `EffectResolved` subject snapshot pairs a hidden

@@ -472,23 +472,24 @@ pub struct EventObjectSnapshot {
 /// saved before this field existed, or any event built without an instruction
 /// capture, is `Unrecorded`, and `Unrecorded` never authorizes a look-back
 /// control-change trigger. It is never reconstructed from current state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Observed` holds only the key of its observation in
+/// `GameState::control_change_observations`. The observation itself (latched
+/// watcher contexts, an exact subject snapshot) can describe hidden cards (a
+/// face-down card exiled with Duplicity), and events are cloned into many
+/// carriers: prompts, pending triggers, logs, the live stream. Keeping it out of
+/// the event means no carrier can expose it; viewer projections drop the one
+/// table instead (CR 400.2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlChangeEvidence {
     #[default]
     Unrecorded,
-    Observed(Box<ControlChangeObservation>),
+    Observed(u64),
 }
 
 impl ControlChangeEvidence {
     pub fn is_unrecorded(&self) -> bool {
         matches!(self, Self::Unrecorded)
-    }
-
-    pub fn observation(&self) -> Option<&ControlChangeObservation> {
-        match self {
-            Self::Unrecorded => None,
-            Self::Observed(observation) => Some(observation),
-        }
     }
 }
 
@@ -545,6 +546,24 @@ pub enum ControlChangeInstructionCarrier {
     /// `Unrecorded` evidence: no observation is substituted. Coverage marks
     /// every such producer unsupported (`PLAYER_SCOPE_CONTROL_BOUNDARY_GAP`).
     Unobservable,
+}
+
+/// A player-scope link's pre-seat capture (`GameState::control_change_captures`)
+/// and the members it has already published.
+///
+/// The engine applies one simultaneous action seat by seat, so a later seat
+/// can find a member whose live controller already moved: a layer-dependent
+/// consequence of an earlier seat (an Aura's controller changing who controls
+/// the enchanted creature), or the same member moved by an earlier seat. The
+/// first is still the captured board's change (CR 608.2e: the action is
+/// processed once, simultaneously), so it publishes its captured observation.
+/// The second would be a second change of one member within one action, so it
+/// publishes `Unrecorded`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlChangeLink {
+    pub capture: std::sync::Arc<ControlChangeInstructionCapture>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub published: std::collections::BTreeSet<ObjectId>,
 }
 
 /// How an [`EventObjectSnapshot`] can answer a given [`TargetFilter`] shape.

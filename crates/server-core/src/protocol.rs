@@ -3348,7 +3348,8 @@ mod tests {
 
     /// v141: CR 603.10d control-change evidence —
     /// `GameEvent::ControllerChanged::evidence`,
-    /// `ResolvedAbility::control_change_instruction` and
+    /// `ResolvedAbility::control_change_instruction`,
+    /// `GameState::control_change_observations` and
     /// `GameState::control_change_captures`, inside `GameState`; look-back
     /// control-change triggers read them, so a v140 peer must be refused before
     /// it receives v141 state.
