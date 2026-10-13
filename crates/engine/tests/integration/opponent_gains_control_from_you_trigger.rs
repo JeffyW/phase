@@ -4,9 +4,10 @@
 //! spells and the cleanup reversion.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::{filter_events_for_viewer, filter_state_for_viewer};
 use engine::types::ability::{TargetFilter, TypedFilter};
 use engine::types::card_type::CoreType;
-use engine::types::events::GameEvent;
+use engine::types::events::{ControlChangeEvidence, GameEvent};
 use engine::types::format::FormatConfig;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
@@ -221,18 +222,14 @@ fn mass_steal_fires_once_per_permanent() {
     assert_eq!(treasures(&runner, P1), 0);
 }
 
-/// FAIL-CLOSED LIMIT, documented: a simultaneous mass steal that also takes
-/// Zidane. The ruling ("If an opponent gains control of Zidane and one or more
-/// other permanents from you simultaneously, Zidane's last ability will
-/// trigger for each of those permanents, including itself.") gives P0 two
-/// Treasures here. Collection can't tell when Zidane changed hands relative
-/// to the bear, so the bear's trigger doesn't fire. This pins only that
-/// nothing fires for the wrong player: Zidane's own trigger fires for P0, and
-/// P1 (Zidane's new controller) gets nothing. Mob Rule's second mode takes
-/// every creature with power 3 or less: Zidane (3/3, printed mana value 5) and
-/// the bear.
+/// CR 603.2c + CR 603.10d (Scryfall ruling: "If an opponent gains control of
+/// Zidane and one or more other permanents from you simultaneously, Zidane's
+/// last ability will trigger for each of those permanents, including itself.")
+/// Mob Rule's second mode takes every creature with power 3 or less: Zidane
+/// (3/3, printed mana value 5) and the bear, in one simultaneous change. Both
+/// look back to P0's Zidane. CodeRabbit 4254189582: exactly 2, not "at least".
 #[test]
-fn limit_mass_steal_taking_zidane_never_fires_for_the_wrong_player() {
+fn mob_rule_taking_zidane_and_a_bear_triggers_twice_for_p0() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
@@ -250,55 +247,116 @@ fn limit_mass_steal_taking_zidane_never_fires_for_the_wrong_player() {
     runner.advance_until_stack_empty();
     assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane stolen");
     assert_eq!(controller(&runner, bear), P1, "REACH: bear stolen");
-    assert!(
-        treasures(&runner, P0) >= 1,
-        "Zidane's own trigger fires for the player who lost it"
+    assert_eq!(
+        treasures(&runner, P0),
+        2,
+        "one Treasure each for Zidane and the bear, both P0's"
     );
     assert_eq!(
         treasures(&runner, P1),
         0,
-        "nothing fires for Zidane's new controller"
+        "nothing for Zidane's new controller"
     );
 }
 
 /// CR 110.1 + CR 109.4: a spell changing control on the stack is not a
 /// permanent. Zidane is on P1's side; P0's Perplexing Chimera exchanges itself
 /// (P0 → P1, not from P1) for P1's creature spell (P1 → P0, a spell).
+/// Paired positive on the same board (F3, CodeRabbit 4254189598): P0 steals a
+/// battlefield creature from P1 with Act of Treason, and P1's Zidane fires.
 #[test]
 fn spell_control_exchange_is_not_a_permanent() {
+    for steal_permanent in [false, true] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P1);
+        let chimera = scenario
+            .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA)
+            .id();
+        let bears = scenario
+            .add_creature_to_hand_from_oracle(P1, "Grizzly Bears", 2, 2, "")
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let p1_creature = scenario.add_vanilla(P1, 2, 2);
+        let treason = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
+        let mut runner = scenario.build();
+
+        if steal_permanent {
+            give_priority(&mut runner, P0);
+            runner.cast(treason).target_object(p1_creature).resolve();
+            runner.advance_until_stack_empty();
+            assert_eq!(
+                controller(&runner, p1_creature),
+                P0,
+                "REACH: P0 stole P1's creature"
+            );
+            assert_eq!(
+                treasures(&runner, P1),
+                1,
+                "P0 gained control of a permanent from P1: one Treasure for P1"
+            );
+            assert_eq!(treasures(&runner, P0), 0);
+            continue;
+        }
+
+        give_priority(&mut runner, P1);
+        runner.cast(bears).accept_optional().resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, chimera),
+            P1,
+            "REACH: the Chimera swapped to P1"
+        );
+        assert!(
+            runner.state().battlefield.contains(&bears),
+            "REACH: the exchanged spell resolved"
+        );
+        assert_eq!(
+            controller(&runner, bears),
+            P0,
+            "REACH: the spell resolved under P0"
+        );
+        assert_eq!(
+            treasures(&runner, P1),
+            0,
+            "P0 gaining control of P1's spell is not gaining control of a permanent"
+        );
+        assert_eq!(treasures(&runner, P0), 0);
+    }
+}
+
+/// CR 603.10d + CR 603.3a: each control change binds to its own holder of
+/// Zidane. P1 steals Zidane (P0's loss: P0 +1); later, in a separate
+/// resolution, P0 steals a creature from P1 while P1 controls Zidane (P1's
+/// loss: P1 +1).
+#[test]
+fn separate_resolutions_bind_each_change_to_its_holder() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    add_zidane(&mut scenario, P1);
-    let chimera = scenario
-        .add_creature_from_oracle(P0, "Perplexing Chimera", 3, 3, PERPLEXING_CHIMERA)
-        .id();
-    let bears = scenario
-        .add_creature_to_hand_from_oracle(P1, "Grizzly Bears", 2, 2, "")
-        .with_mana_cost(ManaCost::zero())
-        .id();
+    let zidane = add_zidane(&mut scenario, P0);
+    let p1_creature = scenario.add_vanilla(P1, 2, 2);
+    let theirs = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let ours = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
     let mut runner = scenario.build();
-    give_priority(&mut runner, P1);
 
-    runner.cast(bears).accept_optional().resolve();
+    give_priority(&mut runner, P1);
+    runner.cast(theirs).target_object(zidane).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, zidane), P1, "REACH: P1 stole Zidane");
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
+
+    give_priority(&mut runner, P0);
+    runner.cast(ours).target_object(p1_creature).resolve();
     runner.advance_until_stack_empty();
     assert_eq!(
-        controller(&runner, chimera),
-        P1,
-        "REACH: the Chimera swapped to P1"
-    );
-    assert!(
-        runner.state().battlefield.contains(&bears),
-        "REACH: the exchanged spell resolved"
-    );
-    assert_eq!(
-        controller(&runner, bears),
+        controller(&runner, p1_creature),
         P0,
-        "REACH: the spell resolved under P0"
+        "REACH: P0 stole P1's creature"
     );
     assert_eq!(
-        treasures(&runner, P1),
-        0,
-        "P0 gaining control of P1's spell is not gaining control of a permanent"
+        (treasures(&runner, P0), treasures(&runner, P1)),
+        (1, 1),
+        "the second steal is P1's loss while P1 controls Zidane"
     );
 }
 
@@ -422,21 +480,86 @@ fn self_subject_fires_only_for_the_source() {
 const HOMEWARD_PATH: &str =
     "{T}: Add {C}.\n{T}: Each player gains control of all creatures they own.";
 
-/// CR 101.4 + CR 608.2e: Homeward Path returns every creature to its owner at
-/// once. After Switcheroo gave P1 Zidane and P0 P1's bear, Homeward Path moves
-/// Zidane back from P1 (an opponent of P1 gains control of it from P1:
-/// Treasure for P1) and the bear back from P0 (P0 didn't control Zidane then:
-/// nothing for P0).
+/// CR 101.4 + CR 608.2e: Homeward Path returns every creature to its owner in
+/// one simultaneous action. After Switcheroo gave P1 Zidane and P0 P1's bear,
+/// Homeward Path moves Zidane back from P1 (an opponent of P1 gains control of
+/// it from P1: Treasure for P1) and the bear back from P0 (P0 didn't control
+/// Zidane immediately before: nothing for P0). The engine applies the action
+/// seat by seat, so both APNAP orders are pinned (P0 active, then P1 active).
 #[test]
-fn homeward_path_returns_fire_for_zidanes_controller_before_the_return() {
+fn homeward_after_switcheroo_is_simultaneous_in_both_apnap_orders() {
+    for active in [P0, P1] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P0);
+        let bear = scenario.add_vanilla(P1, 2, 2);
+        let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
+        let path = scenario
+            .add_land_from_oracle(P0, "Homeward Path", HOMEWARD_PATH)
+            .id();
+        let mut runner = scenario.build();
+
+        runner
+            .cast(switcheroo)
+            .target_objects(&[zidane, bear])
+            .resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane went to P1");
+        assert_eq!(controller(&runner, bear), P0, "REACH: the bear came to P0");
+        let (p0_before, p1_before) = (treasures(&runner, P0), treasures(&runner, P1));
+        assert_eq!((p0_before, p1_before), (1, 0), "Switcheroo: P0 lost Zidane");
+
+        {
+            let state = runner.state_mut();
+            state.active_player = active;
+            state.priority_player = P0;
+            state.waiting_for = WaitingFor::Priority { player: P0 };
+        }
+        runner.activate(path, 1).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, zidane),
+            P0,
+            "REACH ({active:?} active): Zidane returned to P0"
+        );
+        assert_eq!(
+            controller(&runner, bear),
+            P1,
+            "REACH ({active:?} active): the bear returned to P1"
+        );
+        assert_eq!(
+            (
+                treasures(&runner, P0) - p0_before,
+                treasures(&runner, P1) - p1_before
+            ),
+            (0, 1),
+            "{active:?} active: P1 lost Zidane; P0 didn't control Zidane when it lost the bear"
+        );
+        assert!(
+            runner.state().control_change_captures.is_empty(),
+            "the completed link released its capture"
+        );
+    }
+}
+
+/// Labelled synthetic: Homeward Path's action, optional for each player, so the
+/// fan-out pauses on each seat's choice and resumes from a parked
+/// continuation (CR 608.2e: the choices are made in APNAP order, then the
+/// action is processed for every player at once).
+const OPTIONAL_HOMEWARD: &str = "Each player may gain control of all creatures they own.";
+
+/// C2: a parked seat publishes against the link's pre-seat capture. Same board
+/// and expectation as Homeward Path: P1 lost Zidane (P1 +1); P0 didn't control
+/// Zidane when it lost the bear (P0 +0), even though the first seat had already
+/// returned Zidane when the second seat resumed.
+#[test]
+fn paused_scoped_control_fan_out_publishes_against_the_pre_seat_capture() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
     let bear = scenario.add_vanilla(P1, 2, 2);
     let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
-    let path = scenario
-        .add_land_from_oracle(P0, "Homeward Path", HOMEWARD_PATH)
-        .id();
+    let returns = add_free_spell(&mut scenario, P0, "Optional Homeward", OPTIONAL_HOMEWARD);
     let mut runner = scenario.build();
 
     runner
@@ -444,11 +567,9 @@ fn homeward_path_returns_fire_for_zidanes_controller_before_the_return() {
         .target_objects(&[zidane, bear])
         .resolve();
     runner.advance_until_stack_empty();
-    assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane went to P1");
-    assert_eq!(controller(&runner, bear), P0, "REACH: the bear came to P0");
-    let (p0_before, p1_before) = (treasures(&runner, P0), treasures(&runner, P1));
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
 
-    runner.activate(path, 1).resolve();
+    runner.cast(returns).accept_optional().resolve();
     runner.advance_until_stack_empty();
     assert_eq!(
         controller(&runner, zidane),
@@ -461,14 +582,56 @@ fn homeward_path_returns_fire_for_zidanes_controller_before_the_return() {
         "REACH: the bear returned to P1"
     );
     assert_eq!(
-        treasures(&runner, P1),
-        p1_before + 1,
-        "P1 lost Zidane to an opponent"
+        (treasures(&runner, P0), treasures(&runner, P1)),
+        (1, 1),
+        "P1 lost Zidane; P0 didn't control Zidane when it lost the bear"
+    );
+}
+
+/// CodeRabbit 4254189574: control that came back to P0 earlier in the turn
+/// doesn't stop a later loss from triggering. Homeward Path returns Zidane to
+/// P0 (P1 +1); a later steal of another P0 creature, in a separate resolution,
+/// is P0's loss (P0 +1).
+#[test]
+fn return_then_later_loss_triggers_for_each_holder() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P0);
+    let bear = scenario.add_vanilla(P1, 2, 2);
+    let later = scenario.add_vanilla(P0, 2, 2);
+    let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
+    let path = scenario
+        .add_land_from_oracle(P0, "Homeward Path", HOMEWARD_PATH)
+        .id();
+    let treason = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let mut runner = scenario.build();
+
+    runner
+        .cast(switcheroo)
+        .target_objects(&[zidane, bear])
+        .resolve();
+    runner.advance_until_stack_empty();
+    runner.activate(path, 1).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: Zidane back with P0"
     );
     assert_eq!(
-        treasures(&runner, P0),
-        p0_before,
-        "P0 didn't control Zidane when it lost the bear"
+        (treasures(&runner, P0), treasures(&runner, P1)),
+        (1, 1),
+        "Switcheroo: P0 +1; Homeward Path: P1 +1"
+    );
+
+    give_priority(&mut runner, P1);
+    runner.cast(treason).target_object(later).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, later), P1, "REACH: the later steal");
+    assert_eq!(
+        (treasures(&runner, P0), treasures(&runner, P1)),
+        (2, 1),
+        "the later loss is P0's, whose Zidane came back earlier this turn"
     );
 }
 
@@ -477,14 +640,14 @@ fn homeward_path_returns_fire_for_zidanes_controller_before_the_return() {
 const DOUBLE_SWITCHEROO: &str =
     "Exchange control of two target creatures. Exchange control of two target creatures.";
 
-/// FAIL-CLOSED LIMIT, documented: a later instruction after Zidane moved.
-/// The first exchange gives Zidane to P1 (Treasure for P0); the second moves
-/// bear B from P1 to P2 while P1 controls Zidane, which by the rules is a
-/// Treasure for P1. Collection can't order Zidane's change against the
-/// second exchange, so that trigger doesn't fire. This pins only that nothing
-/// fires for the wrong player: P0 gets exactly its own Treasure, and P2 none.
+/// CR 608.2c + CR 603.10d: each instruction looks back to its own moment. The
+/// first exchange gives Zidane to P1 and bear A to P0 (P0's loss of Zidane:
+/// P0 +1; P1's loss of bear A came with P1 not yet controlling Zidane:
+/// nothing). The second moves bear B from P1 to P2 while P1 controls Zidane
+/// (P1's loss: P1 +1) and bear C from P2 to P1 (P2 never controlled Zidane:
+/// nothing). CodeRabbit 4254189607: P1's count is asserted too.
 #[test]
-fn limit_later_instruction_after_zidane_moved_never_fires_for_the_wrong_player() {
+fn double_exchange_binds_each_instruction_to_its_own_holder() {
     let mut scenario = GameScenario::new_n_player(3, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
@@ -504,11 +667,63 @@ fn limit_later_instruction_after_zidane_moved_never_fires_for_the_wrong_player()
     assert_eq!(controller(&runner, bear_b), P2, "REACH: bear B went to P2");
     assert_eq!(controller(&runner, bear_c), P1, "REACH: bear C came to P1");
     assert_eq!(
-        treasures(&runner, P0),
-        1,
-        "P0 gets its Treasure for Zidane and nothing for bear B"
+        (
+            treasures(&runner, P0),
+            treasures(&runner, P1),
+            treasures(&runner, P2)
+        ),
+        (1, 1, 0)
     );
-    assert_eq!(treasures(&runner, P2), 0);
+}
+
+/// Labelled synthetic: two independent "each player" sentences, each its own
+/// scoped control-change action (CR 608.2e: each action processed
+/// simultaneously, the second after the first).
+const TWO_SCOPED_RETURNS: &str = "Each player gains control of all creatures they own with \
+    power 2 or less. Each player gains control of all creatures they own with power 4 or \
+    greater.";
+
+/// Q9: each scoped link captures its own boundary. P0 (with Zidane, 3/3) has
+/// taken P1's 2/2 and 4/4; the first sentence returns the 2/2 and the second
+/// the 4/4, two losses for P0 while P0 controls Zidane: P0 +2.
+#[test]
+fn two_scoped_links_each_get_their_own_boundary() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P0);
+    let small = scenario.add_vanilla(P1, 2, 2);
+    let big = scenario.add_vanilla(P1, 4, 4);
+    let steal_small = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
+    let steal_big = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
+    let returns = add_free_spell(&mut scenario, P0, "Two Returns", TWO_SCOPED_RETURNS);
+    let mut runner = scenario.build();
+
+    runner.cast(steal_small).target_object(small).resolve();
+    runner.advance_until_stack_empty();
+    runner.cast(steal_big).target_object(big).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, small), P0, "REACH: P0 took the 2/2");
+    assert_eq!(controller(&runner, big), P0, "REACH: P0 took the 4/4");
+    assert_eq!(treasures(&runner, P0), 0, "P0's own gains don't fire");
+
+    runner.cast(returns).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, small),
+        P1,
+        "REACH: first link returned the 2/2"
+    );
+    assert_eq!(
+        controller(&runner, big),
+        P1,
+        "REACH: second link returned the 4/4"
+    );
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: Zidane stayed with P0"
+    );
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (2, 0));
 }
 
 /// Verbatim Oracle text (Scryfall).
@@ -517,44 +732,39 @@ const GRAB_THE_REINS: &str = "Choose one \u{2014}\n\u{2022} Until end of turn, y
     damage equal to that creature's power to any target.\nEntwine {2}{R} (Choose both if you \
     pay the entwine cost.)";
 
-/// FAIL-CLOSED LIMIT, documented: a permanent stolen and then sacrificed by
-/// the same resolution. It was a permanent when it changed hands, so by the
-/// rules P0 gets a Treasure; collection runs after it left, when it can't be
-/// told apart from a spell that changed control on the stack, so it doesn't
-/// fire. This pins only that nothing fires for the wrong player.
-/// `p1_has_other` adds a second creature for P1, so the sacrifice pauses for
-/// P1's choice instead of taking the only candidate.
+/// What entwined Grab the Reins steals and then sacrifices in one resolution.
+#[derive(Clone, Copy, Debug)]
+enum SacrificedVictim {
+    /// The stolen bear, P1's only creature: the sacrifice takes it directly.
+    BearOnly,
+    /// The stolen bear while P1 has another creature: the sacrifice pauses for
+    /// P1's choice and resumes.
+    BearAfterChoice,
+    /// Zidane itself.
+    Zidane,
+}
+
+/// CR 110.1 + CR 603.10d: a permanent stolen and then sacrificed by the same
+/// resolution was a permanent when it changed hands, and Zidane (or the
+/// stolen Zidane itself) looks back to that moment: P0 +1, P1 +0 every time,
+/// on the immediate sacrifice, the choice-paused sacrifice, and Zidane's own.
 #[test]
-fn limit_steal_then_sacrifice_never_fires_for_the_wrong_player() {
-    // Trigger reach guard: Grab the Reins' steal mode alone, with the stolen
-    // bear staying on the battlefield, does fire for P0.
-    {
+fn grab_the_reins_steal_then_sacrifice_triggers_for_p0() {
+    for victim_kind in [
+        SacrificedVictim::BearOnly,
+        SacrificedVictim::BearAfterChoice,
+        SacrificedVictim::Zidane,
+    ] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
-        add_zidane(&mut scenario, P0);
+        let zidane = add_zidane(&mut scenario, P0);
         let bear = scenario.add_vanilla(P0, 2, 2);
-        let reins = add_free_spell(&mut scenario, P1, "Grab the Reins", GRAB_THE_REINS);
-        let mut runner = scenario.build();
-        give_priority(&mut runner, P1);
-        runner.cast(reins).modes(&[0]).target_object(bear).resolve();
-        runner.advance_until_stack_empty();
-        assert_eq!(
-            controller(&runner, bear),
-            P1,
-            "REACH: the steal mode resolved"
-        );
-        assert_eq!(
-            treasures(&runner, P0),
-            1,
-            "REACH: Zidane's trigger fires on this board when the bear stays"
-        );
-    }
-    for p1_has_other in [false, true] {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        add_zidane(&mut scenario, P0);
-        let bear = scenario.add_vanilla(P0, 2, 2);
-        let other = p1_has_other.then(|| scenario.add_vanilla(P1, 1, 1));
+        let other = matches!(victim_kind, SacrificedVictim::BearAfterChoice)
+            .then(|| scenario.add_vanilla(P1, 1, 1));
+        let victim = match victim_kind {
+            SacrificedVictim::Zidane => zidane,
+            SacrificedVictim::BearOnly | SacrificedVictim::BearAfterChoice => bear,
+        };
         let reins = scenario
             .add_spell_to_hand_from_oracle(P1, "Grab the Reins", true, GRAB_THE_REINS)
             .from_oracle_text_with_keywords(&["Entwine"], GRAB_THE_REINS)
@@ -575,15 +785,15 @@ fn limit_steal_then_sacrifice_never_fires_for_the_wrong_player() {
         runner
             .cast(reins)
             .modes(&[0, 1])
-            .target_object(bear)
+            .target_object(victim)
             .target_player(P0)
-            .sacrifice_with(&[bear])
+            .sacrifice_with(&[victim])
             .resolve();
         runner.advance_until_stack_empty();
         assert_eq!(
-            runner.state().objects[&bear].zone,
+            runner.state().objects[&victim].zone,
             Zone::Graveyard,
-            "REACH (p1_has_other {p1_has_other}): the stolen bear was sacrificed"
+            "REACH ({victim_kind:?}): the stolen permanent was sacrificed"
         );
         if let Some(other) = other {
             assert!(
@@ -592,9 +802,9 @@ fn limit_steal_then_sacrifice_never_fires_for_the_wrong_player() {
             );
         }
         assert_eq!(
-            treasures(&runner, P1),
-            0,
-            "p1_has_other {p1_has_other}: nothing fires for the thief"
+            (treasures(&runner, P0), treasures(&runner, P1)),
+            (1, 0),
+            "{victim_kind:?}: one Treasure for P0, none for the thief"
         );
     }
 }
@@ -605,55 +815,54 @@ const THRAGTUSK: &str = "When this creature enters, you gain 5 life.\nWhen this 
 /// Labelled synthetic steal-then-exile spell.
 const STEAL_THEN_EXILE: &str = "Gain control of target creature until end of turn. Exile it.";
 
-/// FAIL-CLOSED LIMIT, documented: steal-then-exile of a permanent with its own
-/// leaves-the-battlefield trigger, so the exile's zone event is collected
-/// separately from the control change. As in the sacrifice case, P0's
-/// Treasure doesn't fire; this pins only that Thragtusk's trigger still
-/// creates P1's Beast and nothing fires for the wrong player. `thragtusk`
-/// false is the same steal-then-exile of a vanilla creature.
+/// What the synthetic steal-then-exile takes.
+#[derive(Clone, Copy, Debug)]
+enum ExiledVictim {
+    /// Has its own leaves-the-battlefield trigger, collected with the exile.
+    Thragtusk,
+    Vanilla,
+    /// A token, which ceases to exist once exiled (CR 111.7).
+    Token,
+}
+
+/// CR 110.1 + CR 603.10d: steal-then-exile in one resolution. The subject was
+/// a permanent when it changed hands, so P0 +1, P1 +0, whether it has its own
+/// leaves trigger (Thragtusk's Beast still goes to its last controller, P1),
+/// or is a token that ceased to exist.
 #[test]
-fn limit_steal_then_exile_never_fires_for_the_wrong_player() {
-    // Trigger reach guard: the same steal without the exile fires for P0.
-    {
+fn steal_then_exile_triggers_for_p0() {
+    for victim_kind in [
+        ExiledVictim::Thragtusk,
+        ExiledVictim::Vanilla,
+        ExiledVictim::Token,
+    ] {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
         add_zidane(&mut scenario, P0);
-        let victim = scenario
-            .add_creature_from_oracle(P0, "Thragtusk", 5, 3, THRAGTUSK)
-            .id();
-        let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
-        let mut runner = scenario.build();
-        give_priority(&mut runner, P1);
-        runner.cast(steal).target_object(victim).resolve();
-        runner.advance_until_stack_empty();
-        assert_eq!(controller(&runner, victim), P1, "REACH: the steal resolved");
-        assert_eq!(
-            treasures(&runner, P0),
-            1,
-            "REACH: Zidane's trigger fires on this board when Thragtusk stays"
-        );
-    }
-    for thragtusk in [true, false] {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        add_zidane(&mut scenario, P0);
-        let victim = if thragtusk {
-            scenario
+        let victim = match victim_kind {
+            ExiledVictim::Thragtusk => scenario
                 .add_creature_from_oracle(P0, "Thragtusk", 5, 3, THRAGTUSK)
-                .id()
-        } else {
-            scenario.add_vanilla(P0, 5, 3)
+                .id(),
+            ExiledVictim::Vanilla => scenario.add_vanilla(P0, 5, 3),
+            ExiledVictim::Token => scenario.add_creature(P0, "Soldier", 1, 1).id(),
         };
         let spell = add_free_spell(&mut scenario, P1, "Steal Then Exile", STEAL_THEN_EXILE);
         let mut runner = scenario.build();
+        if matches!(victim_kind, ExiledVictim::Token) {
+            runner
+                .state_mut()
+                .objects
+                .get_mut(&victim)
+                .unwrap()
+                .is_token = true;
+        }
         give_priority(&mut runner, P1);
 
         runner.cast(spell).target_object(victim).resolve();
         runner.advance_until_stack_empty();
-        assert_eq!(
-            runner.state().objects[&victim].zone,
-            Zone::Exile,
-            "REACH (thragtusk {thragtusk}): the stolen creature was exiled"
+        assert!(
+            !runner.state().battlefield.contains(&victim),
+            "REACH ({victim_kind:?}): the stolen creature left the battlefield"
         );
         let p1_beasts = runner
             .state()
@@ -666,17 +875,16 @@ fn limit_steal_then_exile_never_fires_for_the_wrong_player() {
             .count();
         assert_eq!(
             p1_beasts,
-            usize::from(thragtusk),
+            usize::from(matches!(victim_kind, ExiledVictim::Thragtusk)),
             "REACH: Thragtusk's leaves trigger is controlled by its last controller, P1"
         );
         assert_eq!(
-            treasures(&runner, P1),
-            0,
-            "thragtusk {thragtusk}: nothing fires for the thief"
+            (treasures(&runner, P0), treasures(&runner, P1)),
+            (1, 0),
+            "{victim_kind:?}: one Treasure for P0, none for the thief"
         );
     }
 }
-
 /// Verbatim Oracle text (Scryfall).
 const CONTROL_MAGIC: &str = "Enchant creature\nYou control enchanted creature.";
 /// Labelled synthetic two-instruction spell.
@@ -771,95 +979,268 @@ fn silent_layer_two_return_of_zidane_never_fires_for_the_wrong_player() {
     }
 }
 
-/// CR 613.1b + CR 603.10d: the control-change provenance is written by the
-/// layer-2 controller diff on every path that changes a permanent's
-/// controller: a targeted steal, an exchange, an Aura starting and stopping
-/// to apply, and the cleanup reversion.
+/// CR 514.2 + CR 603.10d: the until-end-of-turn reversion is one simultaneous
+/// action. P1 steals Zidane (P0 +1); at cleanup Zidane returns from P1 to P0,
+/// an opponent gaining control of it from P1, who controlled it immediately
+/// before (P1 +1). Zidane coming back is not a loss for P0 (P0 +0).
 #[test]
-fn every_control_change_path_stamps_the_provenance() {
+fn cleanup_revert_of_stolen_zidane_credits_the_thief() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PostCombatMain);
-    let bear = scenario.add_vanilla(P0, 2, 2);
-    let theirs = scenario.add_vanilla(P1, 2, 2);
-    let ours = scenario.add_vanilla(P0, 2, 2);
-    let magic = add_control_magic(&mut scenario, P1);
-    let treason = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
-    let switcheroo = add_free_spell(&mut scenario, P1, "Switcheroo", SWITCHEROO);
-    let disenchant = add_free_spell(
-        &mut scenario,
-        P1,
-        "Steal and Destroy Enchantment",
-        STEAL_AND_DESTROY_ENCHANTMENT,
-    );
+    let zidane = add_zidane(&mut scenario, P0);
+    let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
     let mut runner = scenario.build();
-    make_enchantment_aura(&mut runner, magic);
     give_priority(&mut runner, P1);
-    let turn = runner.state().turn_number;
-    let clear = |runner: &mut GameRunner, ids: &[ObjectId]| {
-        for id in ids {
-            runner
-                .state_mut()
-                .objects
-                .get_mut(id)
-                .unwrap()
-                .controller_changed_turn = None;
-        }
-    };
-    let stamp =
-        |runner: &GameRunner, id: ObjectId| runner.state().objects[&id].controller_changed_turn;
 
-    runner.cast(treason).target_object(bear).resolve();
-    assert_eq!(controller(&runner, bear), P1, "REACH: targeted steal");
-    assert_eq!(stamp(&runner, bear), Some(turn), "targeted steal stamps");
+    runner.cast(steal).target_object(zidane).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, zidane), P1, "REACH: P1 stole Zidane");
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
 
-    clear(&mut runner, &[theirs, ours]);
-    runner
-        .cast(switcheroo)
-        .target_objects(&[theirs, ours])
-        .resolve();
-    assert_eq!(controller(&runner, ours), P1, "REACH: exchange");
-    assert_eq!(stamp(&runner, ours), Some(turn), "exchange stamps one side");
-    assert_eq!(
-        stamp(&runner, theirs),
-        Some(turn),
-        "exchange stamps the other"
-    );
-
-    let to_enchant = theirs;
-    clear(&mut runner, &[to_enchant]);
-    runner.cast(magic).target_object(to_enchant).resolve();
-    assert_eq!(
-        controller(&runner, to_enchant),
-        P1,
-        "REACH: Aura starts to apply"
-    );
-    assert_eq!(
-        stamp(&runner, to_enchant),
-        Some(turn),
-        "Aura starting stamps"
-    );
-
-    // `ours` is only the steal half's target here (P1 already controls it).
-    clear(&mut runner, &[to_enchant]);
-    runner
-        .cast(disenchant)
-        .target_objects(&[ours, magic])
-        .resolve();
-    assert_eq!(
-        runner.state().objects[&magic].zone,
-        Zone::Graveyard,
-        "REACH: Aura destroyed"
-    );
-    assert_eq!(
-        controller(&runner, to_enchant),
-        P0,
-        "REACH: Aura stops applying"
-    );
-    assert_eq!(stamp(&runner, to_enchant), Some(turn), "Aura ending stamps");
-
-    clear(&mut runner, &[bear]);
     runner.advance_to_phase(Phase::Upkeep);
     runner.advance_until_stack_empty();
-    assert_eq!(controller(&runner, bear), P0, "REACH: cleanup reversion");
-    assert_eq!(stamp(&runner, bear), Some(turn), "cleanup reversion stamps");
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: Zidane reverted to P0"
+    );
+    assert_eq!(
+        (treasures(&runner, P0), treasures(&runner, P1)),
+        (1, 1),
+        "the reversion is P1's loss: one Treasure for P1, none for P0"
+    );
+}
+
+/// Verbatim Oracle text (Scryfall).
+const KHARN: &str = "Berzerker \u{2014} Khârn the Betrayer attacks or blocks each combat if \
+    able.\nSigil of Corruption \u{2014} When you lose control of Khârn the Betrayer, draw two \
+    cards.\nThe Betrayer \u{2014} If damage would be dealt to Khârn the Betrayer, prevent that \
+    damage and an opponent of your choice gains control of it.";
+
+/// CR 603.10d: Khârn's "when you lose control" reads the latched watcher like
+/// Zidane: the player who lost it draws exactly two; the thief draws nothing.
+#[test]
+fn kharn_losing_controller_draws_exactly_two() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    scenario.with_library_top(P1, &["Card D", "Card E", "Card F"]);
+    let kharn = scenario
+        .add_creature_from_oracle(P0, "Khârn the Betrayer", 5, 1, KHARN)
+        .id();
+    let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+    let mut runner = scenario.build();
+    give_priority(&mut runner, P1);
+    let hand = |runner: &GameRunner, player: PlayerId| {
+        runner.state().players[player.0 as usize].hand.len()
+    };
+    let (p0_before, p1_before) = (hand(&runner, P0), hand(&runner, P1));
+
+    runner.cast(steal).target_object(kharn).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(controller(&runner, kharn), P1, "REACH: P1 stole Khârn");
+    assert_eq!(hand(&runner, P0) - p0_before, 2, "P0 lost Khârn: draws two");
+    assert_eq!(
+        hand(&runner, P1) + 1,
+        p1_before,
+        "P1 only cast Act of Treason: draws nothing"
+    );
+}
+
+/// Verbatim Oracle text (Scryfall).
+const DUPLICITY: &str = "When this enchantment enters, exile the top five cards of your \
+    library face down.\nAt the beginning of your upkeep, you may exile all cards from your \
+    hand face down. If you do, put all other cards you own exiled with this enchantment into \
+    your hand.\nAt the beginning of your end step, discard a card.\nWhen you lose control of \
+    this enchantment, put all cards exiled with this enchantment into their owner's \
+    graveyard.";
+/// Labelled synthetic: a steal that can take a noncreature permanent.
+const STEAL_PERMANENT: &str = "Gain control of target permanent.";
+
+fn duplicity_board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["One", "Two", "Three", "Four", "Five", "Six"]);
+    add_zidane(&mut scenario, P0);
+    let duplicity = scenario
+        .add_spell_to_hand_from_oracle(P0, "Duplicity", false, DUPLICITY)
+        .as_enchantment()
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let bear = scenario.add_vanilla(P0, 2, 2);
+    let steal = add_free_spell(&mut scenario, P1, "Steal Permanent", STEAL_PERMANENT);
+    let mut runner = scenario.build();
+    runner.cast(duplicity).resolve();
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().battlefield.contains(&duplicity),
+        "REACH: Duplicity entered"
+    );
+    (runner, duplicity, bear, steal)
+}
+
+fn face_down_exiles(runner: &GameRunner) -> Vec<ObjectId> {
+    runner
+        .state()
+        .exile
+        .iter()
+        .copied()
+        .filter(|id| runner.state().objects[id].face_down)
+        .collect()
+}
+
+/// CR 603.10d: Duplicity's "when you lose control" puts its face-down exiles
+/// into their owner's graveyard; the same steal is a loss Zidane sees (P0 +1).
+#[test]
+fn duplicity_losing_control_puts_its_exiles_into_the_owners_graveyard() {
+    let (mut runner, duplicity, _, steal) = duplicity_board();
+    let exiled = face_down_exiles(&runner);
+    assert_eq!(
+        exiled.len(),
+        5,
+        "REACH: Duplicity exiled five cards face down"
+    );
+    give_priority(&mut runner, P1);
+
+    runner.cast(steal).target_object(duplicity).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, duplicity),
+        P1,
+        "REACH: P1 took Duplicity"
+    );
+    for card in exiled {
+        assert_eq!(
+            runner.state().objects[&card].zone,
+            Zone::Graveyard,
+            "each card exiled with Duplicity goes to its owner's graveyard"
+        );
+        assert_eq!(runner.state().objects[&card].owner, P0);
+    }
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
+}
+
+/// CR 400.2 + CR 603.10d: control-change evidence is rules authority. Its
+/// latched watchers include Duplicity, whose context records the face-down
+/// cards it exiled (ids and mana values). The authoritative event keeps that
+/// watcher; no viewer copy (the thief's, the owner's, a spectator's) carries
+/// any observation, in the event stream or in the filtered state.
+#[test]
+fn control_change_evidence_never_reaches_a_viewer() {
+    let (mut runner, duplicity, bear, steal) = duplicity_board();
+    give_priority(&mut runner, P1);
+
+    let outcome = runner.cast(steal).target_object(bear).resolve();
+    let events = outcome.events().to_vec();
+    let authoritative = events
+        .iter()
+        .find_map(|event| match event {
+            GameEvent::ControllerChanged {
+                object_id,
+                evidence: ControlChangeEvidence::Observed(observation),
+                ..
+            } if *object_id == bear => Some(observation.clone()),
+            _ => None,
+        })
+        .expect("REACH: the steal published observed evidence");
+    assert!(
+        authoritative
+            .watchers
+            .iter()
+            .any(|watcher| watcher.identity.reference.object_id == duplicity
+                && !watcher.linked_exile_snapshot.is_empty()),
+        "REACH: the authoritative evidence latched Duplicity with its exiles"
+    );
+    runner.advance_until_stack_empty();
+    assert_eq!(treasures(&runner, P0), 1, "REACH: Zidane fired from it");
+
+    for viewer in [P0, P1, PlayerId(9)] {
+        for event in filter_events_for_viewer(&events, runner.state(), viewer) {
+            if let GameEvent::ControllerChanged { evidence, .. } = event {
+                assert_eq!(
+                    evidence,
+                    ControlChangeEvidence::Unrecorded,
+                    "viewer {viewer:?}: the event stream drops the observation"
+                );
+            }
+        }
+        let view = serde_json::to_string(&filter_state_for_viewer(runner.state(), viewer))
+            .expect("projection serializes");
+        assert!(
+            !view.contains("\"Observed\"") && !view.contains("control_change_captures"),
+            "viewer {viewer:?}: the filtered state carries no control-change evidence"
+        );
+    }
+}
+
+/// Saved games from before control-change evidence carry `ControllerChanged`
+/// with no `evidence` field. It decodes to `Unrecorded` (never rebuilt from the
+/// current board). A trigger that had already fired from such an event still
+/// resolves: here Zidane's trigger is on the stack, with its event, when the
+/// game is saved and restored with every event's evidence stripped.
+#[test]
+fn a_restored_legacy_controller_changed_decodes_unrecorded() {
+    for legacy in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        add_zidane(&mut scenario, P0);
+        let bear = scenario.add_vanilla(P0, 2, 2);
+        let steal = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+        runner.cast(steal).target_object(bear).resolve();
+
+        runner.state_mut().capture_rng_word_pos();
+        let mut saved = serde_json::to_value(runner.state()).expect("state serializes");
+        let mut stripped = 0;
+        strip_controller_changed_evidence(&mut saved, legacy, &mut stripped);
+        assert!(
+            stripped > 0,
+            "REACH (legacy {legacy}): the save holds a ControllerChanged with evidence"
+        );
+        let mut restored: engine::types::game_state::GameState =
+            serde_json::from_value(saved).expect("the saved state restores");
+        restored.rehydrate_rng();
+        *runner.state_mut() = restored;
+
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            (treasures(&runner, P0), treasures(&runner, P1)),
+            (1, 0),
+            "legacy {legacy}: the already-fired trigger resolves"
+        );
+    }
+}
+
+/// Counts every saved `ControllerChanged` with evidence and, when `strip`,
+/// removes the field, as a pre-evidence save would have it.
+fn strip_controller_changed_evidence(
+    value: &mut serde_json::Value,
+    strip: bool,
+    count: &mut usize,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let is_event = map.get("type").and_then(|t| t.as_str()) == Some("ControllerChanged");
+            if is_event {
+                if let Some(data) = map.get_mut("data").and_then(|d| d.as_object_mut()) {
+                    if data.contains_key("evidence") {
+                        *count += 1;
+                        if strip {
+                            data.remove("evidence");
+                        }
+                    }
+                }
+            }
+            for child in map.values_mut() {
+                strip_controller_changed_evidence(child, strip, count);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                strip_controller_changed_evidence(child, strip, count);
+            }
+        }
+        _ => {}
+    }
 }

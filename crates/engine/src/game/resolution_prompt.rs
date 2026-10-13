@@ -637,6 +637,7 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         parent_target_missing_reason: _, // seam flag
         activation_cost_reduction: _,
         activation_record: _,
+        control_change_instruction: _,
     } = a;
 
     // CR 603.5 + CR 608.2d: an optional effect / optional targeting /

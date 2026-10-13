@@ -210,10 +210,11 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 141 — CR 603.10d control-change provenance: GameObject gains
- *      controller_changed_turn — see PROTOCOL_VERSION's own `/// 141` entry in
+ * 141 — CR 603.10d control-change evidence: ControllerChanged gains evidence,
+ *      ResolvedAbility gains control_change_instruction and GameState gains
+ *      control_change_captures — see PROTOCOL_VERSION's own `/// 141` entry in
  *      crates/lobby-broker/src/protocol.rs. Look-back control-change triggers
- *      read it, so a v140 peer resolves them differently. Wire 123 moves with it.
+ *      read them, so a v140 peer resolves them differently. Wire 123 moves with it.
  * 140 — AttackSubject gains EventAttackers (the players a trigger's attack
  *      event's attackers attacked), carried in an ability's player_scope
  *      inside GameState — see PROTOCOL_VERSION's own `/// 140` entry in

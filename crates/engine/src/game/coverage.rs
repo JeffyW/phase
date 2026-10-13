@@ -7338,6 +7338,33 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
     missing
 }
 
+/// The coverage label for an ability whose per-player fan-out ("each player
+/// …", "each target player …") performs a control-change action that can't
+/// share one immediately-before boundary across its seats: more than one
+/// control-change action in the per-seat template, or one behind a retained
+/// prefix. CR 608.2e processes each action simultaneously for every player,
+/// and CR 603.10d look-back control-change triggers need that action's
+/// immediately-before board; the runtime publishes such changes with
+/// `Unrecorded` evidence, so the producer is unsupported and fails closed.
+/// Classified by `effects::player_scope_control_boundary` /
+/// `multi_target_player_control_boundary`, on the exact template the driver
+/// resolves.
+pub const PLAYER_SCOPE_CONTROL_BOUNDARY_GAP: &str = "Effect:fan_out_control_boundary";
+
+fn fan_out_control_boundary_is_unobservable(def: &AbilityDefinition) -> bool {
+    if def.player_scope.is_none() && def.multi_target.is_none() {
+        return false;
+    }
+    let resolved = crate::game::ability_utils::build_resolved_from_def(
+        def,
+        crate::types::identifiers::ObjectId(0),
+        crate::types::player::PlayerId(0),
+    );
+    let unobservable = Some(crate::game::effects::FanOutControlBoundary::Unobservable);
+    crate::game::effects::player_scope_control_boundary(&resolved) == unobservable
+        || crate::game::effects::multi_target_player_control_boundary(&resolved) == unobservable
+}
+
 /// The coverage label for a face whose as-enters choice is made before it
 /// enters (CR 614.12a) but whose own statics write a characteristic that entry
 /// consumers read and the CR 614.12 entry projection doesn't apply
@@ -8305,6 +8332,13 @@ fn collect_ability_missing_parts(
         if !missing.contains(&label) {
             missing.push(label);
         }
+    }
+    if fan_out_control_boundary_is_unobservable(def)
+        && !missing
+            .iter()
+            .any(|label| label == PLAYER_SCOPE_CONTROL_BOUNDARY_GAP)
+    {
+        missing.push(PLAYER_SCOPE_CONTROL_BOUNDARY_GAP.to_string());
     }
     for mode in delayed_trigger_modes(&def.effect) {
         if !delayed_trigger_mode_is_supported(mode, trigger_registry) {
@@ -13634,6 +13668,150 @@ pub fn format_semantic_audit_markdown(summary: &SemanticAuditSummary) -> String 
 
 #[cfg(test)]
 mod tests {
+    /// Every `player_scope` node of a parsed ability chain.
+    fn scoped_nodes(
+        def: &crate::types::ability::AbilityDefinition,
+        out: &mut Vec<crate::types::ability::AbilityDefinition>,
+    ) {
+        if def.player_scope.is_some() {
+            out.push(def.clone());
+        }
+        if let Some(sub) = &def.sub_ability {
+            scoped_nodes(sub, out);
+        }
+        if let Some(else_ability) = &def.else_ability {
+            scoped_nodes(else_ability, out);
+        }
+    }
+
+    /// CR 608.2e + CR 603.10d: the printed "each player gains control" producers
+    /// (verbatim Scryfall text) parse to a head-boundary scoped control action,
+    /// which the runtime captures exactly; none is marked unsupported.
+    #[test]
+    fn printed_scoped_control_producers_have_a_head_boundary() {
+        use crate::game::effects::FanOutControlBoundary;
+        for (name, types, text) in [
+            (
+                "Homeward Path",
+                "Land",
+                "{T}: Add {C}.\n{T}: Each player gains control of all creatures they own.",
+            ),
+            (
+                "Brooding Saurian",
+                "Creature",
+                "At the beginning of each end step, each player gains control of all nontoken \
+                 permanents they own.",
+            ),
+            (
+                "Trostani Discordant",
+                "Creature",
+                "Other creatures you control get +1/+1.\nWhen Trostani enters, create two 1/1 \
+                 white Soldier creature tokens with lifelink.\nAt the beginning of your end \
+                 step, each player gains control of all creatures they own.",
+            ),
+        ] {
+            let parsed =
+                crate::parser::parse_oracle_text(text, name, &[], &[types.to_string()], &[]);
+            let mut scoped = Vec::new();
+            for def in parsed.abilities.iter() {
+                scoped_nodes(def, &mut scoped);
+            }
+            for trigger in parsed.triggers.iter() {
+                if let Some(execute) = &trigger.execute {
+                    scoped_nodes(execute, &mut scoped);
+                }
+            }
+            assert!(!scoped.is_empty(), "REACH: {name} parses a scoped clause");
+            for def in scoped {
+                let resolved = crate::game::ability_utils::build_resolved_from_def(
+                    &def,
+                    crate::types::identifiers::ObjectId(1),
+                    crate::types::player::PlayerId(0),
+                );
+                assert_eq!(
+                    crate::game::effects::player_scope_control_boundary(&resolved),
+                    Some(FanOutControlBoundary::Head),
+                    "{name}: its scoped control action is the template's head"
+                );
+                assert!(
+                    !super::fan_out_control_boundary_is_unobservable(&def),
+                    "{name}: not marked unsupported"
+                );
+            }
+        }
+    }
+
+    /// CR 608.2e + CR 603.10d: a control action retained behind a scoped prefix
+    /// ("each player may <X> and gain control of …": the optional clause keeps
+    /// its continuation in the seat) has no single pre-seat boundary, so the
+    /// producer is unsupported. The same chain with the control action at the
+    /// head is accepted.
+    #[test]
+    fn a_control_action_behind_a_retained_scoped_prefix_is_unsupported() {
+        use crate::game::effects::FanOutControlBoundary;
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, Effect, PlayerFilter, QuantityExpr, SubAbilityLink,
+            TargetFilter,
+        };
+        let steal = || {
+            let mut steal = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainControl {
+                    target: TargetFilter::Any,
+                },
+            );
+            steal.sub_link = SubAbilityLink::ContinuationStep;
+            steal
+        };
+        let draw = Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        };
+        let rejected = AbilityDefinition::new(AbilityKind::Spell, draw.clone())
+            .player_scope(PlayerFilter::All)
+            .optional()
+            .sub_ability(steal());
+        let accepted = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GainControl {
+                target: TargetFilter::Any,
+            },
+        )
+        .player_scope(PlayerFilter::All);
+        let boundary = |def: &AbilityDefinition| {
+            crate::game::effects::player_scope_control_boundary(
+                &crate::game::ability_utils::build_resolved_from_def(
+                    def,
+                    crate::types::identifiers::ObjectId(1),
+                    crate::types::player::PlayerId(0),
+                ),
+            )
+        };
+        assert_eq!(
+            boundary(&rejected),
+            Some(FanOutControlBoundary::Unobservable),
+            "the optional clause retains the control action behind its prefix"
+        );
+        assert!(super::fan_out_control_boundary_is_unobservable(&rejected));
+        let mut missing = Vec::new();
+        super::check_abilities(
+            std::slice::from_ref(&rejected),
+            &super::build_trigger_registry(),
+            &super::build_static_registry(),
+            super::TokenStaticTraversal::Include,
+            &mut missing,
+        );
+        assert!(
+            missing
+                .iter()
+                .any(|label| label == super::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP),
+            "coverage marks the producer unsupported: {missing:?}"
+        );
+
+        assert_eq!(boundary(&accepted), Some(FanOutControlBoundary::Head));
+        assert!(!super::fan_out_control_boundary_is_unobservable(&accepted));
+    }
+
     /// Fixture shared by the replacement-payload stranding tests: an unbound
     /// delayed tracked-set return nested in an `AddTargetReplacement` execute
     /// body — the minimal carrier for the shape CodeRabbit's Major flagged as

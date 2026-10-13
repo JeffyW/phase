@@ -2,12 +2,161 @@ use crate::types::ability::{
     ContinuousModification, Duration, Effect, EffectError, EffectKind, ResolvedAbility,
     TargetFilter, TargetRef,
 };
-use crate::types::events::GameEvent;
+use crate::types::events::{ControlChangeEvidence, ControlChangeInstructionCapture, GameEvent};
 use crate::types::game_state::{GameState, TransientContinuousEffectBindings};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::keywords::Keyword;
 use crate::types::player::PlayerId;
+use std::sync::Arc;
 
+/// CR 603.10 + CR 603.10d + CR 608.2e: the single writer of control-change
+/// evidence. Latches every look-back control-change watcher and snapshots
+/// every candidate subject, as the board stands NOW.
+///
+/// Callers own the boundary: they settle layers once at the instruction's
+/// entrance, determine the instruction's whole population, call this, and
+/// only then install any control effect. The capture is therefore immutable
+/// for the rest of the instruction: later installs, and the per-install
+/// settles a "for as long as" duration performs, can't reach it.
+pub(crate) fn capture_control_change_instruction(
+    state: &GameState,
+    population: impl IntoIterator<Item = ObjectId>,
+) -> Arc<ControlChangeInstructionCapture> {
+    Arc::new(ControlChangeInstructionCapture {
+        watchers: Arc::new(crate::game::triggers::latch_control_change_watchers(state)),
+        subjects: population
+            .into_iter()
+            .filter_map(|object_id| state.capture_event_object_snapshot(object_id))
+            .collect(),
+    })
+}
+
+/// The boundary one control-change resolution publishes against.
+pub(crate) enum InstructionBoundary {
+    Captured(Arc<ControlChangeInstructionCapture>),
+    /// `ControlChangeInstructionCarrier::Unobservable`: publish `Unrecorded`.
+    Unobservable,
+}
+
+/// A fan-out's carried capture (GameState::control_change_captures). An id
+/// whose capture is gone authorizes nothing: Unobservable, never a fresh
+/// capture taken at some other point.
+fn carried_boundary(state: &GameState, id: u64) -> InstructionBoundary {
+    state.control_change_captures.get(&id).cloned().map_or(
+        InstructionBoundary::Unobservable,
+        InstructionBoundary::Captured,
+    )
+}
+
+/// The boundary a control-change resolver publishes against: the one its
+/// fan-out driver carried in (CR 608.2e: captured before the first seat), or
+/// its own, captured at its entrance after one settle. Returns the
+/// instruction's population with it.
+fn instruction_boundary(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    population: impl FnOnce(&GameState) -> Vec<ObjectId>,
+) -> (InstructionBoundary, Vec<ObjectId>) {
+    use crate::types::events::ControlChangeInstructionCarrier;
+    match &ability.control_change_instruction {
+        Some(ControlChangeInstructionCarrier::Captured(id)) => {
+            (carried_boundary(state, *id), population(state))
+        }
+        Some(ControlChangeInstructionCarrier::Unobservable) => {
+            (InstructionBoundary::Unobservable, population(state))
+        }
+        None => {
+            crate::game::layers::flush_layers(state);
+            let members = population(state);
+            let capture = capture_control_change_instruction(state, members.iter().copied());
+            (InstructionBoundary::Captured(capture), members)
+        }
+    }
+}
+
+/// CR 701.12b: an exchange's boundary. `exchange_control::resolve` settles at
+/// its own entrance (before its no-op guards read the two controllers), so an
+/// uncarried exchange captures here without a second settle.
+pub(crate) fn exchange_boundary(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    members: [ObjectId; 2],
+) -> InstructionBoundary {
+    use crate::types::events::ControlChangeInstructionCarrier;
+    match &ability.control_change_instruction {
+        Some(ControlChangeInstructionCarrier::Captured(id)) => carried_boundary(state, *id),
+        Some(ControlChangeInstructionCarrier::Unobservable) => InstructionBoundary::Unobservable,
+        None => InstructionBoundary::Captured(capture_control_change_instruction(state, members)),
+    }
+}
+
+/// One member's pre-change controller and the evidence its event carries.
+pub(crate) struct MemberEvidence {
+    object_id: ObjectId,
+    old_controller: PlayerId,
+    evidence: ControlChangeEvidence,
+}
+
+/// One member's evidence, read before its install.
+///
+/// A captured member publishes its observation, and its observed controller is
+/// the loser, so the event and its evidence agree by construction. A member
+/// the capture doesn't hold (an object that didn't exist when the instruction
+/// began) and every member of an `Unobservable` boundary publish `Unrecorded`:
+/// no other observation is ever substituted for the instruction's boundary.
+pub(crate) fn instruction_member(
+    state: &GameState,
+    boundary: &InstructionBoundary,
+    object_id: ObjectId,
+) -> Option<MemberEvidence> {
+    let live = state.objects.get(&object_id)?;
+    let live_controller = live.controller;
+    let live_identity = ObjectIncarnationRef::from_object(live);
+    // The capture speaks for this member only while the member is still the
+    // object it observed, under the controller it observed. A seat-major
+    // fan-out can move a member in an earlier seat (CR 608.2e would process
+    // the action once, simultaneously); that member's change is then not the
+    // captured board's, so it publishes `Unrecorded`.
+    let observation = match boundary {
+        InstructionBoundary::Captured(capture) => {
+            capture.observation_for(object_id).filter(|observation| {
+                observation.subject.identity == live_identity
+                    && observation.subject.controller == live_controller
+            })
+        }
+        InstructionBoundary::Unobservable => None,
+    };
+    Some(match observation {
+        Some(observation) => MemberEvidence {
+            object_id,
+            old_controller: observation.subject.controller,
+            evidence: ControlChangeEvidence::Observed(Box::new(observation)),
+        },
+        None => MemberEvidence {
+            object_id,
+            old_controller: live_controller,
+            evidence: ControlChangeEvidence::Unrecorded,
+        },
+    })
+}
+
+/// CR 613.1b + CR 603.10d: publish one member's control change. A no-op
+/// self-handoff publishes nothing.
+pub(crate) fn publish_controller_changed(
+    events: &mut Vec<GameEvent>,
+    member: MemberEvidence,
+    new_controller: PlayerId,
+) {
+    if member.old_controller == new_controller {
+        return;
+    }
+    events.push(GameEvent::ControllerChanged {
+        object_id: member.object_id,
+        old_controller: member.old_controller,
+        new_controller,
+        evidence: member.evidence,
+    });
+}
 /// CR 613.3: GainControl creates a transient continuous effect that changes the
 /// target permanent's controller through the layer system (Layer 2).
 ///
@@ -29,19 +178,20 @@ pub fn resolve(
     };
 
     let new_controller = gain_control_controller(ability, target);
-    let object_ids = gain_control_object_targets(state, ability, target);
 
-    // Settle first so the captured prior controllers are post-layer values.
-    if duration.is_for_as_long_as() {
-        crate::game::layers::flush_layers(state);
-    }
+    // CR 608.2e + CR 603.10d: the instruction's boundary. Settle once at its
+    // entrance (so the captured prior controllers are post-layer values), fix
+    // its population, and capture before any member's install.
+    let (boundary, object_ids) = instruction_boundary(state, ability, |state| {
+        gain_control_object_targets(state, ability, target)
+    });
 
     for obj_id in object_ids {
         let Some(object) = state.objects.get(&obj_id) else {
             return Err(EffectError::ObjectNotFound(obj_id));
         };
-        let old_controller = object.controller;
         let recipient = ObjectIncarnationRef::from_object(object);
+        let member = instruction_member(state, &boundary, obj_id);
         // CR 611.2c + CR 400.7: state durations track this exact recipient.
         // CR 400.7a: other control effects retain spell-to-permanent continuity.
         // CR 611.2b: a duration that never starts installs nothing, so no
@@ -69,12 +219,8 @@ pub fn resolve(
         // CR 613.1b: emit the control-change event so "when you lose control"
         // triggers on the *previous* controller observe the loss (mirrors
         // `GainControlAll` and `GiveControl`). Skip no-op self-handoffs.
-        if old_controller != new_controller {
-            events.push(GameEvent::ControllerChanged {
-                object_id: obj_id,
-                old_controller,
-                new_controller,
-            });
+        if let Some(member) = member {
+            publish_controller_changed(events, member, new_controller);
         }
     }
 
@@ -94,7 +240,11 @@ pub(crate) fn apply_permanent_control_change(
     new_controller: PlayerId,
     events: &mut Vec<GameEvent>,
 ) {
-    let old_controller = state.objects.get(&object_id).map(|obj| obj.controller);
+    // CR 603.10d: a one-member instruction; settle, capture, then install.
+    crate::game::layers::flush_layers(state);
+    let boundary =
+        InstructionBoundary::Captured(capture_control_change_instruction(state, [object_id]));
+    let member = instruction_member(state, &boundary, object_id);
     state.add_transient_continuous_effect(
         source_id,
         new_controller,
@@ -104,12 +254,8 @@ pub(crate) fn apply_permanent_control_change(
         None,
     );
     mark_echo_due_for_new_controller(state, object_id);
-    if let Some(old_controller) = old_controller.filter(|old| *old != new_controller) {
-        events.push(GameEvent::ControllerChanged {
-            object_id,
-            old_controller,
-            new_controller,
-        });
+    if let Some(member) = member {
+        publish_controller_changed(events, member, new_controller);
     }
 }
 
@@ -137,28 +283,28 @@ pub fn resolve_all(
     // "you gain control" — the ability's controller takes control.
     let new_controller = ability.controller;
 
-    // Settle first so matching and the captured prior controllers read
-    // post-layer values.
-    if duration.is_for_as_long_as() {
-        crate::game::layers::flush_layers(state);
-    }
-
+    // CR 608.2e + CR 603.10d: the instruction's boundary. Settle once at its
+    // entrance so matching and the captured prior controllers read post-layer
+    // values, fix the population, and capture before any install.
+    //
     // Ability-context filter evaluation, identical to `destroy::resolve_all`:
     // `resolved_object_filter` binds anaphoric scopes (e.g. `controller:
     // TargetPlayer`) from the ability before matching.
-    let effective_filter = crate::game::effects::resolved_object_filter(state, ability, target);
-    let ctx = crate::game::filter::FilterContext::from_ability(ability);
-    let matching: Vec<ObjectId> = state
-        .battlefield
-        .iter()
-        .filter(|id| {
-            crate::game::filter::matches_target_filter(state, **id, &effective_filter, &ctx)
-        })
-        .copied()
-        .collect();
+    let (boundary, matching) = instruction_boundary(state, ability, |state| {
+        let effective_filter = crate::game::effects::resolved_object_filter(state, ability, target);
+        let ctx = crate::game::filter::FilterContext::from_ability(ability);
+        state
+            .battlefield
+            .iter()
+            .filter(|id| {
+                crate::game::filter::matches_target_filter(state, **id, &effective_filter, &ctx)
+            })
+            .copied()
+            .collect()
+    });
 
     for obj_id in matching {
-        let old_controller = state.objects.get(&obj_id).map(|obj| obj.controller);
+        let member = instruction_member(state, &boundary, obj_id);
         // CR 613.1b: register a Layer 2 (Control) transient continuous effect.
         // CR 611.2b: one whose duration never starts (The Wretched after its
         // controller lost it) installs nothing and emits no side effect.
@@ -174,12 +320,8 @@ pub fn resolve_all(
             continue;
         }
         mark_echo_due_for_new_controller(state, obj_id);
-        if let Some(old_controller) = old_controller.filter(|old| *old != new_controller) {
-            events.push(GameEvent::ControllerChanged {
-                object_id: obj_id,
-                old_controller,
-                new_controller,
-            });
+        if let Some(member) = member {
+            publish_controller_changed(events, member, new_controller);
         }
     }
 
@@ -305,14 +447,16 @@ pub fn resolve_give(
         unique_recipient_from_filter(state, recipient, ability)?
     };
 
-    let object_ids = give_control_object_targets(state, ability, target);
+    let (boundary, object_ids) = instruction_boundary(state, ability, |state| {
+        give_control_object_targets(state, ability, target)
+    });
 
     for obj_id in object_ids {
         if !state.objects.contains_key(&obj_id) {
             return Err(EffectError::ObjectNotFound(obj_id));
         }
 
-        let old_controller = state.objects.get(&obj_id).map(|obj| obj.controller);
+        let member = instruction_member(state, &boundary, obj_id);
 
         // CR 613.3: Create a transient continuous effect at Layer 2 (Control)
         // with the recipient as the new controller. CR 611.2b: one whose
@@ -332,12 +476,8 @@ pub fn resolve_give(
 
         // CR 110.2: Record the handoff for downstream "if they do" riders and
         // `ControllerChanged` triggers (mirrors `resolve_all`).
-        if old_controller.is_some_and(|old| old != recipient_id) {
-            events.push(GameEvent::ControllerChanged {
-                object_id: obj_id,
-                old_controller: old_controller.unwrap(),
-                new_controller: recipient_id,
-            });
+        if let Some(member) = member {
+            publish_controller_changed(events, member, recipient_id);
         }
     }
 

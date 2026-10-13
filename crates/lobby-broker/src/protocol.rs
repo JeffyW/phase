@@ -60,12 +60,14 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 141 — CR 603.10d control-change provenance: `GameObject` gains
-///      `controller_changed_turn` (the last turn layer 2 changed its
-///      controller), serialized inside `GameState`; look-back control-change
-///      triggers read it, so a v140 peer would resolve them differently.
-///      Full-game peers and P2P move in lockstep (wire 123); no lobby carrier
-///      names it.
+/// 141 — CR 603.10d control-change evidence: `GameEvent::ControllerChanged`
+///      gains `evidence` (the immediately-before watcher latch and subject
+///      snapshot look-back control-change triggers read), `ResolvedAbility`
+///      gains `control_change_instruction` and `GameState` gains
+///      `control_change_captures` (a player-scope fan-out's pre-seat capture),
+///      all serialized inside `GameState`; a v140 peer would drop the evidence
+///      and resolve those triggers differently. Full-game peers and P2P move in
+///      lockstep (wire 123); no lobby carrier names it.
 /// 140 — `AttackSubject` gains `EventAttackers` (`"EventAttackers"`, the
 ///      players a trigger's attack event's attackers were declared attacking,
 ///      CR 508.6), serialized inside `GameState` wherever a resolving or pending

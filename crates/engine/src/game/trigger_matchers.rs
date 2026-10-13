@@ -3538,151 +3538,49 @@ pub(super) fn match_taps_for_mana(
     }
 }
 
-/// CR 603.2 + CR 613.1b: ChangesController — fires on the `ControllerChanged`
-/// event a Layer-2 control change (or its end) emits. Every control-change path
-/// now emits this event (targeted `GainControl`, `GainControlAll`, `GiveControl`,
-/// `apply_permanent_control_change`, `exchange_control::resolve` — CR 701.12a,
-/// on its success path only — and the until-EOT control reversion in
-/// `turns::execute_cleanup`), so the redundant `EffectResolved { GainControl }`
-/// arm was dropped — matching both would have double-fired now that the gain
-/// also emits `ControllerChanged`.
+/// CR 603.2 + CR 613.1b + CR 603.10d: ChangesController. Fires on the
+/// `ControllerChanged` event every control-change instruction publishes:
+/// targeted `GainControl`, `GainControlAll`, `GiveControl`,
+/// `apply_permanent_control_change`, `exchange_control::resolve` (CR 701.12a,
+/// success path only) and the until-end-of-turn reversion in
+/// `turns::execute_cleanup` (CR 514.2).
 ///
-/// (The until-EOT emitter is `turns::execute_cleanup`, NOT
-/// `layers::prune_end_of_turn_effects`: the latter only retains over
-/// `transient_continuous_effects` and pushes no events.)
+/// The producers are the CR 603.10d look-back abilities: "When you lose control
+/// of ~" (Khârn the Betrayer, Duplicity, Gustha's Scepter), the Stolen Uniform
+/// delayed reflexive, and "Whenever an opponent gains control of a permanent
+/// from you" (Zidane, Tantalus Thief; `valid_target` names the gaining player).
 ///
-/// The producers of this mode are the CR 603.10d lose-side abilities: "When you
-/// lose control of ~" (Khârn the Betrayer, Duplicity, Gustha's Scepter), the S25
-/// Stolen Uniform reflexive, and "Whenever an opponent gains control of a
-/// permanent from you" (Zidane, Tantalus Thief — `valid_target` names the
-/// gaining player). Four guards keep it from over-firing:
-///   * `valid_card` scopes the event to the tracked object (SelfRef for "~";
-///     the bound Equipment for Stolen Uniform's `ParentTarget`). Without this
-///     the trigger fired on *any* object's control change (the Portent trap).
-///   * "lose control" is directional: it fires only for the player *losing*
-///     control. Which side that is depends on whether the trigger source is the
-///     changing object itself:
-///     - Self-ref ("~", `source_id == object_id`): the source's live
-///       `controller` is unusable as the direction test. `collect_pending_triggers`
-///       calls `flush_layers` at its very top (before any trigger scan), so the
-///       object's controller has already flushed to `new_controller` by match
-///       time. Instead we rely on CR 603.10d look-back: a "loses control" ability
-///       is intrinsically the pre-change controller's, and `old != new` (checked
-///       above) already guarantees exactly one loser — fire for it.
-///     - Delayed/`SpecificObject` (Stolen Uniform): the source is the graveyard
-///       spell whose controller stays constant (the temp holder), so the
-///       `old_controller == source.controller` test correctly fires on the loss
-///       (old == caster == source.controller) and NOT on the initial gain
-///       (old == owner != caster).
-///   * CR 110.1: the changing object must be a permanent (on the battlefield);
-///     a spell changing control on the stack never matches.
-///   * Conservative fallback: when collection can't establish the event-time
-///     facts (the changing object has left the battlefield, or the source
-///     changed control elsewhere in the same buffer), it doesn't fire.
-///
-/// Registry entry point: with no wider buffer, the event is its own buffer.
-/// The printed-trigger collector calls [`match_changes_controller_in_batch`]
-/// with the whole collection buffer instead.
+/// Everything is judged on the event's evidence, which the instruction captured
+/// immediately before its first mutation (CR 603.10: "the existence of those
+/// abilities and the appearance of objects immediately prior to the event"):
+///   * `Unrecorded` evidence (a pre-change saved payload) authorizes nothing.
+///     It is never reconstructed from current state.
+///   * CR 110.1: the subject was a permanent, judged by its observed zone. A
+///     spell changing control on the stack (CR 109.4) never matches, and a
+///     permanent stolen and then sacrificed or exiled in the same resolution
+///     still does.
+///   * `valid_card` is judged on the observed subject: `SelfRef` by exact
+///     incarnation (CR 400.7), `SpecificObject` (Stolen Uniform's bound
+///     Equipment) by id, and any other filter only when an event snapshot can
+///     answer it exactly.
+///   * "you" is the source context's controller: for a printed trigger, the
+///     watcher latched immediately before the change (the collector admits
+///     printed `ChangesController` definitions only from that latch); for a
+///     delayed trigger, its creation-time controller (CR 603.7d). It's the same
+///     field the pending trigger's controller is bound from (CR 603.3a).
+///   * CR 603.2: the lose side, `old_controller == you`; then `valid_target`
+///     judges the gaining player relative to that "you".
 pub(super) fn match_changes_controller(
     event: &GameEvent,
     trigger: &TriggerDefinition,
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    match_changes_controller_in_batch(
-        event,
-        std::slice::from_ref(event),
-        trigger,
-        source_context,
-        state,
-    )
-}
-
-/// CR 603.10d + CR 603.3a: the "you" of a look-back control-change trigger —
-/// its source's controller immediately before the control change — when the
-/// collection buffer proves it; `None` when it doesn't.
-///
-/// Every trigger scan runs after `flush_layers`, over a buffer that holds a
-/// whole resolved chain (`collect_pending_triggers`), so live state is the END
-/// of that chain. Two facts are unambiguous there:
-///   * the source IS the changing object: its controller before this change is
-///     the event's `old_controller` (the loser, by construction);
-///   * the source's control didn't change this turn (no `ControllerChanged`
-///     for it in the buffer, and no layer-2 control change stamped on it this
-///     turn — see [`source_controller_stable_this_turn`]): its live controller
-///     is its controller at every event in it.
-///
-/// Otherwise the source changed control in the same buffer as this event, and
-/// whether it did so before, with, or after this event isn't recorded (a
-/// player-scope fan-out publishes one simultaneous instruction as several
-/// resolver calls). That case is the conservative fallback: no "you", so the
-/// trigger doesn't fire rather than fire for a guessed player.
-pub(crate) fn changes_controller_look_back_you(
-    event: &GameEvent,
-    event_batch: &[GameEvent],
-    source_context: &TriggerSourceContext,
-    state: &GameState,
-) -> Option<PlayerId> {
-    let source_id = source_event_subject_id(source_context);
-    let source_change = |candidate: &GameEvent| match candidate {
-        GameEvent::ControllerChanged {
-            object_id,
-            old_controller,
-            new_controller,
-        } if *object_id == source_id && old_controller != new_controller => Some(*old_controller),
-        _ => None,
-    };
-    match source_change(event) {
-        Some(old_controller) => Some(old_controller),
-        None if event_batch
-            .iter()
-            .any(|candidate| source_change(candidate).is_some()) =>
-        {
-            None
-        }
-        None => source_controller_stable_this_turn(source_context, state),
-    }
-}
-
-/// CR 603.10d + CR 613.1b: the source's controller, when it provably held for
-/// the whole turn so far. A battlefield source's control can change through
-/// layer 2 without any `ControllerChanged` being published (an Aura's static
-/// ability starting or stopping to apply), so a missing event isn't proof; the
-/// proof is `controller_changed_turn`, stamped by the layer-2 controller diff
-/// that every legal-game control change of a permanent passes through (the
-/// debug sandbox's direct controller setter is outside it). A stamp from this
-/// turn makes "you" unprovable: `None`, the trigger doesn't fire. A source that
-/// isn't a live battlefield object (a delayed trigger's graveyard spell, or a
-/// latched snapshot) has a controller layer 2 can't move.
-fn source_controller_stable_this_turn(
-    source_context: &TriggerSourceContext,
-    state: &GameState,
-) -> Option<PlayerId> {
-    match source_context.source_read(state) {
-        crate::types::game_state::TriggerSourceRead::ExactLive(object)
-            if object.zone == Zone::Battlefield
-                && object.controller_changed_turn == Some(state.turn_number) =>
-        {
-            None
-        }
-        read => Some(read.controller()),
-    }
-}
-
-/// [`match_changes_controller`] with the collection buffer `event` belongs to,
-/// so a source that changed control elsewhere in the buffer is recognised as
-/// ambiguous (see [`changes_controller_look_back_you`]).
-pub(crate) fn match_changes_controller_in_batch(
-    event: &GameEvent,
-    event_batch: &[GameEvent],
-    trigger: &TriggerDefinition,
-    source_context: &TriggerSourceContext,
-    state: &GameState,
-) -> bool {
     let GameEvent::ControllerChanged {
-        object_id,
         old_controller,
         new_controller,
+        evidence,
+        ..
     } = event
     else {
         return false;
@@ -3690,37 +3588,38 @@ pub(crate) fn match_changes_controller_in_batch(
     if old_controller == new_controller {
         return false;
     }
-    // CR 110.1: every ChangesController subject is a permanent. A
-    // `ControllerChanged` on a stack object (CR 109.4 — e.g. Perplexing
-    // Chimera exchanging control of a spell) is not a permanent changing
-    // control, even when a type-only subject ("a permanent") would match the
-    // spell's card types. Collection runs at the end of the resolved chain, so
-    // an object that has since left the battlefield can't be told apart from a
-    // spell that changed control on the stack: it doesn't fire (conservative
-    // fallback, e.g. a permanent stolen and then sacrificed by one spell).
-    if !state.battlefield.contains(object_id) {
-        return false;
-    }
-    if !valid_card_matches(trigger, state, *object_id, source_context) {
-        return false;
-    }
-    // CR 603.10d: "you lose control of …" and "an opponent gains control of …
-    // from you" look back in time, so "you" is the trigger source's controller
-    // immediately before the change. For the delayed/`SpecificObject` case
-    // (Stolen Uniform) the source is the graveyard spell whose controller is
-    // the player who temporarily held the object, so the loss fires and the
-    // initial gain (old == owner != caster) does not.
-    let Some(you) = changes_controller_look_back_you(event, event_batch, source_context, state)
-    else {
+    let Some(observation) = evidence.observation() else {
         return false;
     };
-    // CR 603.2: the lose side — the object left "your" control.
+    let subject = &observation.subject;
+    if subject.zone != Zone::Battlefield {
+        return false;
+    }
+    let subject_matches = match &trigger.valid_card {
+        None => true,
+        Some(TargetFilter::SelfRef) => subject.identity == source_context.identity.reference,
+        Some(TargetFilter::SpecificObject { id }) => subject.identity.object_id == *id,
+        Some(filter) => {
+            crate::types::events::EventObjectSnapshot::classify_filter_shape(filter)
+                == crate::types::events::EventObjectFilterSupport::Supported
+                && super::filter::matches_target_filter_on_event_snapshot(
+                    state,
+                    subject,
+                    filter,
+                    &super::filter::FilterContext::from_trigger_source(source_context),
+                )
+        }
+    };
+    if !subject_matches {
+        return false;
+    }
+    let you = source_context.lki.controller;
     if *old_controller != you {
         return false;
     }
-    // CR 603.10d + CR 102.2 / CR 102.3: the player who gained control, judged
-    // relative to the look-back "you" ("an opponent gains control … from you").
-    // `None` is "you lose control of …": any new controller.
+    // CR 603.10d + CR 102.2 / CR 102.3: the gaining player, judged relative to
+    // the look-back "you" ("an opponent gains control … from you"). `None` is
+    // "you lose control of …": any new controller.
     //
     // `Controller` here is the legacy lose-control payload: before this slot
     // named the gaining player, the lose-control delayed builder stamped the
@@ -3735,7 +3634,6 @@ pub(crate) fn match_changes_controller_in_batch(
         }
     }
 }
-
 /// CR 712.14: Transformed trigger — fires when an object transforms.
 /// Uses `GameEvent::Transformed { object_id }` which carries the actual transforming object.
 /// If `valid_source` is set (e.g., `SelfRef` for "~ transforms"), only fires when the

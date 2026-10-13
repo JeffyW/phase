@@ -297,7 +297,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v140 before it can read the control-change provenance", async () => {
+  it("rejects Full v140 before it can read the control-change evidence", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 140 }));

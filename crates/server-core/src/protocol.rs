@@ -3346,9 +3346,11 @@ mod tests {
         }
     }
 
-    /// v141: CR 603.10d control-change provenance —
-    /// `GameObject::controller_changed_turn`, inside `GameState`; look-back
-    /// control-change triggers read it, so a v140 peer must be refused before
+    /// v141: CR 603.10d control-change evidence —
+    /// `GameEvent::ControllerChanged::evidence`,
+    /// `ResolvedAbility::control_change_instruction` and
+    /// `GameState::control_change_captures`, inside `GameState`; look-back
+    /// control-change triggers read them, so a v140 peer must be refused before
     /// it receives v141 state.
     ///
     /// v140: `AttackSubject` gains `EventAttackers` (the players a trigger's
@@ -3549,7 +3551,7 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_141_for_control_change_provenance() {
+    fn protocol_version_is_141_for_control_change_evidence() {
         assert_eq!(PROTOCOL_VERSION, 141);
     }
 
