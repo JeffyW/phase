@@ -112,6 +112,26 @@ pub fn resolve(
         copy_source(state, ability, CopySourceReferent::OwnSource)
             .into_iter()
             .collect()
+    } else if reads_copiable_values_of_target(&ability.effect)
+        && target_filter.contains_source_attachment_host()
+    {
+        // CR 303.4b + CR 301.5f + CR 608.2h + CR 707.2: "a copy of enchanted /
+        // equipped creature" copies the host the resolution bound, pinned to its
+        // exact incarnation — its current copiable values while it is still that
+        // object, else its last known ones (Penumbra Umbra after the creature was
+        // exiled). A host with neither supplies nothing (CR 609.3).
+        ability
+            .target_occurrences()
+            .into_iter()
+            .filter_map(|(target, pin)| match target {
+                TargetRef::Object(id) => Some(pin.map_or(
+                    CopySourceReferent::Object(id),
+                    CopySourceReferent::Incarnation,
+                )),
+                TargetRef::Player(_) => None,
+            })
+            .filter_map(|referent| copy_source(state, ability, referent))
+            .collect()
     } else {
         let copy_source_ids: Vec<ObjectId> = if let Some(source_filter) = source_filter {
             let zones = {
@@ -291,6 +311,9 @@ pub(crate) enum CopySourceReferent {
     OwnSource,
     /// An object the effect's route identified at resolution.
     Object(ObjectId),
+    /// CR 400.7 + CR 608.2h: an exact incarnation the effect's route bound — its
+    /// current values while it is still that object, else its last known ones.
+    Incarnation(ObjectIncarnationRef),
 }
 
 /// CR 707.2: one copy source as a copy effect reads it: the incarnation it
@@ -368,6 +391,10 @@ pub(crate) fn copy_source(
 ) -> Option<CopySource> {
     match referent {
         CopySourceReferent::Object(id) => CopySource::live(state, id),
+        CopySourceReferent::Incarnation(reference) if reference.is_current(state) => {
+            CopySource::live(state, reference.object_id)
+        }
+        CopySourceReferent::Incarnation(reference) => CopySource::last_known(state, reference),
         CopySourceReferent::OwnSource if ability.source_is_current(state) => {
             CopySource::live(state, ability.source_id)
         }
@@ -393,6 +420,23 @@ pub(crate) fn copies_own_source(effect: &Effect) -> bool {
             ..
         } | Effect::Myriad
             | Effect::Encore
+    )
+}
+
+/// CR 400.7 + CR 608.2h + CR 707.2: whether `effect` only READS its object
+/// operand — a token copy of it reads its copiable values — rather than acting
+/// on it. Such an operand that has since left the battlefield is still read,
+/// through its last known copiable values; every other instruction on a
+/// departed operand does nothing (CR 609.3). Deliberately narrow: an effect
+/// answers `true` here only once its handler reads a pinned departed
+/// incarnation exactly (the host branch of [`resolve`]).
+pub(crate) fn reads_copiable_values_of_target(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::CopyTokenOf {
+            source_filter: None,
+            ..
+        }
     )
 }
 

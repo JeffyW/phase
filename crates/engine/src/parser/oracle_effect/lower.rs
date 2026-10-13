@@ -2063,7 +2063,7 @@ pub(super) fn target_choice_timing_for_parsed(
             return TargetChoiceTiming::Resolution;
         }
     }
-    // CR 115.10a + CR 115.1b + CR 303.4b + CR 301.5f: "enchanted creature" /
+    // CR 115.10a + CR 115.1b + CR 303.4b + CR 303.4m + CR 301.5f: "enchanted creature" /
     // "equipped creature" in an Aura's or Equipment's own instruction names
     // whatever the source is attached to. Unless the text says "target", the
     // host is affected, not targeted: it claims no announcement slot, so it
