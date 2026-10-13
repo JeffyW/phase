@@ -1785,25 +1785,45 @@ pub(crate) fn resolution_bound_attachment_hosts(
     })
 }
 
+/// What [`bind_resolution_attachment_hosts`] found for a node as it begins to
+/// resolve.
+pub(crate) enum ResolutionHostBinding {
+    /// The node names no resolution-bound "enchanted/equipped X" recipient.
+    NotApplicable,
+    /// The host, bound into the node's targets.
+    Bound(ResolvedAbility),
+    /// CR 115.10a + CR 303.4b + CR 301.5f: the node names its source's host, but
+    /// there is none (the source is attached to nothing, or the host is gone or
+    /// no longer meets the description). The instruction affects nothing; it must
+    /// never fall back to a filter scan, which would read "enchanted creature" as
+    /// "any creature with an Aura attached".
+    Absent,
+}
+
 /// CR 115.10a + CR 608.2c: binds the host of a resolution-timed "enchanted /
 /// equipped X" instruction ([`resolution_bound_attachment_hosts`]) into the
 /// node's targets as it begins to resolve, so its effect handler, its
 /// conditions and the anaphors of the instructions after it ("It deals damage
 /// to you equal to its power") all read the same object. The host is affected,
 /// not targeted: it is bound after target legality was checked (CR 608.2b) and
-/// raises no targeting event. `None` when there is nothing to bind.
+/// raises no targeting event.
 pub(crate) fn bind_resolution_attachment_hosts(
     state: &GameState,
     ability: &ResolvedAbility,
-) -> Option<ResolvedAbility> {
-    let recipient = ability.effect.target_filter()?;
-    let hosts = resolution_bound_attachment_hosts(state, ability, recipient)?;
+) -> ResolutionHostBinding {
+    let Some(hosts) = ability
+        .effect
+        .target_filter()
+        .and_then(|recipient| resolution_bound_attachment_hosts(state, ability, recipient))
+    else {
+        return ResolutionHostBinding::NotApplicable;
+    };
     if hosts.is_empty() {
-        return None;
+        return ResolutionHostBinding::Absent;
     }
     let mut bound = ability.clone();
     bound.set_unpinned_targets(hosts.into_iter().map(TargetRef::Object).collect());
-    Some(bound)
+    ResolutionHostBinding::Bound(bound)
 }
 
 /// Resolve a filter with a caller-supplied semantic context. This preserves the

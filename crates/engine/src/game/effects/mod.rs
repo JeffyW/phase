@@ -15501,13 +15501,20 @@ fn resolve_chain_body(
     // CR 115.10a + CR 301.5f + CR 303.4b: an untargeted "enchanted/equipped X"
     // recipient is bound to the source's host as this instruction begins to
     // resolve, before its conditions, effect and inheriting sub-abilities read it.
+    // With no host, the instruction itself does nothing (`host_absent`).
+    let host_binding = crate::game::targeting::bind_resolution_attachment_hosts(state, ability);
+    let host_absent = matches!(
+        host_binding,
+        crate::game::targeting::ResolutionHostBinding::Absent
+    );
     let host_bound;
-    let ability = match crate::game::targeting::bind_resolution_attachment_hosts(state, ability) {
-        Some(bound) => {
+    let ability = match host_binding {
+        crate::game::targeting::ResolutionHostBinding::Bound(bound) => {
             host_bound = bound;
             &host_bound
         }
-        None => ability,
+        crate::game::targeting::ResolutionHostBinding::NotApplicable
+        | crate::game::targeting::ResolutionHostBinding::Absent => ability,
     };
     // CR 608.2c: Snapshot the `pending_continuation` *value* at chain-body
     // entry so the sub_ability guard further down can compare by IDENTITY, not
@@ -17031,7 +17038,10 @@ fn resolve_chain_body(
         // If targets don't share the required quality, skip the effect.
         let shares_quality_failed = fails_shared_quality(state, effective);
 
-        if shares_quality_failed {
+        // CR 115.10a + CR 303.4b + CR 301.5f: an instruction naming its source's
+        // host when there is no host affects nothing — skipped here like a failed
+        // group constraint, so no resolver can re-read the description as a scan.
+        if shares_quality_failed || host_absent {
             // Group constraint not met — emit EffectResolved but skip execution.
             events.push(GameEvent::EffectResolved {
                 kind: crate::types::ability::EffectKind::from(&ability.effect),

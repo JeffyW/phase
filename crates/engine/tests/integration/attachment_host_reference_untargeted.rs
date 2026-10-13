@@ -36,6 +36,13 @@ const NURTURING_LICID: &str = "{G}, {T}: This creature loses this ability and be
 const FRENZIED_FUGUE: &str = "Enchant permanent\nWhen this Aura enters and at the beginning of your upkeep, gain control of enchanted permanent until end of turn. Untap that permanent. It gains haste until end of turn.";
 const MAROONED: &str = "Enchant artifact or creature\nWhen this Aura enters, you may pay {3}. If you do, tap enchanted permanent.\nEnchanted permanent doesn't untap during its controller's untap step and can't be beamed up.";
 const SWORD_OF_THE_PARUNS: &str = "As long as equipped creature is tapped, tapped creatures you control get +2/+0.\nAs long as equipped creature is untapped, untapped creatures you control get +0/+2.\n{3}: You may tap or untap equipped creature.\nEquip {3}";
+const SUN_CLASP: &str =
+    "Enchant creature\nEnchanted creature gets +1/+3.\n{W}: Return enchanted creature to its owner's hand.";
+const VANISHING: &str = "Enchant creature\n{U}{U}: Enchanted creature phases out. (While it's phased out, it's treated as though it doesn't exist. It phases in before its controller untaps during their next untap step.)";
+const SHATTERED_EGO: &str = "Enchant creature\nEnchanted creature gets -3/-0.\n{3}{U}{U}: Put enchanted creature into its owner's library third from the top.";
+const JUNK_JET: &str = "When this Equipment enters, create a Junk token. (It's an artifact with \"{T}, Sacrifice this token: Exile the top card of your library. You may play that card this turn. Activate only as a sorcery.\")\n{3}, Sacrifice another artifact: Double equipped creature's power until end of turn.\nEquip {1}";
+const FOLLOWED_FOOTSTEPS: &str = "Enchant creature\nAt the beginning of your upkeep, create a token that's a copy of enchanted creature.";
+const CONVENIENT_TARGET: &str = "Enchant creature\nWhen this Aura enters, suspect enchanted creature. (It has menace and can't block.)\nEnchanted creature gets +1/+1.\n{2}{R}: Return this card from your graveyard to your hand.";
 
 fn free_cost() -> ManaCost {
     ManaCost::Cost {
@@ -446,6 +453,215 @@ fn sword_of_the_paruns_untaps_a_shrouded_equipped_creature() {
     );
 }
 
+/// Puts the Aura or Equipment `text` on the battlefield attached to a shrouded
+/// creature of P0's (tapped), with `mana` floating, and activates the ability
+/// `pick` selects. CR 115.10a: the host is not a target, so shroud can't stop it.
+fn activate_on_shrouded_host(
+    text: &str,
+    equipment: bool,
+    mana: Vec<ManaUnit>,
+    pick: fn(&Effect) -> bool,
+) -> (GameRunner, ObjectId, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P0, "Shrouded Bear", 2, 2)
+        .with_keyword(Keyword::Shroud)
+        .id();
+    let source = if equipment {
+        sc.add_creature(P0, "Test Equipment", 0, 0)
+            .as_artifact()
+            .with_subtypes(vec!["Equipment"])
+            .from_oracle_text(text)
+            .id()
+    } else {
+        aura_on_battlefield(&mut sc, P0, "Test Aura", text)
+    };
+    sc.with_mana_pool(P0, mana);
+    let mut runner = sc.build();
+    attach(&mut runner, source, host);
+    let index = ability_index(&runner, source, pick);
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: index,
+        })
+        .expect("CR 115.10a: an ability naming the host without 'target' can be activated");
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the ability resolved"
+    );
+    (runner, source, host)
+}
+
+fn mana(kind: ManaType, n: usize) -> Vec<ManaUnit> {
+    std::iter::repeat_n(ManaUnit::new(kind, ObjectId(0), false, vec![]), n).collect()
+}
+
+/// Bounce sibling: Sun Clasp, "{W}: Return enchanted creature to its owner's hand."
+#[test]
+fn sun_clasp_returns_its_shrouded_host() {
+    let (runner, _, host) =
+        activate_on_shrouded_host(SUN_CLASP, false, mana(ManaType::White, 1), |e| {
+            matches!(e, Effect::Bounce { .. })
+        });
+    assert_eq!(runner.state().objects[&host].zone, Zone::Hand);
+}
+
+/// PhaseOut sibling: Vanishing, "{U}{U}: Enchanted creature phases out."
+#[test]
+fn vanishing_phases_out_its_shrouded_host() {
+    let (runner, _, host) =
+        activate_on_shrouded_host(VANISHING, false, mana(ManaType::Blue, 2), |e| {
+            matches!(e, Effect::PhaseOut { .. })
+        });
+    assert!(
+        !runner.state().objects[&host].is_phased_in(),
+        "the host phased out"
+    );
+}
+
+/// PutAtLibraryPosition sibling: Shattered Ego, "{3}{U}{U}: Put enchanted
+/// creature into its owner's library third from the top."
+#[test]
+fn shattered_ego_puts_its_shrouded_host_into_the_library() {
+    let mut pool = mana(ManaType::Blue, 2);
+    pool.extend(mana(ManaType::Colorless, 3));
+    let (runner, _, host) = activate_on_shrouded_host(SHATTERED_EGO, false, pool, |e| {
+        matches!(e, Effect::PutAtLibraryPosition { .. })
+    });
+    assert_eq!(runner.state().objects[&host].zone, Zone::Library);
+}
+
+/// DoublePT sibling: Junk Jet, "{3}, Sacrifice another artifact: Double equipped
+/// creature's power until end of turn."
+#[test]
+fn junk_jet_doubles_its_shrouded_equipped_creatures_power() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P0, "Shrouded Bear", 3, 3)
+        .with_keyword(Keyword::Shroud)
+        .id();
+    let jet = sc
+        .add_creature(P0, "Junk Jet", 0, 0)
+        .as_artifact()
+        .with_subtypes(vec!["Equipment"])
+        .from_oracle_text(JUNK_JET)
+        .id();
+    let fodder = sc.add_creature(P0, "Spare Part", 0, 0).as_artifact().id();
+    sc.with_mana_pool(P0, mana(ManaType::Colorless, 3));
+    let mut runner = sc.build();
+    attach(&mut runner, jet, host);
+    let index = ability_index(&runner, jet, |e| matches!(e, Effect::DoublePT { .. }));
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: jet,
+            ability_index: index,
+        })
+        .expect("CR 115.10a: 'double equipped creature's power' does not target");
+    for _ in 0..8 {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::PayCost { choices, .. } => {
+                assert_eq!(
+                    choices,
+                    &vec![fodder],
+                    "reach: the other artifact is the fodder"
+                );
+                GameAction::SelectCards {
+                    cards: vec![fodder],
+                }
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        };
+        runner.act(action).expect("prompt accepts");
+    }
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&fodder].zone,
+        Zone::Graveyard,
+        "reach: the artifact was sacrificed"
+    );
+    assert_eq!(
+        s.objects[&host].power,
+        Some(6),
+        "the equipped creature's power doubled"
+    );
+}
+
+/// CopyTokenOf sibling: Followed Footsteps, "At the beginning of your upkeep,
+/// create a token that's a copy of enchanted creature." on a shrouded creature.
+#[test]
+fn followed_footsteps_copies_its_shrouded_host() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P1, "Shrouded Bear", 2, 2)
+        .with_keyword(Keyword::Shroud)
+        .id();
+    let aura = aura_on_battlefield(&mut sc, P0, "Followed Footsteps", FOLLOWED_FOOTSTEPS);
+    sc.with_library_top(P0, &["Card A", "Card B"]);
+    sc.with_library_top(P1, &["Card C", "Card D"]);
+    let mut runner = sc.build();
+    attach(&mut runner, aura, host);
+    // From P1's end step to P0's upkeep.
+    {
+        let state = runner.state_mut();
+        state.phase = Phase::End;
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    runner.advance_to_phase(Phase::Upkeep);
+    runner.advance_until_stack_empty();
+    let s = runner.state();
+    assert_eq!(s.active_player, P0, "reach: it is P0's upkeep");
+    let copies = s
+        .battlefield
+        .iter()
+        .filter(|id| {
+            let o = &s.objects[*id];
+            o.is_token && o.name == "Shrouded Bear" && o.controller == P0
+        })
+        .count();
+    assert_eq!(
+        copies, 1,
+        "P0 creates one token copy of the enchanted creature"
+    );
+}
+
+/// Suspect sibling: Convenient Target, "When this Aura enters, suspect
+/// enchanted creature." cast on an opponent's ward creature.
+#[test]
+fn convenient_target_suspects_ward_host_with_one_ward_trigger() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P1, "Patchwork Automaton", 1, 1)
+        .with_keyword(Keyword::Ward(WardCost::Mana(ManaCost::generic(2))))
+        .id();
+    let aura = aura_in_hand(&mut sc, P0, "Convenient Target", CONVENIENT_TARGET);
+    sc.add_creature(P0, "Grizzly Bears", 2, 2);
+    sc.with_mana_pool(P0, pool(0, 2));
+    let mut runner = sc.build();
+
+    let d = cast_aura_and_resolve(&mut runner, aura, host, CastPaymentMode::Auto);
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&aura].attached_to,
+        Some(AttachTarget::Object(host)),
+        "reach: Convenient Target resolved and attached"
+    );
+    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
+    assert!(
+        s.objects[&host].is_suspected,
+        "the enchanted creature is suspected"
+    );
+}
+
 /// Puts Claustrophobia onto the battlefield attached to `host` (as a resolved
 /// Aura spell would) and leaves its ETB trigger waiting on the stack.
 fn claustrophobia_etb_on_stack(
@@ -759,6 +975,50 @@ fn nurturing_licid_as_creature_regenerates_nothing() {
         !bystander,
         "CR 303.4b: an unattached Licid has no enchanted creature, so a creature wearing an \
          unrelated Aura is not regenerated"
+    );
+}
+
+/// SYNTHETIC (fail-closed guard): a non-Aura source that is attached to nothing
+/// names no enchanted creature, so "Enchanted creature phases out" affects
+/// nothing. PhaseOut's resolver falls back to a filter scan when it has no
+/// targets; without the no-host skip it would phase out an unrelated creature
+/// that happens to wear an Aura.
+#[test]
+fn hostless_phase_out_affects_no_unrelated_enchanted_creature() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let source = sc
+        .add_creature_from_oracle(
+            P0,
+            "Unattached Phaser",
+            1,
+            1,
+            "{U}{U}: Enchanted creature phases out.",
+        )
+        .id();
+    let bystander = sc.add_creature(P1, "Enchanted Bystander", 2, 2).id();
+    let other_aura = aura_on_battlefield(&mut sc, P1, "Unrelated Aura", "Enchant creature");
+    sc.with_mana_pool(P0, mana(ManaType::Blue, 2));
+    let mut runner = sc.build();
+    attach(&mut runner, other_aura, bystander);
+    let index = ability_index(&runner, source, |e| matches!(e, Effect::PhaseOut { .. }));
+    assert_eq!(
+        runner.state().objects[&source].abilities[index].target_choice_timing,
+        TargetChoiceTiming::Resolution,
+        "reach: the host reference is resolution-timed"
+    );
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: index,
+        })
+        .expect("the ability names no target, so it can be activated");
+    runner.advance_until_stack_empty();
+    let s = runner.state();
+    assert!(s.stack.is_empty(), "reach: the ability resolved");
+    assert!(
+        s.objects[&bystander].is_phased_in(),
+        "a creature wearing an unrelated Aura is not the source's enchanted creature"
     );
 }
 
