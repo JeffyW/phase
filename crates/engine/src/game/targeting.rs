@@ -1791,7 +1791,7 @@ pub(crate) enum ResolutionHostBinding {
     /// The node names no resolution-bound "enchanted/equipped X" recipient.
     NotApplicable,
     /// The host, bound into the node's targets.
-    Bound(ResolvedAbility),
+    Bound(Box<ResolvedAbility>),
     /// CR 115.10a + CR 303.4b + CR 301.5f: the node names its source's host, but
     /// there is none (the source is attached to nothing, or the host is gone or
     /// no longer meets the description). The instruction affects nothing; it must
@@ -1823,7 +1823,7 @@ pub(crate) fn bind_resolution_attachment_hosts(
     }
     let mut bound = ability.clone();
     bound.set_unpinned_targets(hosts.into_iter().map(TargetRef::Object).collect());
-    ResolutionHostBinding::Bound(bound)
+    ResolutionHostBinding::Bound(Box::new(bound))
 }
 
 /// Resolve a filter with a caller-supplied semantic context. This preserves the

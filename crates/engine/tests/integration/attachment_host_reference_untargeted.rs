@@ -43,6 +43,9 @@ const SHATTERED_EGO: &str = "Enchant creature\nEnchanted creature gets -3/-0.\n{
 const JUNK_JET: &str = "When this Equipment enters, create a Junk token. (It's an artifact with \"{T}, Sacrifice this token: Exile the top card of your library. You may play that card this turn. Activate only as a sorcery.\")\n{3}, Sacrifice another artifact: Double equipped creature's power until end of turn.\nEquip {1}";
 const FOLLOWED_FOOTSTEPS: &str = "Enchant creature\nAt the beginning of your upkeep, create a token that's a copy of enchanted creature.";
 const CONVENIENT_TARGET: &str = "Enchant creature\nWhen this Aura enters, suspect enchanted creature. (It has menace and can't block.)\nEnchanted creature gets +1/+1.\n{2}{R}: Return this card from your graveyard to your hand.";
+const ASSAULT_SUIT: &str = "Equipped creature gets +2/+2, has haste, can't attack you or planeswalkers you control, and can't be sacrificed.\nAt the beginning of each opponent's upkeep, you may have that player gain control of equipped creature until end of turn. If you do, untap it.\nEquip {3}";
+const OBSERVED_STASIS: &str = "Flash\nEnchant creature an opponent controls\nWhen this Aura enters, remove enchanted creature from combat. Then draw a card for each tapped creature its controller controls.\nEnchanted creature loses all abilities and can't attack or block.";
+const LAST_VOYAGE: &str = "When this enchantment enters, you may put a name sticker on it, then it becomes an Aura with enchant creature. Return a creature card from your graveyard to the battlefield and attach this Aura to it.\nEnchanted creature gets +2/+0 for each name sticker on this Aura with seven or fewer letters.\nWhen this Aura leaves the battlefield, sacrifice enchanted creature.";
 
 fn free_cost() -> ManaCost {
     ManaCost::Cost {
@@ -975,6 +978,131 @@ fn nurturing_licid_as_creature_regenerates_nothing() {
         !bystander,
         "CR 303.4b: an unattached Licid has no enchanted creature, so a creature wearing an \
          unrelated Aura is not regenerated"
+    );
+}
+
+/// GiveControl sibling: Assault Suit, "At the beginning of each opponent's
+/// upkeep, you may have that player gain control of equipped creature until end
+/// of turn. If you do, untap it." — on a shrouded equipped creature.
+#[test]
+fn assault_suit_gives_its_shrouded_equipped_creature_to_the_opponent() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P0, "Shrouded Bear", 2, 2)
+        .with_keyword(Keyword::Shroud)
+        .id();
+    let suit = sc
+        .add_creature(P0, "Assault Suit", 0, 0)
+        .as_artifact()
+        .with_subtypes(vec!["Equipment"])
+        .from_oracle_text(ASSAULT_SUIT)
+        .id();
+    let mut runner = sc.build();
+    attach(&mut runner, suit, host);
+    set_tapped(&mut runner, host, true);
+    // From P0's end step to P1's upkeep.
+    {
+        let state = runner.state_mut();
+        state.phase = Phase::End;
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    runner.advance_to_phase(Phase::Upkeep);
+    let mut accepted = false;
+    for _ in 0..16 {
+        let action = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OptionalEffectChoice { .. } => {
+                accepted = true;
+                GameAction::DecideOptionalEffect { accept: true }
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        };
+        runner.act(action).expect("prompt accepts");
+    }
+    let s = runner.state();
+    assert_eq!(s.active_player, P1, "reach: it is P1's upkeep");
+    assert!(accepted, "reach: Assault Suit's 'you may' was offered");
+    assert_eq!(
+        s.objects[&host].controller, P1,
+        "the opponent gains control"
+    );
+    assert!(
+        !s.objects[&host].tapped,
+        "'If you do, untap it' untaps the host"
+    );
+}
+
+/// RemoveFromCombat sibling with a controller anaphor: Observed Stasis, "When
+/// this Aura enters, remove enchanted creature from combat. Then draw a card for
+/// each tapped creature its controller controls." — cast on a ward creature.
+/// Regression guard: the Aura's own "loses all abilities" already strips ward
+/// before its ETB goes on the stack, so this pins the bound host and the
+/// "its controller" count rather than the ward count.
+#[test]
+fn observed_stasis_etb_does_not_retrigger_ward_and_counts_hosts_controller() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P1, "Patchwork Automaton", 1, 1)
+        .with_keyword(Keyword::Ward(WardCost::Mana(ManaCost::generic(2))))
+        .id();
+    sc.add_creature(P1, "Second Creature", 2, 2);
+    let aura = aura_in_hand(&mut sc, P0, "Observed Stasis", OBSERVED_STASIS);
+    sc.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    sc.with_mana_pool(P0, pool(0, 2));
+    let mut runner = sc.build();
+    set_tapped(&mut runner, host, true);
+    let hand_before = runner.state().players[P0.0 as usize].hand.len();
+
+    let d = cast_aura_and_resolve(&mut runner, aura, host, CastPaymentMode::Auto);
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&aura].attached_to,
+        Some(AttachTarget::Object(host)),
+        "reach: Observed Stasis resolved and attached"
+    );
+    assert_eq!(d.ward_triggers(), 1, "ward triggers exactly once");
+    // The Aura left the hand (-1); one tapped creature under P1 draws one (+1).
+    assert_eq!(
+        s.players[P0.0 as usize].hand.len(),
+        hand_before,
+        "one card is drawn for the one tapped creature the host's controller controls"
+    );
+}
+
+/// Sacrifice sibling (LKI): Last Voyage of the _____, "When this Aura leaves the
+/// battlefield, sacrifice enchanted creature." Regression guard: `Sacrifice`
+/// never announced a slot for this shape, so it pins that the resolution-time
+/// binding keeps reading the departed Aura's last known host.
+#[test]
+fn last_voyage_leaves_trigger_sacrifices_last_known_host() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let host = sc
+        .add_creature(P0, "Shrouded Bear", 2, 2)
+        .with_keyword(Keyword::Shroud)
+        .id();
+    let aura = aura_on_battlefield(&mut sc, P0, "Last Voyage of the _____", LAST_VOYAGE);
+    let mut runner = sc.build();
+    attach(&mut runner, aura, host);
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), aura, Zone::Graveyard, &mut events);
+    engine::game::triggers::process_triggers(runner.state_mut(), &events);
+    assert!(
+        runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }),
+        "reach: the leaves-the-battlefield trigger went on the stack"
+    );
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&host].zone,
+        Zone::Graveyard,
+        "CR 608.2h: the creature the Aura was attached to is sacrificed"
     );
 }
 

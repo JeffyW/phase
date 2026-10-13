@@ -15510,7 +15510,7 @@ fn resolve_chain_body(
     let host_bound;
     let ability = match host_binding {
         crate::game::targeting::ResolutionHostBinding::Bound(bound) => {
-            host_bound = bound;
+            host_bound = *bound;
             &host_bound
         }
         crate::game::targeting::ResolutionHostBinding::NotApplicable
