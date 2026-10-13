@@ -1920,7 +1920,7 @@ fn cost_moved_source_departure(
         .enumerate()
         .filter(|(_, record)| record.object_id == captured.object_id)
         .map(|(index, _)| index)
-        .last()?;
+        .next_back()?;
     (records[index].from_zone == Some(Zone::Battlefield)).then_some(index)
 }
 
@@ -2030,6 +2030,23 @@ pub(crate) fn bind_resolution_attachment_hosts(
         }
         Some(AttachmentHost::Departed(host)) => ResolutionHostBinding::Departed(bind(host)),
         Some(AttachmentHost::Live(_)) | None => ResolutionHostBinding::Absent,
+    }
+}
+
+/// CR 400.7 + CR 608.2h: the departed incarnation of this ability's source host
+/// when `pin` names exactly it, so an information reader ("it deals damage equal
+/// to its power") reads that object as it last existed. Any other stale pin is
+/// an object this ability's own effect moved, which its later parts can still
+/// find in the zone it moved to (CR 400.7j); readers keep their live lookup.
+pub(crate) fn departed_attachment_host_pin(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    pin: Option<ObjectIncarnationRef>,
+) -> Option<ObjectIncarnationRef> {
+    let pin = pin.filter(|pin| !pin.is_current(state))?;
+    match source_attachment_host(state, ability)? {
+        AttachmentHost::Departed(host) if host == pin => Some(host),
+        AttachmentHost::Departed(_) | AttachmentHost::Live(_) => None,
     }
 }
 

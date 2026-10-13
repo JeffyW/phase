@@ -894,12 +894,21 @@ fn equip(runner: &mut GameRunner, cloak: ObjectId, bears: ObjectId) {
     );
 }
 
+/// What happened to the equipped creature before the Cloak's ability is
+/// activated.
+#[derive(Clone, Copy)]
+enum CloakHistory {
+    EquippedOnce,
+    /// Earlier in the turn the creature was blinked (a new object) and the
+    /// Cloak re-equipped to it.
+    BlinkedThenReequipped,
+}
+
 /// Review probe F2 (CR 400.7 + CR 613.7e): Cloak of the Philosopher's "{2}:
 /// Untap equipped creature." is activated, and the Cloak is destroyed in
-/// response. `blink_first`: earlier in the turn the creature was blinked (a new
-/// object) and the Cloak re-equipped to it — that earlier departure must not
-/// override the later attachment.
-fn cloak_destroyed_in_response(blink_first: bool) -> bool {
+/// response. An earlier departure of the creature must not override a later
+/// attachment to its returned object.
+fn cloak_destroyed_in_response(history: CloakHistory) -> bool {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let bears = sc.add_creature(P0, "Grizzly Bears", 2, 2).id();
@@ -912,11 +921,14 @@ fn cloak_destroyed_in_response(blink_first: bool) -> bool {
     sc.with_mana_pool(P0, pool(0, 6));
     let mut runner = sc.build();
     equip(&mut runner, cloak, bears);
-    if blink_first {
-        blink(&mut runner, bears);
-        let mut events = Vec::new();
-        engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
-        equip(&mut runner, cloak, bears);
+    match history {
+        CloakHistory::EquippedOnce => {}
+        CloakHistory::BlinkedThenReequipped => {
+            blink(&mut runner, bears);
+            let mut events = Vec::new();
+            engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
+            equip(&mut runner, cloak, bears);
+        }
     }
     set_tapped(&mut runner, bears, true);
     let index = ability_index(&runner, cloak, |e| matches!(e, Effect::SetTapState { .. }));
@@ -940,12 +952,14 @@ fn cloak_destroyed_in_response(blink_first: bool) -> bool {
 
 #[test]
 fn cloak_destroyed_in_response_still_untaps_its_equipped_creature() {
-    assert!(cloak_destroyed_in_response(false));
+    assert!(cloak_destroyed_in_response(CloakHistory::EquippedOnce));
 }
 
 #[test]
 fn cloak_reequipped_after_a_blink_then_destroyed_untaps_the_returned_creature() {
-    assert!(cloak_destroyed_in_response(true));
+    assert!(cloak_destroyed_in_response(
+        CloakHistory::BlinkedThenReequipped
+    ));
 }
 
 /// Review probe F3 (CR 400.7 + CR 608.2h): Bind the Monster's ETB is pending on
@@ -1107,7 +1121,14 @@ fn pemmins_aura_untaps_a_shrouded_host() {
     );
 }
 
-fn cloak_board(attached: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+/// Whether the source starts attached to the board's host.
+#[derive(Clone, Copy)]
+enum AttachmentStart {
+    AttachedToHost,
+    Unattached,
+}
+
+fn cloak_board(start: AttachmentStart) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc
@@ -1129,8 +1150,9 @@ fn cloak_board(attached: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
         .id();
     sc.with_mana_pool(P0, pool(0, 2));
     let mut runner = sc.build();
-    if attached {
-        attach(&mut runner, cloak, host);
+    match start {
+        AttachmentStart::AttachedToHost => attach(&mut runner, cloak, host),
+        AttachmentStart::Unattached => {}
     }
     attach(&mut runner, other_equipment, other);
     set_tapped(&mut runner, host, true);
@@ -1141,7 +1163,7 @@ fn cloak_board(attached: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
 /// Equipment sibling: "{2}: Untap equipped creature." on a shrouded host.
 #[test]
 fn cloak_of_the_philosopher_untaps_a_shrouded_equipped_creature() {
-    let (mut runner, cloak, host, other) = cloak_board(true);
+    let (mut runner, cloak, host, other) = cloak_board(AttachmentStart::AttachedToHost);
     let index = ability_index(&runner, cloak, |e| matches!(e, Effect::SetTapState { .. }));
     runner
         .act(GameAction::ActivateAbility {
@@ -1166,7 +1188,7 @@ fn cloak_of_the_philosopher_untaps_a_shrouded_equipped_creature() {
 /// creature with an Equipment attached").
 #[test]
 fn unattached_cloak_untaps_nothing() {
-    let (mut runner, cloak, host, other) = cloak_board(false);
+    let (mut runner, cloak, host, other) = cloak_board(AttachmentStart::Unattached);
     let index = ability_index(&runner, cloak, |e| matches!(e, Effect::SetTapState { .. }));
     runner
         .act(GameAction::ActivateAbility {
@@ -1228,7 +1250,7 @@ fn has_regeneration_shield(runner: &GameRunner, id: ObjectId) -> bool {
 /// As an Aura it shields the creature it is attached to. As a creature it is
 /// attached to nothing, so there is no enchanted creature: the ability must not
 /// fall back to "every creature that has some Aura attached".
-fn nurturing_licid_case(attached_as_aura: bool) -> (bool, bool) {
+fn nurturing_licid_case(start: AttachmentStart) -> (bool, bool) {
     let mut sc = GameScenario::new();
     sc.at_phase(Phase::PreCombatMain);
     let host = sc.add_creature(P0, "Licid Host", 2, 2).id();
@@ -1243,7 +1265,7 @@ fn nurturing_licid_case(attached_as_aura: bool) -> (bool, bool) {
     );
     let mut runner = sc.build();
     attach(&mut runner, other_aura, bystander);
-    if attached_as_aura {
+    if let AttachmentStart::AttachedToHost = start {
         // The state its first ability leaves it in: an Aura enchantment, not a
         // creature (written to the base types so the layer pass keeps it).
         let obj = runner.state_mut().objects.get_mut(&licid).unwrap();
@@ -1277,7 +1299,7 @@ fn nurturing_licid_case(attached_as_aura: bool) -> (bool, bool) {
 
 #[test]
 fn nurturing_licid_as_aura_regenerates_its_host() {
-    let (host, bystander) = nurturing_licid_case(true);
+    let (host, bystander) = nurturing_licid_case(AttachmentStart::AttachedToHost);
     assert!(
         host,
         "the creature the Licid enchants gets the regeneration shield"
@@ -1290,7 +1312,7 @@ fn nurturing_licid_as_aura_regenerates_its_host() {
 
 #[test]
 fn nurturing_licid_as_creature_regenerates_nothing() {
-    let (host, bystander) = nurturing_licid_case(false);
+    let (host, bystander) = nurturing_licid_case(AttachmentStart::Unattached);
     assert!(!host, "reach: the Licid enchants nothing");
     assert!(
         !bystander,

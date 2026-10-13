@@ -300,17 +300,22 @@ fn target_damage_source(state: &GameState, ability: &ResolvedAbility) -> Option<
         None => {
             // CR 400.7 + CR 608.2h: "If an ability states that an object does
             // something, it's the object as it exists—or as it most recently
-            // existed—that does it." An occurrence pinned to an incarnation that
-            // has since left deals the damage as that object last existed, never
-            // as the new object reusing its storage id; with no record of it,
-            // nothing deals the damage.
+            // existed—that does it." When the subject is this ability's source
+            // host and it has left the battlefield, it deals the damage as it
+            // last existed, never as the new object reusing its storage id;
+            // with no record of it, nothing deals the damage. Any other subject
+            // keeps the lookup below, which finds an object this effect moved
+            // (CR 400.7j).
             if let Some((_, pin)) = ability
                 .target_occurrences()
                 .into_iter()
                 .find(|(target, _)| matches!(target, TargetRef::Object(_)))
-                .filter(|(_, pin)| pin.is_some_and(|pin| !pin.is_current(state)))
             {
-                return pin.and_then(|pin| DamageContext::from_last_known(state, pin));
+                if let Some(host) =
+                    crate::game::targeting::departed_attachment_host_pin(state, ability, pin)
+                {
+                    return DamageContext::from_last_known(state, host);
+                }
             }
             return Some(
                 ability
