@@ -585,6 +585,14 @@ fn host_blinked_before_etb_resolves_returned_creature_stays_untapped() {
         "reach: the creature returned as a new object"
     );
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     let s = runner.state();
     assert_eq!(
         s.objects[&host].zone,
@@ -615,6 +623,14 @@ fn bind_the_monster_host_bounced_deals_nothing() {
     let mut events = Vec::new();
     engine::game::zones::move_to_zone(runner.state_mut(), host, Zone::Hand, &mut events);
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     let s = runner.state();
     assert_eq!(s.objects[&host].zone, Zone::Hand, "reach: the host left");
     assert_ne!(
@@ -1006,6 +1022,14 @@ fn choking_restraints_sacrificed_as_cost_exiles_nothing() {
         "reach: the cost sacrificed the Aura"
     );
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     assert_eq!(
         runner.state().objects[&host].zone,
         Zone::Battlefield,
@@ -1060,6 +1084,14 @@ fn krasis_incubation_returned_as_cost_counters_nothing() {
         "reach: the cost returned the Aura"
     );
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     assert_eq!(
         runner.state().objects[&host]
             .counters
@@ -1122,6 +1154,14 @@ fn helm_of_the_host_with_its_host_blinked(fate: HelmFate) -> GameRunner {
         );
     }
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     runner
 }
 
@@ -1245,6 +1285,14 @@ fn host_gone_before_etb_resolves_taps_nothing() {
     let mut events = Vec::new();
     engine::game::zones::move_to_zone(runner.state_mut(), host, Zone::Hand, &mut events);
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     let s = runner.state();
     assert_eq!(
         s.objects[&host].zone,
@@ -1620,6 +1668,14 @@ fn observed_stasis_host_blinked_draws_nothing() {
         "reach: the returned creature is a new object under its owner's control"
     );
     runner.advance_until_stack_empty();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach: the pending ability resolved"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach: resolution returned to priority"
+    );
     assert_eq!(
         runner.state().players[P0.0 as usize].hand.len(),
         hand_before,
