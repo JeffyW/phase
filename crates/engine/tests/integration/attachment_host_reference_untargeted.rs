@@ -1850,6 +1850,147 @@ fn only_a_lone_host_instruction_stops_targeting() {
     expect(&base_untargeted, TargetChoiceTiming::Resolution);
 }
 
+/// The target-choice timing of every node in `value` (parsed abilities as JSON)
+/// whose slot filter names the source's host; an absent field is the
+/// serialized default, `Stack`.
+fn host_reference_timings_in_json(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let names_host = map
+                .get("effect")
+                .and_then(|effect| effect.get("target"))
+                .is_some_and(|target| {
+                    let text = target.to_string();
+                    text.contains("EnchantedBy") || text.contains("EquippedBy")
+                });
+            if names_host {
+                out.push(
+                    map.get("target_choice_timing")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("Stack")
+                        .to_string(),
+                );
+            }
+            map.values()
+                .for_each(|v| host_reference_timings_in_json(v, out));
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .for_each(|v| host_reference_timings_in_json(v, out)),
+        _ => {}
+    }
+}
+
+fn parsed_host_timings<T: serde::Serialize>(parsed: &T) -> Vec<String> {
+    let mut out = Vec::new();
+    host_reference_timings_in_json(&serde_json::to_value(parsed).unwrap(), &mut out);
+    out
+}
+
+/// Converted GainControl control: Wellspring, "When this Aura enters, gain
+/// control of enchanted land until end of turn." — the lone instruction binds
+/// the host at resolution and P0 controls the land.
+#[test]
+fn wellspring_gains_control_of_its_land() {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    let land = sc.add_basic_land(P1, engine::types::mana::ManaColor::Green);
+    let aura = aura_in_hand(
+        &mut sc,
+        P0,
+        "Wellspring",
+        "Enchant land\nWhen this Aura enters, gain control of enchanted land until end of turn.\nAt the beginning of your upkeep, untap enchanted land. You gain control of that land until end of turn.",
+    );
+    let mut runner = sc.build();
+    runner.cast(aura).target_object(land).commit();
+    runner.act(GameAction::PassPriority).expect("pass");
+    for _ in 0..8 {
+        if runner.state().stack.iter().any(|e| {
+            matches!(&e.kind, StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == aura)
+        }) {
+            break;
+        }
+        runner.act(GameAction::PassPriority).expect("pass");
+    }
+    assert!(
+        runner.state().stack.iter().any(|e| matches!(
+            &e.kind,
+            StackEntryKind::TriggeredAbility { source_id, ability, .. }
+                if *source_id == aura
+                    && ability.target_choice_timing == TargetChoiceTiming::Resolution
+        )),
+        "reach: the converted ETB is on the stack"
+    );
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&land].controller,
+        P0,
+        "P0 gains control of the enchanted land"
+    );
+}
+
+/// SHAPE (scope, R6-1): a document-level modal spell's modes are parts of one
+/// modal ability, never a whole ability, so a lone host instruction in a mode
+/// keeps its stack-time target. The same instruction as a whole spell converts.
+#[test]
+fn a_modal_spell_mode_keeps_its_host_target() {
+    let sorcery = ["Sorcery".to_string()];
+    let modal = engine::parser::oracle::parse_oracle_text(
+        "Choose one —\n• Tap enchanted creature.\n• Draw a card.",
+        "Modal Probe",
+        &[],
+        &sorcery,
+        &[],
+    );
+    assert!(modal.modal.is_some(), "reach: parsed as a modal spell");
+    let timings = parsed_host_timings(&modal.abilities);
+    assert!(!timings.is_empty(), "reach: a mode names the host");
+    assert!(
+        timings.iter().all(|t| t == "Stack"),
+        "modal modes keep their target: {timings:?}"
+    );
+    let lone = engine::parser::oracle::parse_oracle_text(
+        "Tap enchanted creature.",
+        "Lone Probe",
+        &[],
+        &sorcery,
+        &[],
+    );
+    assert_eq!(
+        parsed_host_timings(&lone.abilities),
+        vec!["Resolution".to_string()],
+        "control: the same instruction as the whole ability converts"
+    );
+}
+
+/// SHAPE (scope, R6-1): an ability quoted inside a grant is not the card's own
+/// ability; only the card's own abilities and triggers convert, so a granted
+/// trigger or activated ability keeps its stack-time target.
+#[test]
+fn a_granted_ability_keeps_its_host_target() {
+    let parsed = engine::parser::oracle::parse_oracle_text(
+        "Enchant creature\nEnchanted creature has \"Whenever this creature attacks, tap enchanted creature.\" and \"{T}: Untap equipped creature.\"",
+        "Grant Probe",
+        &["Enchant creature".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    let timings = parsed_host_timings(&parsed.statics);
+    assert!(
+        !timings.is_empty(),
+        "reach: the granted abilities name a host"
+    );
+    assert!(
+        timings.iter().all(|t| t == "Stack"),
+        "granted abilities keep their target: {timings:?}"
+    );
+    assert!(
+        parsed_host_timings(&parsed.triggers).is_empty()
+            && parsed_host_timings(&parsed.abilities).is_empty(),
+        "reach: the host references live only inside the grant"
+    );
+}
+
 /// The Reviewer's r5 probes, and two neighbours, as ETBs whose host instruction
 /// is followed by other instructions: not converted, so they keep base's
 /// stack-time target.

@@ -2047,17 +2047,11 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
 
     // Lower the body
     let execute = match &ir.body {
-        Some(TriggerBody::EffectChain(chain_ir)) => {
-            let mut ability = lower_trigger_effect_chain(chain_ir, modifiers, &ir.die_results);
-            // CR 115.10a + CR 303.4b + CR 301.5f: a lone "enchanted/equipped X"
-            // instruction that is the whole trigger body names its host without
-            // targeting it (decided on the whole body, never on a nested branch).
-            crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
-                &mut ability,
-                &chain_ir.clauses,
-            );
-            Some(Box::new(ability))
-        }
+        Some(TriggerBody::EffectChain(chain_ir)) => Some(Box::new(lower_trigger_effect_chain(
+            chain_ir,
+            modifiers,
+            &ir.die_results,
+        ))),
         Some(TriggerBody::Reflexive(reflexive)) => {
             let reflexive_owns_die_results =
                 effect_chain_has_terminal_roll_die(&reflexive.effect_chain);

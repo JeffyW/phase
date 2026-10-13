@@ -2003,6 +2003,8 @@ pub(crate) fn convert_terminal_attachment_host_reference(
 ) {
     if def.sub_ability.is_some()
         || def.else_ability.is_some()
+        || def.modal.is_some()
+        || !def.mode_abilities.is_empty()
         || def.target_choice_timing != TargetChoiceTiming::Stack
         || def.effect.attachment_host_slot() != crate::types::ability::AttachmentHostSlot::Operand
     {

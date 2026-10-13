@@ -101,7 +101,7 @@ use super::oracle_ir::trace::{
     document_candidate, parsed_candidate, OuterRoute, ParseObserver, ParserTrace,
     PayloadVisibility, TraceStage,
 };
-use super::oracle_ir::trigger::{TriggerIr, TriggerNodeIr};
+use super::oracle_ir::trigger::{TriggerBody, TriggerIr, TriggerNodeIr};
 pub use super::oracle_keyword::keyword_display_name;
 use super::oracle_keyword::{
     is_keyword_cost_line, is_kicker_family_line, parse_kicker_additional_cost_line,
@@ -4122,6 +4122,13 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     // The match stays EXHAUSTIVE over `OracleNodeIr` (no `_` arm): it is now the
     // single place a new node variant must declare whether it consumes a printed
     // slot, an obligation `finish()` used to carry.
+    // CR 700.2: a document that carries a modal choice owns its `Spell` items as
+    // that choice's modes — parts of one modal ability, never a whole ability —
+    // so none of them is a lone host instruction.
+    let owns_modal_modes = ir
+        .items
+        .iter()
+        .any(|item| matches!(item.node, OracleNodeIr::Modal(_)));
     for item in &ir.items {
         match &item.node {
             OracleNodeIr::Spell(ability_ir) => {
@@ -4130,10 +4137,12 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
                 // X" instruction that is the whole ability names its host
                 // without targeting it. Decided here, on the card's own ability,
                 // because only this level knows nothing precedes or follows it.
-                crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
-                    &mut def,
-                    &ability_ir.body.clauses,
-                );
+                if !owns_modal_modes {
+                    crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
+                        &mut def,
+                        &ability_ir.body.clauses,
+                    );
+                }
                 stamp_printed_ability_slot(&mut def, printed_ability_slot);
                 result.abilities.push(def);
                 ability_ids.push(item.id);
@@ -4173,6 +4182,20 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
             }
             OracleNodeIr::Trigger(trigger_node) => {
                 let mut def = lower_trigger_node_ir(trigger_node);
+                // CR 115.10a + CR 303.4b + CR 301.5f: the card's own trigger
+                // whose whole body is a lone host instruction. Decided here, not
+                // in `lower_trigger_ir`, which also lowers triggers quoted inside
+                // a grant ("… has 'When …'"); those keep their targets.
+                if let (TriggerNodeIr::Parsed(trigger_ir), Some(execute)) =
+                    (trigger_node, def.execute.as_deref_mut())
+                {
+                    if let Some(TriggerBody::EffectChain(chain_ir)) = &trigger_ir.body {
+                        crate::parser::oracle_effect::convert_terminal_attachment_host_reference(
+                            execute,
+                            &chain_ir.clauses,
+                        );
+                    }
+                }
                 stamp_printed_trigger_slot(&mut def, result.triggers.len());
                 result.triggers.push(def);
                 trigger_ids.push(item.id);
