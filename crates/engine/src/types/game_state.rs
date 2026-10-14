@@ -23183,13 +23183,14 @@ declare_game_state! {
     /// CR 608.2e + CR 603.10d: the immediately-before captures of fan-out
     /// control-change instructions, keyed by the id their template's head
     /// carries (`ControlChangeInstructionCarrier::Captured`). Kept here, not on
-    /// the ability, so a paused fan-out's parked seats resume against it while
-    /// no viewer copy can see it: the captured watcher contexts and subject
-    /// snapshots can carry hidden information (a face-down linked exile), and
-    /// `filter_state_for_viewer` drops this table. Removed when its link
-    /// completes unpaused; a paused link's entry is resolution-scoped residue,
-    /// cleared at the next turn (no resolution spans a turn boundary).
-    /// Serialized so authoritative save/restore resumes a paused fan-out.
+    /// the ability, so no viewer copy can see it: the captured watcher contexts
+    /// and subject snapshots can carry hidden information (a face-down linked
+    /// exile), and `filter_state_for_viewer` drops this table. Removed when its
+    /// link completes. Only a bare mass control template is captured, and its
+    /// seats run without a pause, so no admitted link leaves an entry across a
+    /// pause; should one ever park, its entry is resolution-scoped residue,
+    /// cleared at the next turn (no resolution spans a turn boundary), and is
+    /// serialized so authoritative save/restore can't lose it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub control_change_captures: BTreeMap<u64, crate::types::events::ControlChangeLink>,
     /// The next `control_change_captures` key.

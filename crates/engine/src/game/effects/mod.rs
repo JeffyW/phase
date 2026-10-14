@@ -7487,20 +7487,20 @@ fn control_change_node_count(node: &ResolvedAbility) -> usize {
 pub(crate) enum FanOutControlBoundary {
     /// No control-change action: nothing to capture.
     NoControl,
-    /// The template's only control-change action is its head, the first action
-    /// every seat performs, so the board before the first seat is its
-    /// immediately-before board, and its population is the one fixed when the
-    /// action began (CR 611.2c): either no settle can happen between seats, or
-    /// the population reads only control-invariant facts; and every node the
-    /// template retains after the head is proven safe for later seats
-    /// (`retained_continuation_is_safe`).
+    /// The template is one bare mass control action (`fan_out_head_is_bare`):
+    /// mandatory, with no executable modifier and no retained node. Every seat
+    /// then applies it in one synchronous pass with nothing between seats that
+    /// can settle the board, pay a cost, re-check a condition or prompt, so the
+    /// board before the first seat is every seat's immediately-before board, and
+    /// each seat's population is read on the board the action began with (CR
+    /// 611.2c).
     Head,
-    /// More than one control-change action, one behind a retained prefix that
-    /// can mutate first, or a head whose later seats can settle and then read a
-    /// population an earlier seat's control change altered: no single pre-seat
-    /// capture is the boundary of every seat's action. Fails closed: `Unrecorded` evidence at runtime, and
-    /// coverage marks the producer unsupported
-    /// (`coverage::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP`).
+    /// Anything else: more than one control-change action, a control action
+    /// behind a retained prefix, or a head that a seat can pause, pay for,
+    /// re-evaluate or follow with a retained node, so no single pre-seat capture
+    /// is proven to be the boundary of every seat's action. Fails closed:
+    /// `Unrecorded` evidence at runtime, and coverage marks the producer
+    /// unsupported (`coverage::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP`).
     Unobservable,
 }
 
@@ -7510,167 +7510,116 @@ pub(crate) fn fan_out_control_boundary(template: &ResolvedAbility) -> FanOutCont
         control_change_node_count(template),
     ) {
         (_, 0) => FanOutControlBoundary::NoControl,
-        (true, 1)
-            if retained_continuation_is_safe(template)
-                && !(seats_can_settle_between(template)
-                    && !control_population_is_control_invariant(&template.effect)) =>
-        {
-            FanOutControlBoundary::Head
-        }
+        (true, 1) if fan_out_head_is_bare(template) => FanOutControlBoundary::Head,
         _ => FanOutControlBoundary::Unobservable,
     }
 }
 
-/// CR 608.2e: whether layers can settle between one seat's application of the
-/// template and the next seat's. The engine applies the simultaneous action
-/// seat by seat; an earlier seat's control change only reaches the board a
-/// later seat reads (characteristics, controllers) once layers are settled,
-/// which happens at a pause (an optional seat, an unless-payment, a per-seat
-/// target choice, or any other prompt-bearing modifier), at a
-/// retained following node (the chain-link settle), or when a "for as long as"
-/// duration begins.
-fn seats_can_settle_between(template: &ResolvedAbility) -> bool {
-    // The exhaustive field authority: optional, unless-pay (CR 118.12),
-    // resolution-time choosers and timing, modal and repeat prompts.
-    crate::game::resolution_prompt::node_modifiers_offer_choice(template)
-        || template.optional
-        || template.sub_ability.is_some()
-        || template.else_ability.is_some()
-        || template
-            .duration
+/// CR 608.2e + CR 611.2c: whether a fan-out template is one bare mass control
+/// action, the only shape whose seats the engine applies in one synchronous
+/// pass on the board the action began with. Structural, not a census of
+/// hazards: the head must be a mass `GainControlAll` (a single-object control
+/// action reads a per-seat target), retain no node (a retained node runs, and
+/// settles, between seats), and carry no executable modifier, whether it
+/// offers a choice (`resolution_prompt::node_modifiers_offer_choice`: optional,
+/// unless-pay (CR 118.12a), choosers, timing, modal, repeat prompts) or is
+/// evaluated per seat (a condition re-checked on the board an earlier seat
+/// changed, a repeat, a "for as long as" duration that begins per seat).
+///
+/// The `ResolvedAbility` destructure is EXHAUSTIVE with no `..`: a future field
+/// fails to compile here until classified for the per-seat question.
+fn fan_out_head_is_bare(head: &ResolvedAbility) -> bool {
+    let ResolvedAbility {
+        // ---- the action and its retained chain ----
+        effect,
+        sub_ability,
+        else_ability,
+        // ---- per-seat evaluated: folded into the verdict below ----
+        condition,
+        repeat_until,
+        repeat_for,
+        duration,
+        // ---- choice-bearing: classified by node_modifiers_offer_choice ----
+        optional: _,
+        optional_for: _,
+        optional_targeting: _,
+        unless_pay: _,
+        target_chooser: _,
+        target_choice_timing: _,
+        modal: _,
+        mode_abilities: _,
+        // ---- inert for a seat: bound `_` with a one-line justification ----
+        optional_player: _, // selects the optional actor; `optional` records the choice
+        sibling_condition: _, // replication marker for `condition`, evaluates nothing itself
+        player_scope: _,    // cleared on the per-seat template by the split
+        starting_with: _,   // APNAP start of the fan-out, fixed before the first seat
+        announced_x: _,     // announce-time count
+        multi_target: _,    // announce-time target-count bounds
+        target_constraints: _, // announce-time cross-target legality
+        distribution: _,    // announce-time portions
+        distribute: _,      // announce-time division
+        targets: _,         // announced targets, already resolved
+        declares_chosen_group: _, // announce-time identity
+        reads_chosen_group: _, // bound selected targets
+        declares_return_result: _, // publication marker
+        reads_return_result: _, // consumes a settled value
+        source_id: _,       // object id
+        cast_occurrence: _, // cast provenance
+        source_incarnation: _, // self-transform epoch latch
+        noted_mana_payment: _, // activation-payment snapshot
+        trigger_source: _,  // trigger provenance
+        trigger_definition_ref: _, // trigger provenance
+        delayed_origin: _,  // delayed-trigger identity
+        force_block_attacker: _, // force-block referent
+        target_incarnations: _, // CR 400.7 referent pins
+        target_pins: _,     // CR 400.7 selected-target pins
+        legacy_selected_target_incarnations: _,
+        illegal_target_slots: _,         // CR 608.2b legality stamp
+        unjudged_target_slots: _,        // CR 608.2b legality stamp
+        illegal_local_target_slots: _,   // CR 608.2b legality stamp
+        controller: _,                   // player id
+        original_controller: _,          // player id
+        scoped_player: _,                // the seat's binding
+        kind: _,                         // AbilityKind tag
+        context: _,                      // cast-time fact snapshot
+        description: _,                  // display string
+        selected_mode_labels: _,         // display strings
+        modal_instruction_ordinal: _,    // mode-root position marker
+        detached_remainder: _, // split-remainder marker; the tail runs once, after every seat
+        min_x_value: _,        // u32
+        cant_be_copied: _,     // bool
+        illegal_targets_disposition: _, // CR 608.2b disposition
+        copy_count_status: _,  // status tag
+        forward_result: _,     // bool
+        chosen_x: _,           // announce-time X
+        cost_paid_object: _,   // captured snapshot
+        cost_paid_objects: _,  // captured membership records
+        effect_context_object: _, // captured snapshot
+        amassed_army_object: _, // captured snapshot
+        ability_index: _,      // provenance
+        may_trigger_origin: _, // provenance tag
+        target_selection_mode: _, // announce-time tag
+        chosen_players: _,     // already-chosen player ids
+        replacement_applied: _, // replacement provenance
+        sub_link: _,           // link kind of this node to its parent
+        target_reads: _,       // announce-time tag
+        parent_target_missing_reason: _, // seam flag
+        activation_cost_reduction: _, // activation-time provenance
+        activation_record: _,  // activation-time provenance
+        control_change_instruction: _, // the carrier this classification stamps
+    } = head;
+    matches!(effect, Effect::GainControlAll { .. })
+        && sub_ability.is_none()
+        && else_ability.is_none()
+        && condition.is_none()
+        && repeat_until.is_none()
+        && repeat_for.is_none()
+        && !duration
             .as_ref()
             .is_some_and(crate::types::ability::Duration::is_for_as_long_as)
-        || matches!(
-            template.effect,
-            Effect::GainControl { .. }
-                | Effect::GiveControl { .. }
-                | Effect::ExchangeControl { .. }
-        )
+        && !crate::game::resolution_prompt::node_modifiers_offer_choice(head)
 }
 
-/// CR 611.2c: whether the control action's affected set reads only facts no
-/// earlier seat's control change can alter, so a later seat that reads it after
-/// a settle still finds the population fixed when the action began: a context
-/// or chosen reference, or a typed population of permanents bounded only by
-/// token status, "another", and ownership by the seat's own player or the
-/// ability's controller. Card types, power and toughness, controllers,
-/// ownership by any other player reference (which can read a live controller,
-/// e.g. `ParentTargetController`) and every other shape can move with control,
-/// so they are not proven invariant (fail closed).
-fn control_population_is_control_invariant(effect: &Effect) -> bool {
-    // Only a control-change head reaches here (`fan_out_control_boundary`).
-    // ExchangeControl's subjects are per-seat declared targets, not a fixed
-    // population: not proven invariant.
-    let (Effect::GainControl { target }
-    | Effect::GainControlAll { target }
-    | Effect::GiveControl { target, .. }) = effect
-    else {
-        return false;
-    };
-    target_population_is_control_invariant(target)
-}
-
-fn target_population_is_control_invariant(target: &TargetFilter) -> bool {
-    use crate::types::ability::{ControllerRef, FilterProp, TypeFilter};
-    match target {
-        TargetFilter::Any
-        | TargetFilter::ParentTarget
-        | TargetFilter::SelfRef
-        | TargetFilter::SpecificObject { .. }
-        | TargetFilter::TrackedSet { .. } => true,
-        TargetFilter::Typed(typed) => {
-            typed.controller.is_none()
-                && typed
-                    .type_filters
-                    .iter()
-                    .all(|type_filter| matches!(type_filter, TypeFilter::Permanent))
-                && typed.properties.iter().all(|property| match property {
-                    FilterProp::Owned { controller } => {
-                        matches!(controller, ControllerRef::ScopedPlayer | ControllerRef::You)
-                    }
-                    other => matches!(
-                        other,
-                        FilterProp::NonToken | FilterProp::Token | FilterProp::Another
-                    ),
-                })
-        }
-        // Not proven invariant: player selectors, composite shapes, and every
-        // reference that reads a live characteristic, controller, relation or
-        // event fact a control change can move.
-        TargetFilter::None
-        | TargetFilter::Player
-        | TargetFilter::Controller
-        | TargetFilter::SourceController
-        | TargetFilter::ControllerAndControlledPermanents { .. }
-        | TargetFilter::Opponent
-        | TargetFilter::GrantingObject { .. }
-        | TargetFilter::SourceOrPaired
-        | TargetFilter::Not { .. }
-        | TargetFilter::Or { .. }
-        | TargetFilter::And { .. }
-        | TargetFilter::StackAbility { .. }
-        | TargetFilter::StackSpell
-        | TargetFilter::SpecificPlayer { .. }
-        | TargetFilter::PlayerWhoChoseLabel { .. }
-        | TargetFilter::PlayerMatching { .. }
-        | TargetFilter::Neighbor { .. }
-        | TargetFilter::ScopedPlayer
-        | TargetFilter::AttachedTo
-        | TargetFilter::LastCreated
-        | TargetFilter::LastRevealed
-        | TargetFilter::LastZoneChanged
-        | TargetFilter::CostPaidObject
-        | TargetFilter::AmassedArmy
-        | TargetFilter::ChosenCard
-        | TargetFilter::TrackedSetFiltered { .. }
-        | TargetFilter::ExiledBySource
-        | TargetFilter::ExiledCardByIndex { .. }
-        | TargetFilter::TriggeringSpellController
-        | TargetFilter::TriggeringSpellOwner
-        | TargetFilter::TriggeringPlayer
-        | TargetFilter::TriggeringSource
-        | TargetFilter::EventTarget
-        | TargetFilter::TriggeringSourceController
-        | TargetFilter::EventTargetController
-        | TargetFilter::ParentTargetSlot { .. }
-        | TargetFilter::DeclaredPlayer { .. }
-        | TargetFilter::ParentTargetController
-        | TargetFilter::ParentTargetOwner
-        | TargetFilter::SourceChosenPlayer
-        | TargetFilter::OriginalController
-        | TargetFilter::OriginalSource
-        | TargetFilter::PostReplacementSourceController
-        | TargetFilter::PostReplacementDamageSource
-        | TargetFilter::PostReplacementDamageTarget
-        | TargetFilter::PostReplacementDamageTargetOwner
-        | TargetFilter::DefendingPlayer
-        | TargetFilter::HasChosenName
-        | TargetFilter::ChosenDamageSource { .. }
-        | TargetFilter::Named { .. }
-        | TargetFilter::Owner
-        | TargetFilter::AllPlayers => false,
-    }
-}
-
-/// CR 608.2e + CR 611.2c: whether every node a template retains after its
-/// head is proven unable to remove, move or rebind a later seat's member
-/// before that seat's head runs (the engine runs each seat's whole template
-/// before the next seat's head). Exhaustive typed whitelist: changing tapped
-/// state only (a same-sentence "… and untap them"; Scrambleverse's following
-/// "Untap those permanents." is detached from the seat template), on a node whose
-/// executable modifiers offer no choice (`node_modifiers_offer_choice`: an
-/// unless-pay or optional rider is a pause, and a payment can mutate). A
-/// template with no retained node is trivially safe.
-fn retained_continuation_is_safe(template: &ResolvedAbility) -> bool {
-    fn node_is_safe(node: &ResolvedAbility) -> bool {
-        matches!(node.effect, Effect::SetTapState { .. })
-            && !crate::game::resolution_prompt::node_modifiers_offer_choice(node)
-            && node.sub_ability.as_deref().is_none_or(node_is_safe)
-            && node.else_ability.as_deref().is_none_or(node_is_safe)
-    }
-    template.sub_ability.as_deref().is_none_or(node_is_safe)
-        && template.else_ability.as_deref().is_none_or(node_is_safe)
-}
 /// The boundary of a `player_scope` link: classified on the exact template the
 /// driver resolves per seat (`split_player_scope_chain`), so coverage and the
 /// runtime share one authority. `None` when `ability` isn't a scoped link.
@@ -7735,8 +7684,8 @@ fn fail_closed_unobservable_fan_out(
 /// the board before the first seat. Settle once, capture every object that
 /// has a controller (battlefield and stack; any later member is among them,
 /// since nothing mutates before the head), and carry the capture's id on the
-/// head: every seat, including one parked and resumed, publishes against it.
-/// Returns the id, so the driver can release it when the link completes.
+/// head: every seat publishes against it. Returns the id, so the driver can
+/// release it when the link completes.
 fn stamp_fan_out_head_capture(
     state: &mut GameState,
     template: &mut ResolvedAbility,

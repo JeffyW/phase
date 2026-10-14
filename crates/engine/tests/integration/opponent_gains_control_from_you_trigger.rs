@@ -549,12 +549,15 @@ fn homeward_after_switcheroo_is_simultaneous_in_both_apnap_orders() {
 /// action is processed for every player at once).
 const OPTIONAL_HOMEWARD: &str = "Each player may gain control of all nontoken permanents they own.";
 
-/// C2: a parked seat publishes against the link's pre-seat capture. Same board
-/// and expectation as Homeward Path: P1 lost Zidane (P1 +1); P0 didn't control
-/// Zidane when it lost the bear (P0 +0), even though the first seat had already
-/// returned Zidane when the second seat resumed.
+/// DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. An optional
+/// scoped control action pauses between seats, so it isn't one bare mass
+/// action (`fan_out_head_is_bare`): no pre-seat capture is taken, its changes
+/// publish `Unrecorded`, and Zidane fires for no player. The same board with
+/// Homeward Path's mandatory action is exact
+/// (`homeward_after_switcheroo_is_simultaneous_in_both_apnap_orders`); the rules
+/// give P1 +1 here too.
 #[test]
-fn paused_scoped_control_fan_out_publishes_against_the_pre_seat_capture() {
+fn an_optional_scoped_control_fan_out_fails_closed() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
@@ -584,8 +587,8 @@ fn paused_scoped_control_fan_out_publishes_against_the_pre_seat_capture() {
     );
     assert_eq!(
         (treasures(&runner, P0), treasures(&runner, P1)),
-        (1, 1),
-        "P1 lost Zidane; P0 didn't control Zidane when it lost the bear"
+        (1, 0),
+        "the class fires for no player"
     );
 }
 
@@ -1357,127 +1360,93 @@ fn answer_optional(runner: &mut GameRunner) {
         .expect("the seat accepts");
 }
 
-/// R3-2: a paused fan-out's capture survives authoritative save/restore. After
-/// Switcheroo (Zidane to P1, P1's bear to P0), P1 is active, so P1's seat
-/// returns the bear first (P1's Zidane, latched before the first seat, isn't
-/// "you" for P0's loss: nothing), and the game is saved while P0's seat is
-/// choosing. The parked seat carries `Captured(id)`; the table holds the
-/// pre-seat watcher (Zidane under P1) and subject (Zidane under P1). Restored
-/// and resumed, P0's seat returns Zidane from P1: P1 +1, exactly (1, 1).
-/// `drop_capture` removes the table entry from the save: the carried id then
-/// authorizes nothing (a damaged save fails closed, never recaptures), and
-/// that exact count changes to (1, 0).
+/// R3-2, under the bare-head admission: a fan-out that pauses between seats is
+/// never `Head`, so no capture is ever held across a pause; the parked seat
+/// carries the fail-closed `Unobservable` carrier instead, and that survives
+/// authoritative save/restore. After Switcheroo (Zidane to P1, P1's bear to
+/// P0), P1 is active, so P1's seat returns the bear first, and the game is
+/// saved while P0's seat is choosing. Restored and resumed, P0's seat returns
+/// Zidane from P1, publishing `Unrecorded`: Zidane fires for no player, (1, 0),
+/// where an exact capture would give (1, 1).
 #[test]
-fn a_paused_fan_out_capture_survives_save_and_restore() {
-    for drop_capture in [false, true] {
-        let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
-        let zidane = add_zidane(&mut scenario, P0);
-        let bear = scenario.add_vanilla(P1, 2, 2);
-        let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
-        let returns = scenario
-            .add_spell_to_hand_from_oracle(P0, "Optional Homeward", true, OPTIONAL_HOMEWARD_INSTANT)
-            .with_mana_cost(ManaCost::zero())
-            .id();
-        let mut runner = scenario.build();
-        runner
-            .cast(switcheroo)
-            .target_objects(&[zidane, bear])
-            .resolve();
-        runner.advance_until_stack_empty();
-        assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
+fn a_paused_fail_closed_fan_out_survives_save_and_restore() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P0);
+    let bear = scenario.add_vanilla(P1, 2, 2);
+    let switcheroo = add_free_spell(&mut scenario, P0, "Switcheroo", SWITCHEROO);
+    let returns = scenario
+        .add_spell_to_hand_from_oracle(P0, "Optional Homeward", true, OPTIONAL_HOMEWARD_INSTANT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .cast(switcheroo)
+        .target_objects(&[zidane, bear])
+        .resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!((treasures(&runner, P0), treasures(&runner, P1)), (1, 0));
 
-        {
-            let state = runner.state_mut();
-            state.active_player = P1;
-            state.priority_player = P0;
-            state.waiting_for = WaitingFor::Priority { player: P0 };
-        }
-        cast_and_pass(&mut runner, returns);
-        answer_optional(&mut runner); // P1's seat (active player first)
-        assert_eq!(
-            controller(&runner, bear),
-            P1,
-            "REACH: P1's seat returned the bear"
-        );
-        assert_eq!(
-            controller(&runner, zidane),
-            P1,
-            "REACH: Zidane not yet returned"
-        );
-        assert!(
-            matches!(
-                runner.state().waiting_for,
-                WaitingFor::OptionalEffectChoice { .. }
-            ),
-            "REACH: paused on P0's seat"
-        );
-
-        let (&id, link) = runner
-            .state()
-            .control_change_captures
-            .iter()
-            .next()
-            .expect("REACH: the paused link holds its capture");
-        assert!(
-            link.capture
-                .watchers
-                .iter()
-                .any(|watcher| watcher.identity.reference.object_id == zidane
-                    && watcher.lki.controller == P1),
-            "the capture latched Zidane under P1, before the first seat"
-        );
-        assert!(
-            link.capture
-                .subjects
-                .iter()
-                .any(|subject| subject.identity.object_id == zidane && subject.controller == P1),
-            "the capture snapshotted Zidane under P1"
-        );
-
-        runner.state_mut().capture_rng_word_pos();
-        let mut saved = serde_json::to_value(runner.state()).expect("state serializes");
-        let text = saved.to_string();
-        assert!(
-            text.contains(&format!(
-                "\"control_change_instruction\":{{\"Captured\":{id}}}"
-            )),
-            "the parked seat carries Captured({id}) in the save"
-        );
-        if drop_capture {
-            saved["control_change_captures"]
-                .as_object_mut()
-                .expect("the save holds the capture table")
-                .remove(&id.to_string())
-                .expect("the entry is saved under its id");
-        }
-        let mut restored: engine::types::game_state::GameState =
-            serde_json::from_value(saved).expect("the saved state restores");
-        restored.rehydrate_rng();
-        if !drop_capture {
-            assert_eq!(
-                restored.control_change_captures,
-                runner.state().control_change_captures,
-                "the capture round-trips exactly"
-            );
-        }
-        *runner.state_mut() = restored;
-
-        answer_optional(&mut runner); // P0's seat, resumed from the restore
-        runner.advance_until_stack_empty();
-        assert_eq!(
-            controller(&runner, zidane),
-            P0,
-            "REACH: P0's seat returned Zidane"
-        );
-        let expected = if drop_capture { (1, 0) } else { (1, 1) };
-        assert_eq!(
-            (treasures(&runner, P0), treasures(&runner, P1)),
-            expected,
-            "drop_capture {drop_capture}"
-        );
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
     }
+    cast_and_pass(&mut runner, returns);
+    answer_optional(&mut runner); // P1's seat (active player first)
+    assert_eq!(
+        controller(&runner, bear),
+        P1,
+        "REACH: P1's seat returned the bear"
+    );
+    assert_eq!(
+        controller(&runner, zidane),
+        P1,
+        "REACH: Zidane not yet returned"
+    );
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ),
+        "REACH: paused on P0's seat"
+    );
+    assert!(
+        runner.state().control_change_captures.is_empty(),
+        "no capture is held across the pause"
+    );
+
+    runner.state_mut().capture_rng_word_pos();
+    let saved = serde_json::to_value(runner.state()).expect("state serializes");
+    assert!(
+        saved
+            .to_string()
+            .contains("\"control_change_instruction\":\"Unobservable\""),
+        "the parked seat carries the fail-closed carrier in the save"
+    );
+    let mut restored: engine::types::game_state::GameState =
+        serde_json::from_value(saved).expect("the saved state restores");
+    restored.rehydrate_rng();
+    *runner.state_mut() = restored;
+
+    answer_optional(&mut runner); // P0's seat, resumed from the restore
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        controller(&runner, zidane),
+        P0,
+        "REACH: P0's seat returned Zidane"
+    );
+    assert_eq!(
+        (treasures(&runner, P0), treasures(&runner, P1)),
+        (1, 0),
+        "the resumed fail-closed seat fires for no player"
+    );
 }
+
+/// Labelled synthetic instant: Brooding Saurian's mandatory scoped action.
+const MANDATORY_RETURN_INSTANT: &str =
+    "Each player gains control of all nontoken permanents they own.";
 
 /// Labelled synthetic: steal any permanent, for the probe setups below.
 const STEAL_ANY_PERMANENT: &str = "Gain control of target permanent.";
@@ -1485,10 +1454,11 @@ const STEAL_ANY_PERMANENT: &str = "Gain control of target permanent.";
 /// The gate's `Head` probe pair (CR 608.2e + CR 603.10 + CR 603.10d + CR
 /// 603.2c). Three players, P0 active. P1 owns and controls Zidane; P0 owns
 /// Control Magic, which P1 has taken; P1 has also taken a creature P2 owns.
-/// "Each player may gain control of all nontoken permanents they own", every
-/// seat accepting: in one simultaneous action P1 loses the Aura to P0 and the
-/// creature to P2, so P1 gets exactly 2 Treasures, although the engine
-/// applies P0's seat (the Aura) before P2's (the creature).
+/// "Each player gains control of all nontoken permanents they own" (Brooding
+/// Saurian's action, as a labelled synthetic instant): in one simultaneous
+/// action P1 loses the Aura to P0 and the creature to P2, so P1 gets exactly 2
+/// Treasures, although the engine applies P0's seat (the Aura) before P2's
+/// (the creature).
 ///
 /// The gate's hostile variant (Control Magic enchanting P2's creature, so P1
 /// controls the creature only through the stolen Aura) isn't reachable here:
@@ -1510,7 +1480,7 @@ fn head_capture_two_losses_in_one_scoped_action() {
     let steal_aura = add_free_spell(&mut scenario, P1, "Steal Permanent", STEAL_ANY_PERMANENT);
     let steal_creature = add_free_spell(&mut scenario, P1, "Steal Permanent", STEAL_ANY_PERMANENT);
     let returns = scenario
-        .add_spell_to_hand_from_oracle(P0, "Optional Homeward", true, OPTIONAL_HOMEWARD_INSTANT)
+        .add_spell_to_hand_from_oracle(P0, "Mandatory Return", true, MANDATORY_RETURN_INSTANT)
         .with_mana_cost(ManaCost::zero())
         .id();
     let mut runner = scenario.build();
@@ -1542,14 +1512,6 @@ fn head_capture_two_losses_in_one_scoped_action() {
 
     give_priority(&mut runner, P0);
     cast_and_pass(&mut runner, returns);
-    for _ in 0..3 {
-        if matches!(
-            runner.state().waiting_for,
-            WaitingFor::OptionalEffectChoice { .. }
-        ) {
-            answer_optional(&mut runner);
-        }
-    }
     runner.advance_until_stack_empty();
     assert_eq!(
         controller(&runner, magic),
@@ -1592,8 +1554,8 @@ fn power(runner: &GameRunner, id: ObjectId) -> i32 {
 /// closed): `base_power` 3 gave P1 +2 and moved the creature to P2, where the
 /// rules give P1 +1 and leave it with P1.
 ///
-/// Such a producer (a pausing or settling head whose population reads more
-/// than control-invariant facts) is unsupported in coverage, and its changes
+/// Such a producer (an optional head, which pauses between seats) is
+/// unsupported in coverage, and its changes
 /// publish `Unrecorded`, so Zidane never fires for them, for any player. This
 /// pins that, with reach guards; the creature's own move is the engine's
 /// pre-existing seat-by-seat population (reported separately).
@@ -1730,9 +1692,9 @@ fn r5_1_probe_spell(scenario: &mut GameScenario, owner: PlayerId) -> ObjectId {
 /// DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. Probed at
 /// 151bf7c05 (before the class failed closed): P1 +3, because P2's seat
 /// re-read `ParentTargetController` as P0 after P0 took Anchor and also took
-/// the bear; the rules give P1 +2. `Owned` by a player reference that can read
-/// a live controller isn't control-invariant, so the producer is unsupported
-/// and Zidane fires for no player.
+/// the bear; the rules give P1 +2. An optional head pauses between seats, so
+/// whatever its population reads the producer is unsupported, and Zidane
+/// fires for no player.
 #[test]
 fn r5_1_owned_by_a_live_reference_fails_closed() {
     let mut scenario = GameScenario::new_n_player(3, 42);
@@ -1800,8 +1762,8 @@ const RETURN_AND_DESTROY: &str = "Each player may gain control of all nontoken p
 /// DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. Probed at
 /// 151bf7c05: P1 +1, because P0's seat ran the retained destroy on B before
 /// P2's seat could take B back; CR 608.2e processes the return for every player
-/// first (P1 +2). A retained continuation outside the typed whitelist makes the
-/// producer unsupported, and Zidane fires for no player.
+/// first (P1 +2). Any node retained in the seat template makes the producer
+/// unsupported, and Zidane fires for no player.
 #[test]
 fn r5_2_retained_destroy_fails_closed() {
     let mut scenario = GameScenario::new_n_player(3, 42);
@@ -1870,8 +1832,8 @@ const RETURN_SMALL_UNLESS_PAY: &str = "Each player gains control of all creature
     power 3 or less unless they pay {1}.";
 
 /// R6-1: DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. An
-/// unless-payment is a per-seat pause (CR 118.12a), so the head settles between
-/// seats and its power-bounded population is not control-invariant. Probed at
+/// unless-payment is a per-seat pause (CR 118.12a), so the head isn't one bare
+/// mass action. Probed at
 /// cc30bfe87's classifier (`Head`, capture taken): `base_power` 3 gave P1 +2
 /// and moved the creature to P2, where the rules (CR 608.2e + CR 611.2c) give
 /// P1 +1 and leave it with P1. The producer is unsupported, and Zidane fires
@@ -1968,6 +1930,212 @@ fn r6_1_unless_payment_head_fails_closed() {
             treasures(&runner, P1) - before,
             0,
             "base_power {base_power}: the class fires for no player"
+        );
+    }
+}
+
+/// Labelled synthetic for R7-1: a mandatory scoped return with an
+/// unless-sacrifice rider (CR 118.12a + CR 701.21a).
+const RETURN_UNLESS_SACRIFICE: &str = "Each player gains control of all nontoken permanents they \
+    own unless they sacrifice a creature.";
+
+/// R7-1: DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. A
+/// payment runs between seats, so a seat can mutate the board before a later
+/// seat's control change: P0 (Zidane, a spare bear, and P1's stolen bear) pays
+/// by sacrificing Zidane, then P1 declines and takes its bear back. Zidane was
+/// gone before that change, so the rules give P0 +0 (CR 603.10d looks back to
+/// the change, not to the start of the spell); sacrificing the spare instead
+/// gives P0 +1. Probed at 616fe406b's classifier (`Head`, a capture taken
+/// before the first payment): +1 in both legs. An unless-payment head is
+/// unsupported, and Zidane fires for no player.
+#[test]
+fn r7_1_unless_sacrifice_head_fails_closed() {
+    for sacrifice_zidane in [true, false] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P0);
+        let spare = scenario.add_vanilla(P0, 2, 2);
+        let theirs = scenario.add_vanilla(P1, 2, 2);
+        let steal = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
+        let returns = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Return Unless Sacrificed",
+                true,
+                RETURN_UNLESS_SACRIFICE,
+            )
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P0);
+        runner.cast(steal).target_object(theirs).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, theirs), P0, "REACH: P0 stole the bear");
+        let before = treasures(&runner, P0);
+
+        give_priority(&mut runner, P0);
+        cast_and_pass(&mut runner, returns);
+        let mut seats = Vec::new();
+        let mut sacrificed = false;
+        for _ in 0..4 {
+            match runner.state().waiting_for.clone() {
+                WaitingFor::UnlessPayment { player, .. } => {
+                    assert!(
+                        runner.state().control_change_captures.is_empty(),
+                        "the class takes no pre-seat capture"
+                    );
+                    seats.push(player);
+                    runner
+                        .act(GameAction::PayUnlessCost { pay: player == P0 })
+                        .expect("the seat answers");
+                }
+                WaitingFor::WardSacrificeChoice {
+                    player, permanents, ..
+                } => {
+                    let chosen = if sacrifice_zidane { zidane } else { spare };
+                    assert_eq!(player, P0, "REACH: P0 pays");
+                    assert!(permanents.contains(&chosen), "REACH: {chosen:?} eligible");
+                    runner
+                        .act(GameAction::SelectCards {
+                            cards: vec![chosen],
+                        })
+                        .expect("P0 sacrifices");
+                    sacrificed = true;
+                }
+                _ => {}
+            }
+        }
+        runner.advance_until_stack_empty();
+        assert_eq!(seats, vec![P0, P1], "REACH: each seat reached its payment");
+        assert!(sacrificed, "REACH: P0 paid by sacrificing");
+        let gone = if sacrifice_zidane { zidane } else { spare };
+        assert_eq!(
+            runner.state().objects[&gone].zone,
+            Zone::Graveyard,
+            "REACH: the sacrificed creature left first"
+        );
+        assert_eq!(
+            controller(&runner, theirs),
+            P1,
+            "REACH: P1 declined and took its bear back"
+        );
+        assert_eq!(
+            treasures(&runner, P0) - before,
+            0,
+            "sacrifice_zidane {sacrifice_zidane}: the class fires for no player"
+        );
+    }
+}
+
+/// R7-2 synthetic, hand-built (the parsed "if you control ?" binds "you" to the
+/// seat, a separate parse defect): "If you control three or more creatures,
+/// each player may gain control of all nontoken permanents they own."
+fn r7_2_conditional_return(scenario: &mut GameScenario, owner: PlayerId) -> ObjectId {
+    use engine::types::ability::{
+        AbilityCondition, AbilityDefinition, AbilityKind, Comparator, ControllerRef, Effect,
+        FilterProp, PlayerFilter, QuantityExpr, QuantityRef, TargetFilter, TypedFilter,
+    };
+    let def = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainControlAll {
+            target: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                FilterProp::NonToken,
+                FilterProp::Owned {
+                    controller: ControllerRef::ScopedPlayer,
+                },
+            ])),
+        },
+    )
+    .player_scope(PlayerFilter::All)
+    .optional()
+    .condition(AbilityCondition::QuantityCheck {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 3 },
+    });
+    let mut builder = scenario.add_spell_to_hand(owner, "R7-2 Conditional Return", true);
+    builder.with_ability_definition(def);
+    builder.with_mana_cost(ManaCost::zero()).id()
+}
+
+/// R7-2: DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. The
+/// head's condition is re-checked for each seat on the board an earlier seat
+/// changed. Three players, P0 active; P1 controls Zidane and has stolen A (P0's)
+/// and B (P2's), exactly three creatures. P0's seat takes A back, and P2's seat
+/// then fails the condition, so B stays with P1; the rules (CR 608.2e + CR
+/// 611.2c) give P1 +2 and B to P2. With a spare P1 creature the condition holds
+/// for every seat (P1 +2 by the rules). Probed at 616fe406b's classifier
+/// (`Head`, capture taken): P1 +1 and +2. A conditional head is unsupported,
+/// and Zidane fires for no player.
+#[test]
+fn r7_2_condition_rechecked_per_seat_fails_closed() {
+    for spare in [false, true] {
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P1);
+        let a = scenario.add_vanilla(P0, 2, 2);
+        let b = scenario.add_vanilla(P2, 2, 2);
+        if spare {
+            scenario.add_vanilla(P1, 2, 2);
+        }
+        let steal_a = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let steal_b = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let spell = r7_2_conditional_return(&mut scenario, P1);
+        let mut runner = scenario.build();
+        give_priority(&mut runner, P1);
+        runner.cast(steal_a).target_object(a).resolve();
+        runner.advance_until_stack_empty();
+        runner.cast(steal_b).target_object(b).resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            (controller(&runner, a), controller(&runner, b)),
+            (P1, P1),
+            "REACH: P1 stole both"
+        );
+        let before = treasures(&runner, P1);
+
+        give_priority(&mut runner, P1);
+        runner.state_mut().active_player = P0;
+        cast_and_pass(&mut runner, spell);
+        let mut seats = Vec::new();
+        for _ in 0..4 {
+            if let WaitingFor::OptionalEffectChoice { player, .. } =
+                runner.state().waiting_for.clone()
+            {
+                assert!(
+                    runner.state().control_change_captures.is_empty(),
+                    "the class takes no pre-seat capture"
+                );
+                seats.push(player);
+                answer_optional(&mut runner);
+            }
+        }
+        runner.advance_until_stack_empty();
+        assert_eq!(controller(&runner, a), P0, "REACH: P0's seat took A back");
+        assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane stayed");
+        if spare {
+            assert_eq!(
+                seats,
+                vec![P0, P1, P2],
+                "REACH: every seat passed the check"
+            );
+            assert_eq!(controller(&runner, b), P2, "REACH: P2 took B back");
+        } else {
+            assert_eq!(
+                seats,
+                vec![P0, P1],
+                "REACH: P2's seat failed the re-checked condition"
+            );
+            assert_eq!(controller(&runner, b), P1, "REACH: B stayed with P1");
+        }
+        assert_eq!(
+            treasures(&runner, P1) - before,
+            0,
+            "spare {spare}: the class fires for no player"
         );
     }
 }

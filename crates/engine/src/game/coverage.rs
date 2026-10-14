@@ -7339,16 +7339,16 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
 }
 
 /// The coverage label for an ability whose per-player fan-out ("each player
-/// …", "each target player …") performs a control-change action that can't
-/// share one immediately-before boundary across its seats: more than one
-/// control-change action in the per-seat template, one behind a retained
-/// prefix, or one whose later seats can settle (a pause, a per-seat choice, a
-/// retained following node) and then read a population an earlier seat's
-/// control change altered (CR 611.2c: the affected set is fixed when the
-/// action begins). CR 608.2e processes each action simultaneously for every
-/// player, and CR 603.10d look-back control-change triggers need that action's
-/// immediately-before board; the runtime publishes such changes with
-/// `Unrecorded` evidence, so the producer is unsupported and fails closed.
+/// …", "each target player …") performs a control-change action whose seat
+/// template isn't one bare mass control action (`effects::fan_out_control_boundary`):
+/// more than one control-change action, one behind a retained prefix, a
+/// single-object control head, or a head a seat can pause, pay for,
+/// re-evaluate or follow with a retained node between seats (CR 611.2c: the
+/// affected set is fixed when the action begins). CR 608.2e processes each
+/// action simultaneously for every player, and CR 603.10d look-back
+/// control-change triggers need that action's immediately-before board; the
+/// runtime publishes such changes with `Unrecorded` evidence, so the producer
+/// is unsupported and fails closed.
 /// Classified by `effects::player_scope_control_boundary` /
 /// `multi_target_player_control_boundary`, on the exact template the driver
 /// resolves.
@@ -13688,8 +13688,9 @@ mod tests {
     }
 
     /// CR 608.2e + CR 603.10d: the printed "each player gains control" producers
-    /// (verbatim Scryfall text) parse to a head-boundary scoped control action,
-    /// which the runtime captures exactly; none is marked unsupported.
+    /// (verbatim Scryfall text) whose scoped action is one bare mass control
+    /// action parse to a head-boundary template, which the runtime captures
+    /// exactly; none is marked unsupported.
     #[test]
     fn printed_scoped_control_producers_have_a_head_boundary() {
         use crate::game::effects::FanOutControlBoundary;
@@ -13744,21 +13745,6 @@ mod tests {
                 "Sorcery",
                 "For each nonland permanent, choose a player at random. Then each player gains \
                  control of each permanent for which they were chosen. Untap those permanents.",
-            ),
-            (
-                "Dack Fayden, Helping Hand",
-                "Creature",
-                "When Dack Fayden enters, reveal cards from the top of your library until you \
-                 reveal X creature cards, where X is the number of opponents you have. Put \
-                 those creature cards onto the battlefield, then shuffle. They're goaded for \
-                 the rest of the game. For each of those permanents, choose a different \
-                 opponent. Each opponent gains control of the permanent for which they were \
-                 chosen.",
-            ),
-            (
-                "Optional Homeward (synthetic, the probe fixture)",
-                "Instant",
-                "Each player may gain control of all nontoken permanents they own.",
             ),
         ] {
             let parsed =
@@ -13818,13 +13804,12 @@ mod tests {
         }
     }
 
-    /// CR 611.2c + CR 608.2e: the printed scoped producers whose later seats can
-    /// settle (a per-seat choice, a retained following node) and then read a
-    /// population an earlier seat's control change can alter (card types,
-    /// controllers) fail closed: coverage marks them unsupported, and Zidane
-    /// doesn't trigger on their changes.
+    /// CR 611.2c + CR 608.2e: the printed scoped producers whose seat template
+    /// isn't one bare mass control action (a per-seat choice, a retained
+    /// following node, a single-object control head) fail closed: coverage
+    /// marks them unsupported, and Zidane doesn't trigger on their changes.
     #[test]
-    fn printed_scoped_producers_with_a_shifting_population_are_unsupported() {
+    fn printed_scoped_producers_outside_the_bare_head_are_unsupported() {
         for (name, types, text) in [
             (
                 "Inniaz, the Gale Force",
@@ -13841,6 +13826,16 @@ mod tests {
                  control of a creature that player controls until end of turn. Untap those \
                  creatures and they gain haste until end of turn. For each player who chose \
                  fortune, you draw a card and create a Treasure token.",
+            ),
+            (
+                "Dack Fayden, Helping Hand",
+                "Creature",
+                "When Dack Fayden enters, reveal cards from the top of your library until you \
+                 reveal X creature cards, where X is the number of opponents you have. Put \
+                 those creature cards onto the battlefield, then shuffle. They're goaded for \
+                 the rest of the game. For each of those permanents, choose a different \
+                 opponent. Each opponent gains control of the permanent for which they were \
+                 chosen.",
             ),
         ] {
             let parsed =
@@ -13868,18 +13863,22 @@ mod tests {
             );
         }
     }
-    /// CR 611.2c: ownership is fixed, but the player it's tested against must be
-    /// too. `Owned` by the seat's own player is control-invariant; `Owned` by a
-    /// reference that reads a live controller (`ParentTargetController`) isn't,
-    /// so a settling (optional) scoped head over it is unsupported (R5-1).
+    /// CR 608.2e + CR 611.2c + CR 118.12a: the `Head` admission is structural.
+    /// Only one bare mass control action (mandatory, no executable modifier, no
+    /// retained node) is exact, whatever its population reads, since its seats
+    /// apply in one synchronous pass on the board the action began with. Every
+    /// axis that lets a seat pause, pay, re-evaluate or act between seats is
+    /// unsupported (R4-1, R5-1, R6-1, R7-1, R7-2), and so is a single-object
+    /// control head, which reads a per-seat target.
     #[test]
-    fn owned_by_a_live_player_reference_is_not_control_invariant() {
+    fn only_a_bare_mandatory_mass_control_head_is_exact() {
         use crate::game::effects::FanOutControlBoundary;
         use crate::types::ability::{
-            AbilityDefinition, AbilityKind, ControllerRef, Effect, FilterProp, PlayerFilter,
-            TargetFilter, TypedFilter,
+            AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, Comparator,
+            ControllerRef, Duration, Effect, FilterProp, PlayerFilter, QuantityExpr, QuantityRef,
+            StaticCondition, TargetFilter, TypedFilter, UnlessPayModifier,
         };
-        let scoped = |owner: ControllerRef| {
+        let bare = |owner: ControllerRef| {
             AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::GainControlAll {
@@ -13890,7 +13889,6 @@ mod tests {
                 },
             )
             .player_scope(PlayerFilter::All)
-            .optional()
         };
         let boundary = |def: &AbilityDefinition| {
             crate::game::effects::player_scope_control_boundary(
@@ -13901,22 +13899,80 @@ mod tests {
                 ),
             )
         };
-        assert_eq!(
-            boundary(&scoped(ControllerRef::ScopedPlayer)),
-            Some(FanOutControlBoundary::Head),
-            "REACH: the seat's own ownership is invariant"
-        );
-        let live = scoped(ControllerRef::ParentTargetController);
-        assert_eq!(boundary(&live), Some(FanOutControlBoundary::Unobservable));
-        assert!(super::fan_out_control_boundary_is_unobservable(&live));
+        // The population is free: a live controller reference is read on the
+        // board the action began with, since nothing settles between seats.
+        for owner in [
+            ControllerRef::ScopedPlayer,
+            ControllerRef::ParentTargetController,
+        ] {
+            assert_eq!(
+                boundary(&bare(owner.clone())),
+                Some(FanOutControlBoundary::Head),
+                "REACH: the bare mandatory head over {owner:?} is exact"
+            );
+            assert_eq!(
+                boundary(&bare(owner.clone()).optional()),
+                Some(FanOutControlBoundary::Unobservable),
+                "optional over {owner:?} (R4-1, R5-1)"
+            );
+        }
+
+        let mut unsupported: Vec<(&str, AbilityDefinition)> = Vec::new();
+        let mut paying = bare(ControllerRef::ScopedPlayer);
+        paying.unless_pay = Some(UnlessPayModifier {
+            cost: AbilityCost::Tap,
+            payer: TargetFilter::ScopedPlayer,
+        });
+        unsupported.push(("an unless-payment (R6-1, R7-1)", paying));
+        unsupported.push((
+            "a condition re-checked per seat (R7-2)",
+            bare(ControllerRef::ScopedPlayer).condition(AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().controller(ControllerRef::You),
+                        ),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }),
+        ));
+        let mut repeated = bare(ControllerRef::ScopedPlayer);
+        repeated.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+        unsupported.push(("a repeat", repeated));
+        let mut lasting = bare(ControllerRef::ScopedPlayer);
+        lasting.duration = Some(Duration::ForAsLongAs {
+            condition: StaticCondition::IsPresent { filter: None },
+        });
+        unsupported.push(("a \"for as long as\" duration", lasting));
+        unsupported.push((
+            "a single-object control head",
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainControl {
+                    target: TargetFilter::ParentTarget,
+                },
+            )
+            .player_scope(PlayerFilter::All),
+        ));
+        for (axis, def) in unsupported {
+            assert_eq!(
+                boundary(&def),
+                Some(FanOutControlBoundary::Unobservable),
+                "{axis}"
+            );
+            assert!(
+                super::fan_out_control_boundary_is_unobservable(&def),
+                "{axis}: coverage marks it"
+            );
+        }
     }
 
     /// CR 608.2e: a node retained in the seat template after the head can
-    /// remove a later seat's member before that seat's head runs, so only a
-    /// typed whitelist (changing tapped state) is admitted (R5-2). The parsed
-    /// synthetic retains its destroy inside the seat template and is
-    /// unsupported; Scrambleverse's retained untap stays exact (see the
-    /// printed-producer receipt).
+    /// remove a later seat's member before that seat's head runs, so no
+    /// retained node is admitted (R5-2). The parsed synthetic retains its
+    /// destroy inside the seat template and is unsupported.
     #[test]
     fn a_retained_mutating_continuation_is_unsupported() {
         use crate::game::effects::FanOutControlBoundary;
@@ -13956,10 +14012,10 @@ mod tests {
     }
     /// CR 118.12a + CR 608.2e: an unless-payment is a per-seat pause, read from
     /// the exhaustive field authority (`resolution_prompt::node_modifiers_offer_choice`)
-    /// on the head and on every retained node (R6-1). Homeward Path's mandatory
-    /// head stays exact; the same head with an unless-payment, and
-    /// Scrambleverse with an unless-payment on its retained untap, are
-    /// unsupported.
+    /// (R6-1). Homeward Path's mandatory head stays exact; the same head with an
+    /// unless-payment is unsupported. Scrambleverse's untap is detached, so a
+    /// rider there leaves it exact; any node retained inside the seat template,
+    /// even a plain untap, is unsupported.
     #[test]
     fn an_unless_payment_on_the_head_or_a_retained_node_settles_seats() {
         use crate::game::effects::FanOutControlBoundary;
@@ -14021,25 +14077,12 @@ mod tests {
             .unless_pay = Some(rider());
         assert_eq!(boundary(&detached), Some(FanOutControlBoundary::Head));
 
-        // A tap-state node retained inside the seat template passes the effect
-        // whitelist only while its modifiers offer no choice.
+        // A node retained inside the seat template runs between seats: even a
+        // plain untap is not admitted.
         use crate::types::ability::{
             Effect, EffectScope, ResolvedAbility, TapStateChange, TypedFilter,
         };
-        let template = |retained_rider: bool| {
-            let mut untap = ResolvedAbility::new(
-                Effect::SetTapState {
-                    target: TargetFilter::Any,
-                    scope: EffectScope::Single,
-                    state: TapStateChange::Untap,
-                },
-                vec![],
-                crate::types::identifiers::ObjectId(1),
-                crate::types::player::PlayerId(0),
-            );
-            if retained_rider {
-                untap.unless_pay = Some(rider());
-            }
+        let template = |retained: Option<bool>| {
             let mut head = ResolvedAbility::new(
                 Effect::GainControlAll {
                     target: TargetFilter::Typed(TypedFilter::permanent()),
@@ -14048,19 +14091,36 @@ mod tests {
                 crate::types::identifiers::ObjectId(1),
                 crate::types::player::PlayerId(0),
             );
-            head.sub_ability = Some(Box::new(untap));
+            if let Some(rider_on_untap) = retained {
+                let mut untap = ResolvedAbility::new(
+                    Effect::SetTapState {
+                        target: TargetFilter::Any,
+                        scope: EffectScope::Single,
+                        state: TapStateChange::Untap,
+                    },
+                    vec![],
+                    crate::types::identifiers::ObjectId(1),
+                    crate::types::player::PlayerId(0),
+                );
+                if rider_on_untap {
+                    untap.unless_pay = Some(rider());
+                }
+                head.sub_ability = Some(Box::new(untap));
+            }
             head
         };
         assert_eq!(
-            crate::game::effects::fan_out_control_boundary(&template(false)),
+            crate::game::effects::fan_out_control_boundary(&template(None)),
             FanOutControlBoundary::Head,
-            "REACH: a plain retained untap is whitelisted"
+            "REACH: the bare head"
         );
-        assert_eq!(
-            crate::game::effects::fan_out_control_boundary(&template(true)),
-            FanOutControlBoundary::Unobservable,
-            "a retained untap with an unless-payment is a pause that can mutate"
-        );
+        for rider_on_untap in [false, true] {
+            assert_eq!(
+                crate::game::effects::fan_out_control_boundary(&template(Some(rider_on_untap))),
+                FanOutControlBoundary::Unobservable,
+                "a retained untap (rider {rider_on_untap})"
+            );
+        }
     }
     /// CR 608.2e + CR 603.10d: a control action retained behind a scoped prefix
     /// ("each player may <X> and gain control of …": the optional clause keeps
@@ -14094,7 +14154,7 @@ mod tests {
             .sub_ability(steal());
         let accepted = AbilityDefinition::new(
             AbilityKind::Spell,
-            Effect::GainControl {
+            Effect::GainControlAll {
                 target: TargetFilter::Any,
             },
         )
