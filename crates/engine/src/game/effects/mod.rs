@@ -7525,11 +7525,15 @@ pub(crate) fn fan_out_control_boundary(template: &ResolvedAbility) -> FanOutCont
 /// template and the next seat's. The engine applies the simultaneous action
 /// seat by seat; an earlier seat's control change only reaches the board a
 /// later seat reads (characteristics, controllers) once layers are settled,
-/// which happens at a pause (an optional seat, a per-seat target choice), at a
+/// which happens at a pause (an optional seat, an unless-payment, a per-seat
+/// target choice, or any other prompt-bearing modifier), at a
 /// retained following node (the chain-link settle), or when a "for as long as"
 /// duration begins.
 fn seats_can_settle_between(template: &ResolvedAbility) -> bool {
-    template.optional
+    // The exhaustive field authority: optional, unless-pay (CR 118.12),
+    // resolution-time choosers and timing, modal and repeat prompts.
+    crate::game::resolution_prompt::node_modifiers_offer_choice(template)
+        || template.optional
         || template.sub_ability.is_some()
         || template.else_ability.is_some()
         || template
@@ -7652,11 +7656,15 @@ fn target_population_is_control_invariant(target: &TargetFilter) -> bool {
 /// head is proven unable to remove, move or rebind a later seat's member
 /// before that seat's head runs (the engine runs each seat's whole template
 /// before the next seat's head). Exhaustive typed whitelist: changing tapped
-/// state only (Scrambleverse's "Untap those permanents"). A template with no
-/// retained node is trivially safe.
+/// state only (a same-sentence "… and untap them"; Scrambleverse's following
+/// "Untap those permanents." is detached from the seat template), on a node whose
+/// executable modifiers offer no choice (`node_modifiers_offer_choice`: an
+/// unless-pay or optional rider is a pause, and a payment can mutate). A
+/// template with no retained node is trivially safe.
 fn retained_continuation_is_safe(template: &ResolvedAbility) -> bool {
     fn node_is_safe(node: &ResolvedAbility) -> bool {
         matches!(node.effect, Effect::SetTapState { .. })
+            && !crate::game::resolution_prompt::node_modifiers_offer_choice(node)
             && node.sub_ability.as_deref().is_none_or(node_is_safe)
             && node.else_ability.as_deref().is_none_or(node_is_safe)
     }

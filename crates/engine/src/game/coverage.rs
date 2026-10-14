@@ -13954,6 +13954,114 @@ mod tests {
         );
         assert!(super::fan_out_control_boundary_is_unobservable(def));
     }
+    /// CR 118.12a + CR 608.2e: an unless-payment is a per-seat pause, read from
+    /// the exhaustive field authority (`resolution_prompt::node_modifiers_offer_choice`)
+    /// on the head and on every retained node (R6-1). Homeward Path's mandatory
+    /// head stays exact; the same head with an unless-payment, and
+    /// Scrambleverse with an unless-payment on its retained untap, are
+    /// unsupported.
+    #[test]
+    fn an_unless_payment_on_the_head_or_a_retained_node_settles_seats() {
+        use crate::game::effects::FanOutControlBoundary;
+        use crate::types::ability::{AbilityCost, TargetFilter, UnlessPayModifier};
+        let scoped = |text: &str, name: &str, types: &str| {
+            let parsed = crate::parser::parse_oracle_text(text, name, &[], &[types.into()], &[]);
+            let mut scoped = Vec::new();
+            for def in parsed.abilities.iter() {
+                scoped_nodes(def, &mut scoped);
+            }
+            scoped
+                .into_iter()
+                .next()
+                .expect("REACH: a scoped clause parses")
+        };
+        let boundary = |def: &crate::types::ability::AbilityDefinition| {
+            crate::game::effects::player_scope_control_boundary(
+                &crate::game::ability_utils::build_resolved_from_def(
+                    def,
+                    crate::types::identifiers::ObjectId(1),
+                    crate::types::player::PlayerId(0),
+                ),
+            )
+        };
+        let rider = || UnlessPayModifier {
+            cost: AbilityCost::Tap,
+            payer: TargetFilter::ScopedPlayer,
+        };
+
+        let homeward = scoped(
+            "{T}: Add {C}.\n{T}: Each player gains control of all creatures they own.",
+            "Homeward Path",
+            "Land",
+        );
+        assert_eq!(
+            boundary(&homeward),
+            Some(FanOutControlBoundary::Head),
+            "REACH"
+        );
+        let mut paying = homeward.clone();
+        paying.unless_pay = Some(rider());
+        assert_eq!(boundary(&paying), Some(FanOutControlBoundary::Unobservable));
+        assert!(super::fan_out_control_boundary_is_unobservable(&paying));
+
+        // Scrambleverse's untap is a following sentence, detached from the seat
+        // template (it runs once, after every seat), so a rider there leaves the
+        // link exact.
+        let scramble = scoped(
+            "For each nonland permanent, choose a player at random. Then each player gains \
+             control of each permanent for which they were chosen. Untap those permanents.",
+            "Scrambleverse",
+            "Sorcery",
+        );
+        let mut detached = scramble.clone();
+        detached
+            .sub_ability
+            .as_mut()
+            .expect("REACH: Scrambleverse has an untap")
+            .unless_pay = Some(rider());
+        assert_eq!(boundary(&detached), Some(FanOutControlBoundary::Head));
+
+        // A tap-state node retained inside the seat template passes the effect
+        // whitelist only while its modifiers offer no choice.
+        use crate::types::ability::{
+            Effect, EffectScope, ResolvedAbility, TapStateChange, TypedFilter,
+        };
+        let template = |retained_rider: bool| {
+            let mut untap = ResolvedAbility::new(
+                Effect::SetTapState {
+                    target: TargetFilter::Any,
+                    scope: EffectScope::Single,
+                    state: TapStateChange::Untap,
+                },
+                vec![],
+                crate::types::identifiers::ObjectId(1),
+                crate::types::player::PlayerId(0),
+            );
+            if retained_rider {
+                untap.unless_pay = Some(rider());
+            }
+            let mut head = ResolvedAbility::new(
+                Effect::GainControlAll {
+                    target: TargetFilter::Typed(TypedFilter::permanent()),
+                },
+                vec![],
+                crate::types::identifiers::ObjectId(1),
+                crate::types::player::PlayerId(0),
+            );
+            head.sub_ability = Some(Box::new(untap));
+            head
+        };
+        assert_eq!(
+            crate::game::effects::fan_out_control_boundary(&template(false)),
+            FanOutControlBoundary::Head,
+            "REACH: a plain retained untap is whitelisted"
+        );
+        assert_eq!(
+            crate::game::effects::fan_out_control_boundary(&template(true)),
+            FanOutControlBoundary::Unobservable,
+            "a retained untap with an unless-payment is a pause that can mutate"
+        );
+    }
     /// CR 608.2e + CR 603.10d: a control action retained behind a scoped prefix
     /// ("each player may <X> and gain control of …": the optional clause keeps
     /// its continuation in the seat) has no single pre-seat boundary, so the

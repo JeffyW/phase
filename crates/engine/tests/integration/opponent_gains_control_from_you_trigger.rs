@@ -1863,3 +1863,111 @@ fn r5_2_retained_destroy_fails_closed() {
         "the class fires for no player"
     );
 }
+
+/// Labelled synthetic for R6-1: the R4-1 population, mandatory, with an
+/// unless-payment per player (CR 118.12a) instead of "may".
+const RETURN_SMALL_UNLESS_PAY: &str = "Each player gains control of all creatures they own with \
+    power 3 or less unless they pay {1}.";
+
+/// R6-1: DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. An
+/// unless-payment is a per-seat pause (CR 118.12a), so the head settles between
+/// seats and its power-bounded population is not control-invariant. Probed at
+/// cc30bfe87's classifier (`Head`, capture taken): `base_power` 3 gave P1 +2
+/// and moved the creature to P2, where the rules (CR 608.2e + CR 611.2c) give
+/// P1 +1 and leave it with P1. The producer is unsupported, and Zidane fires
+/// for no player.
+#[test]
+fn r6_1_unless_payment_head_fails_closed() {
+    for base_power in [3, 2] {
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let zidane = add_zidane(&mut scenario, P1);
+        let trostani = scenario
+            .add_creature_from_oracle(P0, "Trostani Discordant", 1, 4, TROSTANI)
+            .id();
+        let p2_creature = scenario.add_vanilla(P2, base_power, base_power);
+        let steal_trostani = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let steal_creature = add_free_spell(&mut scenario, P1, "Act of Treason", ACT_OF_TREASON);
+        let returns = scenario
+            .add_spell_to_hand_from_oracle(P0, "Return Unless Paid", true, RETURN_SMALL_UNLESS_PAY)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        for player in [P0, P1, P2] {
+            scenario.with_mana_pool(
+                player,
+                vec![ManaUnit::new(
+                    ManaType::Colorless,
+                    ObjectId(0),
+                    false,
+                    vec![],
+                )],
+            );
+        }
+        let mut runner = scenario.build();
+
+        give_priority(&mut runner, P1);
+        runner
+            .cast(steal_trostani)
+            .target_object(trostani)
+            .resolve();
+        runner.advance_until_stack_empty();
+        runner
+            .cast(steal_creature)
+            .target_object(p2_creature)
+            .resolve();
+        runner.advance_until_stack_empty();
+        assert_eq!(
+            controller(&runner, trostani),
+            P1,
+            "REACH: P1 controls Trostani"
+        );
+        assert_eq!(
+            controller(&runner, p2_creature),
+            P1,
+            "REACH: P1 controls P2's creature"
+        );
+        assert_eq!(
+            power(&runner, p2_creature),
+            base_power + 1,
+            "REACH: P1's anthem"
+        );
+        assert_eq!(power(&runner, zidane), 4, "REACH: P1's anthem pumps Zidane");
+        let before = treasures(&runner, P1);
+
+        give_priority(&mut runner, P0);
+        cast_and_pass(&mut runner, returns);
+        let captured = !runner.state().control_change_captures.is_empty();
+        let mut seats = 0;
+        for _ in 0..3 {
+            if matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }) {
+                if seats == 1 {
+                    assert_eq!(
+                        controller(&runner, trostani),
+                        P0,
+                        "REACH: P0 declined first"
+                    );
+                    assert_eq!(
+                        power(&runner, p2_creature),
+                        base_power,
+                        "REACH: the anthem left P1 before the later seats"
+                    );
+                }
+                seats += 1;
+                runner
+                    .act(GameAction::PayUnlessCost { pay: false })
+                    .expect("the seat declines");
+            }
+        }
+        assert_eq!(seats, 3, "REACH: every seat reached its unless-payment");
+        runner.advance_until_stack_empty();
+        assert!(
+            !captured,
+            "the class takes no pre-seat capture: it fails closed"
+        );
+        assert_eq!(
+            treasures(&runner, P1) - before,
+            0,
+            "base_power {base_power}: the class fires for no player"
+        );
+    }
+}
