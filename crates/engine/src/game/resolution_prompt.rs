@@ -569,7 +569,7 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
 /// optional / unless-pay / chooser / timing / modal / repeat fields) enter a
 /// resolution-time player choice, independent of what its effect does? The
 /// field-level half of [`chain_offers_choice`], shared with the scoped
-/// control-capture admission (`effects::fan_out_head_is_bare`), so both
+/// control-capture admission (`effects::fan_out_head_is_allowlisted`), so both
 /// read one exhaustive classification of every `ResolvedAbility` field.
 ///
 /// The `ResolvedAbility` destructure is EXHAUSTIVE with no `..`: a FUTURE field

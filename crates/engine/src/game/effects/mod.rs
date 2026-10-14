@@ -7487,18 +7487,14 @@ fn control_change_node_count(node: &ResolvedAbility) -> usize {
 pub(crate) enum FanOutControlBoundary {
     /// No control-change action: nothing to capture.
     NoControl,
-    /// The template is one bare mass control action (`fan_out_head_is_bare`):
-    /// mandatory, with no executable modifier and no retained node. Every seat
-    /// then applies it in one synchronous pass with nothing between seats that
-    /// can settle the board, pay a cost, re-check a condition or prompt, so the
-    /// board before the first seat is every seat's immediately-before board, and
-    /// each seat's population is read on the board the action began with (CR
-    /// 611.2c).
+    /// The template is one allowlisted printed shape (`fan_out_head_is_allowlisted`):
+    /// a mandatory mass control action over one of the printed producers' exact
+    /// parsed populations, with no executable modifier and no retained node. The
+    /// board before the first seat is every seat's immediately-before board.
     Head,
-    /// Anything else: more than one control-change action, a control action
-    /// behind a retained prefix, or a head that a seat can pause, pay for,
-    /// re-evaluate or follow with a retained node, so no single pre-seat capture
-    /// is proven to be the boundary of every seat's action. Fails closed:
+    /// Anything else, including every shape no printed producer on the
+    /// allowlist has: no single pre-seat capture is proven to be the boundary of
+    /// every seat's action. Fails closed:
     /// `Unrecorded` evidence at runtime, and coverage marks the producer
     /// unsupported (`coverage::PLAYER_SCOPE_CONTROL_BOUNDARY_GAP`).
     Unobservable,
@@ -7510,25 +7506,62 @@ pub(crate) fn fan_out_control_boundary(template: &ResolvedAbility) -> FanOutCont
         control_change_node_count(template),
     ) {
         (_, 0) => FanOutControlBoundary::NoControl,
-        (true, 1) if fan_out_head_is_bare(template) => FanOutControlBoundary::Head,
+        (true, 1) if fan_out_head_is_allowlisted(template) => FanOutControlBoundary::Head,
         _ => FanOutControlBoundary::Unobservable,
     }
 }
 
-/// CR 608.2e + CR 611.2c: whether a fan-out template is one bare mass control
-/// action, the only shape whose seats the engine applies in one synchronous
-/// pass on the board the action began with. Structural, not a census of
-/// hazards: the head must be a mass `GainControlAll` (a single-object control
-/// action reads a per-seat target), retain no node (a retained node runs, and
-/// settles, between seats), and carry no executable modifier, whether it
-/// offers a choice (`resolution_prompt::node_modifiers_offer_choice`: optional,
-/// unless-pay (CR 118.12a), choosers, timing, modal, repeat prompts) or is
-/// evaluated per seat (a condition re-checked on the board an earlier seat
-/// changed, a repeat, a "for as long as" duration that begins per seat).
+/// CR 608.2e + CR 603.10d: the exact parsed populations of the printed "each
+/// player gains control" producers whose fan-out is captured exactly. A closed
+/// allowlist, not a classifier: any other population, however similar, fails
+/// closed. Keyed on the typed shape the parser emits for each card, so a
+/// reprint or another card with the identical shape shares the entry, and a
+/// new shape stays unsupported until it's added here with its receipt
+/// (`coverage::tests::printed_scoped_control_producers_have_a_head_boundary`).
+pub(crate) fn allowlisted_fan_out_control_populations() -> [TargetFilter; 6] {
+    use crate::types::ability::{ControllerRef, FilterProp, TypeFilter, TypedFilter};
+    let owned_by_seat = || FilterProp::Owned {
+        controller: ControllerRef::ScopedPlayer,
+    };
+    [
+        // Homeward Path, Trostani Discordant, Alicia Masters: "all creatures
+        // they own".
+        TargetFilter::Typed(TypedFilter::creature().properties(vec![owned_by_seat()])),
+        // Brooding Saurian: "all nontoken permanents they own".
+        TargetFilter::Typed(
+            TypedFilter::permanent().properties(vec![FilterProp::NonToken, owned_by_seat()]),
+        ),
+        // The Fall of Lord Konda, chapter II: "all permanents they own".
+        TargetFilter::Typed(TypedFilter::permanent().properties(vec![owned_by_seat()])),
+        // Aminatou, the Fateshifter's -6, as parsed.
+        TargetFilter::Typed(
+            TypedFilter::permanent()
+                .with_type(TypeFilter::Non(Box::new(TypeFilter::Land)))
+                .properties(vec![FilterProp::Another]),
+        ),
+        // Herald of Leshrac: "each land they own that you control".
+        TargetFilter::Typed(
+            TypedFilter::land()
+                .controller(ControllerRef::You)
+                .properties(vec![owned_by_seat()]),
+        ),
+        // Scrambleverse, as parsed.
+        TargetFilter::Typed(TypedFilter::permanent()),
+    ]
+}
+
+/// CR 608.2e + CR 611.2c: whether a fan-out template is one allowlisted printed
+/// shape: a mandatory `GainControlAll` over an allowlisted population
+/// (`allowlisted_fan_out_control_populations`), retaining no node and carrying
+/// no executable modifier, whether choice-bearing
+/// (`resolution_prompt::node_modifiers_offer_choice`: optional, unless-pay (CR
+/// 118.12a), choosers, timing, modal, repeat prompts) or evaluated per seat (a
+/// condition, a repeat, a "for as long as" duration). Every printed producer on
+/// the allowlist has exactly this shape.
 ///
 /// The `ResolvedAbility` destructure is EXHAUSTIVE with no `..`: a future field
 /// fails to compile here until classified for the per-seat question.
-fn fan_out_head_is_bare(head: &ResolvedAbility) -> bool {
+fn fan_out_head_is_allowlisted(head: &ResolvedAbility) -> bool {
     let ResolvedAbility {
         // ---- the action and its retained chain ----
         effect,
@@ -7608,7 +7641,10 @@ fn fan_out_head_is_bare(head: &ResolvedAbility) -> bool {
         activation_record: _,  // activation-time provenance
         control_change_instruction: _, // the carrier this classification stamps
     } = head;
-    matches!(effect, Effect::GainControlAll { .. })
+    let Effect::GainControlAll { target } = effect else {
+        return false;
+    };
+    allowlisted_fan_out_control_populations().contains(target)
         && sub_ability.is_none()
         && else_ability.is_none()
         && condition.is_none()

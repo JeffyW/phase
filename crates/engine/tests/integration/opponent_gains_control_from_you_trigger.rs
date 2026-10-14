@@ -550,8 +550,8 @@ fn homeward_after_switcheroo_is_simultaneous_in_both_apnap_orders() {
 const OPTIONAL_HOMEWARD: &str = "Each player may gain control of all nontoken permanents they own.";
 
 /// DOCUMENTS A FAIL-CLOSED PRODUCER CLASS, not rules-correct counts. An optional
-/// scoped control action pauses between seats, so it isn't one bare mass
-/// action (`fan_out_head_is_bare`): no pre-seat capture is taken, its changes
+/// scoped control action pauses between seats, so it isn't an allowlisted
+/// shape (`fan_out_head_is_allowlisted`): no pre-seat capture is taken, its changes
 /// publish `Unrecorded`, and Zidane fires for no player. The same board with
 /// Homeward Path's mandatory action is exact
 /// (`homeward_after_switcheroo_is_simultaneous_in_both_apnap_orders`); the rules
@@ -682,45 +682,52 @@ fn double_exchange_binds_each_instruction_to_its_own_holder() {
 
 /// Labelled synthetic: two independent "each player" sentences, each its own
 /// scoped control-change action (CR 608.2e: each action processed
-/// simultaneously, the second after the first).
-const TWO_SCOPED_RETURNS: &str = "Each player gains control of all creatures they own with \
-    power 2 or less. Each player gains control of all creatures they own with power 4 or \
-    greater.";
+/// simultaneously, the second after the first), each an allowlisted printed
+/// shape (Homeward Path's, then The Fall of Lord Konda's).
+const TWO_SCOPED_RETURNS: &str = "Each player gains control of all creatures they own. Each \
+    player gains control of all permanents they own.";
 
-/// Q9: each scoped link captures its own boundary. P0 (with Zidane, 3/3) has
-/// taken P1's 2/2 and 4/4; the first sentence returns the 2/2 and the second
-/// the 4/4, two losses for P0 while P0 controls Zidane: P0 +2.
+/// Q9: each scoped link captures its own boundary. P0 (with Zidane) has taken
+/// P1's creature and land; the first sentence returns the creature and the
+/// second the land, two losses for P0 while P0 controls Zidane: P0 +2.
 #[test]
 fn two_scoped_links_each_get_their_own_boundary() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let zidane = add_zidane(&mut scenario, P0);
-    let small = scenario.add_vanilla(P1, 2, 2);
-    let big = scenario.add_vanilla(P1, 4, 4);
-    let steal_small = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
-    let steal_big = add_free_spell(&mut scenario, P0, "Act of Treason", ACT_OF_TREASON);
+    let creature = scenario.add_vanilla(P1, 2, 2);
+    let land = scenario.add_basic_land(P1, engine::types::mana::ManaColor::Green);
+    let steal_creature = add_free_spell(&mut scenario, P0, "Steal", STEAL_ANY_PERMANENT);
+    let steal_land = add_free_spell(&mut scenario, P0, "Steal", STEAL_ANY_PERMANENT);
     let returns = add_free_spell(&mut scenario, P0, "Two Returns", TWO_SCOPED_RETURNS);
     let mut runner = scenario.build();
 
-    runner.cast(steal_small).target_object(small).resolve();
+    runner
+        .cast(steal_creature)
+        .target_object(creature)
+        .resolve();
     runner.advance_until_stack_empty();
-    runner.cast(steal_big).target_object(big).resolve();
+    runner.cast(steal_land).target_object(land).resolve();
     runner.advance_until_stack_empty();
-    assert_eq!(controller(&runner, small), P0, "REACH: P0 took the 2/2");
-    assert_eq!(controller(&runner, big), P0, "REACH: P0 took the 4/4");
+    assert_eq!(
+        controller(&runner, creature),
+        P0,
+        "REACH: P0 took the creature"
+    );
+    assert_eq!(controller(&runner, land), P0, "REACH: P0 took the land");
     assert_eq!(treasures(&runner, P0), 0, "P0's own gains don't fire");
 
     runner.cast(returns).resolve();
     runner.advance_until_stack_empty();
     assert_eq!(
-        controller(&runner, small),
+        controller(&runner, creature),
         P1,
-        "REACH: first link returned the 2/2"
+        "REACH: first link returned the creature"
     );
     assert_eq!(
-        controller(&runner, big),
+        controller(&runner, land),
         P1,
-        "REACH: second link returned the 4/4"
+        "REACH: second link returned the land"
     );
     assert_eq!(
         controller(&runner, zidane),
@@ -2138,4 +2145,99 @@ fn r7_2_condition_rechecked_per_seat_fails_closed() {
             "spare {spare}: the class fires for no player"
         );
     }
+}
+
+/// R8-1 synthetic, hand-built: "Return all creature cards from all graveyards to
+/// the battlefield under your control. Each player gains control of each of
+/// those permanents they own." The scoped head is mandatory and bare, but its
+/// population (`And(LastZoneChanged, Typed(Permanent, Owned(ScopedPlayer)))`)
+/// isn't an allowlisted printed shape.
+fn r8_1_return_then_hand_back(scenario: &mut GameScenario, owner: PlayerId) -> ObjectId {
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, ControllerRef, Effect, FilterProp, PlayerFilter,
+        SubAbilityLink, TargetFilter, TypedFilter,
+    };
+    let mut hand_back = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainControlAll {
+            target: TargetFilter::And {
+                filters: vec![
+                    TargetFilter::LastZoneChanged,
+                    TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::ScopedPlayer,
+                        },
+                    ])),
+                ],
+            },
+        },
+    )
+    .player_scope(PlayerFilter::All);
+    hand_back.sub_link = SubAbilityLink::SequentialSibling;
+    let root = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZoneAll {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::Typed(TypedFilter::creature()),
+            enters_under: Some(ControllerRef::You),
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            library_shuffle: Default::default(),
+            random_order: false,
+        },
+    )
+    .sub_ability(hand_back);
+    let mut builder = scenario.add_spell_to_hand(owner, "R8-1 Return Then Hand Back", true);
+    builder.with_ability_definition(root);
+    builder.with_mana_cost(ManaCost::zero()).id()
+}
+
+/// Main's scope stop: a fan-out whose seat template isn't an allowlisted
+/// printed shape fails closed, so Zidane fires for no player, even when its
+/// head is mandatory and bare. R8-1's board: P1 controls Zidane; P1's spell
+/// returns P0's bear A and P2's bear B from their graveyards under P1's
+/// control, then each player gains control of those of them they own. The
+/// rules (CR 608.2e + CR 603.2c) give P1 +2; the engine's per-seat population
+/// re-read (the last-zone-changed set is replaced after the first seat) leaves
+/// B with P1. Either way, P1 gets +0 here.
+#[test]
+fn a_non_allowlisted_fan_out_does_not_fire() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let zidane = add_zidane(&mut scenario, P1);
+    let a = scenario.add_creature_to_graveyard(P0, "Bears A", 2, 2).id();
+    let b = scenario.add_creature_to_graveyard(P2, "Bears B", 2, 2).id();
+    let spell = r8_1_return_then_hand_back(&mut scenario, P1);
+    let mut runner = scenario.build();
+    let before = treasures(&runner, P1);
+
+    give_priority(&mut runner, P1);
+    runner.state_mut().active_player = P0;
+    cast_and_pass(&mut runner, spell);
+    runner.advance_until_stack_empty();
+    assert_eq!(
+        runner.state().objects[&a].zone,
+        Zone::Battlefield,
+        "REACH: A returned"
+    );
+    assert_eq!(
+        runner.state().objects[&b].zone,
+        Zone::Battlefield,
+        "REACH: B returned"
+    );
+    assert_eq!(
+        controller(&runner, a),
+        P0,
+        "REACH: the scoped head ran and P0 took A back from P1"
+    );
+    assert_eq!(controller(&runner, zidane), P1, "REACH: Zidane stayed");
+    assert_eq!(
+        treasures(&runner, P1) - before,
+        0,
+        "a non-allowlisted fan-out fires for no player"
+    );
 }

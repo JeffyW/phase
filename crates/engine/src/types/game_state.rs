@@ -23186,7 +23186,7 @@ declare_game_state! {
     /// the ability, so no viewer copy can see it: the captured watcher contexts
     /// and subject snapshots can carry hidden information (a face-down linked
     /// exile), and `filter_state_for_viewer` drops this table. Removed when its
-    /// link completes. Only a bare mass control template is captured, and its
+    /// link completes. Only an allowlisted mandatory mass template is captured, and its
     /// seats run without a pause, so no admitted link leaves an entry across a
     /// pause; should one ever park, its entry is resolution-scoped residue,
     /// cleared at the next turn (no resolution spans a turn boundary), and is

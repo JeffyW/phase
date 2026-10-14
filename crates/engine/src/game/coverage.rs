@@ -7340,11 +7340,10 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
 
 /// The coverage label for an ability whose per-player fan-out ("each player
 /// …", "each target player …") performs a control-change action whose seat
-/// template isn't one bare mass control action (`effects::fan_out_control_boundary`):
-/// more than one control-change action, one behind a retained prefix, a
-/// single-object control head, or a head a seat can pause, pay for,
-/// re-evaluate or follow with a retained node between seats (CR 611.2c: the
-/// affected set is fixed when the action begins). CR 608.2e processes each
+/// template isn't one of the allowlisted printed shapes
+/// (`effects::fan_out_control_boundary`): a mandatory mass control action over
+/// a printed producer's exact parsed population, with no executable modifier
+/// and no retained node. Every other fan-out control shape is gapped. CR 608.2e processes each
 /// action simultaneously for every player, and CR 603.10d look-back
 /// control-change triggers need that action's immediately-before board; the
 /// runtime publishes such changes with `Unrecorded` evidence, so the producer
@@ -13687,18 +13686,29 @@ mod tests {
         }
     }
 
-    /// CR 608.2e + CR 603.10d: the printed "each player gains control" producers
-    /// (verbatim Scryfall text) whose scoped action is one bare mass control
-    /// action parse to a head-boundary template, which the runtime captures
-    /// exactly; none is marked unsupported.
+    /// CR 608.2e + CR 603.10d: the allowlist's receipt. Each printed "each player
+    /// gains control" producer on it (verbatim Scryfall text) parses to a
+    /// head-boundary template, which the runtime captures exactly, and isn't
+    /// marked unsupported; and every allowlisted population is one of these
+    /// cards' parsed populations, so the allowlist holds nothing unprinted.
     #[test]
     fn printed_scoped_control_producers_have_a_head_boundary() {
         use crate::game::effects::FanOutControlBoundary;
+        let mut seen = Vec::new();
         for (name, types, text) in [
             (
                 "Homeward Path",
                 "Land",
                 "{T}: Add {C}.\n{T}: Each player gains control of all creatures they own.",
+            ),
+            (
+                "The Fall of Lord Konda",
+                "Enchantment Saga",
+                "(As this Saga enters and after your draw step, add a lore counter.)\nI \u{2014} \
+                 Exile target creature an opponent controls with mana value 4 or greater.\nII \
+                 \u{2014} Each player gains control of all permanents they own.\nIII \u{2014} \
+                 Exile this Saga, then return it to the battlefield transformed under your \
+                 control.",
             ),
             (
                 "Brooding Saurian",
@@ -13747,8 +13757,11 @@ mod tests {
                  control of each permanent for which they were chosen. Untap those permanents.",
             ),
         ] {
+            // "Enchantment Saga": the card type, then its subtypes.
+            let (core, subtypes) = types.split_once(' ').unwrap_or((types, ""));
+            let subtypes: Vec<String> = subtypes.split_whitespace().map(String::from).collect();
             let parsed =
-                crate::parser::parse_oracle_text(text, name, &[], &[types.to_string()], &[]);
+                crate::parser::parse_oracle_text(text, name, &[], &[core.to_string()], &subtypes);
             let mut scoped = Vec::new();
             for def in parsed.abilities.iter() {
                 scoped_nodes(def, &mut scoped);
@@ -13796,20 +13809,29 @@ mod tests {
                     Some(FanOutControlBoundary::Head),
                     "{name}: its scoped control action is the template's head"
                 );
+                if let crate::types::ability::Effect::GainControlAll { target } = &*def.effect {
+                    seen.push(target.clone());
+                }
                 assert!(
                     !super::fan_out_control_boundary_is_unobservable(&def),
                     "{name}: not marked unsupported"
                 );
             }
         }
+        for population in crate::game::effects::allowlisted_fan_out_control_populations() {
+            assert!(
+                seen.contains(&population),
+                "allowlisted {population:?} is a printed producer's parsed population"
+            );
+        }
     }
 
     /// CR 611.2c + CR 608.2e: the printed scoped producers whose seat template
-    /// isn't one bare mass control action (a per-seat choice, a retained
-    /// following node, a single-object control head) fail closed: coverage
-    /// marks them unsupported, and Zidane doesn't trigger on their changes.
+    /// isn't an allowlisted shape (a per-seat choice, a retained following
+    /// node, a single-object control head) fail closed: coverage marks them
+    /// unsupported, and Zidane doesn't trigger on their changes.
     #[test]
-    fn printed_scoped_producers_outside_the_bare_head_are_unsupported() {
+    fn printed_scoped_producers_off_the_allowlist_are_unsupported() {
         for (name, types, text) in [
             (
                 "Inniaz, the Gale Force",
@@ -13863,33 +13885,32 @@ mod tests {
             );
         }
     }
-    /// CR 608.2e + CR 611.2c + CR 118.12a: the `Head` admission is structural.
-    /// Only one bare mass control action (mandatory, no executable modifier, no
-    /// retained node) is exact, whatever its population reads, since its seats
-    /// apply in one synchronous pass on the board the action began with. Every
-    /// axis that lets a seat pause, pay, re-evaluate or act between seats is
-    /// unsupported (R4-1, R5-1, R6-1, R7-1, R7-2), and so is a single-object
-    /// control head, which reads a per-seat target.
+    /// CR 608.2e + CR 611.2c + CR 118.12a: the `Head` admission is a closed
+    /// allowlist. An allowlisted printed population, mandatory and bare, is
+    /// exact. The same population with any axis that lets a seat pause, pay,
+    /// re-evaluate or act between seats is unsupported (R4-1, R5-1, R6-1, R7-1,
+    /// R7-2), and so is a bare mandatory head over any population off the
+    /// allowlist (R5-1's live owner reference, R8-1's last-zone-changed set) or
+    /// a single-object control head.
     #[test]
-    fn only_a_bare_mandatory_mass_control_head_is_exact() {
+    fn only_an_allowlisted_bare_mass_control_head_is_exact() {
         use crate::game::effects::FanOutControlBoundary;
         use crate::types::ability::{
             AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, Comparator,
             ControllerRef, Duration, Effect, FilterProp, PlayerFilter, QuantityExpr, QuantityRef,
             StaticCondition, TargetFilter, TypedFilter, UnlessPayModifier,
         };
-        let bare = |owner: ControllerRef| {
-            AbilityDefinition::new(
-                AbilityKind::Spell,
-                Effect::GainControlAll {
-                    target: TargetFilter::Typed(TypedFilter::permanent().properties(vec![
-                        FilterProp::NonToken,
-                        FilterProp::Owned { controller: owner },
-                    ])),
-                },
-            )
-            .player_scope(PlayerFilter::All)
+        let owned_by = |owner: ControllerRef| {
+            TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                FilterProp::NonToken,
+                FilterProp::Owned { controller: owner },
+            ]))
         };
+        let head = |target: TargetFilter| {
+            AbilityDefinition::new(AbilityKind::Spell, Effect::GainControlAll { target })
+                .player_scope(PlayerFilter::All)
+        };
+        let allowlisted = || head(owned_by(ControllerRef::ScopedPlayer));
         let boundary = |def: &AbilityDefinition| {
             crate::game::effects::player_scope_control_boundary(
                 &crate::game::ability_utils::build_resolved_from_def(
@@ -13899,63 +13920,70 @@ mod tests {
                 ),
             )
         };
-        // The population is free: a live controller reference is read on the
-        // board the action began with, since nothing settles between seats.
-        for owner in [
-            ControllerRef::ScopedPlayer,
-            ControllerRef::ParentTargetController,
-        ] {
-            assert_eq!(
-                boundary(&bare(owner.clone())),
-                Some(FanOutControlBoundary::Head),
-                "REACH: the bare mandatory head over {owner:?} is exact"
-            );
-            assert_eq!(
-                boundary(&bare(owner.clone()).optional()),
-                Some(FanOutControlBoundary::Unobservable),
-                "optional over {owner:?} (R4-1, R5-1)"
-            );
-        }
+        assert_eq!(
+            boundary(&allowlisted()),
+            Some(FanOutControlBoundary::Head),
+            "REACH: Brooding Saurian's population, mandatory and bare"
+        );
 
-        let mut unsupported: Vec<(&str, AbilityDefinition)> = Vec::new();
-        let mut paying = bare(ControllerRef::ScopedPlayer);
+        let mut unsupported: Vec<(&str, AbilityDefinition)> = vec![
+            ("optional (R4-1)", allowlisted().optional()),
+            (
+                "off the allowlist: a live owner reference (R5-1)",
+                head(owned_by(ControllerRef::ParentTargetController)),
+            ),
+            (
+                "off the allowlist: the last-zone-changed set (R8-1)",
+                head(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::LastZoneChanged,
+                        TargetFilter::Typed(TypedFilter::permanent().properties(vec![
+                            FilterProp::Owned {
+                                controller: ControllerRef::ScopedPlayer,
+                            },
+                        ])),
+                    ],
+                }),
+            ),
+            (
+                "a condition re-checked per seat (R7-2)",
+                allowlisted().condition(AbilityCondition::QuantityCheck {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(
+                                TypedFilter::creature().controller(ControllerRef::You),
+                            ),
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 3 },
+                }),
+            ),
+            (
+                "a single-object control head",
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainControl {
+                        target: TargetFilter::ParentTarget,
+                    },
+                )
+                .player_scope(PlayerFilter::All),
+            ),
+        ];
+        let mut paying = allowlisted();
         paying.unless_pay = Some(UnlessPayModifier {
             cost: AbilityCost::Tap,
             payer: TargetFilter::ScopedPlayer,
         });
         unsupported.push(("an unless-payment (R6-1, R7-1)", paying));
-        unsupported.push((
-            "a condition re-checked per seat (R7-2)",
-            bare(ControllerRef::ScopedPlayer).condition(AbilityCondition::QuantityCheck {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::ObjectCount {
-                        filter: TargetFilter::Typed(
-                            TypedFilter::creature().controller(ControllerRef::You),
-                        ),
-                    },
-                },
-                comparator: Comparator::GE,
-                rhs: QuantityExpr::Fixed { value: 3 },
-            }),
-        ));
-        let mut repeated = bare(ControllerRef::ScopedPlayer);
+        let mut repeated = allowlisted();
         repeated.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
         unsupported.push(("a repeat", repeated));
-        let mut lasting = bare(ControllerRef::ScopedPlayer);
+        let mut lasting = allowlisted();
         lasting.duration = Some(Duration::ForAsLongAs {
             condition: StaticCondition::IsPresent { filter: None },
         });
         unsupported.push(("a \"for as long as\" duration", lasting));
-        unsupported.push((
-            "a single-object control head",
-            AbilityDefinition::new(
-                AbilityKind::Spell,
-                Effect::GainControl {
-                    target: TargetFilter::ParentTarget,
-                },
-            )
-            .player_scope(PlayerFilter::All),
-        ));
         for (axis, def) in unsupported {
             assert_eq!(
                 boundary(&def),
@@ -14112,7 +14140,7 @@ mod tests {
         assert_eq!(
             crate::game::effects::fan_out_control_boundary(&template(None)),
             FanOutControlBoundary::Head,
-            "REACH: the bare head"
+            "REACH: the allowlisted head"
         );
         for rider_on_untap in [false, true] {
             assert_eq!(
@@ -14155,7 +14183,7 @@ mod tests {
         let accepted = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::GainControlAll {
-                target: TargetFilter::Any,
+                target: TargetFilter::Typed(crate::types::ability::TypedFilter::permanent()),
             },
         )
         .player_scope(PlayerFilter::All);
