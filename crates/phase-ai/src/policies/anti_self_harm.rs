@@ -233,10 +233,13 @@ fn cast_has_unpayable_self_etb_may_cost(ctx: &PolicyContext<'_>) -> bool {
             let ReplacementMode::MayCost { cost, decline } = &replacement.mode else {
                 return false;
             };
+            // CR 601.2a: the cost is paid as the cast spell enters from the
+            // stack, so it is priced as a spell being cast: a graveyard spell
+            // can't pay it from the graveyard it was cast from.
             decline
                 .as_deref()
                 .is_some_and(decline_moves_self_to_graveyard)
-                && !cost.is_payable_for_replacement(ctx.state, ctx.ai_player, source.id)
+                && !cost.is_payable_for_spell(ctx.state, ctx.ai_player, source.id)
         })
 }
 
@@ -7561,6 +7564,69 @@ mod tests {
         let mut state = make_state();
         let spell_id = mox_diamond_like_spell(&mut state);
         hand_land(&mut state);
+
+        assert!(matches!(
+            pre_cast_verdict_for_spell(&state, spell_id),
+            PolicyVerdict::Score { .. }
+        ));
+    }
+
+    /// A graveyard spell (mana value 3) whose "as this enters, you may
+    /// collect evidence 6" cost puts it into the graveyard if declined, plus
+    /// `others` more mana value 3 cards in the graveyard.
+    fn graveyard_evidence_may_cost_spell(state: &mut GameState, others: usize) -> ObjectId {
+        let template = mox_diamond_like_spell(state);
+        let mut replacements = state.objects[&template].replacement_definitions.clone();
+        let ReplacementMode::MayCost { cost, .. } = &mut replacements[0].mode else {
+            unreachable!("mox_diamond_like_spell carries a MayCost replacement");
+        };
+        *cost = AbilityCost::CollectEvidence { amount: 6 };
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            "Graveyard Evidence Spell".to_string(),
+            Zone::Graveyard,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.mana_cost = engine::types::mana::ManaCost::generic(3);
+        obj.replacement_definitions = replacements;
+        for i in 0..others {
+            let card = create_object(
+                state,
+                CardId(state.next_object_id),
+                PlayerId(0),
+                format!("Evidence {i}"),
+                Zone::Graveyard,
+            );
+            state.objects.get_mut(&card).unwrap().mana_cost =
+                engine::types::mana::ManaCost::generic(3);
+        }
+        id
+    }
+
+    /// CR 601.2a + CR 701.59b: the cost is paid as the cast spell enters from
+    /// the stack, so it can't count its own mana value toward the evidence;
+    /// one other mana value 3 card isn't enough.
+    #[test]
+    fn rejects_graveyard_cast_whose_etb_evidence_counts_only_itself() {
+        let mut state = make_state();
+        let spell_id = graveyard_evidence_may_cost_spell(&mut state, 1);
+        assert_eq!(state.objects[&spell_id].zone, Zone::Graveyard);
+
+        assert!(matches!(
+            pre_cast_verdict_for_spell(&state, spell_id),
+            PolicyVerdict::Reject { reason }
+                if reason.kind == "anti_self_harm_unpayable_etb_may_cost"
+        ));
+    }
+
+    /// Positive control: two other mana value 3 cards pay the evidence.
+    #[test]
+    fn allows_graveyard_cast_whose_etb_evidence_is_payable_without_itself() {
+        let mut state = make_state();
+        let spell_id = graveyard_evidence_may_cost_spell(&mut state, 2);
 
         assert!(matches!(
             pre_cast_verdict_for_spell(&state, spell_id),
