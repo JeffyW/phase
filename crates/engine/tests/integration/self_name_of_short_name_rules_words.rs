@@ -27,6 +27,7 @@ use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -409,5 +410,99 @@ fn cleric_of_lifes_bond_triggers_on_another_cleric_only() {
         runner.state().players[0].life,
         life_before + 1,
         "defect: another Cleric entering must gain 1 life"
+    );
+}
+
+const FEAR_OF_FEAR_ITSELF: &str = "{2}: Target creature gains fear until end of turn. (It can't be blocked except by artifact creatures and/or black creatures.)";
+
+const MINN: &str = "Whenever you draw your second card each turn, create a 1/1 blue Illusion creature token with \"This token gets +1/+0 for each other Illusion you control.\"\nWhenever an Illusion you control dies, you may put a permanent card with mana value less than or equal to that creature's power from your hand onto the battlefield.";
+
+/// CR 201.5c + CR 702.36a: "gains fear" grants the Fear keyword; "fear" is not a shortened
+/// name for Fear of Fear Itself.
+#[test]
+fn fear_of_fear_itself_grants_fear() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_enchantment_from_oracle(P0, "Fear of Fear Itself", FEAR_OF_FEAR_ITSELF)
+        .id();
+    let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    scenario.with_mana_pool(P0, mana(&[ManaType::Colorless, ManaType::Colorless]));
+    let mut runner = scenario.build();
+    assert!(
+        !runner.state().objects[&bears]
+            .keywords
+            .contains(&Keyword::Fear),
+        "reach: the target starts without fear"
+    );
+
+    runner.activate(source, 0).target_object(bears).resolve();
+
+    assert!(
+        runner.state().objects[&bears]
+            .keywords
+            .contains(&Keyword::Fear),
+        "defect: the target creature must gain fear"
+    );
+}
+
+/// Cast a "Draw two cards." sorcery so Minn's second-draw trigger creates its Illusion token,
+/// and return the token's power.
+fn minn_token_power(other_illusions: usize) -> i32 {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature_from_oracle(P0, "Minn, Wily Illusionist", 1, 4, MINN)
+        .as_legendary()
+        .with_subtypes(vec!["Gnome", "Wizard"]);
+    for _ in 0..other_illusions {
+        scenario
+            .add_creature(P0, "Phantasmal Bear", 2, 2)
+            .with_subtypes(vec!["Illusion", "Bear"]);
+    }
+    // An opponent's Illusion is not "you control".
+    scenario
+        .add_creature(P1, "Phantasmal Bear", 2, 2)
+        .with_subtypes(vec!["Illusion", "Bear"]);
+    let draw_two = scenario
+        .add_spell_to_hand_from_oracle(P0, "Divination", false, "Draw two cards.")
+        .id();
+    scenario.with_library_top(P0, &["Plains"; 5]);
+    let mut runner = scenario.build();
+
+    runner.cast(draw_two).resolve();
+
+    let tokens: Vec<_> = runner
+        .state()
+        .objects
+        .values()
+        .filter(|object| object.is_token && object.zone == Zone::Battlefield)
+        .collect();
+    assert_eq!(
+        tokens.len(),
+        1,
+        "reach: the second draw must create exactly one Illusion token"
+    );
+    tokens[0].power.expect("the token is a creature")
+}
+
+/// CR 201.5c + CR 205.3a: inside the token named "Illusion", "each other Illusion you
+/// control" counts Illusions, not the token by name. Two other Illusions make it 3/1.
+#[test]
+fn minn_illusion_token_counts_other_illusions() {
+    assert_eq!(
+        minn_token_power(2),
+        3,
+        "defect: the token gets +1/+0 for each of the two other Illusions you control"
+    );
+}
+
+/// Control for the dynamic count: with no other Illusion you control, the token stays 1/1.
+#[test]
+fn minn_illusion_token_without_other_illusions_stays_one_one() {
+    assert_eq!(
+        minn_token_power(0),
+        1,
+        "defect: no other Illusion you control means no bonus"
     );
 }
