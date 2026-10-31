@@ -1408,10 +1408,11 @@ mod tests {
 
     /// CR 601.2h + CR 400.2: an offer step is information-safe only while it
     /// neither draws from the game's generator nor moves or shows a hidden
-    /// card. No payment path in the current engine reaches such a step (a cost
-    /// or effect that moves a library card disqualifies a mana ability under
-    /// CR 605.1a, and random-discard mana costs are refused during payment), so
-    /// the predicate is pinned here.
+    /// card. Production payment paths reach both: Vexing Puzzlebox's mana
+    /// ability rolls a d20, and a mana ability may reveal the top card of a
+    /// library (CR 701.20b: revealing moves nothing, so CR 605.1a keeps it a
+    /// mana ability). This pins the predicate itself; the integration tests
+    /// drive both through the offer.
     #[test]
     fn offer_steps_touching_hidden_information_are_unsafe() {
         use crate::types::game_state::RandomDraw;

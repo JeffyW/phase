@@ -337,10 +337,9 @@ fn targeted_cast_offer_witnessed(
     if let Some(remaining) = pool {
         OFFER_WITNESS_POOL.with(|cell| cell.set(Some(remaining - witness.reducer_attempts)));
     }
-    let completed = witness.verdict == TargetedCastVerdict::Completed;
     #[cfg(feature = "test-support")]
-    crate::game::perf_counters::record_targeted_offer_witness(witness.reducer_attempts, completed);
-    completed
+    crate::game::perf_counters::record_targeted_offer_witness(&witness);
+    witness.verdict == TargetedCastVerdict::Completed
 }
 
 fn pending_spell_root_provenance(state: &GameState) -> Option<SpellRootProvenance> {

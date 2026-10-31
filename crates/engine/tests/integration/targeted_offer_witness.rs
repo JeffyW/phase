@@ -690,12 +690,30 @@ fn r3b_free_sibling_ability_does_not_pay_the_discard_demand() {
         "{{B}}{{C}} can't pay {{B}}{{B}}"
     );
 
-    let (payable, payable_spell, _, _, _) = twin_skirge_board(2, SKIRGE_WITH_FREE_SIBLING);
-    assert!(offered(&payable, &auto_cast(&payable, payable_spell)));
+    let (mut payable, payable_spell, skirges, bear, others) =
+        twin_skirge_board(2, SKIRGE_WITH_FREE_SIBLING);
+    let action = auto_cast(&payable, payable_spell);
+    assert!(offered(&payable, &action));
     assert_eq!(
         verdict(&payable, payable_spell, 64),
         TargetedCastVerdict::Completed
     );
+    announce_to_payment(&mut payable, action, vec![TargetRef::Object(bear)]);
+    for (skirge, other) in skirges.iter().zip(&others) {
+        activate_paying(&mut payable, *skirge, |id| id == other, ManaType::Black)
+            .expect("each Familiar discards one other card");
+    }
+    pay_and_resolve(&mut payable, payable_spell);
+    let s = payable.state();
+    assert_eq!(
+        s.objects[&bear].zone,
+        Zone::Graveyard,
+        "Victim of Night destroyed it"
+    );
+    assert_eq!(s.objects[&payable_spell].zone, Zone::Graveyard);
+    assert!(others
+        .iter()
+        .all(|id| s.objects[id].zone == Zone::Graveyard));
 }
 
 /// R3-A: two Citanul Stalwarts and `helpers` P0 Grizzly Bears; Victim of
@@ -1097,37 +1115,39 @@ fn r11_colors_read_after_their_own_counter_cost() {
 #[test]
 fn r12_mana_swapped_by_a_condition_after_its_cost() {
     use engine::types::ability::AbilityCondition;
-    let battery = |instead: bool| {
-        let ability = mana_ability(fixed(vec![ManaColor::Blue, ManaColor::Blue]), pay_life(3));
-        if !instead {
-            return ability;
-        }
-        ability.sub_ability(
-            AbilityDefinition::new(
-                AbilityKind::Activated,
-                Effect::Mana {
-                    produced: fixed(vec![ManaColor::Blue]),
-                    restrictions: vec![],
-                    grants: vec![],
-                    expiry: None,
-                    target: None,
-                },
-            )
-            .condition(AbilityCondition::ConditionInstead {
-                inner: Box::new(AbilityCondition::QuantityCheck {
-                    lhs: controller_life(),
-                    comparator: Comparator::LE,
-                    rhs: QuantityExpr::Fixed { value: 1 },
-                }),
-            }),
-        )
-    };
-    let (runner, spell, sources, bears) = battery_board(4, vec![battery(true)], |_| {});
+    let instead = AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Mana {
+            produced: fixed(vec![ManaColor::Blue]),
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .condition(AbilityCondition::ConditionInstead {
+        inner: Box::new(AbilityCondition::QuantityCheck {
+            lhs: controller_life(),
+            comparator: Comparator::LE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        }),
+    });
+    let (runner, spell, sources, bears) =
+        battery_board(4, vec![life_battery(Some(instead))], |_| {});
     assert_battery_refused(&runner, spell, &sources, bears, (0, 1));
-    let (control, spell, sources, bears) = battery_board(4, vec![battery(false)], |_| {});
+    let (control, spell, sources, bears) = battery_board(4, vec![life_battery(None)], |_| {});
     assert_battery_completes(control, spell, &sources, bears);
 }
 
+/// "Pay 3 life: Add {U}{U}." with an optional sub-ability `rider` that the
+/// ability follows after producing its mana (CR 608.2c).
+fn life_battery(rider: Option<AbilityDefinition>) -> AbilityDefinition {
+    let battery = mana_ability(fixed(vec![ManaColor::Blue, ManaColor::Blue]), pay_life(3));
+    match rider {
+        Some(rider) => battery.sub_ability(rider),
+        None => battery,
+    }
+}
 /// R13/R15 infrastructure artifact for P0: "If a permanent would produce
 /// mana, it produces {B} instead", applicable while `condition` holds.
 /// - No printed counterpart applies to non-land permanents.
@@ -1191,8 +1211,9 @@ fn r15_replacement_made_applicable_by_the_sources_own_cost() {
 /// R14 infrastructure battery: "Pay 3 life: Add {U}. Activate only if your
 /// life total is 4 or greater."
 /// - No printed counterpart.
-/// - Nearest printed shape: "Activate only if ..." restrictions on mana
-///   abilities.
+/// - Nearest printed card: Fanatic of Rhonas ("Ferocious — {T}: Add
+///   {G}{G}{G}{G}. Activate only if you control a creature with power 4 or
+///   greater.").
 /// - Needed because the restriction is rechecked at each activation (CR
 ///   602.1b + CR 602.5), after the first source's payment.
 ///
@@ -1418,4 +1439,203 @@ fn completion_that_ends_the_game_is_no_claim_either_way() {
         "CR 704.5a: the caster then loses: {:?}",
         announced.state().waiting_for
     );
+}
+
+// ---------------------------------------------------------------------------
+// Information safety through the offer (CR 601.2h + CR 400.2)
+// ---------------------------------------------------------------------------
+
+const VEXING_PUZZLEBOX: &str = "Whenever you roll one or more dice, put a number of charge counters on this artifact equal to the result.\n{T}: Add one mana of any color. Roll a d20.\n{T}, Remove 100 charge counters from this artifact: Search your library for an artifact card, put that card onto the battlefield, then shuffle.";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BlueFrom {
+    /// Vexing Puzzlebox: "{T}: Add one mana of any color. Roll a d20."
+    Puzzlebox,
+    /// Control: a basic Island.
+    Island,
+}
+
+/// P0 at 20 life: `blue` and Treasonous Ogre, no other mana; Unsubstantiate
+/// in hand; P1 has Grizzly Bears.
+fn die_roll_board(blue: BlueFrom) -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut sc = GameScenario::new();
+    sc.at_phase(Phase::PreCombatMain);
+    sc.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let source = match blue {
+        BlueFrom::Puzzlebox => sc
+            .add_artifact_from_oracle(P0, "Vexing Puzzlebox", VEXING_PUZZLEBOX)
+            .with_mana_cost(cost(vec![], 3))
+            .id(),
+        BlueFrom::Island => sc.add_basic_land(P0, ManaColor::Blue),
+    };
+    let ogre = sc
+        .add_creature(P0, "Treasonous Ogre", 2, 3)
+        .from_oracle_text_with_keywords(&["Dethrone"], TREASONOUS_OGRE)
+        .with_mana_cost(cost(vec![ManaCostShard::Red], 3))
+        .id();
+    let bear = sc.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let spell = sc
+        .add_spell_to_hand_from_oracle(P0, "Unsubstantiate", true, UNSUBSTANTIATE)
+        .with_mana_cost(cost(vec![ManaCostShard::Blue], 1))
+        .id();
+    (sc.build(), spell, source, ogre, bear)
+}
+
+/// The index of `source`'s first mana ability.
+fn mana_ability_index(runner: &GameRunner, source: ObjectId) -> usize {
+    runner.state().objects[&source]
+        .abilities
+        .iter()
+        .position(|ability| matches!(&*ability.effect, Effect::Mana { .. }))
+        .expect("the source has a mana ability")
+}
+
+/// Activate `source`'s mana ability during payment, answer a colour prompt
+/// with `color`, and return every event the activation emitted.
+fn activate_collecting(
+    runner: &mut GameRunner,
+    source: ObjectId,
+    color: ManaType,
+) -> Vec<engine::types::events::GameEvent> {
+    let ability_index = mana_ability_index(runner, source);
+    let mut events = runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index,
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the mana ability activates during payment")
+        .events;
+    if let WaitingFor::ChooseManaColor { .. } = runner.state().waiting_for {
+        events.extend(
+            runner
+                .act(GameAction::ChooseManaColor {
+                    choice: ManaChoice::SingleColor(color),
+                    count: 1,
+                })
+                .expect("the colour is chosen")
+                .events,
+        );
+    }
+    events
+}
+
+/// The offer is evaluated on scratch copies: the live state, including the
+/// game's random generator, is unchanged, and the witness was consulted.
+fn offer_with_witness_reach(runner: &GameRunner, action: &GameAction) -> bool {
+    let before = serde_json::to_value(runner.state()).expect("the state serializes");
+    let rng_before = runner.state().rng.get_word_pos();
+    perf_counters::reset_targeted_offer_witness_counters();
+    let offered = offered(runner, action);
+    assert!(
+        perf_counters::targeted_offer_witness_snapshot().calls >= 1,
+        "reach: the offer consulted the witness"
+    );
+    assert_eq!(runner.state().rng.get_word_pos(), rng_before);
+    assert_eq!(
+        serde_json::to_value(runner.state()).expect("the state serializes"),
+        before
+    );
+    offered
+}
+
+/// RNG leg (CR 601.2h + CR 706.1). Vexing Puzzlebox's blue and the Ogre's red
+/// complete Unsubstantiate, but the Puzzlebox's mana ability rolls a d20,
+/// which draws from the game's random generator. The witness never certifies
+/// that branch, so it makes no claim and the cast isn't offered; cast by hand
+/// it completes and the die is rolled (a deliberate under-offer). Control: an
+/// Island instead is offered and completes.
+#[test]
+fn completion_that_rolls_a_die_is_not_certified() {
+    let (runner, spell, puzzlebox, ogre, bear) = die_roll_board(BlueFrom::Puzzlebox);
+    let action = auto_cast(&runner, spell);
+    assert!(generated(&runner, &action), "reach: the cast is generated");
+    assert!(
+        !offer_with_witness_reach(&runner, &action),
+        "a completion that needs a die roll isn't certified"
+    );
+    assert_eq!(
+        verdict(&runner, spell, 64),
+        TargetedCastVerdict::Indeterminate
+    );
+
+    let mut forced = GameRunner::from_state(runner.state().clone());
+    announce_to_payment(&mut forced, action, vec![TargetRef::Object(bear)]);
+    let events = activate_collecting(&mut forced, puzzlebox, ManaType::Blue);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            engine::types::events::GameEvent::DieRolled { sides: 20, .. }
+        )),
+        "reach: the Puzzlebox's mana ability rolled a d20"
+    );
+    activate_paying(&mut forced, ogre, |_| true, ManaType::Red).expect("the Ogre pays");
+    pay_and_resolve(&mut forced, spell);
+    assert_eq!(forced.state().objects[&bear].zone, Zone::Hand);
+
+    let (mut control, spell, island, ogre, bear) = die_roll_board(BlueFrom::Island);
+    let action = auto_cast(&control, spell);
+    assert!(offer_with_witness_reach(&control, &action));
+    announce_to_payment(&mut control, action, vec![TargetRef::Object(bear)]);
+    activate_paying(&mut control, ogre, |_| true, ManaType::Red).expect("the Ogre pays");
+    pay_and_resolve(&mut control, spell);
+    assert!(control.state().objects[&island].tapped);
+    assert_eq!(control.state().objects[&bear].zone, Zone::Hand);
+}
+
+/// Hidden-event leg (CR 601.2h + CR 701.20b). Infrastructure battery: "Pay 3
+/// life: Add {U}{U}. Reveal the top card of your library."
+/// - No printed counterpart.
+/// - Nearest printed cards: Treasonous Ogre (pay life for mana) and
+///   Metalworker (a mana ability that reveals).
+/// - Needed because revealing moves no card (CR 701.20b), so CR 605.1a keeps
+///   it a mana ability, yet it shows a card from a hidden zone.
+///
+/// The witness never certifies that branch, so it makes no claim and the cast
+/// isn't offered; cast by hand it completes and the card is revealed.
+/// Control: the same battery without the rider is offered and completes.
+#[test]
+fn completion_that_reveals_a_library_card_is_not_certified() {
+    let reveal = AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::RevealTop {
+            player: TargetFilter::Controller,
+            count: 1,
+        },
+    );
+    let library = |sc: &mut GameScenario| {
+        sc.with_library_top(P0, &["Library Card A", "Library Card B"]);
+    };
+    let (runner, spell, sources, bears) =
+        battery_board(20, vec![life_battery(Some(reveal))], library);
+    let action = auto_cast(&runner, spell);
+    assert!(generated(&runner, &action), "reach: the cast is generated");
+    assert!(
+        !offer_with_witness_reach(&runner, &action),
+        "a completion that reveals a library card isn't certified"
+    );
+    assert_eq!(
+        verdict(&runner, spell, 64),
+        TargetedCastVerdict::Indeterminate
+    );
+
+    let mut forced = GameRunner::from_state(runner.state().clone());
+    announce_to_payment(&mut forced, action, vec![TargetRef::Object(bears)]);
+    let events = activate_collecting(&mut forced, sources[0], ManaType::Blue);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            engine::types::events::GameEvent::CardsRevealed { .. }
+        )),
+        "reach: the mana ability revealed a card: {events:?}"
+    );
+    pay_and_resolve(&mut forced, spell);
+    assert_eq!(forced.state().objects[&bears].zone, Zone::Hand);
+
+    let (control, spell, sources, bears) = battery_board(20, vec![life_battery(None)], library);
+    assert!(offer_with_witness_reach(
+        &control,
+        &auto_cast(&control, spell)
+    ));
+    assert_battery_completes(control, spell, &sources, bears);
 }

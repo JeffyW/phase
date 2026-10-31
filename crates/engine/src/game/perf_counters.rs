@@ -945,14 +945,18 @@ pub fn prior_target_binding_snapshot() -> PriorTargetBindingCounters {
     PRIOR_TARGET_BINDING_COUNTERS.with(Cell::get)
 }
 
-/// One targeted-cast offer witness run, its spend, and whether it certified.
+/// One targeted-cast offer witness run: its spend, and whether it certified.
 #[cfg(feature = "test-support")]
-pub fn record_targeted_offer_witness(reducer_attempts: usize, completed: bool) {
+pub fn record_targeted_offer_witness(witness: &crate::ai_support::TargetedCastWitness) {
     TARGETED_OFFER_WITNESS_COUNTERS.with(|cell| {
         let mut counters = cell.get();
         counters.calls += 1;
-        counters.completed += u64::from(completed);
-        counters.reducer_attempts += reducer_attempts as u64;
+        match witness.verdict {
+            crate::ai_support::TargetedCastVerdict::Completed => counters.completed += 1,
+            crate::ai_support::TargetedCastVerdict::NotFound
+            | crate::ai_support::TargetedCastVerdict::Indeterminate => {}
+        }
+        counters.reducer_attempts += witness.reducer_attempts as u64;
         cell.set(counters);
     });
 }
