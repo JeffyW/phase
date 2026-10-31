@@ -1408,9 +1408,10 @@ mod tests {
 
     /// CR 601.2h + CR 400.2: an offer step is information-safe only while it
     /// neither draws from the game's generator nor moves or shows a hidden
-    /// card. No payment path in the current engine reaches such a step (mill
-    /// and random-discard mana costs, and mana abilities with draw or shuffle
-    /// riders, are refused during payment), so the predicate is pinned here.
+    /// card. No payment path in the current engine reaches such a step (a cost
+    /// or effect that moves a library card disqualifies a mana ability under
+    /// CR 605.1a, and random-discard mana costs are refused during payment), so
+    /// the predicate is pinned here.
     #[test]
     fn offer_steps_touching_hidden_information_are_unsafe() {
         use crate::types::game_state::RandomDraw;
