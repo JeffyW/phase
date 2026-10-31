@@ -1259,6 +1259,7 @@ fn spell_alternative_cost_is_payable(
                 None,
                 costs,
                 super::cost_payability::ObjectLegPayment::Unguided,
+                super::cost_payability::CostSourceRole::SpellBeingCast,
             )
         }
         other => other.is_payable(state, player, object_id),

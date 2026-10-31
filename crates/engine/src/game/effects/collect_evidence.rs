@@ -13,20 +13,19 @@ use super::super::engine::EngineError;
 use super::super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 
 /// CR 701.59a: the cards in `player`'s graveyard that can be exiled as
-/// evidence to pay a cost of `cost_source`. CR 601.2a: a spell is moved to the
-/// stack before its costs are paid, so it is never its own evidence: neither
-/// once announced (`casting::is_spell_being_cast`) nor while the castability
-/// gate prices its cast, when it is still `cost_source` in the graveyard. An
-/// activated ability's source is excluded the same way, like every other
-/// cost-fodder enumeration (no printed card activates collect evidence from
-/// the graveyard). `None` for collect evidence as an effect.
+/// evidence. CR 601.2a: a spell is moved to the stack before its costs are
+/// paid, so it is never its own evidence. Once announced it is excluded by
+/// `casting::is_spell_being_cast`, the announcement authority; before that,
+/// while the castability gate prices its cast, the gate names it as
+/// `spell_being_priced`. CR 602.2a: an activated ability's source stays where
+/// it is, so it can be evidence for its own cost (the gate passes `None`).
 ///
 /// The single authority for the payability gate, the joint object-leg model
 /// and the `CollectEvidenceChoice` prompt.
 pub(crate) fn evidence_candidates(
     state: &GameState,
     player: PlayerId,
-    cost_source: Option<ObjectId>,
+    spell_being_priced: Option<ObjectId>,
 ) -> Vec<ObjectId> {
     state
         .players
@@ -37,7 +36,7 @@ pub(crate) fn evidence_candidates(
                 .iter()
                 .copied()
                 .filter(|&id| {
-                    Some(id) != cost_source
+                    Some(id) != spell_being_priced
                         && !super::super::casting::is_spell_being_cast(state, id)
                 })
                 .collect()
@@ -60,23 +59,27 @@ fn total_mana_value(state: &GameState, cards: &[ObjectId]) -> u32 {
 pub(crate) fn can_collect_evidence(
     state: &GameState,
     player: PlayerId,
-    cost_source: Option<ObjectId>,
+    spell_being_priced: Option<ObjectId>,
     amount: u32,
 ) -> bool {
-    total_mana_value(state, &evidence_candidates(state, player, cost_source)) >= amount
+    total_mana_value(
+        state,
+        &evidence_candidates(state, player, spell_being_priced),
+    ) >= amount
 }
 
+/// The prompt runs while a cost is being paid, after any spell paying it was
+/// announced, so `is_spell_being_cast` alone keeps that spell out.
 fn waiting_state(
     state: &GameState,
     player: PlayerId,
-    cost_source: Option<ObjectId>,
     amount: u32,
     resume: CollectEvidenceResume,
 ) -> WaitingFor {
     WaitingFor::CollectEvidenceChoice {
         player,
         minimum_mana_value: amount,
-        cards: evidence_candidates(state, player, cost_source),
+        cards: evidence_candidates(state, player, None),
         resume: Box::new(resume),
     }
 }
@@ -95,7 +98,6 @@ pub(crate) fn begin_cost_payment_for_mana_ability(
     waiting_state(
         state,
         player,
-        Some(pending.source_id),
         amount,
         CollectEvidenceResume::ManaAbility {
             pending_mana_ability: Box::new(pending),
@@ -111,8 +113,7 @@ pub(crate) fn begin_cost_payment(
     pending_cast: PendingCast,
     source: crate::types::game_state::SpellCostSource,
 ) -> Result<WaitingFor, EngineError> {
-    let cost_source = Some(pending_cast.object_id);
-    if !can_collect_evidence(state, player, cost_source, amount) {
+    if !can_collect_evidence(state, player, None, amount) {
         return Err(EngineError::ActionNotAllowed(format!(
             "Not enough total mana value in graveyard to collect evidence {}",
             amount
@@ -122,7 +123,6 @@ pub(crate) fn begin_cost_payment(
     Ok(waiting_state(
         state,
         player,
-        cost_source,
         amount,
         CollectEvidenceResume::Casting {
             pending_cast: Box::new(pending_cast),
@@ -164,7 +164,6 @@ pub(crate) fn resolve(
         state.waiting_for = waiting_state(
             state,
             ability.controller,
-            None,
             amount,
             CollectEvidenceResume::Effect {
                 pending_ability: Box::new(pending_ability),
@@ -206,8 +205,6 @@ pub(crate) fn handle_choice(
         }
     }
 
-    // `legal_cards` (the prompt's candidates) already applied the cost-source
-    // exclusion; this re-check only confirms each card is still in the graveyard.
     let still_legal = evidence_candidates(state, player, None);
     for id in chosen {
         if !still_legal.contains(id) {

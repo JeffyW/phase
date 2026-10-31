@@ -482,6 +482,33 @@ pub(crate) enum ObjectLegPayment {
     Unguided,
 }
 
+/// What the `source` of a priced cost is, threaded explicitly by each gate
+/// entry point. It decides whether `source` can itself be chosen to pay the
+/// cost from its own zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostSourceRole {
+    /// `source` is the spell whose cast is being priced. CR 601.2a: the card
+    /// is moved to the stack before its costs are paid, so it can't pay them
+    /// from the zone it is cast from, though it is still there while its cast
+    /// is priced (before announcement, `casting::is_spell_being_cast` can't
+    /// see it yet).
+    SpellBeingCast,
+    /// `source` is the object an activated ability belongs to, or an object
+    /// offering a cost outside casting. CR 602.2a: only the ability is put on
+    /// the stack; the object stays where it is.
+    AbilitySource,
+}
+
+impl CostSourceRole {
+    /// The spell whose cast is being priced, when `source` is one.
+    pub(crate) fn spell_being_cast(self, source: ObjectId) -> Option<ObjectId> {
+        match self {
+            Self::SpellBeingCast => Some(source),
+            Self::AbilitySource => None,
+        }
+    }
+}
+
 /// How many objects one object-using leg needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectLegDemand {
@@ -660,6 +687,7 @@ fn object_leg_demand_and_candidates(
     source: ObjectId,
     granting_object: Option<ObjectIncarnationRef>,
     kind: &ObjectLegKind<'_>,
+    role: CostSourceRole,
 ) -> (ObjectLegDemand, Vec<ObjectId>) {
     let source_in = |zone: Zone| -> Vec<ObjectId> {
         state
@@ -777,7 +805,11 @@ fn object_leg_demand_and_candidates(
         // their graveyard.
         ObjectLegKind::CollectEvidence => (
             ObjectLegDemand::Unmodeled,
-            super::effects::collect_evidence::evidence_candidates(state, player, Some(source)),
+            super::effects::collect_evidence::evidence_candidates(
+                state,
+                player,
+                role.spell_being_cast(source),
+            ),
         ),
         // CR 702.49a: ninjutsu returns an unblocked attacker the player controls.
         ObjectLegKind::Ninjutsu { variant } => (
@@ -797,12 +829,13 @@ fn collect_object_cost_legs<'a>(
     source: ObjectId,
     granting_object: Option<ObjectIncarnationRef>,
     cost: &'a AbilityCost,
+    role: CostSourceRole,
     legs: &mut Vec<ObjectCostLeg<'a>>,
 ) {
     match object_cost_node(cost) {
         ObjectCostNode::AllOf(costs) => {
             for leg in costs {
-                collect_object_cost_legs(state, player, source, granting_object, leg, legs);
+                collect_object_cost_legs(state, player, source, granting_object, leg, role, legs);
             }
         }
         ObjectCostNode::OneOf(costs) => {
@@ -814,6 +847,7 @@ fn collect_object_cost_legs<'a>(
                     source,
                     granting_object,
                     branch,
+                    role,
                     &mut branch_legs,
                 );
             }
@@ -834,8 +868,14 @@ fn collect_object_cost_legs<'a>(
             });
         }
         ObjectCostNode::ObjectLeg(kind) => {
-            let (demand, candidates) =
-                object_leg_demand_and_candidates(state, player, source, granting_object, &kind);
+            let (demand, candidates) = object_leg_demand_and_candidates(
+                state,
+                player,
+                source,
+                granting_object,
+                &kind,
+                role,
+            );
             legs.push(ObjectCostLeg {
                 leaf: cost,
                 demand,
@@ -963,6 +1003,7 @@ pub(crate) fn object_cost_legs_jointly_payable(
     granting_object: Option<ObjectIncarnationRef>,
     costs: &[AbilityCost],
     payment: ObjectLegPayment,
+    role: CostSourceRole,
 ) -> bool {
     if costs.iter().map(object_cost_leg_count).sum::<usize>() < 2 {
         return true;
@@ -970,7 +1011,15 @@ pub(crate) fn object_cost_legs_jointly_payable(
     let mut legs = Vec::new();
     for cost in costs {
         let first = legs.len();
-        collect_object_cost_legs(state, player, source, granting_object, cost, &mut legs);
+        collect_object_cost_legs(
+            state,
+            player,
+            source,
+            granting_object,
+            cost,
+            role,
+            &mut legs,
+        );
         if printed_order_discard_count(cost).is_some() {
             for leg in &mut legs[first..] {
                 leg.coverage = ObjectLegCoverage::PrintedOrderDiscardSequence;
@@ -1005,6 +1054,7 @@ pub(crate) fn activation_residual_jointly_payable(
         granting_object,
         children,
         ObjectLegPayment::GuidedActivation,
+        CostSourceRole::AbilitySource,
     )
 }
 
@@ -1063,6 +1113,7 @@ pub(crate) fn restrict_activation_prompt_to_joint_payment(
         spell.object_id,
         spell.ability.context.granting_object,
         residual,
+        CostSourceRole::AbilitySource,
         &mut legs,
     );
     let Some(current) = legs.iter().position(|leg| is_current_leg(leg.leaf)) else {
@@ -1115,9 +1166,12 @@ pub trait AbilityCostPayability {
     /// Mana affordability is NOT checked here; CR 601.2g handles the mana step
     /// separately through the mana-payment flow.
     ///
-    /// Ability-agnostic entry point for costs paid outside the activated-ability
-    /// pipeline (spell costs): delegates to `AbilityCostLegPayability::is_payable_in` with no
-    /// activation index and [`ObjectLegPayment::Unguided`] object legs.
+    /// Ability-agnostic entry point for spell costs: `source` is the spell whose
+    /// cast is being priced ([`CostSourceRole::SpellBeingCast`]). Delegates to
+    /// `AbilityCostLegPayability::is_payable_in` with no activation index and
+    /// [`ObjectLegPayment::Unguided`] object legs. A cost offered by an object
+    /// that isn't being cast (a replacement's "you may pay") goes through
+    /// `is_payable_in` with [`CostSourceRole::AbilitySource`].
     /// Callers that KNOW the ability whose cost this is (the activation
     /// pipeline) must use [`Self::is_payable_for_activation`] instead so CR 106.6
     /// tag-scoped mana is judged the same way the real payment step judges it.
@@ -1150,8 +1204,9 @@ pub(crate) trait AbilityCostLegPayability {
     /// [`AbilityCostPayability::is_payable_for_activation`] and the mana-ability gates, so the
     /// composite/disjunctive traversal is not duplicated. `ability_index` is the
     /// ability's identity (granting object, CR 106.6 tagged mana); `payment` is
-    /// how the caller's payment pipeline surfaces object-using legs. The two are
-    /// independent.
+    /// how the caller's payment pipeline surfaces object-using legs; `role` is
+    /// what `source` is (a spell being cast or an ability's source). The three
+    /// are independent.
     fn is_payable_in(
         &self,
         state: &GameState,
@@ -1159,6 +1214,7 @@ pub(crate) trait AbilityCostLegPayability {
         source: ObjectId,
         ability_index: Option<usize>,
         payment: ObjectLegPayment,
+        role: CostSourceRole,
     ) -> bool;
 }
 
@@ -1196,6 +1252,7 @@ impl AbilityCostPayability for AbilityCost {
                         source,
                         Some(ability_index),
                         ObjectLegPayment::Unguided,
+                        CostSourceRole::AbilitySource,
                     );
                 }
                 let (pending_spell, reserved_count) = reserved.expect("checked reservation");
@@ -1295,6 +1352,7 @@ impl AbilityCostPayability for AbilityCost {
                     granter,
                     costs,
                     ObjectLegPayment::Unguided,
+                    CostSourceRole::AbilitySource,
                 )
             }
             // Every other kind has no mana-pool component — defer to the
@@ -1305,12 +1363,20 @@ impl AbilityCostPayability for AbilityCost {
                 source,
                 Some(ability_index),
                 ObjectLegPayment::Unguided,
+                CostSourceRole::AbilitySource,
             ),
         }
     }
 
     fn is_payable(&self, state: &GameState, player: PlayerId, source: ObjectId) -> bool {
-        self.is_payable_in(state, player, source, None, ObjectLegPayment::Unguided)
+        self.is_payable_in(
+            state,
+            player,
+            source,
+            None,
+            ObjectLegPayment::Unguided,
+            CostSourceRole::SpellBeingCast,
+        )
     }
 
     fn is_payable_for_activation(
@@ -1326,6 +1392,7 @@ impl AbilityCostPayability for AbilityCost {
             source,
             ability_index,
             ObjectLegPayment::GuidedActivation,
+            CostSourceRole::AbilitySource,
         )
     }
 }
@@ -1338,6 +1405,7 @@ impl AbilityCostLegPayability for AbilityCost {
         source: ObjectId,
         ability_index: Option<usize>,
         payment: ObjectLegPayment,
+        role: CostSourceRole,
     ) -> bool {
         let granting_object =
             super::casting::activated_ability_granting_object(state, source, ability_index);
@@ -1506,14 +1574,15 @@ impl AbilityCostLegPayability for AbilityCost {
                 eligible_craft_materials(state, player, source, materials).len()
                     >= count.min_count()
             }
-            // CR 701.59b + CR 601.2a: Can't collect evidence if the total mana
-            // value of the graveyard cards other than the source (the spell
-            // being priced, which will be on the stack) is less than N.
+            // CR 701.59b: Can't collect evidence if the total mana value of the
+            // graveyard cards that can be exiled as evidence is less than N.
+            // CR 601.2a vs CR 602.2a: a spell being priced is one of them only
+            // until announced, an ability's source stays one.
             AbilityCost::CollectEvidence { amount } => {
                 super::effects::collect_evidence::can_collect_evidence(
                     state,
                     player,
-                    Some(source),
+                    role.spell_being_cast(source),
                     *amount,
                 )
             }
@@ -1764,7 +1833,9 @@ impl AbilityCostLegPayability for AbilityCost {
                         filter,
                         true,
                     ),
-                    other => other.is_payable_in(state, player, source, ability_index, payment),
+                    other => {
+                        other.is_payable_in(state, player, source, ability_index, payment, role)
+                    }
                 }) && object_cost_legs_jointly_payable(
                     state,
                     player,
@@ -1772,6 +1843,7 @@ impl AbilityCostLegPayability for AbilityCost {
                     granting_object,
                     costs,
                     payment,
+                    role,
                 )
             }
             // CR 118.12a: Disjunctive — payable if **any** sub-cost is
@@ -1780,7 +1852,7 @@ impl AbilityCostLegPayability for AbilityCost {
             // gate only needs at least one branch to be reachable.
             AbilityCost::OneOf { costs } => costs
                 .iter()
-                .any(|c| c.is_payable_in(state, player, source, ability_index, payment)),
+                .any(|c| c.is_payable_in(state, player, source, ability_index, payment, role)),
             // CR 601.2b + CR 701.67a: Waterbend composes a mana cost with a
             // tap-creature-or-artifact-to-help option (the whole point of the
             // keyword). The plain auto-tap pre-check (`can_pay_cost_after_auto_tap`)
@@ -3039,7 +3111,8 @@ mod tests {
             P0,
             source,
             Some(0),
-            ObjectLegPayment::Unguided
+            ObjectLegPayment::Unguided,
+            CostSourceRole::AbilitySource,
         ));
         // Unguided (spell) payment would let the Swamp leg strand the Forest
         // leg, so the overlapping shape fails closed there, and on the
@@ -3226,16 +3299,17 @@ mod tests {
     }
 
     /// CR 601.2a + CR 701.59b: collect evidence, alone or inside a composite
-    /// (Detective's Phoenix's "{R}, Collect evidence 6"), never counts its
-    /// source: a spell priced while still in the graveyard is on the stack by
-    /// the time the cost is paid. The same graveyard pays for a source that
-    /// isn't in it.
+    /// (Detective's Phoenix's "{R}, Collect evidence 6"), never counts a spell
+    /// whose cast it prices: that spell is on the stack by the time the cost is
+    /// paid. CR 602.2a: an activated ability's source stays where it is, so a
+    /// graveyard source counts toward its own ability's collect evidence, as
+    /// does a source that isn't in the graveyard.
     #[test]
-    fn collect_evidence_payable_excludes_its_source() {
+    fn collect_evidence_payable_excludes_only_a_spell_being_cast() {
         use crate::types::mana::ManaCost;
         let mut scenario = GameScenario::new();
-        let spell = scenario
-            .add_creature_to_graveyard(P0, "Graveyard Spell", 2, 2)
+        let source = scenario
+            .add_creature_to_graveyard(P0, "Graveyard Card", 2, 2)
             .with_mana_cost(ManaCost::generic(3))
             .id();
         scenario
@@ -3259,11 +3333,21 @@ mod tests {
                 "reach: both graveyard cards total mana value 6: {cost:?}"
             );
             assert!(
-                !cost.is_payable(state, P0, spell),
-                "the source's own mana value 3 isn't evidence: {cost:?}"
+                !cost.is_payable(state, P0, source),
+                "a spell being cast isn't its own evidence: {cost:?}"
+            );
+            assert!(
+                cost.is_payable_for_activation(state, P0, source, Some(0)),
+                "an activation's graveyard source is evidence: {cost:?}"
             );
         }
-        assert!(AbilityCost::CollectEvidence { amount: 3 }.is_payable(state, P0, spell));
+        // The mana-ability gate prices mana legs for real, so only the bare
+        // collect-evidence cost is probed there.
+        assert!(
+            alone.is_payable_for_mana_ability(state, P0, source, 0),
+            "a mana ability's graveyard source is evidence"
+        );
+        assert!(AbilityCost::CollectEvidence { amount: 3 }.is_payable(state, P0, source));
     }
 
     /// CR 118.3: #542 Loch Mare — `RemoveCounter` with `CounterMatch::Any`

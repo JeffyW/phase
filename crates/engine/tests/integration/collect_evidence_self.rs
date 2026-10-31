@@ -19,7 +19,7 @@ use engine::ai_support::legal_actions;
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, StackEntryKind, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -128,7 +128,8 @@ fn graveyard_bestow_evidence_prompt_excludes_the_spell_being_cast() {
 }
 
 /// CR 601.2a + CR 701.59a: submitting the Phoenix itself as evidence is refused, and the
-/// cast stays at the evidence prompt with the Phoenix untouched.
+/// cast stays at the evidence prompt with the Phoenix untouched; the other cards then pay,
+/// the cast completes and the Phoenix resolves enchanting Grizzly Bears.
 #[test]
 fn graveyard_bestow_refuses_the_spell_as_its_own_evidence() {
     let (mut runner, phoenix, fodder) = phoenix_in_graveyard(2);
@@ -158,6 +159,43 @@ fn graveyard_bestow_refuses_the_spell_as_its_own_evidence() {
     for id in &fodder {
         assert_eq!(runner.state().objects[id].zone, Zone::Exile);
     }
+    // CR 601.2i: the cast completes: the Phoenix is the spell on top of the
+    // stack and its caster has priority.
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == P0),
+        "the cast completes with priority, got {:?}",
+        runner.state().waiting_for
+    );
+    let top = runner
+        .state()
+        .stack
+        .last()
+        .expect("the Phoenix is on the stack");
+    assert!(
+        top.id == phoenix && matches!(top.kind, StackEntryKind::Spell { .. }),
+        "the Phoenix is the spell on the stack, got {top:?}"
+    );
+    // CR 702.103b + CR 303.4f: it resolves as an Aura attached to the Bears.
+    let bears = runner
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Grizzly Bears")
+        .expect("Grizzly Bears is on the battlefield");
+    runner.advance_until_stack_empty();
+    let resolved = &runner.state().objects[&phoenix];
+    assert_eq!(resolved.zone, Zone::Battlefield);
+    assert_eq!(
+        resolved.attached_to.and_then(|t| t.as_object()),
+        Some(bears),
+        "the bestowed Phoenix enchants Grizzly Bears"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "the game returns to priority, got {:?}",
+        runner.state().waiting_for
+    );
 }
 
 /// CR 701.59b: with one mana value 3 card besides the Phoenix, there isn't evidence 6 to
