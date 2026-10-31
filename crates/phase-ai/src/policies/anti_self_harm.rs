@@ -236,7 +236,7 @@ fn cast_has_unpayable_self_etb_may_cost(ctx: &PolicyContext<'_>) -> bool {
             decline
                 .as_deref()
                 .is_some_and(decline_moves_self_to_graveyard)
-                && !cost.is_payable(ctx.state, ctx.ai_player, source.id)
+                && !cost.is_payable_for_replacement(ctx.state, ctx.ai_player, source.id)
         })
 }
 

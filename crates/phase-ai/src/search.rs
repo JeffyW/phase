@@ -14,7 +14,6 @@ use engine::ai_support::{
     retarget_actions, root_may_yield_adverse_exchange, targeted_exchange_verdict,
     validated_candidate_actions_for_semantic_owner, AiDecisionContract, TargetedExchangeVerdict,
 };
-use engine::game::cost_payability::AbilityCostPayability;
 use engine::game::game_object::ObjectIncarnationRefExt;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility,
@@ -2103,15 +2102,11 @@ pub fn fallback_action(
             pay: zero_counter_payment_owed_by(state, *player),
         }),
 
-        // Disjunctive activation costs: default to the first payable branch.
-        WaitingFor::ActivationCostOneOfChoice {
-            player,
-            costs,
-            pending_cast,
-        } => costs
-            .iter()
-            .position(|cost| cost.is_payable(state, *player, pending_cast.object_id))
-            .map(|index| GameAction::ChooseActivationCostBranch { index }),
+        // Disjunctive activation costs: default to the first branch the engine
+        // issued (it offers only branches the activation can pay).
+        WaitingFor::ActivationCostOneOfChoice { .. } => issued(|action| {
+            matches!(action, GameAction::ChooseActivationCostBranch { .. })
+        }),
         // CR 118.12a: Disjunctive unless-cost choice. Fallback is to decline
         // the choice (let the effect resolve), mirroring `UnlessPayment`'s
         // pessimistic-default policy.

@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use crate::game::cost_payability::{AbilityCostLegPayability, CostSourceRole, ObjectLegPayment};
+use crate::game::cost_payability::AbilityCostPayability;
 use crate::game::filter::ReplacementDefinitionFilterExt;
 use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::types::ability::{
@@ -1894,14 +1894,7 @@ fn pay_replacement_may_cost(
     }
     // CR 614.1c: an "as this enters, you may pay" cost is offered by a
     // replacement effect, not a cast, so its source isn't a spell being cast.
-    if !cost.is_payable_in(
-        state,
-        player,
-        source_id,
-        None,
-        ObjectLegPayment::Unguided,
-        CostSourceRole::AbilitySource,
-    ) {
+    if !cost.is_payable_for_replacement(state, player, source_id) {
         return MayCostOutcome::Unpaid;
     }
     let paid = match cost {

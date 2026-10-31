@@ -175,7 +175,7 @@ fn graveyard_bestow_refuses_the_spell_as_its_own_evidence() {
         top.id == phoenix && matches!(top.kind, StackEntryKind::Spell { .. }),
         "the Phoenix is the spell on the stack, got {top:?}"
     );
-    // CR 702.103b + CR 303.4f: it resolves as an Aura attached to the Bears.
+    // CR 702.103b + CR 608.3c: it resolves as an Aura attached to the Bears.
     let bears = runner
         .state()
         .battlefield
