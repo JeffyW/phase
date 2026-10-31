@@ -3461,15 +3461,17 @@ mod tests {
 
     #[test]
     fn normalize_curse_attachment_qualifier_keeps_subtype_literal() {
-        // Two occurrences of the same subtype-word short name in one text: the
-        // subject occurrence ("Curse is put …" — no article, the CR 201.5c
-        // shortened-name self-reference) normalizes to `~`, while the
-        // attachment-qualified type reference ("the Curse attached to enchanted
-        // player") must stay literal. This isolates the
-        // `precedes_attachment_qualifier` guard: without it the second
-        // occurrence folds to `~` like the first. ("the" keeps the
-        // `follows_type_noun_determiner` guard out of the way; with "a" that
-        // guard would also hold the occurrence literal.)
+        // SYNTHETIC fixture (not printed Oracle text). No printed card isolates
+        // `precedes_attachment_qualifier`: every printed "Curse attached to"
+        // reference is determiner-led ("a Curse attached to enchanted player" on
+        // Curse of Misfortunes, the nearest printed card, covered by
+        // `normalize_of_short_name_curse_of_misfortunes_keeps_type_references_literal`),
+        // and `follows_type_noun_determiner` also holds that occurrence literal.
+        // So this text pairs a determiner-free subject occurrence ("Curse is put
+        // …", the CR 201.5c shortened-name self-reference, which normalizes to
+        // `~`) with "the Curse attached to enchanted player" ("the" is not a type
+        // determiner), which only the attachment-qualifier guard keeps literal:
+        // without it the second occurrence folds to `~` like the first.
         let text = "Whenever Curse is put into a graveyard from the battlefield, you may attach it to the Curse attached to enchanted player.";
         let normalized = normalize_card_name_refs(text, "Curse of Misfortunes");
         assert_eq!(
@@ -4296,6 +4298,10 @@ mod tests {
                 "If you don't, that player sacrifices all but that many permanents of their choice.",
                 "Choice of Damnations",
             ),
+            (
+                "{2}: Target creature gains fear until end of turn. (It can't be blocked except by artifact creatures and/or black creatures.)",
+                "Fear of Fear Itself",
+            ),
         ] {
             assert_eq!(
                 normalize_card_name_refs(text, name),
@@ -4303,10 +4309,14 @@ mod tests {
                 "{name}: the lower-case rules word must stay literal"
             );
         }
-        // Paired positive: the capitalized subject occurrence still normalizes.
+        // Paired positive (Kiora of Fire and Ashes' printed text): the capitalized
+        // subject occurrence still normalizes.
         assert_eq!(
-            normalize_card_name_refs("When Kiora enters, draw a card.", "Kiora of Fire and Ashes"),
-            "When ~ enters, draw a card."
+            normalize_card_name_refs(
+                "When Kiora enters, create a 5/5 red Dragon creature token with flying.",
+                "Kiora of Fire and Ashes"
+            ),
+            "When ~ enters, create a 5/5 red Dragon creature token with flying."
         );
     }
 
@@ -4324,7 +4334,6 @@ mod tests {
                 "Storm (When you cast this spell, copy it for each spell cast before it this turn.)\nExile an instant or sorcery card with mana value 3 or less from your graveyard at random.",
                 "Storm of Memories",
             ),
-            ("Fear\nEnchanted creature has fear.", "Fear of Fear Itself"),
         ] {
             assert_eq!(
                 normalize_card_name_refs(text, name),

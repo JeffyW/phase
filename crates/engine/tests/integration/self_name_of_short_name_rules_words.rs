@@ -34,6 +34,19 @@ use engine::types::zones::Zone;
 
 const TOSHIRO: &str = "(As this Saga enters and after your draw step, add a lore counter.)\nI, II \u{2014} Choose one \u{2014}\n\u{2022} Target creature gets +2/+2 until end of turn.\n\u{2022} Target creature gets -1/-1 until end of turn.\n\u{2022} You gain 2 life.\nIII \u{2014} Exile this Saga, then return it to the battlefield transformed under your control.";
 
+/// Completion boundary: the operation under test finished with priority back and an empty
+/// stack, rather than stopping at an unanswered prompt or at a driver loop's bound.
+#[track_caller]
+fn assert_settled(runner: &GameRunner, what: &str) {
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+            && runner.state().stack.is_empty(),
+        "boundary: {what} must finish at Priority with an empty stack, got {:?} with {} stack item(s)",
+        runner.state().waiting_for,
+        runner.state().stack.len()
+    );
+}
+
 const NIGHTSTALKERS: &str = "Return all Nightstalker permanent cards from your graveyard to the battlefield. Then destroy all Swamps you control.";
 
 /// Mirror of the `modal_saga_chapter_runtime` driver: move P0 into its precombat main so
@@ -88,11 +101,7 @@ fn fire_chapter_one(runner: &mut GameRunner, saga: ObjectId, mode: usize) -> boo
             other => panic!("unexpected prompt while resolving chapter I: {other:?}"),
         }
     }
-    assert!(
-        runner.state().stack.is_empty(),
-        "reach: chapter I must resolve, waiting_for={:?}",
-        runner.state().waiting_for
-    );
+    assert_settled(runner, "chapter I");
     chose_mode
 }
 
@@ -145,6 +154,7 @@ fn return_of_the_nightstalkers_returns_nightstalker_cards() {
     let mut runner = scenario.build();
 
     let outcome = runner.cast(spell).resolve();
+    assert_settled(&runner, "Return of the Nightstalkers");
 
     assert_eq!(
         outcome.zone_of(spell),
@@ -274,6 +284,7 @@ fn wall_of_mulch_sacrifices_any_wall_but_no_non_wall() {
             other => panic!("unexpected prompt while resolving Wall of Mulch: {other:?}"),
         }
     }
+    assert_settled(&runner, "the Wall of Mulch activation");
 
     assert_eq!(runner.state().objects[&other_wall].zone, Zone::Graveyard);
     assert_eq!(runner.state().objects[&mulch].zone, Zone::Battlefield);
@@ -329,10 +340,7 @@ fn cast_knight_of_the_mists(
             other => panic!("unexpected prompt while resolving Knight of the Mists: {other:?}"),
         }
     }
-    assert!(
-        runner.state().stack.is_empty(),
-        "reach: Knight of the Mists and its trigger must resolve"
-    );
+    assert_settled(runner, "Knight of the Mists and its trigger");
     legal.expect("reach: the ETB trigger must prompt for its \"target Knight\"")
 }
 
@@ -407,6 +415,7 @@ fn cleric_of_lifes_bond_triggers_on_another_cleric_only() {
     let life_before = runner.state().players[0].life;
 
     let outcome = runner.cast(bears).resolve();
+    assert_settled(&runner, "casting bears and its triggers");
     assert_eq!(
         outcome.zone_of(bears),
         Zone::Battlefield,
@@ -419,6 +428,7 @@ fn cleric_of_lifes_bond_triggers_on_another_cleric_only() {
     );
 
     let outcome = runner.cast(namesake).resolve();
+    assert_settled(&runner, "casting namesake and its triggers");
     assert_eq!(
         outcome.zone_of(namesake),
         Zone::Battlefield,
@@ -431,6 +441,7 @@ fn cleric_of_lifes_bond_triggers_on_another_cleric_only() {
     );
 
     let outcome = runner.cast(cleric).resolve();
+    assert_settled(&runner, "casting cleric and its triggers");
     assert_eq!(
         outcome.zone_of(cleric),
         Zone::Battlefield,
@@ -467,6 +478,7 @@ fn fear_of_fear_itself_grants_fear() {
     );
 
     runner.activate(source, 0).target_object(bears).resolve();
+    assert_settled(&runner, "the Fear of Fear Itself activation");
 
     assert!(
         runner.state().objects[&bears]
@@ -501,6 +513,7 @@ fn minn_token_power(other_illusions: usize) -> i32 {
     let mut runner = scenario.build();
 
     runner.cast(draw_two).resolve();
+    assert_settled(&runner, "Divination and Minn's trigger");
 
     let tokens: Vec<_> = runner
         .state()
