@@ -777,13 +777,7 @@ fn object_leg_demand_and_candidates(
         // their graveyard.
         ObjectLegKind::CollectEvidence => (
             ObjectLegDemand::Unmodeled,
-            state
-                .graveyard_of(player)
-                .iter()
-                .copied()
-                // CR 601.2a: a spell being cast is on the stack.
-                .filter(|&id| !super::casting::is_spell_being_cast(state, id))
-                .collect(),
+            super::effects::collect_evidence::evidence_candidates(state, player, Some(source)),
         ),
         // CR 702.49a: ninjutsu returns an unblocked attacker the player controls.
         ObjectLegKind::Ninjutsu { variant } => (
@@ -1512,10 +1506,16 @@ impl AbilityCostLegPayability for AbilityCost {
                 eligible_craft_materials(state, player, source, materials).len()
                     >= count.min_count()
             }
-            // CR 701.59b: Can't collect evidence if graveyard total mana value
-            // is less than N.
+            // CR 701.59b + CR 601.2a: Can't collect evidence if the total mana
+            // value of the graveyard cards other than the source (the spell
+            // being priced, which will be on the stack) is less than N.
             AbilityCost::CollectEvidence { amount } => {
-                super::effects::collect_evidence::can_collect_evidence(state, player, *amount)
+                super::effects::collect_evidence::can_collect_evidence(
+                    state,
+                    player,
+                    Some(source),
+                    *amount,
+                )
             }
             // CR 118.3 + CR 601.2b: An "exile any number of [filter] with
             // [aggregate] [cmp] N" cost is payable iff the aggregate over EVERY
@@ -3223,6 +3223,47 @@ mod tests {
     fn exert_always_payable() {
         let state = new_state();
         assert!(AbilityCost::Exert.is_payable(&state, P0, ObjectId(0)));
+    }
+
+    /// CR 601.2a + CR 701.59b: collect evidence, alone or inside a composite
+    /// (Detective's Phoenix's "{R}, Collect evidence 6"), never counts its
+    /// source: a spell priced while still in the graveyard is on the stack by
+    /// the time the cost is paid. The same graveyard pays for a source that
+    /// isn't in it.
+    #[test]
+    fn collect_evidence_payable_excludes_its_source() {
+        use crate::types::mana::ManaCost;
+        let mut scenario = GameScenario::new();
+        let spell = scenario
+            .add_creature_to_graveyard(P0, "Graveyard Spell", 2, 2)
+            .with_mana_cost(ManaCost::generic(3))
+            .id();
+        scenario
+            .add_creature_to_graveyard(P0, "Evidence", 2, 2)
+            .with_mana_cost(ManaCost::generic(3));
+        let elsewhere = scenario.add_creature(P0, "Battlefield Source", 2, 2).id();
+        let state = &scenario.state;
+
+        let alone = AbilityCost::CollectEvidence { amount: 6 };
+        let composite = AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
+                },
+                alone.clone(),
+            ],
+        };
+        for cost in [&alone, &composite] {
+            assert!(
+                cost.is_payable(state, P0, elsewhere),
+                "reach: both graveyard cards total mana value 6: {cost:?}"
+            );
+            assert!(
+                !cost.is_payable(state, P0, spell),
+                "the source's own mana value 3 isn't evidence: {cost:?}"
+            );
+        }
+        assert!(AbilityCost::CollectEvidence { amount: 3 }.is_payable(state, P0, spell));
     }
 
     /// CR 118.3: #542 Loch Mare — `RemoveCounter` with `CounterMatch::Any`

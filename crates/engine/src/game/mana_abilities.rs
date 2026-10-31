@@ -2507,6 +2507,7 @@ pub(super) fn advance_mana_ability_activation(
                 if !super::effects::collect_evidence::can_collect_evidence(
                     state,
                     pending.player,
+                    Some(pending.source_id),
                     amount,
                 ) {
                     return Err(EngineError::ActionNotAllowed(
