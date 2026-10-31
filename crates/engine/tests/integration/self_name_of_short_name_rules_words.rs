@@ -226,6 +226,9 @@ fn wall_of_mulch_sacrifices_any_wall_but_no_non_wall() {
         .with_subtypes(vec!["Wall"])
         .id();
     let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    // Hostile: shares the source's name but is not a Wall. "Sacrifice a Wall" is a type
+    // filter, so the name match must not make it payable.
+    let namesake = scenario.add_creature(P0, "Wall of Mulch", 0, 4).id();
     scenario.with_mana_pool(P0, mana(&[ManaType::Green]));
     scenario.with_library_top(P0, &["Plains"; 3]);
     let mut runner = scenario.build();
@@ -251,6 +254,10 @@ fn wall_of_mulch_sacrifices_any_wall_but_no_non_wall() {
     assert!(
         !choices.contains(&bears),
         "defect: a non-Wall creature must not pay \"Sacrifice a Wall\", got {choices:?}"
+    );
+    assert!(
+        !choices.contains(&namesake),
+        "a non-Wall sharing the source's name must not pay \"Sacrifice a Wall\", got {choices:?}"
     );
 
     runner
@@ -349,6 +356,9 @@ fn knight_of_the_mists_targets_any_knight_but_no_non_knight() {
         .with_subtypes(vec!["Human", "Knight"])
         .id();
     let bears = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    // Hostile: shares the source's name but is not a Knight. "target Knight" is a type
+    // filter, so the name match must not make it legal.
+    let namesake = scenario.add_creature(P1, "Knight of the Mists", 2, 2).id();
     scenario.with_mana_pool(
         P0,
         mana(&[ManaType::Blue, ManaType::Colorless, ManaType::Colorless]),
@@ -365,6 +375,10 @@ fn knight_of_the_mists_targets_any_knight_but_no_non_knight() {
         !legal.contains(&TargetRef::Object(bears)),
         "defect: a non-Knight creature must not be a legal \"target Knight\", got {legal:?}"
     );
+    assert!(
+        !legal.contains(&TargetRef::Object(namesake)),
+        "a non-Knight sharing the source's name must not be a legal \"target Knight\", got {legal:?}"
+    );
     assert_eq!(runner.state().objects[&rival_knight].zone, Zone::Graveyard);
     assert_eq!(runner.state().objects[&bears].zone, Zone::Battlefield);
 }
@@ -380,6 +394,10 @@ fn cleric_of_lifes_bond_triggers_on_another_cleric_only() {
         .with_subtypes(vec!["Vampire", "Cleric"]);
     let bears = scenario
         .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
+        .id();
+    // Hostile: shares the source's name but is not a Cleric.
+    let namesake = scenario
+        .add_creature_to_hand(P0, "Cleric of Life's Bond", 2, 2)
         .id();
     let cleric = scenario
         .add_creature_to_hand(P0, "Acolyte", 1, 1)
@@ -398,6 +416,18 @@ fn cleric_of_lifes_bond_triggers_on_another_cleric_only() {
         runner.state().players[0].life,
         life_before,
         "a non-Cleric entering must not trigger \"another Cleric you control\""
+    );
+
+    let outcome = runner.cast(namesake).resolve();
+    assert_eq!(
+        outcome.zone_of(namesake),
+        Zone::Battlefield,
+        "reach: the non-Cleric namesake entered"
+    );
+    assert_eq!(
+        runner.state().players[0].life,
+        life_before,
+        "a non-Cleric sharing the source's name must not trigger \"another Cleric\""
     );
 
     let outcome = runner.cast(cleric).resolve();
